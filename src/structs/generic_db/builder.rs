@@ -18,11 +18,11 @@ use crate::{
         },
     },
     traits::{
-        DomainLike, ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike, SchemaLike,
-        TableLike, TriggerLike, UserDefinedTypeLike, ViewLike,
+        DialectLike, DomainLike, ExtensionLike, FunctionLike, PolicyLike, RoleLike, RuleLike,
+        SchemaLike, TableLike, TriggerLike, UserDefinedTypeLike, ViewLike,
     },
     utils::object_name::{
-        RelationKey, render_table_candidate, stored_function_key, stored_sequence_key,
+        Namespaces, RelationKey, render_table_candidate, stored_function_key, stored_sequence_key,
         stored_table_key, stored_view_key, table_matches_key, view_matches_key,
     },
 };
@@ -36,9 +36,18 @@ fn table_names_match<T: TableLike>(left: &T, right: &T, case: IdentifierCase) ->
     )
 }
 
-fn table_schema_is_public<T: TableLike>(table: &T, case: IdentifierCase) -> bool {
+fn table_schema_is_default<T: TableLike>(
+    namespaces: Namespaces,
+    table: &T,
+    case: IdentifierCase,
+) -> bool {
     table.table_schema().is_some_and(|schema_name| {
-        case.identifiers_match(schema_name, table.table_schema_is_quoted(), "public", false)
+        case.identifiers_match(
+            schema_name,
+            table.table_schema_is_quoted(),
+            namespaces.default_schema(),
+            false,
+        )
     })
 }
 
@@ -58,27 +67,40 @@ fn tables_share_identity<T: TableLike>(left: &T, right: &T, case: IdentifierCase
         }
 }
 
-fn creates_implicit_public_ambiguity<T: TableLike>(
+fn creates_implicit_default_ambiguity<T: TableLike>(
+    namespaces: Namespaces,
     left: &T,
     right: &T,
     case: IdentifierCase,
 ) -> bool {
     table_names_match(left, right, case)
-        && ((left.table_schema().is_none() && table_schema_is_public(right, case))
-            || (right.table_schema().is_none() && table_schema_is_public(left, case)))
+        && ((left.table_schema().is_none() && table_schema_is_default(namespaces, right, case))
+            || (right.table_schema().is_none() && table_schema_is_default(namespaces, left, case)))
 }
 
 /// The stored views one of `keys` names, each keyed as written.
 fn views_named_by<V: ViewLike>(
+    namespaces: Namespaces,
     views: &[Identified<V, RelationIdentity>],
     keys: &[RelationKey],
 ) -> Vec<Identified<V, RelationIdentity>> {
     views
         .iter()
         .filter(|(view, _, _)| {
-            keys.iter().any(|key| view_matches_key(view.as_ref(), key, IdentifierCase::AsWritten))
+            keys.iter().any(|key| {
+                view_matches_key(namespaces, view.as_ref(), key, IdentifierCase::AsWritten)
+            })
         })
         .cloned()
+        .collect()
+}
+
+/// The search path a database of `dialect` starts with.
+fn initial_search_path<D: DialectLike>(dialect: &D) -> Vec<(String, bool)> {
+    Namespaces::of(dialect.sqlparser_dialect())
+        .initial_search_path()
+        .iter()
+        .map(|&(schema, quoted)| (schema.to_string(), quoted))
         .collect()
 }
 
@@ -205,11 +227,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         column_table: impl Fn(&P::Column) -> &P::Table,
     ) -> GenericDB<P> {
         let case = IdentifierCase::AsWritten;
+        let namespaces = self.namespaces();
         let tables: Vec<_> = self
             .tables
             .iter()
             .filter(|(table, _, _)| {
-                keys.iter().any(|key| table_matches_key(table.as_ref(), key, case))
+                keys.iter().any(|key| table_matches_key(namespaces, table.as_ref(), key, case))
             })
             .cloned()
             .collect();
@@ -226,8 +249,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             dialect: self.dialect.clone(),
             catalog_name: self.catalog_name.clone(),
             role_settings: Vec::new(),
-            views: views_named_by(&self.views, keys),
-            materialized_views: views_named_by(&self.materialized_views, keys),
+            views: views_named_by(namespaces, &self.views, keys),
+            materialized_views: views_named_by(namespaces, &self.materialized_views, keys),
             sequences: Vec::new(),
             dropped_sequences: Vec::new(),
             tables,
@@ -323,8 +346,35 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
 
     /// Returns `saved` as the builder a rollback leaves, keeping this
     /// builder's identity counter so no identity is handed out twice.
+    ///
+    /// SQLite's `ATTACH DATABASE` takes effect outside the transaction, so a
+    /// database attached since `saved` stays attached, with its place on the
+    /// search path, while the objects created in it are rolled back.
     pub(crate) fn rolled_back_to(&self, mut saved: Self) -> Self {
         saved.identities = self.identities;
+        let namespaces = self.namespaces();
+        if namespaces != Namespaces::Sqlite {
+            return saved;
+        }
+        let case = self.identifier_case;
+        let held = |schemas: &[Stored<P::Schema>], name: &str, quoted: bool| {
+            schemas.iter().position(|(schema, _)| {
+                namespaces.schemas_match(
+                    (schema.name(), schema.name_is_quoted()),
+                    (name, quoted),
+                    case,
+                )
+            })
+        };
+        for (name, quoted) in &self.search_path {
+            if held(&saved.schemas, name, *quoted).is_some() {
+                continue;
+            }
+            if let Some(position) = held(&self.schemas, name, *quoted) {
+                saved.schemas.push(self.schemas[position].clone());
+                saved.search_path.push((name.clone(), *quoted));
+            }
+        }
         saved
     }
 
@@ -349,6 +399,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self.dialect
     }
 
+    /// Returns how this builder's dialect names schemas and resolves an
+    /// unqualified name.
+    pub(crate) fn namespaces(&self) -> Namespaces {
+        Namespaces::of(self.dialect.sqlparser_dialect())
+    }
+
     /// Returns the catalog this builder is filling, which a qualified
     /// reference may name outermost.
     pub(crate) fn catalog_name(&self) -> &str {
@@ -356,11 +412,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     }
 
     /// Returns the path a database starts with, and the one `RESET` restores.
-    pub(crate) fn default_search_path() -> Vec<(String, bool)> {
-        crate::utils::object_name::DEFAULT_SEARCH_PATH
-            .iter()
-            .map(|&(schema, quoted)| (schema.to_string(), quoted))
-            .collect()
+    pub(crate) fn default_search_path(&self) -> Vec<(String, bool)> {
+        initial_search_path(&self.dialect)
     }
 
     /// Returns a mutable reference to the table grants list.
@@ -567,6 +620,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     /// Creates a new `GenericDBBuilder` instance.
     pub fn new(catalog_name: String, dialect: P::Dialect) -> Self {
         let schemas = P::initial_schemas(&dialect).into_iter().collect();
+        let search_path = initial_search_path(&dialect);
         Self {
             dialect,
             catalog_name,
@@ -595,7 +649,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             schemas,
             table_grants: Vec::new(),
             column_grants: Vec::new(),
-            search_path: Self::default_search_path(),
+            search_path,
             identifier_case: IdentifierCase::AsWritten,
             identities: IdentityCounter::default(),
         }
@@ -652,10 +706,11 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         table: &P::Table,
     ) -> Result<(), LookupError> {
         let case = self.identifier_case;
+        let namespaces = self.namespaces();
         for (existing, _, _) in self.tables() {
             let existing = existing.as_ref();
             if tables_share_identity(existing, table, case)
-                || creates_implicit_public_ambiguity(existing, table, case)
+                || creates_implicit_default_ambiguity(namespaces, existing, table, case)
             {
                 return Err(LookupError::TableLookupConflict {
                     table: render_table_candidate(table),
@@ -1267,17 +1322,28 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.roles
             .sort_unstable_by(|(left, _), (right, _)| left.stored_name().cmp(&right.stored_name()));
         self.schemas.sort_unstable_by(|(a, _), (b, _)| a.name().cmp(b.name()));
+        let namespaces = self.namespaces();
+        let case = IdentifierCase::AsWritten;
         self.views.sort_unstable_by(|(a, _, _), (b, _, _)| {
-            stored_view_key(a.as_ref(), IdentifierCase::AsWritten)
-                .cmp(&stored_view_key(b.as_ref(), IdentifierCase::AsWritten))
+            stored_view_key(namespaces, a.as_ref(), case).cmp(&stored_view_key(
+                namespaces,
+                b.as_ref(),
+                case,
+            ))
         });
         self.materialized_views.sort_unstable_by(|(a, _, _), (b, _, _)| {
-            stored_view_key(a.as_ref(), IdentifierCase::AsWritten)
-                .cmp(&stored_view_key(b.as_ref(), IdentifierCase::AsWritten))
+            stored_view_key(namespaces, a.as_ref(), case).cmp(&stored_view_key(
+                namespaces,
+                b.as_ref(),
+                case,
+            ))
         });
         self.sequences.sort_unstable_by(|(a, _), (b, _)| {
-            stored_sequence_key(a.as_ref(), IdentifierCase::AsWritten)
-                .cmp(&stored_sequence_key(b.as_ref(), IdentifierCase::AsWritten))
+            stored_sequence_key(namespaces, a.as_ref(), case).cmp(&stored_sequence_key(
+                namespaces,
+                b.as_ref(),
+                case,
+            ))
         });
         // Grants are not sorted as their order may be significant
     }
@@ -1293,6 +1359,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     #[must_use]
     pub fn into_database(mut self, ingestion: P::Ingestion) -> GenericDB<P> {
         self.sort_stores();
+        let namespaces = self.namespaces();
         let catalog_name = self.catalog_name;
         let (foreign_tables, tables): (Vec<_>, Vec<_>) =
             self.tables.into_iter().partition(|(_, metadata, _)| P::is_foreign_table(metadata));
@@ -1305,30 +1372,32 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             tables.len() + foreign_tables.len() + self.views.len() + self.materialized_views.len(),
         );
         for (position, (table, _, identity)) in tables.iter().enumerate() {
-            relations
-                .file(RelationSlot::Table(position), |case| stored_table_key(table.as_ref(), case));
+            relations.file(RelationSlot::Table(position), |case| {
+                stored_table_key(namespaces, table.as_ref(), case)
+            });
             relation_identities.push((*identity, RelationSlot::Table(position)));
         }
         for (position, (table, _, identity)) in foreign_tables.iter().enumerate() {
             relations.file(RelationSlot::ForeignTable(position), |case| {
-                stored_table_key(table.as_ref(), case)
+                stored_table_key(namespaces, table.as_ref(), case)
             });
             relation_identities.push((*identity, RelationSlot::ForeignTable(position)));
         }
         for (position, (view, _, identity)) in self.views.iter().enumerate() {
-            relations
-                .file(RelationSlot::View(position), |case| stored_view_key(view.as_ref(), case));
+            relations.file(RelationSlot::View(position), |case| {
+                stored_view_key(namespaces, view.as_ref(), case)
+            });
             relation_identities.push((*identity, RelationSlot::View(position)));
         }
         for (position, (view, _, identity)) in self.materialized_views.iter().enumerate() {
             relations.file(RelationSlot::MaterializedView(position), |case| {
-                stored_view_key(view.as_ref(), case)
+                stored_view_key(namespaces, view.as_ref(), case)
             });
             relation_identities.push((*identity, RelationSlot::MaterializedView(position)));
         }
         for (position, (sequence, _)) in self.sequences.iter().enumerate() {
             relations.file(RelationSlot::Sequence(position), |case| {
-                stored_sequence_key(sequence.as_ref(), case)
+                stored_sequence_key(namespaces, sequence.as_ref(), case)
             });
         }
         let (relation_index, folded_relation_index) = relations.finish();
@@ -1345,7 +1414,8 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         // argument lists holds several slots, ascending in storage order.
         let mut functions = KeyIndex::default();
         for (position, (function, _)) in self.functions.iter().enumerate() {
-            functions.file(position, |case| stored_function_key(function.as_ref(), case));
+            functions
+                .file(position, |case| stored_function_key(namespaces, function.as_ref(), case));
         }
         let (function_index, folded_function_index) = functions.finish();
 

@@ -2925,6 +2925,29 @@ pub enum Error {
         /// The non-temporary schema the statement named.
         schema_name: String,
     },
+    #[error("Database `{database_name}` is already in use.")]
+    /// Error indicating that SQLite's `ATTACH DATABASE` names `main`, `temp`
+    /// or a database already attached, which SQLite refuses.
+    DatabaseAlreadyInUse {
+        /// Name the statement attaches the database as.
+        database_name: String,
+    },
+    #[error(
+        "{object_kind} `{object_name}` cannot reference objects in database `{database_name}`."
+    )]
+    /// Error indicating that a SQLite index, or a permanent SQLite view or
+    /// trigger, names a relation of a database other than its own, which
+    /// SQLite refuses.
+    ///
+    /// Only a temporary view or trigger may reach into another database.
+    CrossDatabaseReference {
+        /// Kind of object the statement creates.
+        object_kind: ObjectKind,
+        /// Name of the object the statement creates.
+        object_name: String,
+        /// The other database the statement named.
+        database_name: String,
+    },
     #[error("Materialized view `{view_name}` cannot be declared `TEMP`.")]
     /// Error indicating that the input writes `CREATE TEMP MATERIALIZED
     /// VIEW`, which the parser accepts and PostgreSQL rejects as a syntax

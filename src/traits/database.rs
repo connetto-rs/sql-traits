@@ -29,8 +29,8 @@ use crate::{
         coercion::common_type_name,
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
-            RelationKey, RoutinePath, function_has_stored_identity, function_search_path,
-            relation_name_is_claimed, resolve_function_in_iter,
+            Namespaces, RelationKey, RoutinePath, function_has_stored_identity,
+            function_search_path, relation_name_is_claimed, resolve_function_in_iter,
             resolve_function_on_search_path_in_iter, resolve_one_function,
             resolve_sequence_in_iter, resolve_sequence_on_search_path_in_iter,
             resolve_target_in_iter, resolve_target_on_search_path_in_iter, resolve_view_in_iter,
@@ -826,9 +826,10 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// An unqualified name resolves through the first schema holding it, with
     /// the temporary schema `pg_temp` searched before [`Self::search_path`]
     /// unless the path names it, and a table stored without a schema resides
-    /// in the default schema `public`. What `case` decides is the
-    /// comparison of each part, both the name and any qualifier, and of the
-    /// schemas on the search path:
+    /// in the default schema `public`. Under SQLite the path lists `temp`,
+    /// `main` and the attached databases, and the default is `main`. What
+    /// `case` decides is the comparison of each part, both the name and any
+    /// qualifier, and of the schemas on the search path:
     /// [`IdentifierCase::AsWritten`] lets quoting decide, which is
     /// PostgreSQL's rule, [`IdentifierCase::Folded`] folds both sides, which
     /// is SQLite's, and [`IdentifierCase::Exact`] folds neither, which is
@@ -874,6 +875,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
         resolve_target_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.tables(),
             &target,
             || self.search_path(),
@@ -897,6 +899,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::View>, LookupError> {
         resolve_view_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.views(),
             &target,
             || self.search_path(),
@@ -920,6 +923,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
         resolve_view_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.materialized_views(),
             &target,
             || self.search_path(),
@@ -1032,12 +1036,18 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     ) -> Result<Option<Relation<'_, Self>>, LookupError> {
         let path = || search_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
         let claimed = |key: &RelationKey| relation_name_is_claimed(self, key, case);
-        if let Some(table) =
-            resolve_target_on_search_path_in_iter(self.tables(), &target, path, case, claimed)?
-        {
+        if let Some(table) = resolve_target_on_search_path_in_iter(
+            Namespaces::of_database(self),
+            self.tables(),
+            &target,
+            path,
+            case,
+            claimed,
+        )? {
             return Ok(Some(Relation::Table(table)));
         }
         if let Some(table) = resolve_target_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.foreign_tables(),
             &target,
             path,
@@ -1046,12 +1056,18 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         )? {
             return Ok(Some(Relation::ForeignTable(table)));
         }
-        if let Some(view) =
-            resolve_view_on_search_path_in_iter(self.views(), &target, path, case, claimed)?
-        {
+        if let Some(view) = resolve_view_on_search_path_in_iter(
+            Namespaces::of_database(self),
+            self.views(),
+            &target,
+            path,
+            case,
+            claimed,
+        )? {
             return Ok(Some(Relation::View(view)));
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.materialized_views(),
             &target,
             path,
@@ -1060,8 +1076,15 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         )? {
             return Ok(Some(Relation::MaterializedView(view)));
         }
-        resolve_sequence_on_search_path_in_iter(self.sequences(), &target, path, case, claimed)
-            .map(|sequence| sequence.map(Relation::Sequence))
+        resolve_sequence_on_search_path_in_iter(
+            Namespaces::of_database(self),
+            self.sequences(),
+            &target,
+            path,
+            case,
+            claimed,
+        )
+        .map(|sequence| sequence.map(Relation::Sequence))
     }
 
     /// Resolves a reference a stored object carries into the relation it
@@ -1165,6 +1188,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Sequence>, LookupError> {
         resolve_sequence_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.sequences(),
             &target,
             || self.search_path(),
@@ -1187,6 +1211,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
         resolve_target_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.foreign_tables(),
             &target,
             || self.search_path(),
@@ -1197,8 +1222,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
 
     /// Returns the table an identifier and its optional qualifier name,
     /// comparing them as `case` says the engine does and consulting no search
-    /// path, so an unqualified target names the default schema `public` and a
-    /// `public` qualifier reaches a table stored without one.
+    /// path, so an unqualified target names the default schema, `public` or
+    /// SQLite's `main`, and a qualifier naming it reaches a table stored
+    /// without one.
     ///
     /// Takes the name in parts, which is what a caller holding identifier
     /// values rather than written SQL has, so a table really called
@@ -1248,7 +1274,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
-        resolve_target_in_iter(self.tables(), &target, case)
+        resolve_target_in_iter(Namespaces::of_database(self), self.tables(), &target, case)
     }
 
     /// Returns the foreign table a name in parts denotes, applying the same
@@ -1282,7 +1308,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
-        resolve_target_in_iter(self.foreign_tables(), &target, case)
+        resolve_target_in_iter(Namespaces::of_database(self), self.foreign_tables(), &target, case)
     }
 
     /// Returns the plain view a name in parts denotes, applying the same rules
@@ -1321,7 +1347,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::View>, LookupError> {
-        resolve_view_in_iter(self.views(), &target, case)
+        resolve_view_in_iter(Namespaces::of_database(self), self.views(), &target, case)
     }
 
     /// Returns the materialized view a name in parts denotes, applying the
@@ -1356,7 +1382,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
-        resolve_view_in_iter(self.materialized_views(), &target, case)
+        resolve_view_in_iter(
+            Namespaces::of_database(self),
+            self.materialized_views(),
+            &target,
+            case,
+        )
     }
 
     /// Returns the sequence a name in parts denotes, applying the same rules
@@ -1389,7 +1420,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Sequence>, LookupError> {
-        resolve_sequence_in_iter(self.sequences(), &target, case)
+        resolve_sequence_in_iter(Namespaces::of_database(self), self.sequences(), &target, case)
     }
 
     /// Returns the function a name in parts denotes, applying the same rules
@@ -1433,7 +1464,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Function>, LookupError> {
-        resolve_function_in_iter(self.functions(), &target, case)
+        resolve_function_in_iter(Namespaces::of_database(self), self.functions(), &target, case)
     }
 
     /// Returns the table ID for the given table object according to its
@@ -1743,6 +1774,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Function>, LookupError> {
         resolve_function_on_search_path_in_iter(
+            Namespaces::of_database(self),
             self.functions(),
             &target,
             function_search_path(|| self.search_path()),
@@ -2588,7 +2620,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     }
 
     /// Iterates over the schemas the database holds, `public` among them while
-    /// it exists.
+    /// it exists. Under SQLite they are `main` and each attached database.
     ///
     /// # Example
     ///
@@ -2624,6 +2656,12 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// no schema at all when that is the default one, which this model already
     /// spells without the prefix.
     ///
+    /// Under SQLite the schemas are the databases of the connection, and the
+    /// path lists them in the order SQLite searches them, `temp`, `main`,
+    /// then each attached database in attach order. A statement creating a
+    /// permanent object without a database puts it in `main` whatever the
+    /// path holds.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -2657,7 +2695,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```
     #[inline]
     fn search_path(&self) -> impl Iterator<Item = (&str, bool)> {
-        core::iter::once(("public", false))
+        Namespaces::of_database(self).initial_search_path().iter().copied()
     }
 
     /// Returns the schema with the given name, if it exists.

@@ -24,7 +24,7 @@ use crate::{
     traits::{ColumnLike, CreatedFromQuery, DataTypeLike, DatabaseLike, FunctionLike, TableLike},
     utils::{
         call_sites::{ExpressionForm, call_reaches, expression_form},
-        object_name::object_name_last_part,
+        object_name::{Namespaces, object_name_last_part},
         postgres_types::{PgType, Polymorphic},
     },
 };
@@ -851,7 +851,10 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             (RelationKey { value: AstRef::Query(alias), quoted }, None)
         } else {
             let schema = table.table_schema().map_or(
-                RelationKey { value: AstRef::Database("public"), quoted: false },
+                RelationKey {
+                    value: AstRef::Database(Namespaces::of_database(database).default_schema()),
+                    quoted: false,
+                },
                 |schema| {
                     RelationKey {
                         value: AstRef::Database(schema),

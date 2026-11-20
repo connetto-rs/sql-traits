@@ -14,7 +14,7 @@ use crate::{
     },
     traits::{DatabaseLike, FunctionLike, Relation, TableLike},
     utils::object_name::{
-        RelationKey, function_has_stored_identity, function_search_path, relation_search_path,
+        Namespaces, RelationKey, function_has_stored_identity, function_search_path,
         render_relation, render_sequence_candidate, render_table_candidate, render_view_candidate,
         resolve_one_function, resolve_one_relation, resolve_target_from_candidates,
         stored_function_key, stored_identity_key, stored_sequence_key, stored_table_key,
@@ -91,7 +91,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     fn table_by_stored_identity(&self, schema: Option<&str>, name: &str) -> Option<&Self::Table> {
         // One bucket holds both spellings of the default schema, so the probe
         // narrows to a name and the comparison decides the identity.
-        self.indexed_tables(&stored_identity_key(schema, name)).find(|table| {
+        self.indexed_tables(&stored_identity_key(self.namespaces(), schema, name)).find(|table| {
             table.stored_table_schema().as_deref() == schema && table.stored_table_name() == name
         })
     }
@@ -133,10 +133,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     }
 
     fn view_identity(&self, view: &Self::View) -> Option<Self::RelationId> {
-        let key = stored_view_key(view, IdentifierCase::AsWritten);
+        let key = stored_view_key(self.namespaces(), view, IdentifierCase::AsWritten);
         self.views
             .binary_search_by(|(candidate, _, _)| {
-                stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten).cmp(&key)
+                stored_view_key(self.namespaces(), candidate.as_ref(), IdentifierCase::AsWritten)
+                    .cmp(&key)
             })
             .ok()
             .map(|position| self.views[position].2)
@@ -146,10 +147,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         &self,
         view: &Self::MaterializedView,
     ) -> Option<Self::RelationId> {
-        let key = stored_view_key(view, IdentifierCase::AsWritten);
+        let key = stored_view_key(self.namespaces(), view, IdentifierCase::AsWritten);
         self.materialized_views
             .binary_search_by(|(candidate, _, _)| {
-                stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten).cmp(&key)
+                stored_view_key(self.namespaces(), candidate.as_ref(), IdentifierCase::AsWritten)
+                    .cmp(&key)
             })
             .ok()
             .map(|position| self.materialized_views[position].2)
@@ -295,7 +297,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         &self,
         target: TargetName<'_>,
     ) -> Result<Option<Relation<'_, Self>>, LookupError> {
-        let probe = IndexProbe::new(&target, IdentifierCase::AsWritten, None);
+        let probe = IndexProbe::new(self.namespaces(), &target, IdentifierCase::AsWritten, None);
         self.resolve_probed_relation(&probe, &target)
     }
 
@@ -326,7 +328,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
-        let probe = IndexProbe::new(&target, case, None);
+        let probe = IndexProbe::new(self.namespaces(), &target, case, None);
         resolve_target_from_candidates(&target, &self.probed_foreign_tables(&probe))
     }
 
@@ -335,7 +337,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::View>, LookupError> {
-        let probe = IndexProbe::new(&target, case, None);
+        let probe = IndexProbe::new(self.namespaces(), &target, case, None);
         resolve_one_relation(&target, &self.probed_views(&probe), render_view_candidate)
     }
 
@@ -344,7 +346,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
-        let probe = IndexProbe::new(&target, case, None);
+        let probe = IndexProbe::new(self.namespaces(), &target, case, None);
         resolve_one_relation(
             &target,
             &self.probed_materialized_views(&probe),
@@ -357,7 +359,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Sequence>, LookupError> {
-        let probe = IndexProbe::new(&target, case, None);
+        let probe = IndexProbe::new(self.namespaces(), &target, case, None);
         resolve_one_relation(&target, &self.probed_sequences(&probe), render_sequence_candidate)
     }
 
@@ -366,7 +368,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Function>, LookupError> {
-        let probe = IndexProbe::new(&target, case, None);
+        let probe = IndexProbe::new(self.namespaces(), &target, case, None);
         resolve_one_function(&target.to_string(), &self.probed_functions(&probe))
     }
 
@@ -440,7 +442,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         // One bucket holds both spellings of the default schema, so the probe
         // narrows by name and the comparison decides the identity.
         let candidates: Vec<&P::Function> = self
-            .indexed_functions(&stored_identity_key(schema, name))
+            .indexed_functions(&stored_identity_key(self.namespaces(), schema, name))
             .filter(|function| function_has_stored_identity(*function, schema, name))
             .collect();
         resolve_one_function(name, &candidates)
@@ -514,7 +516,12 @@ fn probing_case(case: IdentifierCase) -> IdentifierCase {
 impl IndexProbe {
     /// Probe for `target` under `case`, aimed at `entry` when the search path
     /// supplies the schema rather than the target's own qualifier.
-    fn new(target: &TargetName<'_>, case: IdentifierCase, entry: Option<(&str, bool)>) -> Self {
+    fn new(
+        namespaces: Namespaces,
+        target: &TargetName<'_>,
+        case: IdentifierCase,
+        entry: Option<(&str, bool)>,
+    ) -> Self {
         let name = |under: IdentifierCase| {
             under.compared_form(target.name(), target.name_is_quoted()).into_owned()
         };
@@ -523,7 +530,7 @@ impl IndexProbe {
                 Some((entry, quoted)) => under.compared_form(entry, quoted).into_owned(),
                 None => {
                     target.schema().map_or_else(
-                        || String::from("public"),
+                        || String::from(namespaces.default_schema()),
                         |schema| {
                             under.compared_form(schema, target.schema_is_quoted()).into_owned()
                         },
@@ -616,7 +623,7 @@ impl<P: SchemaProfile> GenericDB<P> {
         self.probed_relation_slots(probe)
             .filter_map(|slot| stored(*slot))
             .map(|(table, _, _)| table.as_ref())
-            .filter(|table| probe.accepts(|case| stored_table_key(*table, case)))
+            .filter(|table| probe.accepts(|case| stored_table_key(self.namespaces(), *table, case)))
             .collect()
     }
 
@@ -633,7 +640,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 }
             })
             .map(|(view, _, _)| view.as_ref())
-            .filter(|view| probe.accepts(|case| stored_view_key(*view, case)))
+            .filter(|view| probe.accepts(|case| stored_view_key(self.namespaces(), *view, case)))
             .collect()
     }
 
@@ -655,7 +662,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 }
             })
             .map(|(view, _, _)| view.as_ref())
-            .filter(|view| probe.accepts(|case| stored_view_key(*view, case)))
+            .filter(|view| probe.accepts(|case| stored_view_key(self.namespaces(), *view, case)))
             .collect()
     }
 
@@ -672,7 +679,9 @@ impl<P: SchemaProfile> GenericDB<P> {
                 }
             })
             .map(|(sequence, _)| sequence.as_ref())
-            .filter(|sequence| probe.accepts(|case| stored_sequence_key(*sequence, case)))
+            .filter(|sequence| {
+                probe.accepts(|case| stored_sequence_key(self.namespaces(), *sequence, case))
+            })
             .collect()
     }
 
@@ -686,27 +695,35 @@ impl<P: SchemaProfile> GenericDB<P> {
             match slot {
                 RelationSlot::Table(position) => {
                     self.tables.get(*position).is_some_and(|(table, _, _)| {
-                        probe.accepts(|case| stored_table_key(table.as_ref(), case))
+                        probe.accepts(|case| {
+                            stored_table_key(self.namespaces(), table.as_ref(), case)
+                        })
                     })
                 }
                 RelationSlot::ForeignTable(position) => {
                     self.foreign_tables.get(*position).is_some_and(|(table, _, _)| {
-                        probe.accepts(|case| stored_table_key(table.as_ref(), case))
+                        probe.accepts(|case| {
+                            stored_table_key(self.namespaces(), table.as_ref(), case)
+                        })
                     })
                 }
                 RelationSlot::View(position) => {
                     self.views.get(*position).is_some_and(|(view, _, _)| {
-                        probe.accepts(|case| stored_view_key(view.as_ref(), case))
+                        probe
+                            .accepts(|case| stored_view_key(self.namespaces(), view.as_ref(), case))
                     })
                 }
                 RelationSlot::MaterializedView(position) => {
                     self.materialized_views.get(*position).is_some_and(|(view, _, _)| {
-                        probe.accepts(|case| stored_view_key(view.as_ref(), case))
+                        probe
+                            .accepts(|case| stored_view_key(self.namespaces(), view.as_ref(), case))
                     })
                 }
                 RelationSlot::Sequence(position) => {
                     self.sequences.get(*position).is_some_and(|(sequence, _)| {
-                        probe.accepts(|case| stored_sequence_key(sequence.as_ref(), case))
+                        probe.accepts(|case| {
+                            stored_sequence_key(self.namespaces(), sequence.as_ref(), case)
+                        })
                     })
                 }
             }
@@ -747,7 +764,9 @@ impl<P: SchemaProfile> GenericDB<P> {
             .chain(aliases.iter().flat_map(own))
             .chain(self.builtins.keyed(&probe.key, probe.aliases))
             .map(|(function, _)| function.as_ref())
-            .filter(|function| probe.accepts(|case| stored_function_key(*function, case)))
+            .filter(|function| {
+                probe.accepts(|case| stored_function_key(self.namespaces(), *function, case))
+            })
             .collect()
     }
 
@@ -765,13 +784,13 @@ impl<P: SchemaProfile> GenericDB<P> {
     ) -> Result<Option<&P::Function>, LookupError> {
         let written = target.to_string();
         if target.schema().is_some() {
-            let probe = IndexProbe::new(target, case, None);
+            let probe = IndexProbe::new(self.namespaces(), target, case, None);
             return resolve_one_function(&written, &self.probed_functions(&probe));
         }
 
         let path = || self.search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted));
         for entry in function_search_path(path) {
-            let probe = IndexProbe::new(target, case, Some(entry));
+            let probe = IndexProbe::new(self.namespaces(), target, case, Some(entry));
             let candidates = self.probed_functions(&probe);
             if !candidates.is_empty() {
                 return resolve_one_function(&written, &candidates);
@@ -816,7 +835,7 @@ impl<P: SchemaProfile> GenericDB<P> {
         target: &TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&P::Table>, LookupError> {
-        let probe = IndexProbe::new(target, case, None);
+        let probe = IndexProbe::new(self.namespaces(), target, case, None);
         resolve_target_from_candidates(target, &self.probed_tables(&probe))
     }
 
@@ -835,12 +854,17 @@ impl<P: SchemaProfile> GenericDB<P> {
         I: Iterator<Item = (&'path str, bool)>,
     {
         if target.schema().is_some() {
-            let probe = IndexProbe::new(target, case, None);
+            let probe = IndexProbe::new(self.namespaces(), target, case, None);
             return resolve_one_relation(target, &candidates_of(self, &probe), render);
         }
 
-        for (entry_schema, entry_quoted) in relation_search_path(search_path) {
-            let probe = IndexProbe::new(target, case, Some((entry_schema, entry_quoted)));
+        for (entry_schema, entry_quoted) in self.namespaces().relation_search_path(search_path) {
+            let probe = IndexProbe::new(
+                self.namespaces(),
+                target,
+                case,
+                Some((entry_schema, entry_quoted)),
+            );
             if self.probed_name_is_taken(&probe) {
                 // Reported under the written name: the entry qualifier is
                 // resolution machinery, not something the statement spelled.
@@ -869,12 +893,17 @@ impl<P: SchemaProfile> GenericDB<P> {
         I: Iterator<Item = (&'path str, bool)>,
     {
         if target.schema().is_some() {
-            let probe = IndexProbe::new(target, case, None);
+            let probe = IndexProbe::new(self.namespaces(), target, case, None);
             return self.resolve_probed_relation(&probe, target);
         }
 
-        for (entry_schema, entry_quoted) in relation_search_path(search_path) {
-            let probe = IndexProbe::new(target, case, Some((entry_schema, entry_quoted)));
+        for (entry_schema, entry_quoted) in self.namespaces().relation_search_path(search_path) {
+            let probe = IndexProbe::new(
+                self.namespaces(),
+                target,
+                case,
+                Some((entry_schema, entry_quoted)),
+            );
             if self.probed_name_is_taken(&probe) {
                 return self.resolve_probed_relation(&probe, target);
             }

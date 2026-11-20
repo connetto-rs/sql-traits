@@ -96,7 +96,8 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// the default schema without a qualifier.
     ///
     /// Ingestion records where the view landed: the schema the search path
-    /// selected for a bare name, and `pg_temp` for a temporary view.
+    /// selected for a bare name, and `pg_temp` for a temporary view, or
+    /// `temp` under SQLite.
     fn view_schema(&self) -> Option<&str>;
 
     /// Returns whether the schema identifier of this view was quoted in SQL.

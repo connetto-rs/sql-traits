@@ -830,6 +830,7 @@ pub(super) fn shadows_of(
                 owner.table_name(),
                 owner.table_name_is_quoted(),
             ) && schema_qualifiers_match(
+                builder.namespaces(),
                 table_schema_qualifier(table),
                 table_schema_qualifier(owner),
                 case,

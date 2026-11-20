@@ -59,12 +59,11 @@ use crate::{
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
         object_name::{
-            PG_CATALOG, Qualifier, RelationKey, SearchPathChange, TEMPORARY_SCHEMA,
+            Namespaces, PG_CATALOG, Qualifier, RelationKey, SearchPathChange, TEMPORARY_SCHEMA,
             is_search_path_parameter, object_name_identifiers, object_name_last_part,
-            overqualified_object_name, qualifier_of, relation_search_path,
-            require_local_object_name, require_static_object_name,
-            resolve_sequence_on_search_path_in_iter, resolve_table_object_name_in_iter,
-            resolve_table_object_name_on_search_path_in_iter,
+            overqualified_object_name, qualifier_of, require_local_object_name,
+            require_static_object_name, resolve_sequence_on_search_path_in_iter,
+            resolve_table_object_name_in_iter, resolve_table_object_name_on_search_path_in_iter,
             resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
             search_path_change, search_path_entry, sequence_matches_key, stored_table_key,
             table_matches_key, table_matches_object_name, target_name_of_idents,
@@ -122,6 +121,7 @@ mod rules;
 mod schema_usage;
 mod sequences;
 mod signature_types;
+mod sqlite_databases;
 mod stored_expressions;
 mod table_as;
 mod table_owner;
@@ -248,6 +248,11 @@ impl SchemaProfile for SqlparserProfile {
     }
 
     fn initial_schemas(dialect: &SqlparserDialect) -> impl IntoIterator<Item = (Arc<Schema>, ())> {
+        // SQLite's schemas are the connection's databases, `main` the only one
+        // listed before any `ATTACH`, as `temp` is the temporary schema.
+        if matches!(dialect, SqlparserDialect::SQLite) {
+            return [(Arc::new(Schema::new(String::from("main"))), ())];
+        }
         // PostgreSQL 15 and later hand `public` to the database owner's
         // predefined role.
         let owner = matches!(dialect, SqlparserDialect::PostgreSql)
@@ -1284,7 +1289,9 @@ impl ParserDBBuilder {
             let declared_in = qualifier_of(&function.name).named();
             search_path
                 .iter()
-                .position(|&entry| schema_qualifiers_match(declared_in, Some(entry), case))
+                .position(|&entry| {
+                    schema_qualifiers_match(self.namespaces(), declared_in, Some(entry), case)
+                })
                 .map_or(0, |position| position + 1)
         };
         scope
@@ -1308,6 +1315,7 @@ impl ParserDBBuilder {
         let case = self.identifier_case();
         let resolve = |name: &ObjectName| {
             resolve_table_object_name_in_iter(
+                self.namespaces(),
                 self.tables().iter().map(|(table, _, _)| table.as_ref()),
                 name,
                 case,
@@ -1760,6 +1768,7 @@ impl ParserDBBuilder {
         // An object stored without a schema sits in `public`.
         let in_schema = |stored: Option<(&str, bool)>| {
             schema_qualifiers_match(
+                self.namespaces(),
                 stored,
                 Some((schema_name, schema_quoted)),
                 self.identifier_case(),
@@ -1808,6 +1817,7 @@ impl ParserDBBuilder {
     ) -> Result<Option<&CreateTable>, LookupError> {
         let case = self.identifier_case();
         resolve_table_object_name_on_search_path_in_iter(
+            self.namespaces(),
             self.tables().iter().map(|(table, _, _)| table.as_ref()),
             object_name,
             || self.search_path(),
@@ -1873,6 +1883,7 @@ impl ParserDBBuilder {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
+            self.namespaces(),
             self.views().iter().map(|(view, _, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
             || self.search_path(),
@@ -1890,6 +1901,7 @@ impl ParserDBBuilder {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
+            self.namespaces(),
             self.materialized_views().iter().map(|(view, _, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
             || self.search_path(),
@@ -1912,23 +1924,29 @@ impl ParserDBBuilder {
         match qualifier_of(name) {
             Qualifier::Named(schema, quoted) => holder((schema, quoted)),
             Qualifier::RunTime => None,
-            Qualifier::Absent => relation_search_path(|| self.search_path()).find_map(holder),
+            Qualifier::Absent => {
+                self.namespaces().relation_search_path(|| self.search_path()).find_map(holder)
+            }
         }
     }
 
     /// Whether any table, view, materialized view or sequence is stored under
     /// `key`.
     fn relation_key_is_held(&self, key: &RelationKey, case: IdentifierCase) -> bool {
-        self.tables().iter().any(|(table, _, _)| table_matches_key(table.as_ref(), key, case))
-            || self.views().iter().any(|(view, _, _)| view_matches_key(view.as_ref(), key, case))
+        self.tables()
+            .iter()
+            .any(|(table, _, _)| table_matches_key(self.namespaces(), table.as_ref(), key, case))
+            || self
+                .views()
+                .iter()
+                .any(|(view, _, _)| view_matches_key(self.namespaces(), view.as_ref(), key, case))
             || self
                 .materialized_views()
                 .iter()
-                .any(|(view, _, _)| view_matches_key(view.as_ref(), key, case))
-            || self
-                .sequences()
-                .iter()
-                .any(|(sequence, ())| sequence_matches_key(sequence.as_ref(), key, case))
+                .any(|(view, _, _)| view_matches_key(self.namespaces(), view.as_ref(), key, case))
+            || self.sequences().iter().any(|(sequence, ())| {
+                sequence_matches_key(self.namespaces(), sequence.as_ref(), key, case)
+            })
     }
 
     /// Binds every relation a grant or revoke names to the one it reaches
@@ -1962,10 +1980,9 @@ impl ParserDBBuilder {
         }
         let case = self.identifier_case();
         let in_schemas = |schemas: &[ObjectName], qualifier: SchemaQualifier<'_>| {
-            schemas
-                .iter()
-                .filter_map(object_name_last_part)
-                .any(|schema| schema_qualifiers_match(qualifier, Some(schema), case))
+            schemas.iter().filter_map(object_name_last_part).any(|schema| {
+                schema_qualifiers_match(self.namespaces(), qualifier, Some(schema), case)
+            })
         };
         let stored_name = |qualifier: SchemaQualifier<'_>, name: &str, quoted: bool| {
             ObjectName::from(
@@ -2162,6 +2179,7 @@ impl ParserDBBuilder {
         object_name: &ObjectName,
     ) -> Result<Option<&CreateTable>, LookupError> {
         resolve_table_object_name_in_iter(
+            self.namespaces(),
             self.tables().iter().map(|(table, _, _)| table.as_ref()),
             object_name,
             self.identifier_case(),
@@ -2184,6 +2202,7 @@ impl ParserDBBuilder {
                             case.identifiers_match(stored, quoted, written.0, written.1)
                         },
                     ) && schema_qualifiers_match(
+                        self.namespaces(),
                         table_schema_qualifier(TableAttribute::table(index.as_ref())),
                         Some(schema),
                         case,
@@ -2197,6 +2216,7 @@ impl ParserDBBuilder {
                                 index,
                                 written,
                                 Some(schema),
+                                self.namespaces(),
                                 case,
                             )
                         })
@@ -2239,6 +2259,7 @@ impl ParserDBBuilder {
         let claimed = |key: &RelationKey| self.relation_key_is_held(key, case);
         let path = || self.search_path();
         if let Some(table) = resolve_target_on_search_path_in_iter(
+            self.namespaces(),
             self.tables().iter().map(|(table, _, _)| table.as_ref()),
             &target,
             path,
@@ -2253,6 +2274,7 @@ impl ParserDBBuilder {
             });
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
+            self.namespaces(),
             self.views().iter().map(|(view, _, _)| view.as_ref()),
             &target,
             path,
@@ -2267,6 +2289,7 @@ impl ParserDBBuilder {
             });
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
+            self.namespaces(),
             self.materialized_views().iter().map(|(view, _, _)| view.as_ref()),
             &target,
             path,
@@ -2281,6 +2304,7 @@ impl ParserDBBuilder {
             });
         }
         resolve_sequence_on_search_path_in_iter(
+            self.namespaces(),
             self.sequences().iter().map(|(sequence, ())| sequence.as_ref()),
             &target,
             path,
@@ -2952,13 +2976,14 @@ fn tables_declaring_column(
 /// reading the table name it, or `None` when the table declares no such
 /// column.
 fn column_rename(
+    namespaces: Namespaces,
     node: &CreateTable,
     from: &NamedColumn,
     to: &Ident,
 ) -> Option<view_rewrites::Rename> {
     let ordinal = node.columns.iter().position(|column| from.matches(&column.name))?;
     Some(view_rewrites::Rename::Column {
-        key: stored_table_key(node, IdentifierCase::AsWritten),
+        key: stored_table_key(namespaces, node, IdentifierCase::AsWritten),
         ordinal,
         to: to.clone(),
         columns: node.columns.iter().map(|column| column.name.clone()).collect(),
@@ -3449,12 +3474,18 @@ fn routines_on_path(
 /// Returns whether two function names name the same function or set of
 /// overloads, which takes the same name in the same schema, a missing
 /// qualifier reading as `public`. A qualifier built at run time names no
-/// schema yet, so it matches nothing.
+/// schema yet, so it matches nothing. Functions are PostgreSQL's objects, so
+/// their names read under its namespaces whatever the dialect.
 fn function_names_match(left: &ObjectName, right: &ObjectName, case: IdentifierCase) -> bool {
     object_names_match(left, right, case)
         && !matches!(qualifier_of(left), Qualifier::RunTime)
         && !matches!(qualifier_of(right), Qualifier::RunTime)
-        && schema_qualifiers_match(qualifier_of(left).named(), qualifier_of(right).named(), case)
+        && schema_qualifiers_match(
+            Namespaces::PostgreSql,
+            qualifier_of(left).named(),
+            qualifier_of(right).named(),
+            case,
+        )
 }
 
 /// Returns whether two functions are the same function to PostgreSQL, which
@@ -3769,17 +3800,18 @@ fn declared_schema<'builder>(
     name: &str,
     quoted: bool,
 ) -> Option<&'builder Schema> {
-    builder
-        .schemas()
-        .iter()
-        .map(|(schema, ())| schema.as_ref())
-        .find(|schema| identifiers_match(schema.name(), schema.is_quoted(), name, quoted))
+    let namespaces = builder.namespaces();
+    let case = builder.identifier_case();
+    builder.schemas().iter().map(|(schema, ())| schema.as_ref()).find(|schema| {
+        namespaces.schemas_match((schema.name(), schema.is_quoted()), (name, quoted), case)
+    })
 }
 
 /// Returns whether a schema by this name is one a relation may be created in,
 /// the session's temporary schema included, which no statement can create.
 fn schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bool {
-    is_temporary_schema(name, quoted) || declared_schema(builder, name, quoted).is_some()
+    builder.namespaces().is_temporary((name, quoted), builder.identifier_case())
+        || declared_schema(builder, name, quoted).is_some()
 }
 
 fn collation_schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bool {
@@ -4248,10 +4280,13 @@ fn place_relation(
     let Some((relation_name, _)) = object_name_last_part(name) else {
         return Ok(temporary);
     };
+    let namespaces = builder.namespaces();
     match qualifier_of(name) {
-        Qualifier::Named(schema, quoted) if is_temporary_schema(schema, quoted) => {}
         Qualifier::Named(schema, quoted)
-            if identifiers_match(schema, quoted, PG_CATALOG, false) =>
+            if namespaces.is_temporary((schema, quoted), builder.identifier_case()) => {}
+        Qualifier::Named(schema, quoted)
+            if namespaces == Namespaces::PostgreSql
+                && identifiers_match(schema, quoted, PG_CATALOG, false) =>
         {
             refuse_system_schema_relation(object_kind, relation_name)?;
             return Ok(false);
@@ -4265,10 +4300,21 @@ fn place_relation(
                     schema_name: schema.to_string(),
                 });
             }
+            // A database name may be spelled several ways that compare equal,
+            // so the name is stored under the spelling `ATTACH` gave it.
+            if namespaces == Namespaces::Sqlite
+                && let Some(declared) = declared_schema(builder, schema, quoted)
+            {
+                let declared = schema_ident(declared);
+                bind_reference(name, Some(declared));
+            }
             return Ok(false);
         }
         Qualifier::RunTime => return Ok(temporary),
         Qualifier::Absent if temporary => {}
+        // SQLite creates a permanent object named without a database in
+        // `main`, which the model leaves unwritten, whatever the path holds.
+        Qualifier::Absent if namespaces == Namespaces::Sqlite => return Ok(false),
         Qualifier::Absent => {
             let qualifier = search_path_qualifier(builder, object_kind, relation_name, role)?;
             let Some(qualifier) = qualifier else {
@@ -4281,8 +4327,17 @@ fn place_relation(
         }
     }
     // One spelling, so every comparison rule reaches it.
-    bind_reference(name, Some(Ident::new(TEMPORARY_SCHEMA)));
+    bind_reference(name, Some(Ident::new(namespaces.temporary_schema())));
     Ok(true)
+}
+
+/// The identifier spelling a schema the way the catalog holds it.
+fn schema_ident(schema: &Schema) -> Ident {
+    if schema.is_quoted() {
+        Ident::with_quote('"', schema.name())
+    } else {
+        Ident::new(schema.name())
+    }
 }
 
 /// Replaces a reference's qualifier, keeping the identifier it names as
@@ -4388,6 +4443,7 @@ fn bind_foreign_key_targets(
     let bindings: Vec<Option<ForeignKeyBinding>> = foreign_keys_of(node)
         .map(|foreign_key| {
             resolve_table_object_name_on_search_path_in_iter(
+                builder.namespaces(),
                 builder
                     .tables()
                     .iter()
@@ -4482,11 +4538,7 @@ fn search_path_qualifier(
         if let Some(schema) = declared_schema(builder, entry, quoted) {
             // The catalog spelling wins over the one the path used, since the
             // two only differ where quoting makes them the same name anyway.
-            return Ok(Some(if schema.is_quoted() {
-                Ident::with_quote('"', schema.name())
-            } else {
-                Ident::new(schema.name())
-            }));
+            return Ok(Some(schema_ident(schema)));
         }
     }
     Err(crate::errors::Error::NoSchemaSelectedForRelation {
@@ -4551,9 +4603,10 @@ fn table_schema_qualifier(table: &CreateTable) -> SchemaQualifier<'_> {
 }
 
 /// Returns whether two qualifiers name the same schema, reading a missing one
-/// as `public`, which is the allowance the table store already makes when it
-/// refuses a lookup ambiguity.
+/// as the default schema, which is the allowance the table store already
+/// makes when it refuses a lookup ambiguity.
 fn schema_qualifiers_match(
+    namespaces: Namespaces,
     left: SchemaQualifier<'_>,
     right: SchemaQualifier<'_>,
     case: IdentifierCase,
@@ -4564,7 +4617,7 @@ fn schema_qualifiers_match(
             case.identifiers_match(left, left_quoted, right, right_quoted)
         }
         (Some((schema, quoted)), None) | (None, Some((schema, quoted))) => {
-            case.identifiers_match(schema, quoted, "public", false)
+            case.identifiers_match(schema, quoted, namespaces.default_schema(), false)
         }
     }
 }
@@ -4619,6 +4672,7 @@ fn refuse_index_in_another_schema(
     create_index: &CreateIndex,
     relation_name: &str,
     schema: SchemaQualifier<'_>,
+    namespaces: Namespaces,
     case: IdentifierCase,
 ) -> Result<(), crate::errors::Error> {
     let Some(name) = create_index.name.as_ref() else {
@@ -4627,7 +4681,7 @@ fn refuse_index_in_another_schema(
     let Some(written) = qualifier_of(name).named() else {
         return Ok(());
     };
-    if schema_qualifiers_match(Some(written), schema, case) {
+    if schema_qualifiers_match(namespaces, Some(written), schema, case) {
         return Ok(());
     }
     Err(crate::errors::Error::IndexInAnotherSchema {
@@ -4643,6 +4697,7 @@ fn index_holds_name<A>(
     index: &TableAttribute<CreateTable, A>,
     name: &Ident,
     schema: SchemaQualifier<'_>,
+    namespaces: Namespaces,
     case: IdentifierCase,
 ) -> bool
 where
@@ -4655,7 +4710,7 @@ where
             name.value.as_str(),
             name.quote_style.is_some(),
         )
-    }) && schema_qualifiers_match(table_schema_qualifier(index.table()), schema, case)
+    }) && schema_qualifiers_match(namespaces, table_schema_qualifier(index.table()), schema, case)
 }
 
 /// Returns the kind of index already holding `name` in `schema`, if any,
@@ -4666,13 +4721,18 @@ fn index_name_holder(
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
+    let namespaces = builder.namespaces();
     let case = builder.identifier_case();
-    if builder.indices().iter().any(|(index, _)| index_holds_name(index, name, schema, case))
+    if builder
+        .indices()
+        .iter()
+        .any(|(index, _)| index_holds_name(index, name, schema, namespaces, case))
         || builder.materialized_view_indices().iter().any(|(index, _)| {
             materialized_view_indexes::holds_name(
                 index,
                 (name.value.as_str(), name.quote_style.is_some()),
                 schema,
+                namespaces,
                 case,
             )
         })
@@ -4682,7 +4742,7 @@ fn index_name_holder(
     builder
         .unique_indices()
         .iter()
-        .any(|(index, _)| index_holds_name(index, name, schema, case))
+        .any(|(index, _)| index_holds_name(index, name, schema, namespaces, case))
         .then_some(ObjectKind::UniqueIndex)
 }
 
@@ -4692,15 +4752,19 @@ fn view_name_holder(
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
+    let namespaces = builder.namespaces();
     let case = builder.identifier_case();
-    if builder.views().iter().any(|(view, _, _)| view_holds_name(view.as_ref(), name, schema, case))
+    if builder
+        .views()
+        .iter()
+        .any(|(view, _, _)| view_holds_name(view.as_ref(), name, schema, namespaces, case))
     {
         return Some(ObjectKind::View);
     }
     builder
         .materialized_views()
         .iter()
-        .any(|(view, _, _)| view_holds_name(view.as_ref(), name, schema, case))
+        .any(|(view, _, _)| view_holds_name(view.as_ref(), name, schema, namespaces, case))
         .then_some(ObjectKind::MaterializedView)
 }
 
@@ -4709,6 +4773,7 @@ fn view_holds_name<V: ViewLike>(
     view: &V,
     name: &Ident,
     schema: SchemaQualifier<'_>,
+    namespaces: Namespaces,
     case: IdentifierCase,
 ) -> bool {
     case.identifiers_match(
@@ -4717,6 +4782,7 @@ fn view_holds_name<V: ViewLike>(
         name.value.as_str(),
         name.quote_style.is_some(),
     ) && schema_qualifiers_match(
+        namespaces,
         view.view_schema().map(|value| (value, view.view_schema_is_quoted())),
         schema,
         case,
@@ -4741,6 +4807,7 @@ fn sequence_name_holder(
                 name.value.as_str(),
                 name.quote_style.is_some(),
             ) && schema_qualifiers_match(
+                builder.namespaces(),
                 sequence
                     .sequence_schema()
                     .map(|value| (value, sequence.sequence_schema_is_quoted())),
@@ -4769,7 +4836,12 @@ fn relation_name_holder(
             table.table_name_is_quoted(),
             name.value.as_str(),
             name.quote_style.is_some(),
-        ) && schema_qualifiers_match(table_schema_qualifier(table), schema, case)
+        ) && schema_qualifiers_match(
+            builder.namespaces(),
+            table_schema_qualifier(table),
+            schema,
+            case,
+        )
     });
     if let Some((_, metadata, _)) = table {
         return Some(if SqlparserProfile::is_foreign_table(metadata) {
@@ -6215,6 +6287,7 @@ impl ParserDB {
             &create_index,
             table.table_name(),
             table_schema_qualifier(table),
+            builder.namespaces(),
             builder.identifier_case(),
         )?;
         builder.refuse_table_kinds(
@@ -6268,7 +6341,7 @@ impl ParserDB {
             });
         };
         let renamed = StoredTable::of(resolved_table);
-        let key = stored_table_key(resolved_table, IdentifierCase::AsWritten);
+        let key = stored_table_key(builder.namespaces(), resolved_table, IdentifierCase::AsWritten);
         let target = RenameTarget::new(new_name, &resolved_table.name)?;
         let original = resolved_table.name.clone();
         // A rename cannot take a shell over the way a creation fills it.
@@ -6283,6 +6356,7 @@ impl ParserDB {
             });
         }
         let changing_schema = !schema_qualifiers_match(
+            builder.namespaces(),
             qualifier_of(&original).named(),
             qualifier_of(&target.name).named(),
             builder.identifier_case(),
@@ -6357,8 +6431,12 @@ impl ParserDB {
         let case = builder.identifier_case();
         let mut doomed = signature_types::functions_naming_schema_types(builder, schema);
         for (function, _) in builder.functions() {
-            if schema_qualifiers_match(qualifier_of(&function.name).named(), Some(schema), case)
-                && !doomed.iter().any(|held| Arc::ptr_eq(held, function))
+            if schema_qualifiers_match(
+                builder.namespaces(),
+                qualifier_of(&function.name).named(),
+                Some(schema),
+                case,
+            ) && !doomed.iter().any(|held| Arc::ptr_eq(held, function))
             {
                 doomed.push(Arc::clone(function));
             }
@@ -6405,9 +6483,11 @@ impl ParserDB {
         arrays: &mut Arc<TypeArrays>,
         catalog: &mut Arc<PostgresCatalog>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let namespaces = builder.namespaces();
         let case = builder.identifier_case();
-        let in_from =
-            |qualifier: SchemaQualifier<'_>| schema_qualifiers_match(qualifier, Some(from), case);
+        let in_from = |qualifier: SchemaQualifier<'_>| {
+            schema_qualifiers_match(namespaces, qualifier, Some(from), case)
+        };
         let functions = builder
             .functions()
             .iter()
@@ -6526,6 +6606,7 @@ impl ParserDB {
         // A table keeping its schema stays where it was declared even while a
         // schema rename has taken the old name, so only a move is checked.
         if !schema_qualifiers_match(
+            builder.namespaces(),
             table_schema_qualifier(&previous_node),
             table_schema_qualifier(&replacement),
             builder.identifier_case(),
@@ -6818,6 +6899,7 @@ impl ParserDB {
     ) -> Result<&'a CreateTable, crate::errors::Error> {
         let case = builder.identifier_case();
         let referenced_table = resolve_table_object_name_on_search_path_in_iter(
+            builder.namespaces(),
             builder
                 .tables()
                 .iter()
@@ -6938,7 +7020,12 @@ impl ParserDB {
         let referred: Vec<&Ident> = fk.referred_columns.iter().collect();
         let unique_indexes =
             builder.indices().iter().map(|(index, _)| index.attribute()).filter(|index| {
-                index.unique && table_matches_object_name(referenced_table, &index.table_name)
+                index.unique
+                    && table_matches_object_name(
+                        builder.namespaces(),
+                        referenced_table,
+                        &index.table_name,
+                    )
             });
         if referred.is_empty()
             || !is_candidate_key(referenced_table, unique_indexes, &referred, case)
@@ -8714,7 +8801,11 @@ impl ParserDB {
         cascade: bool,
         arrays: &mut Arc<TypeArrays>,
     ) -> Result<user_defined_types::TypeDrop, crate::errors::Error> {
-        let key = stored_table_key(Self::stored_node(builder, table)?, IdentifierCase::AsWritten);
+        let key = stored_table_key(
+            builder.namespaces(),
+            Self::stored_node(builder, table)?,
+            IdentifierCase::AsWritten,
+        );
         if cascade {
             return Ok(views::remove_dependent_views(builder, &key, arrays));
         }
@@ -9014,7 +9105,13 @@ impl ParserDB {
         let probe = Ident::with_quote('"', "");
         let mut probes = Vec::with_capacity(tables.len());
         for table in tables {
-            probes.extend(column_rename(Self::stored_node(builder, table)?, column, &probe));
+            let namespaces = builder.namespaces();
+            probes.extend(column_rename(
+                namespaces,
+                Self::stored_node(builder, table)?,
+                column,
+                &probe,
+            ));
         }
         let keys: Vec<&RelationKey> = probes.iter().map(view_rewrites::Rename::key).collect();
         Ok(view_rewrites::readers(builder, &keys)
@@ -9280,6 +9377,7 @@ impl ParserDB {
         let mut renames = Vec::with_capacity(inheritors.len() + 1);
         for table in core::iter::once(&stored).chain(&inheritors) {
             renames.extend(column_rename(
+                builder.namespaces(),
                 Self::stored_node(&builder, table)?,
                 &from,
                 new_column_name,
@@ -9904,6 +10002,9 @@ impl ParserDB {
             mut default_privileges,
         } = catalog;
         let dialect = *builder.dialect();
+        // SQLite reads the names of a permanent object in its own database
+        // alone, so the path narrows for the statement and widens after it.
+        let mut whole_search_path: Option<Vec<(String, bool)>> = None;
         for statement in statements {
             // What the previous statement created is named before this one can
             // refer to it.
@@ -9983,6 +10084,14 @@ impl ParserDB {
                 statement => (statement, RoutineKeyword::Function),
             };
             take_builtins_named_by(&mut builder, &statement);
+            if builder.namespaces() == Namespaces::Sqlite
+                && let Some(home) = sqlite_databases::home_database(&builder, &statement)?
+            {
+                whole_search_path = Some(
+                    builder.search_path().map(|(schema, quoted)| (schema.into(), quoted)).collect(),
+                );
+                builder = builder.with_search_path([home]);
+            }
             match statement {
                 Statement::CreateFunction(mut create_function) => {
                     // Two functions may share a name as long as they take
@@ -10580,6 +10689,7 @@ impl ParserDB {
                                 .map(|(t, _, _)| t.as_ref())
                                 .filter(|t| {
                                     schema_qualifiers_match(
+                                        builder.namespaces(),
                                         table_schema_qualifier(t),
                                         Some((&resolved_schema_name, resolved_schema_quoted)),
                                         builder.identifier_case(),
@@ -11814,6 +11924,11 @@ impl ParserDB {
                 Statement::RevokeRole(revoke) => {
                     role_memberships::revoke_role(&mut builder, &revoke, access_resolution)?;
                 }
+                Statement::AttachDatabase { schema_name, .. }
+                    if builder.namespaces() == Namespaces::Sqlite =>
+                {
+                    builder = sqlite_databases::attach(builder, &schema_name)?;
+                }
                 Statement::CreateSchema { schema_name, if_not_exists, .. } => {
                     if let SchemaName::Simple(name) | SchemaName::NamedAuthorization(name, _) =
                         &schema_name
@@ -11941,6 +12056,7 @@ impl ParserDB {
                         for objects in builder.per_object_targets(grant.objects.take()) {
                             let mut part = Grant { objects, ..grant.clone() };
                             crate::impls::validate_granted_columns(
+                                builder.namespaces(),
                                 &part.privileges,
                                 part.objects.as_ref(),
                                 &tables,
@@ -12018,6 +12134,7 @@ impl ParserDB {
                         for objects in builder.per_object_targets(revoke.objects.clone()) {
                             let part = sqlparser::ast::Revoke { objects, ..revoke.clone() };
                             crate::impls::validate_granted_columns(
+                                builder.namespaces(),
                                 &part.privileges,
                                 part.objects.as_ref(),
                                 &tables,
@@ -12070,8 +12187,8 @@ impl ParserDB {
                             );
                         }
                         Some(SearchPathChange::Reset) => {
-                            builder =
-                                builder.with_search_path(ParserDBBuilder::default_search_path());
+                            let path = builder.default_search_path();
+                            builder = builder.with_search_path(path);
                         }
                         None => {}
                     }
@@ -12230,6 +12347,7 @@ impl ParserDB {
                             }
                             // A function set into the schema it is in stays.
                             if schema_qualifiers_match(
+                                builder.namespaces(),
                                 qualifier_of(&function.name).named(),
                                 Some((schema, quoted)),
                                 builder.identifier_case(),
@@ -12529,6 +12647,9 @@ impl ParserDB {
                     // `AlterIndex`.
                 }
             }
+        }
+        if let Some(search_path) = whole_search_path {
+            builder = builder.with_search_path(search_path);
         }
         constraint_names::name_pending(&mut builder);
         Ok(transactions::Catalog {

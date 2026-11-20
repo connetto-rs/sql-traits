@@ -259,7 +259,7 @@ fn written_column_lists_of_different_lengths_are_refused() {
 /// table reaches only a temporary target and a main table only a main one.
 #[test]
 fn the_target_is_looked_up_in_the_schema_of_the_host() {
-    let temporary_child = || TargetName::new("child", false).with_schema("pg_temp", false);
+    let temporary_child = || TargetName::new("child", false).with_schema("temp", false);
 
     let database = parse(
         "CREATE TABLE parent (id INTEGER PRIMARY KEY);
@@ -268,7 +268,7 @@ fn the_target_is_looked_up_in_the_schema_of_the_host() {
     .expect("SQLite stores a temporary key to a main table");
     assert_eq!(
         key(&database, temporary_child()).referenced_table(&database),
-        Err(table_not_found("pg_temp.parent"))
+        Err(table_not_found("temp.parent"))
     );
 
     let database = parse(
@@ -279,7 +279,7 @@ fn the_target_is_looked_up_in_the_schema_of_the_host() {
     let target = key(&database, temporary_child())
         .referenced_table(&database)
         .expect("the temporary parent exists");
-    assert_eq!((target.table_schema(), target.table_name()), (Some("pg_temp"), "parent"));
+    assert_eq!((target.table_schema(), target.table_name()), (Some("temp"), "parent"));
 
     let database = parse(
         "CREATE TEMP TABLE parent (id INTEGER PRIMARY KEY);
@@ -296,7 +296,7 @@ fn the_target_is_looked_up_in_the_schema_of_the_host() {
     .expect("SQLite adds a temporary key to a main table");
     assert_eq!(
         key(&database, temporary_child()).referenced_table(&database),
-        Err(table_not_found("pg_temp.parent"))
+        Err(table_not_found("temp.parent"))
     );
 }
 
@@ -362,8 +362,8 @@ fn renames_move_the_keys_that_reached_the_table() {
     .expect("SQLite renames a referenced table");
     assert_eq!(key_of(&database, "child").referenced_table_name().to_string(), "renamed");
     assert_eq!(target_of(&database, "child"), Ok("renamed".to_owned()));
-    let scratch = TargetName::new("scratch", false).with_schema("pg_temp", false);
-    assert_eq!(key(&database, scratch).referenced_table_name().to_string(), "pg_temp.parent");
+    let scratch = TargetName::new("scratch", false).with_schema("temp", false);
+    assert_eq!(key(&database, scratch).referenced_table_name().to_string(), "temp.parent");
 
     let database = parse(
         "CREATE TABLE child (pid REFERENCES parent (id));

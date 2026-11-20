@@ -204,7 +204,8 @@ fn resolve_owner(
         });
     }
     let case = builder.identifier_case();
-    if !schema_qualifiers_match(Some(relation_schema), sequence_schema, case) {
+    if !schema_qualifiers_match(builder.namespaces(), Some(relation_schema), sequence_schema, case)
+    {
         return Err(Error::SequenceOwnerInAnotherSchema {
             sequence_name: sequence_name(),
             relation_name: relation_name(),
@@ -270,6 +271,7 @@ fn resolve_sequence<'builder>(
     let (schema_ident, name_ident) = object_name_identifiers(name)?;
     let case = builder.identifier_case();
     resolve_sequence_on_search_path_in_iter(
+        builder.namespaces(),
         builder.sequences().iter().map(|(sequence, ())| sequence.as_ref()),
         &target_name_of_idents(schema_ident, name_ident),
         || builder.search_path(),
@@ -380,7 +382,11 @@ pub(super) fn drop_sequences(
         });
         if let Some(doomed) = doomed {
             refuse_dropping_identity_sequence(&builder, &doomed)?;
-            let key = stored_sequence_key(doomed.as_ref(), IdentifierCase::AsWritten);
+            let key = stored_sequence_key(
+                builder.namespaces(),
+                doomed.as_ref(),
+                IdentifierCase::AsWritten,
+            );
             if cascade {
                 let taken = views::remove_dependent_views(&mut builder, &key, arrays);
                 drop.types.extend(taken.types);
@@ -434,7 +440,12 @@ pub(super) fn drop_sequences_in(
             let stored = sequence
                 .sequence_schema()
                 .map(|stored| (stored, sequence.sequence_schema_is_quoted()));
-            schema_qualifiers_match(stored, Some((schema_name, schema_quoted)), case)
+            schema_qualifiers_match(
+                builder.namespaces(),
+                stored,
+                Some((schema_name, schema_quoted)),
+                case,
+            )
         })
         .cloned()
         .collect();
@@ -1173,13 +1184,14 @@ pub(super) fn move_sequences(
             let stored = sequence
                 .sequence_schema()
                 .map(|schema| (schema, sequence.sequence_schema_is_quoted()));
-            schema_qualifiers_match(stored, Some(from), case)
+            schema_qualifiers_match(builder.namespaces(), stored, Some(from), case)
         })
         .map(|(position, _)| position)
         .collect();
     for position in moving {
         let previous = Arc::clone(&builder.sequences()[position].0);
-        let key = stored_sequence_key(previous.as_ref(), IdentifierCase::AsWritten);
+        let key =
+            stored_sequence_key(builder.namespaces(), previous.as_ref(), IdentifierCase::AsWritten);
         let readers = super::view_rewrites::readers(&builder, &[&key]);
         let mut moved = (*previous).clone();
         moved.set_schema(to.0.to_string(), to.1);

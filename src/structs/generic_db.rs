@@ -21,10 +21,10 @@ pub(crate) use sqlparser::{ConstraintObject, OperatorRow, is_candidate_key, tabl
 
 use crate::{
     structs::{ColumnIdentity, IdentifierCase, IdentityCounter, RelationIdentity, RoleSetting},
-    traits::{PolicyLike, Relation, RoleLike, SchemaLike, TableLike, TriggerLike},
+    traits::{DialectLike, PolicyLike, Relation, RoleLike, SchemaLike, TableLike, TriggerLike},
     utils::{
         identifier_resolution::stored_identifier_matches_lookup,
-        object_name::{RelationKey, stored_view_key},
+        object_name::{Namespaces, RelationKey, stored_view_key},
     },
 };
 
@@ -248,6 +248,12 @@ impl<P: SchemaProfile> GenericDB<P> {
         self.identifier_case
     }
 
+    /// How this catalog's dialect names schemas and resolves an unqualified
+    /// name.
+    pub(crate) fn namespaces(&self) -> Namespaces {
+        Namespaces::of(self.dialect.sqlparser_dialect())
+    }
+
     /// Returns a reference to the metadata of the specified table, if it exists
     /// in the database.
     ///
@@ -304,8 +310,8 @@ impl<P: SchemaProfile> GenericDB<P> {
     pub fn view_metadata(&self, view: &P::View) -> Option<&Meta<P::View>> {
         self.views
             .binary_search_by(|(candidate, _, _)| {
-                stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten)
-                    .cmp(&stored_view_key(view, IdentifierCase::AsWritten))
+                stored_view_key(self.namespaces(), candidate.as_ref(), IdentifierCase::AsWritten)
+                    .cmp(&stored_view_key(self.namespaces(), view, IdentifierCase::AsWritten))
             })
             .ok()
             .map(|index| &self.views[index].1)
@@ -336,8 +342,8 @@ impl<P: SchemaProfile> GenericDB<P> {
     ) -> Option<&Meta<P::MaterializedView>> {
         self.materialized_views
             .binary_search_by(|(candidate, _, _)| {
-                stored_view_key(candidate.as_ref(), IdentifierCase::AsWritten)
-                    .cmp(&stored_view_key(view, IdentifierCase::AsWritten))
+                stored_view_key(self.namespaces(), candidate.as_ref(), IdentifierCase::AsWritten)
+                    .cmp(&stored_view_key(self.namespaces(), view, IdentifierCase::AsWritten))
             })
             .ok()
             .map(|index| &self.materialized_views[index].1)

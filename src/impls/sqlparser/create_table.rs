@@ -16,7 +16,7 @@ use crate::{
     },
     traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
     utils::{
-        identifier_resolution::{identifiers_match, stored_ident_name},
+        identifier_resolution::{identifiers_match, is_temporary_schema, stored_ident_name},
         last_str,
         object_name::{qualifier_of, resolve_bound_table_or_foreign_table},
     },
@@ -204,6 +204,16 @@ impl TableLike for CreateTable {
         self.name.0.first().is_some_and(
             |part| matches!(part, ObjectNamePart::Identifier(ident) if ident.quote_style.is_some()),
         )
+    }
+
+    #[inline]
+    fn is_temporary(&self) -> bool {
+        // Ingestion marks every table it places in the temporary schema, so
+        // the flag answers for SQLite's `temp` as well as `pg_temp`.
+        self.temporary
+            || self
+                .table_schema()
+                .is_some_and(|schema| is_temporary_schema(schema, self.table_schema_is_quoted()))
     }
 
     #[inline]

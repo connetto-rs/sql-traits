@@ -335,7 +335,7 @@ impl ParserDBBuilder {
         if let Some((view, _, _)) =
             self.views().iter().find(|(_, metadata, _)| calls_dropped(metadata.calls()))
         {
-            let key = stored_view_key(view.as_ref(), IdentifierCase::AsWritten);
+            let key = stored_view_key(self.namespaces(), view.as_ref(), IdentifierCase::AsWritten);
             return Some(Holder::new(
                 ObjectKind::View,
                 key.name.clone(),
@@ -347,7 +347,7 @@ impl ParserDBBuilder {
             .iter()
             .find(|(_, metadata, _)| calls_dropped(metadata.calls()))
         {
-            let key = stored_view_key(view.as_ref(), IdentifierCase::AsWritten);
+            let key = stored_view_key(self.namespaces(), view.as_ref(), IdentifierCase::AsWritten);
             return Some(Holder::new(
                 ObjectKind::MaterializedView,
                 key.name.clone(),
@@ -367,7 +367,7 @@ impl ParserDBBuilder {
             return Some(Holder::new(
                 ObjectKind::Rule,
                 rule.name.value.clone(),
-                Held::Reader(rules::dependent(rule)),
+                Held::Reader(rules::dependent(self.namespaces(), rule)),
             ));
         }
         // A bound name left bare is one in the default schema.

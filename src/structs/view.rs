@@ -20,6 +20,7 @@ use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, S
 use crate::{
     errors::{Error, ObjectKind},
     utils::{
+        identifier_resolution::is_temporary_schema,
         object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of},
         output_from_wildcard,
     },
@@ -44,6 +45,8 @@ pub struct ViewDeclaration {
     schema: Option<String>,
     /// Whether that qualifier was quoted.
     schema_is_quoted: bool,
+    /// Whether the view lives in the temporary schema.
+    temporary: bool,
     /// The query the view is defined by.
     query: Query,
     /// The column names the declaration wrote, each with its quote state.
@@ -96,6 +99,8 @@ impl ViewDeclaration {
             name_is_quoted,
             schema: schema.map(|(value, _)| value.to_string()),
             schema_is_quoted: schema.is_some_and(|(_, quoted)| quoted),
+            temporary: node.temporary
+                || schema.is_some_and(|(value, quoted)| is_temporary_schema(value, quoted)),
             query: (*node.query).clone(),
             columns: node
                 .columns
@@ -128,6 +133,13 @@ impl ViewDeclaration {
     #[must_use]
     pub fn schema_is_quoted(&self) -> bool {
         self.schema_is_quoted
+    }
+
+    /// Returns whether the view lives in the temporary schema, which the
+    /// declaration said with `TEMP` or by naming the schema.
+    #[must_use]
+    pub fn is_temporary(&self) -> bool {
+        self.temporary
     }
 
     /// Returns the query the view is defined by.

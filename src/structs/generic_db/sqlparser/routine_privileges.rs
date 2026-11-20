@@ -200,7 +200,12 @@ impl Reached {
                         let qualifier = qualifier_of(&function.name).named();
                         (keyword.admits(metadata.kind())
                             && schemas.iter().filter_map(object_name_last_part).any(|schema| {
-                                schema_qualifiers_match(qualifier, Some(schema), case)
+                                schema_qualifiers_match(
+                                    builder.namespaces(),
+                                    qualifier,
+                                    Some(schema),
+                                    case,
+                                )
                             }))
                         .then_some(position)
                     },

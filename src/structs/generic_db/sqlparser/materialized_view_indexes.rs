@@ -24,7 +24,7 @@ use crate::{
         metadata::IndexMetadata,
     },
     traits::ViewLike,
-    utils::object_name::{object_name_last_part, qualifier_of},
+    utils::object_name::{Namespaces, object_name_last_part, qualifier_of},
 };
 
 /// The name a stored materialized view is reached by exactly: its schema when
@@ -65,6 +65,7 @@ pub(super) fn create(
         &create_index,
         view.view_name(),
         schema,
+        builder.namespaces(),
         builder.identifier_case(),
     )?;
     views::require_indexed_columns(
@@ -112,11 +113,17 @@ pub(super) fn holds_name(
     index: &MaterializedViewIndex,
     (index_name, index_quoted): (&str, bool),
     schema: SchemaQualifier<'_>,
+    namespaces: Namespaces,
     case: IdentifierCase,
 ) -> bool {
     index.index().name.as_ref().and_then(object_name_last_part).is_some_and(|(stored, quoted)| {
         case.identifiers_match(stored, quoted, index_name, index_quoted)
-    }) && schema_qualifiers_match(qualifier_of(&index.index().table_name).named(), schema, case)
+    }) && schema_qualifiers_match(
+        namespaces,
+        qualifier_of(&index.index().table_name).named(),
+        schema,
+        case,
+    )
 }
 
 /// Drops every index on a materialized view the stores no longer hold.

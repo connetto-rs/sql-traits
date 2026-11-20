@@ -400,7 +400,7 @@ fn constraint_name_held(builder: &ParserDBBuilder, node: &CreateTable, name: &st
     let schema = table_schema_qualifier(node);
     let case = builder.identifier_case();
     builder.tables().iter().any(|(table, metadata, _)| {
-        schema_qualifiers_match(table_schema_qualifier(table), schema, case)
+        schema_qualifiers_match(builder.namespaces(), table_schema_qualifier(table), schema, case)
             && names(table, metadata.generated_constraint_names())
                 .iter()
                 .any(|(_, held)| held.as_deref() == Some(name))
@@ -416,7 +416,7 @@ pub(super) fn index_name_held(
     let wanted = stored_ident_name(name);
     let case = builder.identifier_case();
     builder.tables().iter().any(|(table, metadata, _)| {
-        schema_qualifiers_match(table_schema_qualifier(table), schema, case)
+        schema_qualifiers_match(builder.namespaces(), table_schema_qualifier(table), schema, case)
             && metadata
                 .generated_constraint_names()
                 .iter()
@@ -909,10 +909,14 @@ pub(super) fn key_index_table(
                 .tables()
                 .iter()
                 .find(|(table, metadata, _)| {
-                    schema_qualifiers_match(table_schema_qualifier(table), Some(schema), case)
-                        && locate(table, metadata.generated_constraint_names(), old)
-                            .and_then(|position| slot_at(table, position))
-                            .is_some_and(|(slot, _)| backed_by_index(slot))
+                    schema_qualifiers_match(
+                        builder.namespaces(),
+                        table_schema_qualifier(table),
+                        Some(schema),
+                        case,
+                    ) && locate(table, metadata.generated_constraint_names(), old)
+                        .and_then(|position| slot_at(table, position))
+                        .is_some_and(|(slot, _)| backed_by_index(slot))
                 })
                 .map(|(table, _, _)| (StoredTable::of(table), schema))
         });
