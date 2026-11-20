@@ -64,52 +64,26 @@ jobs:
   no_std:
     name: no_std + alloc build
     if: github.event_name != 'pull_request'
-    # Verifies the library is truly `no_std + alloc`-portable, in two
-    # layers:
-    #
-    #   1. Host build with `--no-default-features`: catches accidental
-    #      `std::*` references introduced into the library tree.
-    #   2. Cross-compile to two real targets with no host-side `std`
-    #      backend:
-    #        - `thumbv7em-none-eabihf` — bare-metal ARM Cortex-M.
-    #        - `wasm32-unknown-unknown` — WebAssembly without WASI.
-    #      Either failing would surface a hidden `std`-dependency that
-    #      the host check missed.
-    #
-    # Tests under `cargo test` still run with the `std` default
-    # feature (covered by the `test` job above), since the standard
-    # libtest harness itself requires `std`. Running the suite under
-    # `wasm32-*` would require a `wasm-bindgen-test` rewrite of every
-    # test — out of scope; the cross-compile check is the practical
-    # "works in wasm" gate for a no-IO library.
+    # Cross-compiles to targets with no `std` backend, where a dependency pulling in `std` fails to build.
     runs-on: ubuntu-26.04
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
     - name: Install Rust + no_std cross-compile targets
       uses: dtolnay/rust-toolchain@stable
       with:
-        components: clippy
         targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
     - name: Rust Cache
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-    - name: Build lib (host, no default features → no_std + alloc)
-      run: cargo build --lib --no-default-features
-    - name: Clippy under no_std
-      run: cargo clippy --lib --no-default-features -- -D warnings
     - name: Cross-compile lib for thumbv7em-none-eabihf (bare-metal ARM)
       run: cargo build --lib --no-default-features --target thumbv7em-none-eabihf
     - name: Cross-compile lib for wasm32-unknown-unknown (WebAssembly)
       run: cargo build --lib --no-default-features --target wasm32-unknown-unknown
-    - name: Build lib and cross-compile it with the serde feature
+    - name: Cross-compile lib with the serde feature
       run: |
-        cargo build --lib --no-default-features --features serde
-        cargo clippy --lib --no-default-features --features serde -- -D warnings
         cargo build --lib --no-default-features --features serde --target thumbv7em-none-eabihf
         cargo build --lib --no-default-features --features serde --target wasm32-unknown-unknown
-    - name: Build lib and cross-compile it with the canonicalize feature
+    - name: Cross-compile lib with the canonicalize feature
       run: |
-        cargo build --lib --no-default-features --features canonicalize
-        cargo clippy --lib --no-default-features --features canonicalize -- -D warnings
         cargo build --lib --no-default-features --features canonicalize --target thumbv7em-none-eabihf
         cargo build --lib --no-default-features --features canonicalize --target wasm32-unknown-unknown
     - name: Run full test suite under default features
@@ -140,6 +114,11 @@ jobs:
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Run clippy
       run: cargo clippy --all-targets --features git,serde,canonicalize -- -D warnings
+    - name: Clippy under no_std
+      run: |
+        cargo clippy --lib --no-default-features -- -D warnings
+        cargo clippy --lib --no-default-features --features serde -- -D warnings
+        cargo clippy --lib --no-default-features --features canonicalize -- -D warnings
 
   doc:
     name: Documentation
