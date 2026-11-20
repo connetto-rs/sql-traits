@@ -1569,13 +1569,16 @@ pub enum Error {
     /// Wrapper around identifier-aware lookup errors.
     #[error(transparent)]
     IdentifierLookupError(#[from] LookupError),
-    #[error("Unknown column `{column_name}` in table `{table_name}`.")]
-    /// A check constraint contained columns which do not exist in the table.
-    UnknownColumnInCheckConstraint {
-        /// Name of the unknown column.
-        column_name: String,
-        /// Name of the table the check constraint belongs to.
-        table_name: String,
+    #[error("Column `{reference}` does not exist.")]
+    /// A column reference reaches no column of the relations in its reach.
+    /// PostgreSQL refuses one with `42703` when the statement storing it runs,
+    /// in a check constraint, a generated column, an index expression or
+    /// predicate, a trigger's `WHEN` condition, a policy, or the query of a
+    /// view or of `CREATE TABLE … AS`.
+    UnknownColumn {
+        /// The reference as written, such as `nosuch`, `"nosuch"` or
+        /// `new.nosuch`.
+        reference: String,
     },
     #[error(
         "Column reference `{reference}` in table `{table_name}` names something other than that \

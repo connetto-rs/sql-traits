@@ -80,6 +80,7 @@ mod call_selection;
 mod calls_in_expression;
 use calls_in_expression::CarriedCalls;
 mod column_copy;
+mod column_references;
 mod comment_on;
 mod constraint_names;
 mod constraint_validity;
@@ -6769,6 +6770,18 @@ impl ParserDB {
 
                     table_metadata.set_primary_key(vec![column.clone()]);
                 }
+                // PostgreSQL reads a generation expression over the table's
+                // columns, as it reads a check constraint.
+                ColumnOption::Generated { generation_expr: Some(expression), .. }
+                    if matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
+                {
+                    columns_in_expression::<Arc<TableAttribute<CreateTable, ColumnDef>>>(
+                        &expression,
+                        builder.catalog_name(),
+                        &target_name_of_object_name(&create_table.name),
+                        table_metadata.column_arc_slice(),
+                    )?;
+                }
                 _ => {}
             }
         }
@@ -10645,6 +10658,7 @@ impl ParserDB {
                     let if_not_exists = create_index.if_not_exists;
                     let (index, metadata) = Self::process_create_index(create_index, &builder)?;
                     stored_expressions::refuse_in_index(&builder, index.attribute())?;
+                    column_references::refuse_in_index(&builder, index.attribute())?;
                     let resolved_table = index.table();
                     let resolved_table_name = resolved_table.table_name().to_string();
                     let resolved_table_quoted = resolved_table.table_name_is_quoted();
@@ -11679,6 +11693,12 @@ impl ParserDB {
                         &[ObjectKind::ForeignTable],
                     )?;
                     builder.bind_table_reference(&mut policy.table_name);
+                    column_references::refuse_in_expressions(
+                        &builder,
+                        &policy.table_name,
+                        &[None],
+                        policy.using.iter().chain(&policy.with_check),
+                    )?;
 
                     // A policy name is unique per table, whatever command the
                     // policy is declared `FOR`. Matched the way `DROP POLICY`
@@ -12235,6 +12255,12 @@ impl ParserDB {
                                     to.as_deref().unwrap_or_default(),
                                 )?;
                             }
+                            column_references::refuse_in_expressions(
+                                &builder,
+                                &table_name,
+                                &[None],
+                                using.iter().chain(&with_check),
+                            )?;
 
                             let session = policy_literals::LiteralSession::of(&session_settings);
                             let bind = |clause: Option<&mut Expr>| {

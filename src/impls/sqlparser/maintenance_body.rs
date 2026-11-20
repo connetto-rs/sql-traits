@@ -2,7 +2,7 @@
 //! each with the one expression it holds when the body returns.
 
 use alloc::{string::ToString, vec::Vec};
-use core::{ops::ControlFlow, slice};
+use core::ops::ControlFlow;
 
 use sqlparser::ast::{Expr, Ident};
 use sqlparser_plpgsql::{
@@ -17,7 +17,10 @@ use crate::{
     errors::LookupError,
     structs::{BodyExcerpt, IdentifierCase, MaintenanceRefusal},
     traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike, TriggerLike},
-    utils::{identifier_resolution::stored_identifier, walk::walk_expressions},
+    utils::{
+        identifier_resolution::{name_parts, stored_identifier},
+        walk::walk_expressions,
+    },
 };
 
 /// The columns a maintenance body assigns, each with the expression it holds
@@ -176,14 +179,5 @@ impl<'db, DB: DatabaseLike> Reader<'_, 'db, DB> {
         } else {
             None
         }
-    }
-}
-
-/// The parts of the name `read` writes, when it is a name.
-fn name_parts(read: &Expr) -> Option<&[Ident]> {
-    match read {
-        Expr::Identifier(name) => Some(slice::from_ref(name)),
-        Expr::CompoundIdentifier(parts) => Some(parts),
-        _ => None,
     }
 }

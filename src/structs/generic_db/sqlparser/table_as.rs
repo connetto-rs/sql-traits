@@ -23,7 +23,7 @@ use sqlparser::ast::{
     SelectInto, SetExpr, Statement, helpers::stmt_create_table::CreateTableBuilder,
 };
 
-use super::{ParserDBBuilder, view_rewrites, views};
+use super::{ParserDBBuilder, column_references, view_rewrites, views};
 use crate::{
     errors::Error,
     impls::serial_sequence_type,
@@ -83,7 +83,8 @@ pub(super) struct QueryColumns {
 ///
 /// # Errors
 ///
-/// Returns the lookup errors reading the query raises.
+/// Returns [`Error::UnknownColumn`] for a column reference of the query that
+/// reaches nothing, and the lookup errors reading the query raises.
 pub(super) fn query_columns(
     builder: &ParserDBBuilder,
     create_table: &CreateTable,
@@ -97,6 +98,7 @@ pub(super) fn query_columns(
 
     let mut bound = query.clone();
     views::bind_definition(builder, &mut bound);
+    column_references::refuse_in_query(builder, &bound)?;
     let read = view_rewrites::catalog(builder, core::iter::once(&bound));
     let mut columns = Vec::new();
     let mut output_names = Vec::new();

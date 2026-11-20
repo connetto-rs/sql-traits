@@ -1,7 +1,10 @@
 //! The column references of a query, each with what it reaches, and how its
 //! wildcards and `NATURAL` joins would be spelled out.
 
-use alloc::vec::Vec;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -22,8 +25,15 @@ use super::{
     output_columns::{QueryId, unwrap_nested},
 };
 use crate::{
-    errors::LookupError, impls::dql::scoped_roots::ScopedRoot, structs::IdentifierCase,
-    traits::DatabaseLike, utils::walk::walk,
+    errors::LookupError,
+    impls::dql::scoped_roots::ScopedRoot,
+    structs::IdentifierCase,
+    traits::DatabaseLike,
+    utils::{
+        columns_in_expression::Labels,
+        identifier_resolution::{identifiers_match, name_parts},
+        walk::walk,
+    },
 };
 
 /// What one column reference reached.
@@ -235,6 +245,116 @@ pub(crate) fn query_references<DB: DatabaseLike>(
     Some(references)
 }
 
+/// The first column reference of `query` that reaches nothing PostgreSQL
+/// accepts, rendered as written, or `None` when each one reaches something or
+/// the query's scopes cannot be derived.
+///
+/// A name no column holds is still read the ways PostgreSQL's
+/// `transformColumnRef` reads it. A relation in reach named alone is its
+/// whole row, a system column every table carries reads that column, a column
+/// a shorter prefix names holds the field the rest names, a reference of four
+/// parts may lead with the catalog's name, and a relation followed by a name
+/// `names_routine` accepts applies that function or cast to the row. A
+/// reference an opaque relation or an ambiguity leaves uncertain and one
+/// sitting where no scope was derived are not judged, and neither are the
+/// clauses of a data-modifying statement the query holds.
+pub(crate) fn first_unknown_column<DB: DatabaseLike>(
+    query: &Query,
+    database: &DB,
+    case: IdentifierCase,
+    names_routine: &dyn Fn(&Ident) -> bool,
+) -> Option<String> {
+    let (graph, _) = build_definition_graph(query, database, case).ok()?;
+    let mut unknown = None;
+    let mut sink = |expression: &Expr, rule: Option<SiteRule>| {
+        if unknown.is_none()
+            && let Some(rule) = rule
+            && let Some(parts) = name_parts(expression)
+            && matches!(graph.resolve_site(rule, expression), Ok(None))
+            && !graph.reads_otherwise(rule, parts, database.catalog_name(), names_routine)
+        {
+            unknown = Some(expression.to_string());
+        }
+    };
+    Walk {
+        graph: &graph,
+        references: QueryReferences::default(),
+        sink: &mut sink,
+        modifying_bodies: false,
+    }
+    .query(query);
+    unknown
+}
+
+impl<DB: DatabaseLike> DefinitionGraph<'_, '_, DB> {
+    /// Whether the reference written as `parts`, which `rule` resolves to no
+    /// column, reads a whole row, a system column, a field of a column, or a
+    /// function or cast applied to a row, as [`first_unknown_column`]
+    /// describes, `catalog` naming the catalog a reference of four parts may
+    /// lead with.
+    fn reads_otherwise(
+        &self,
+        rule: SiteRule,
+        parts: &[Ident],
+        catalog: &str,
+        names_routine: &dyn Fn(&Ident) -> bool,
+    ) -> bool {
+        let cursor = match rule {
+            SiteRule::Scope(cursor)
+            | SiteRule::OutputFirst(cursor)
+            | SiteRule::InputFirst(cursor) => cursor,
+            SiteRule::OrderBy(query) => {
+                let Some(cursor) = self.order_by_cursor(query) else { return false };
+                cursor
+            }
+        };
+        let relation = |parts: &[Ident]| {
+            without_catalog(parts, catalog).is_some_and(|parts| {
+                self.resolve_relation(cursor, &ObjectName::from(parts.to_vec())).is_some()
+            })
+        };
+        let column = |parts: &[Ident]| {
+            without_catalog(parts, catalog).is_some_and(|parts| {
+                let reference = Expr::CompoundIdentifier(parts.to_vec());
+                parts.len() <= 3 && !matches!(self.resolve_binding(cursor, &reference), Ok(None))
+            })
+        };
+        let Some((last, qualifier)) = parts.split_last() else { return true };
+        if qualifier.is_empty() {
+            return is_system_column(last) || relation(parts);
+        }
+        (parts.len() == 4 && column(parts))
+            || (2..parts.len().min(5)).any(|end| column(&parts[..end]))
+            || ((is_system_column(last) || names_routine(last)) && relation(qualifier))
+    }
+}
+
+/// `parts` without the catalog a name of four parts leads with, `None` when
+/// that part names another catalog than `catalog`, and `parts` whole for any
+/// other length.
+fn without_catalog<'parts>(parts: &'parts [Ident], catalog: &str) -> Option<&'parts [Ident]> {
+    match parts {
+        [catalog_part, rest @ ..] if rest.len() == 3 => {
+            identifiers_match(
+                &catalog_part.value,
+                catalog_part.quote_style.is_some(),
+                catalog,
+                false,
+            )
+            .then_some(rest)
+        }
+        _ => Some(parts),
+    }
+}
+
+/// Whether `name` spells one of the system columns PostgreSQL gives every
+/// table, which no declared column may take.
+fn is_system_column(name: &Ident) -> bool {
+    ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"]
+        .into_iter()
+        .any(|system| identifiers_match(system, false, &name.value, name.quote_style.is_some()))
+}
+
 /// What a resolver answered for one reference, before `FROM` item addresses
 /// are turned into positions.
 #[derive(Clone, Copy)]
@@ -290,7 +410,7 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
     /// Walks the references of any node with a select's scope, entering the
     /// queries nested in it on their own terms.
     fn node<N: Visit + ?Sized>(&mut self, node: &N, cursor: Option<ScopeCursor>) {
-        let mut sites = Sites { walk: self, cursor, depth: 0 };
+        let mut sites = Sites { walk: self, cursor, depth: 0, labels: Labels::default() };
         let walked = walk(node, &mut sites);
         debug_assert!(walked.is_continue(), "the site visitor never breaks");
     }
@@ -773,6 +893,9 @@ struct Sites<'walk, 'graph, 'sink, 'query, 'db, DB: DatabaseLike> {
     /// How many queries deep the visitor stands below the node it started
     /// from, whose references the nested walk records instead.
     depth: usize,
+    /// The expressions standing in a name position, a named argument's label
+    /// or a field after a dot, which reference no column.
+    labels: Labels,
 }
 
 impl<DB: DatabaseLike> Visitor for Sites<'_, '_, '_, '_, '_, DB> {
@@ -792,9 +915,10 @@ impl<DB: DatabaseLike> Visitor for Sites<'_, '_, '_, '_, '_, DB> {
     }
 
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-        if self.depth > 0 {
+        if self.depth > 0 || self.labels.holds(expression) {
             return ControlFlow::Continue(());
         }
+        self.labels.enter(expression);
         match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 self.walk.record(expression, self.cursor.map(SiteRule::Scope));

@@ -28,6 +28,6 @@ fn an_unknown_column_inside_an_any_form_is_refused() {
     );
     assert!(matches!(
         parsed,
-        Err(Error::UnknownColumnInCheckConstraint { column_name, .. }) if column_name == "missing"
+        Err(Error::UnknownColumn { reference }) if reference == "missing"
     ));
 }

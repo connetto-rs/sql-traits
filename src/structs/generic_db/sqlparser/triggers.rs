@@ -25,6 +25,7 @@ use sqlparser::ast::{
 
 use super::{
     AlterTableScope, NamedColumn, ParserDB, ParserDBBuilder, StoredTable, bind_reference,
+    column_references,
     inheritance::{self, ParentKind},
     object_names_match, rename_column_idents, require_named, rules, stored_expressions,
     stored_qualifier, stored_view_qualifier,
@@ -49,7 +50,9 @@ use crate::{
 /// virtual table holds,
 /// [`Error::RelationNotFoundForTrigger`] for one nothing holds,
 /// [`Error::FunctionNotFoundForTrigger`] for a function the trigger cannot
-/// run, [`Error::TriggerAlreadyExists`] when the relation or a partition below
+/// run, [`Error::UnknownColumn`] for a column reference of the `WHEN`
+/// condition that reaches nothing in `NEW` and `OLD`,
+/// [`Error::TriggerAlreadyExists`] when the relation or a partition below
 /// carries a trigger of the name and the statement wrote no `OR REPLACE`,
 /// [`Error::ClonedTriggerReplaced`] when the trigger replaced is a copy, and
 /// [`Error::ConstraintTriggerOnForeignTable`] for a constraint trigger that
@@ -69,6 +72,12 @@ pub(super) fn create_trigger(
         refuse_firing(&builder, &create_trigger, false)?;
         let mut create_trigger = bind_parts(&builder, create_trigger)?;
         builder.bind_table_reference(&mut create_trigger.table_name);
+        column_references::refuse_in_expressions(
+            &builder,
+            &create_trigger.table_name,
+            &[Some("new"), Some("old")],
+            &create_trigger.condition,
+        )?;
         return create_on_table(builder, create_trigger, &table);
     }
     if let Some(view) = builder.resolve_view_object_name(&create_trigger.table_name)? {
