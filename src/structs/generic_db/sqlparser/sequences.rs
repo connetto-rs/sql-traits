@@ -51,8 +51,8 @@ use sqlparser::{
 };
 
 use super::{
-    Creator, DefaultKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, domains,
-    generated_names, object_name_last_identifier, object_name_matches_resolved_identity,
+    Creator, DefaultPrivilegeKind, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable,
+    domains, generated_names, object_name_last_identifier, object_name_matches_resolved_identity,
     place_relation, relation_name_holder, require_named_in_catalog, schema_qualifiers_match,
     stored_ident, table_owner::Handover, type_arrays::TypeArrays, user_defined_types::TypeDrop,
     views,
@@ -148,7 +148,11 @@ pub(super) fn create_sequence(
         SequenceOrigin::Declared,
     );
     let builder = builder.add_sequence(Arc::new(sequence), ());
-    Ok(creator.grant(builder, DefaultKind::Sequences, &GrantObjects::Sequences(vec![name])))
+    Ok(creator.grant(
+        builder,
+        DefaultPrivilegeKind::Sequences,
+        &GrantObjects::Sequences(vec![name]),
+    ))
 }
 
 /// Resolves the column an `OWNED BY` names, through the search path, into the
@@ -689,8 +693,11 @@ pub(super) fn create_column_sequences(
         ));
         created.push((column, Arc::as_ptr(&sequence)));
         builder = builder.add_sequence(sequence, ());
-        builder =
-            creator.grant(builder, DefaultKind::Sequences, &GrantObjects::Sequences(vec![granted]));
+        builder = creator.grant(
+            builder,
+            DefaultPrivilegeKind::Sequences,
+            &GrantObjects::Sequences(vec![granted]),
+        );
     }
     Ok((builder, UnownedSequences(created)))
 }

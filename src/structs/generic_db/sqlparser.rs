@@ -41,10 +41,11 @@ use crate::{
     errors::{KeyConstraint, LookupError, ObjectKind},
     impls::{PrivilegeKind, SqlparserDialect},
     structs::{
-        ColumnIdentity, ColumnMetadata, DeclaredVirtualTable, ForeignTableSource, FunctionKind,
-        GenericDB, IdentifierCase, MaterializedView, MaterializedViewIndex, RelationIdentity,
-        RoleMembership, Schema, SchemaProfile, Sequence, TableAttribute, TableMetadata,
-        TriggerEnablement, UserDefinedType, View, VirtualTableSource,
+        ColumnIdentity, ColumnMetadata, DeclaredVirtualTable, DefaultPrivilege,
+        DefaultPrivilegeKind, ForeignTableSource, FunctionKind, GenericDB, IdentifierCase,
+        MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership, Schema,
+        SchemaProfile, Sequence, TableAttribute, TableMetadata, TriggerEnablement, UserDefinedType,
+        View, VirtualTableSource,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -135,7 +136,7 @@ mod views;
 mod virtual_tables;
 
 use default_privileges::{
-    Creator, DefaultKind, DefaultPrivileges, SessionChange, SessionRoles, tracks_session_roles,
+    Creator, DefaultPrivileges, SessionChange, SessionRoles, tracks_session_roles,
 };
 use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
@@ -234,17 +235,10 @@ impl SchemaProfile for SqlparserProfile {
         type_facts::type_facts(database, &type_name)
     }
 
-    fn new_function_executable_by_public(
-        database: &ParserDB,
+    fn default_privileges(
         ingestion: &Arc<ParserIngestion>,
-        owner: Option<&str>,
-        schema: &str,
-    ) -> Option<bool> {
-        Some(ingestion.default_privileges.function_executable_by_public(
-            owner,
-            schema,
-            database.identifier_case(),
-        ))
+    ) -> Option<impl Iterator<Item = DefaultPrivilege<'_>>> {
+        Some(ingestion.default_privileges.entries())
     }
 
     fn initial_schemas(dialect: &SqlparserDialect) -> impl IntoIterator<Item = (Arc<Schema>, ())> {
@@ -11681,7 +11675,7 @@ impl ParserDB {
                     sequences::own_column_sequences(&mut builder, &stored, column_sequences);
                     builder = creator.grant(
                         builder,
-                        DefaultKind::Relations,
+                        DefaultPrivilegeKind::Tables,
                         &GrantObjects::Tables(vec![name]),
                     );
                 }
@@ -12021,7 +12015,7 @@ impl ParserDB {
                         builder = builder.add_schema(Arc::new(schema), ());
                         builder = creator.grant(
                             builder,
-                            DefaultKind::Schemas,
+                            DefaultPrivilegeKind::Schemas,
                             &GrantObjects::Schemas(vec![granted]),
                         );
                     }

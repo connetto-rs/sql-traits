@@ -8,8 +8,8 @@ use alloc::{
 use crate::{
     errors::LookupError,
     structs::{
-        ColumnIdentity, GenericDB, IdentifierCase, RelationIdentity, RoleSetting, SchemaProfile,
-        TargetName, TypeFacts,
+        ColumnIdentity, DefaultPrivilege, GenericDB, IdentifierCase, RelationIdentity, RoleSetting,
+        SchemaProfile, TargetName, TypeFacts,
         generic_db::{Identified, RelationSlot},
     },
     traits::{DatabaseLike, FunctionLike, Relation, TableLike},
@@ -69,8 +69,8 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         P::type_facts(self, &self.ingestion, type_name)
     }
 
-    fn new_function_executable_by_public(&self, owner: Option<&str>, schema: &str) -> Option<bool> {
-        P::new_function_executable_by_public(self, &self.ingestion, owner, schema)
+    fn default_privileges(&self) -> Option<impl Iterator<Item = DefaultPrivilege<'_>>> {
+        P::default_privileges(&self.ingestion)
     }
 
     #[inline]

@@ -854,6 +854,7 @@ fn a_default_revoking_everything_falls_back_to_the_builtin_privileges() {
     .expect("schema parses");
 
     assert!(executable_by_public(&db, "f"));
+    assert_eq!(next_function_public(&db, Some("r"), "public"), Some(true));
     assert!(can_execute(&db, "f", "r"));
     assert_eq!(table(&db, "t").privileges(role(&db, "r"), &db).map(|held| held.delete), Ok(true));
 }
@@ -938,4 +939,130 @@ fn the_next_function_reads_the_defaults_of_its_creating_role_and_schema() {
     assert_eq!(next_function_public(&db, owner, "Kept"), Some(true));
     assert_eq!(next_function_public(&db, owner, "kept"), Some(false));
     assert_eq!(next_function_public(&db, None, "api"), Some(true));
+}
+
+/// The standing defaults the parse recorded.
+fn standing(db: &ParserDB) -> Vec<DefaultPrivilege<'_>> {
+    db.default_privileges().expect("the parser records defaults").collect()
+}
+
+/// The one standing default the parse recorded.
+fn only_standing(db: &ParserDB) -> DefaultPrivilege<'_> {
+    let [entry] = <[_; 1]>::try_from(standing(db)).expect("one standing default");
+    entry
+}
+
+/// What `grantee` holds in `entry`, each privilege spelled as PostgreSQL prints
+/// it, beside the privileges it holds with grant option.
+fn held(entry: &DefaultPrivilege<'_>, grantee: &DefaultGrantee<'_>) -> Option<[Vec<String>; 2]> {
+    let grant = entry.grant_to(grantee)?;
+    let spelled = |actions: &[Action]| {
+        let mut spelled: Vec<String> = actions.iter().map(ToString::to_string).collect();
+        spelled.sort();
+        spelled
+    };
+    Some([spelled(grant.privileges()), spelled(grant.grantable())])
+}
+
+/// A default limited to a schema lists only what it adds, under the role the
+/// input never names, and a revoke taking it back leaves nothing standing.
+#[test]
+fn a_schema_default_lists_what_it_adds_until_revoked() {
+    let granted = "CREATE SCHEMA api;
+         ALTER DEFAULT PRIVILEGES IN SCHEMA api GRANT SELECT, INSERT ON TABLES TO PUBLIC;";
+    let db = parse(granted).expect("schema parses");
+    let entry = &only_standing(&db);
+
+    assert_eq!(entry.role(), None);
+    assert_eq!(entry.kind(), DefaultPrivilegeKind::Tables);
+    assert_eq!(entry.schema(), Some("api"));
+    assert_eq!(entry.grants().len(), 1);
+    assert_eq!(
+        held(entry, &DefaultGrantee::Public),
+        Some([vec![String::from("INSERT"), String::from("SELECT")], Vec::new()])
+    );
+
+    let revoked = parse(&format!(
+        "{granted}
+         ALTER DEFAULT PRIVILEGES IN SCHEMA api REVOKE SELECT, INSERT ON TABLES FROM PUBLIC;"
+    ))
+    .expect("schema parses");
+    assert_eq!(standing(&revoked), []);
+}
+
+/// A global default starts from the built-in one, so it lists the owner's
+/// privileges beside what it grants, under the role `FOR ROLE` or `SET ROLE`
+/// names.
+#[test]
+fn a_global_default_lists_the_owner_under_its_creating_role() {
+    let for_role = parse(
+        "CREATE ROLE migrator;
+         ALTER DEFAULT PRIVILEGES FOR ROLE migrator GRANT USAGE ON SEQUENCES TO PUBLIC;",
+    )
+    .expect("schema parses");
+    let entry = &only_standing(&for_role);
+    assert_eq!(entry.role(), Some("migrator"));
+    assert_eq!(entry.kind(), DefaultPrivilegeKind::Sequences);
+    assert_eq!(entry.schema(), None);
+    assert_eq!(
+        held(entry, &DefaultGrantee::Public),
+        Some([vec![String::from("USAGE")], Vec::new()])
+    );
+    assert_eq!(
+        held(entry, &DefaultGrantee::Owner),
+        Some([
+            vec![String::from("SELECT"), String::from("UPDATE"), String::from("USAGE")],
+            Vec::new()
+        ])
+    );
+
+    let set_role = parse(
+        "CREATE ROLE migrator;
+         SET ROLE migrator;
+         ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC;",
+    )
+    .expect("schema parses");
+    let entry = &only_standing(&set_role);
+    assert_eq!(entry.role(), Some("migrator"));
+    assert_eq!(
+        held(entry, &DefaultGrantee::Public),
+        Some([vec![String::from("SELECT")], Vec::new()])
+    );
+}
+
+/// Revoking the built-in `PUBLIC EXECUTE` leaves a global default holding only
+/// the owner's.
+#[test]
+fn a_revoked_builtin_grant_lists_the_owner_alone() {
+    let db = parse("ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;")
+        .expect("schema parses");
+    let entry = &only_standing(&db);
+
+    assert_eq!(entry.kind(), DefaultPrivilegeKind::Functions);
+    assert_eq!(entry.schema(), None);
+    assert_eq!(held(entry, &DefaultGrantee::Public), None);
+    assert_eq!(
+        held(entry, &DefaultGrantee::Owner),
+        Some([vec![String::from("EXECUTE")], Vec::new()])
+    );
+}
+
+/// A default names its schema and grantees by the names PostgreSQL stores, and
+/// keeps the privileges a grantee may grant on.
+#[test]
+fn a_default_names_stored_identifiers_and_grant_options() {
+    let db = parse(
+        "CREATE ROLE Reader; CREATE SCHEMA \"Api\";
+         ALTER DEFAULT PRIVILEGES IN SCHEMA \"Api\"
+             GRANT SELECT ON TABLES TO Reader WITH GRANT OPTION;
+         ALTER DEFAULT PRIVILEGES IN SCHEMA \"Api\" GRANT UPDATE ON TABLES TO reader;",
+    )
+    .expect("schema parses");
+    let entry = &only_standing(&db);
+
+    assert_eq!(entry.schema(), Some("Api"));
+    assert_eq!(
+        held(entry, &DefaultGrantee::Role("reader".into())),
+        Some([vec![String::from("SELECT"), String::from("UPDATE")], vec![String::from("SELECT")]])
+    );
 }

@@ -8,6 +8,7 @@
 //! which is `None` here.
 
 use alloc::{
+    borrow::Cow,
     string::{String, ToString},
     vec,
     vec::Vec,
@@ -31,7 +32,10 @@ use super::{
 use crate::{
     errors::Error,
     impls::{SqlparserDialect, grantee_is_public, grantee_is_session_principal, grantees_match},
-    structs::{FunctionMetadata, IdentifierCase},
+    structs::{
+        DefaultGrant, DefaultGrantee, DefaultPrivilege, DefaultPrivilegeKind, FunctionMetadata,
+        IdentifierCase,
+    },
     utils::{
         identifier_resolution::{SessionPrincipal, stored_identifier},
         last_str,
@@ -317,22 +321,10 @@ impl Parameter {
     }
 }
 
-/// The kinds of object a default applies to, `ROUTINES` being `FUNCTIONS`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DefaultKind {
-    /// Tables, views and materialized views.
-    Relations,
-    Sequences,
-    Functions,
-    Types,
-    Schemas,
-    LargeObjects,
-}
-
-impl DefaultKind {
+impl DefaultPrivilegeKind {
     fn of(object_type: DefaultPrivilegesObjectType) -> Self {
         match object_type {
-            DefaultPrivilegesObjectType::Tables => Self::Relations,
+            DefaultPrivilegesObjectType::Tables => Self::Tables,
             DefaultPrivilegesObjectType::Sequences => Self::Sequences,
             DefaultPrivilegesObjectType::Functions | DefaultPrivilegesObjectType::Routines => {
                 Self::Functions
@@ -348,7 +340,7 @@ impl DefaultKind {
         let all =
             |rights: &[Rights]| rights.iter().fold(Rights::NONE, |all, right| all.with(*right));
         match self {
-            Self::Relations => {
+            Self::Tables => {
                 all(&[
                     Rights::SELECT,
                     Rights::INSERT,
@@ -459,7 +451,7 @@ impl Rights {
     /// does not have.
     fn of(
         privileges: &Privileges,
-        kind: DefaultKind,
+        kind: DefaultPrivilegeKind,
         object_type: DefaultPrivilegesObjectType,
     ) -> Result<Self, Error> {
         let Privileges::Actions(actions) = privileges else {
@@ -507,6 +499,24 @@ struct Item {
     grantable: Rights,
 }
 
+impl Item {
+    /// The grant the item gives, naming a role by the name PostgreSQL stores
+    /// and any other grantee as written.
+    fn grant(&self) -> DefaultGrant<'_> {
+        let grantee = match &self.holder {
+            Holder::Public => DefaultGrantee::Public,
+            Holder::Owner => DefaultGrantee::Owner,
+            Holder::Role(grantee) => {
+                DefaultGrantee::Role(grantee_role_ident(grantee).map_or_else(
+                    || Cow::Owned(grantee.to_string()),
+                    |ident| stored_identifier(&ident.value, ident.quote_style.is_some()),
+                ))
+            }
+        };
+        DefaultGrant::new(grantee, self.privileges.actions(), self.grantable.actions())
+    }
+}
+
 /// Adds `item` to `items`, widening the item of the same holder.
 fn merge(items: &mut Vec<Item>, item: &Item) {
     match items.iter_mut().find(|held| held.holder.is(&item.holder)) {
@@ -535,7 +545,7 @@ fn same_items(left: &[Item], right: &[Item]) -> bool {
 struct Row {
     /// The stored name of the role the default belongs to.
     role: Option<String>,
-    kind: DefaultKind,
+    kind: DefaultPrivilegeKind,
     /// The schema the default is limited to, with whether it was quoted.
     schema: Option<(String, bool)>,
     items: Vec<Item>,
@@ -598,7 +608,7 @@ impl DefaultPrivileges {
                 )
             }
         };
-        let kind = DefaultKind::of(object_type);
+        let kind = DefaultPrivilegeKind::of(object_type);
         let rights = Rights::of(&privileges, kind, object_type)?;
 
         let mut roles = Vec::new();
@@ -609,7 +619,9 @@ impl DefaultPrivileges {
                 DefaultPrivilegesOption::InSchema(named) => schemas.extend(named),
             }
         }
-        if !schemas.is_empty() && matches!(kind, DefaultKind::Schemas | DefaultKind::LargeObjects) {
+        if !schemas.is_empty()
+            && matches!(kind, DefaultPrivilegeKind::Schemas | DefaultPrivilegeKind::LargeObjects)
+        {
             return Err(Error::DefaultPrivilegesInSchema { object_type: object_type.to_string() });
         }
 
@@ -736,7 +748,7 @@ impl DefaultPrivileges {
     fn items(
         &self,
         owner: Option<&str>,
-        kind: DefaultKind,
+        kind: DefaultPrivilegeKind,
         schema: SchemaQualifier<'_>,
         case: IdentifierCase,
     ) -> Vec<Item> {
@@ -768,17 +780,16 @@ impl DefaultPrivileges {
         items
     }
 
-    /// Whether `PUBLIC` holds `EXECUTE` on a new function in the schema
-    /// stored as `schema`, created by `owner`.
-    pub(super) fn function_executable_by_public(
-        &self,
-        owner: Option<&str>,
-        schema: &str,
-        case: IdentifierCase,
-    ) -> bool {
-        // A stored name compares as it stands, which a quoted one does.
-        self.items(owner, DefaultKind::Functions, Some((schema, true)), case).iter().any(|item| {
-            matches!(item.holder, Holder::Public) && item.privileges.contains(Rights::EXECUTE)
+    /// The standing defaults, each schema and grantee by the name PostgreSQL
+    /// stores.
+    pub(super) fn entries(&self) -> impl Iterator<Item = DefaultPrivilege<'_>> {
+        self.rows.iter().map(|row| {
+            DefaultPrivilege::new(
+                row.role.as_deref().map(Cow::Borrowed),
+                row.kind,
+                row.schema.as_ref().map(|(name, quoted)| stored_identifier(name, *quoted)),
+                row.items.iter().map(Item::grant).collect(),
+            )
         })
     }
 
@@ -853,7 +864,7 @@ impl Row {
 #[derive(Debug, Clone, Copy)]
 struct Key<'a> {
     role: Option<&'a str>,
-    kind: DefaultKind,
+    kind: DefaultPrivilegeKind,
     schema: Option<(&'a str, bool)>,
 }
 
@@ -933,7 +944,7 @@ impl<'a> Creator<'a> {
 
     fn items(
         &self,
-        kind: DefaultKind,
+        kind: DefaultPrivilegeKind,
         schema: SchemaQualifier<'_>,
         case: IdentifierCase,
     ) -> Vec<Item> {
@@ -947,7 +958,7 @@ impl<'a> Creator<'a> {
         schema: SchemaQualifier<'_>,
         case: IdentifierCase,
     ) -> FunctionMetadata {
-        let items = self.items(DefaultKind::Functions, schema, case);
+        let items = self.items(DefaultPrivilegeKind::Functions, schema, case);
         let holds = |holder: &Holder| {
             items
                 .iter()
@@ -977,7 +988,7 @@ impl<'a> Creator<'a> {
         schema: SchemaQualifier<'_>,
         case: IdentifierCase,
     ) -> Vec<Action> {
-        self.items(DefaultKind::Relations, schema, case)
+        self.items(DefaultPrivilegeKind::Tables, schema, case)
             .iter()
             .find(|item| matches!(item.holder, Holder::Owner))
             .map_or_else(Vec::new, |item| item.privileges.actions())
@@ -989,7 +1000,7 @@ impl<'a> Creator<'a> {
     pub(super) fn grant(
         &self,
         mut builder: ParserDBBuilder,
-        kind: DefaultKind,
+        kind: DefaultPrivilegeKind,
         objects: &GrantObjects,
     ) -> ParserDBBuilder {
         let schema = match objects {
