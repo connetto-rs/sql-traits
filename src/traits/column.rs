@@ -721,10 +721,9 @@ pub trait ColumnLike:
         table.is_primary_key_column(database, self.borrow())
     }
 
-    #[inline]
-    /// Returns whether the column is a surrogate key.
-    ///
-    /// A surrogate key is defined as a primary key that is also generative.
+    /// Returns whether the column belongs to the primary key of its table and
+    /// the database assigns that whole key, as
+    /// [`TableLike::has_surrogate_primary_key`] tells.
     ///
     /// # Arguments
     ///
@@ -739,26 +738,28 @@ pub trait ColumnLike:
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
-    ///     "CREATE TABLE my_table (id SERIAL PRIMARY KEY, name TEXT, age INT);",
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE my_table (id SERIAL PRIMARY KEY, name TEXT, age INT);
+    ///      CREATE TABLE computed (price INT, doubled INT GENERATED ALWAYS AS (price * 2) STORED PRIMARY KEY);",
     /// )?;
-    /// let table =
-    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let id_column =
-    ///     table.column("id", &db, IdentifierCase::AsWritten)?.expect("Column 'id' should exist");
-    /// let name_column =
-    ///     table.column("name", &db, IdentifierCase::AsWritten)?.expect("Column 'name' should exist");
-    /// let age_column =
-    ///     table.column("age", &db, IdentifierCase::AsWritten)?.expect("Column 'age' should exist");
-    /// assert!(id_column.is_surrogate_key(&db)?, "id column should be a surrogate key");
-    /// assert!(!name_column.is_surrogate_key(&db)?, "name column should not be a surrogate key");
-    /// assert!(!age_column.is_surrogate_key(&db)?, "age column should not be a surrogate key");
+    /// let surrogate = |table: &str, column: &str| -> Result<bool, sql_traits::errors::Error> {
+    ///     let table =
+    ///         db.table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)?.unwrap();
+    ///     Ok(table.column(column, &db, IdentifierCase::AsWritten)?.unwrap().is_surrogate_key(&db)?)
+    /// };
+    /// assert!(surrogate("my_table", "id")?);
+    /// assert!(!surrogate("my_table", "name")?);
+    /// assert!(!surrogate("my_table", "age")?);
+    /// assert!(surrogate("computed", "doubled")?);
+    /// assert!(!surrogate("computed", "price")?);
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn is_surrogate_key(&self, database: &Self::DB) -> Result<bool, LookupError> {
         let table: &<Self::DB as DatabaseLike>::Table = ColumnLike::table(self, database);
         Ok(table.has_surrogate_primary_key(database)? && self.is_primary_key(database)?)
