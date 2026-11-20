@@ -137,9 +137,8 @@ fn reached_function<'db, DB: DatabaseLike>(
 ) -> Result<Option<&'db DB::Function>, LookupError> {
     let Some(call) = WrittenCall::relation(factor) else { return Ok(None) };
     let mut reached = match database.functions_reached_by(call, case) {
-        Ok(reached) => reached,
         Err(LookupError::InvalidObjectName { .. }) => return Ok(None),
-        Err(error) => return Err(error),
+        reached => reached?,
     };
     let (Some(function), None) = (reached.next(), reached.next()) else { return Ok(None) };
     Ok((function.kind(database)? == FunctionKind::Normal).then_some(function))

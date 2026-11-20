@@ -50,6 +50,24 @@ const SCHEMA: &str = "
         PERFORM 1 FROM held_notes() held WHERE note_id = 1 AND held.note_id = 2;
     END $$;
     CREATE PROCEDURE tidy() LANGUAGE sql AS $$ SELECT 1 $$;
+    CREATE TYPE mood AS ENUM ('sad', 'glad');
+    CREATE TYPE tagged_pair AS (tags TEXT[], label TEXT);
+    CREATE TABLE tagged (id INT, tags TEXT[]);
+    CREATE MATERIALIZED VIEW note_labels AS SELECT label FROM notes;
+    CREATE VIEW loose AS SELECT * FROM same_value(1);
+    CREATE FUNCTION one_mood() RETURNS mood LANGUAGE sql AS $$ SELECT 'sad'::mood $$;
+    CREATE FUNCTION qualified_notes() RETURNS SETOF public.notes
+        LANGUAGE sql AS $$ SELECT * FROM notes $$;
+    CREATE FUNCTION all_note_labels() RETURNS SETOF note_labels
+        LANGUAGE sql AS $$ SELECT * FROM note_labels $$;
+    CREATE FUNCTION all_loose() RETURNS SETOF loose LANGUAGE sql AS $$ SELECT * FROM loose $$;
+    CREATE FUNCTION untyped() RETURNS SETOF nowhere LANGUAGE sql AS $$ SELECT 1 $$;
+    CREATE FUNCTION tag_lists() RETURNS TABLE (tags TEXT[]) LANGUAGE sql AS $$ SELECT '{}' $$;
+    CREATE FUNCTION all_tagged() RETURNS SETOF tagged LANGUAGE sql AS $$ SELECT * FROM tagged $$;
+    CREATE FUNCTION one_tagged_pair() RETURNS tagged_pair LANGUAGE sql AS $$ SELECT '{}', 'x' $$;
+    CREATE FUNCTION pair_list() RETURNS _pair LANGUAGE sql AS $$ SELECT '{}' $$;
+    CREATE TYPE shell;
+    CREATE FUNCTION shell_value() RETURNS shell LANGUAGE sql AS $$ SELECT NULL $$;
 ";
 
 fn database() -> ParserDB {
@@ -80,6 +98,7 @@ fn describe(definition: &ColumnDefinition<'_, '_, '_, ParserDB>) -> String {
         }
         ColumnDefinition::Expression { expression, .. } => format!("expression {expression}"),
         ColumnDefinition::Ordinality => "ordinality".to_owned(),
+        ColumnDefinition::ArrayElement { .. } => "element".to_owned(),
         ColumnDefinition::Opaque => "opaque".to_owned(),
         other => panic!("unexpected definition {other:?}"),
     }
@@ -182,8 +201,11 @@ fn a_single_column_takes_the_name_postgresql_chooses() {
     assert_eq!(columns("ids() AS i"), named(&[("i", "ids BIGINT")]));
     assert_eq!(columns("ids() AS t(i)"), named(&[("i", "ids BIGINT")]));
     assert_eq!(columns("one_id()"), named(&[("\"one_id\"", "one_id INT")]));
-    // A domain over a scalar type is a scalar result.
+    // A domain over a scalar type and an enum are scalar results.
     assert_eq!(columns("one_positive() AS p"), named(&[("p", "one_positive positive")]));
+    assert_eq!(columns("one_mood()"), named(&[("\"one_mood\"", "one_mood mood")]));
+    // An array type spelled as its stored `_` name is a scalar result too.
+    assert_eq!(columns("pair_list()"), named(&[("\"pair_list\"", "pair_list public.pair[]")]));
 }
 
 #[test]
@@ -191,6 +213,13 @@ fn a_row_type_result_exposes_the_columns_of_its_type() {
     assert_eq!(
         columns("all_notes()"),
         named(&[("id", "all_notes row notes.id"), ("label", "all_notes row notes.label")])
+    );
+    assert_eq!(
+        columns("qualified_notes()"),
+        named(&[
+            ("id", "qualified_notes row notes.id"),
+            ("label", "qualified_notes row notes.label")
+        ])
     );
     assert_eq!(
         columns("all_labels()"),
@@ -260,8 +289,42 @@ fn calls_whose_columns_are_not_known_stay_opaque() {
         "held_notes(1)",
         "tidy()",
         "elsewhere.held_notes()",
+        "catalog.public.held_notes()",
+        "untyped()",
+        "all_loose()",
+        "shell_value()",
     ] {
         assert_eq!(columns(from), unexpanded(), "`{from}` stays opaque");
+    }
+}
+
+/// `unnest` expands a function's result column only when the column's
+/// declared type is an array, whatever declares it.
+#[test]
+fn unnest_expands_a_function_result_column_of_an_array_type() {
+    for from in [
+        "tag_lists() l",
+        "all_tagged() l",
+        "one_tagged_pair() l",
+        "rows_of() AS l(tags TEXT[], label TEXT)",
+    ] {
+        let columns = columns(&format!("{from}, unnest(l.tags) AS u(tag)"));
+        assert_eq!(columns.last(), Some(&("tag".to_owned(), "element".to_owned())), "{from}");
+    }
+    for from in ["held_notes() l", "all_notes() l", "one_pair() l", "rows_of() AS l(label TEXT)"] {
+        let columns = columns(&format!("{from}, unnest(l.label) AS u(tag)"));
+        assert_eq!(columns.last(), unexpanded().last(), "{from}");
+    }
+}
+
+/// A function's rows are no rows of a base table, even when the function
+/// returns that table's row type.
+#[test]
+fn a_function_result_has_no_source_table() {
+    let database = database();
+    for sql in ["SELECT * FROM all_notes()", "SELECT id FROM all_notes() WITH ORDINALITY"] {
+        let source = query(sql).projection_source_table(&database).expect("source resolves");
+        assert!(source.is_none(), "{sql}");
     }
 }
 
