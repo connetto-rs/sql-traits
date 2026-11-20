@@ -1468,7 +1468,10 @@ impl UserDefinedTypeLike for MemoryUserDefinedType {
         })
     }
 
-    fn attributes(&self) -> Option<impl Iterator<Item = (TargetName<'_>, &MemoryDataType)>> {
+    fn attributes<'db>(
+        &'db self,
+        _: &'db MemoryCatalog,
+    ) -> Option<impl Iterator<Item = StructuredField<'db, MemoryDataType>>> {
         None::<core::iter::Empty<_>>
     }
 }

@@ -1080,8 +1080,8 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                     FunctionResultType::RowType(column) => {
                         self.definition_type(column.definition())?
                     }
-                    FunctionResultType::Attribute { data_type, database } => {
-                        column_type(database, data_type)
+                    FunctionResultType::Attribute { field, database } => {
+                        column_type(database, field.data_type())
                     }
                     FunctionResultType::DefinitionList(data_type) => {
                         declared_type(self.database, data_type)

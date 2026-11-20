@@ -20,7 +20,7 @@ use crate::{
         CastContext, CastLike, CastMethod, DatabaseLike, DomainLike, Enumeration,
         EnumerationMember, ExtensionLike, IndexLike, Metadata, OperatorKind, OperatorLike,
         PolicyLike, Relation, RuleLike, SequenceLike, SequenceOrigin, SequenceOwner,
-        UserDefinedTypeKind, UserDefinedTypeLike, ViewLike,
+        StructuredField, UserDefinedTypeKind, UserDefinedTypeLike, ViewLike,
     },
 };
 
@@ -298,7 +298,10 @@ impl<DB: DatabaseLike> UserDefinedTypeLike for Absent<DB> {
         self.unreachable::<Option<Enumeration<core::iter::Empty<_>>>>()
     }
 
-    fn attributes(&self) -> Option<impl Iterator<Item = (TargetName<'_>, &DB::DataType)>> {
+    fn attributes<'db>(
+        &'db self,
+        _: &'db DB,
+    ) -> Option<impl Iterator<Item = StructuredField<'db, DB::DataType>>> {
         self.unreachable::<Option<core::iter::Empty<_>>>()
     }
 }

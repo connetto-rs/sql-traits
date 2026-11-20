@@ -4,8 +4,7 @@ use alloc::borrow::Cow;
 use core::fmt::Debug;
 
 use crate::{
-    structs::TargetName,
-    traits::{DatabaseLike, Enumeration, EnumerationMember, Metadata},
+    traits::{DatabaseLike, Enumeration, EnumerationMember, Metadata, StructuredField},
     utils::identifier_resolution::stored_identifier,
 };
 
@@ -172,12 +171,16 @@ pub trait UserDefinedTypeLike: Clone + Debug + Metadata + Send + Sync {
     /// ```
     fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>>;
 
-    /// Returns the name and declared type of each attribute of a composite
-    /// type, in declaration order, or `None` for every other kind.
+    /// Returns each attribute of a composite type as a field, in declaration
+    /// order, or `None` for every other kind.
     ///
     /// A function returning the type outputs one column per attribute when
     /// called in `FROM`, as `pg_attribute` lists them for the type's
-    /// `typrelid`.
+    /// `typrelid`. Each field names the attribute and carries its declared
+    /// type and the collation it declares, with the facts that collation
+    /// reached when the type was declared, the fields
+    /// [`DataTypeLike::structured_fields`](crate::traits::DataTypeLike::structured_fields)
+    /// answers for a column of the type.
     ///
     /// # Example
     ///
@@ -187,28 +190,31 @@ pub trait UserDefinedTypeLike: Clone + Debug + Metadata + Send + Sync {
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE TYPE pair AS (left_side INT, \"Right\" VARCHAR(3));
+    ///     "CREATE TYPE pair AS (left_side INT, \"Right\" VARCHAR(3) COLLATE \"C\");
     ///      CREATE TYPE mood AS ENUM ('sad');",
     /// )?;
     /// let type_named = |name: &str| db.user_defined_types().find(|type_| type_.name() == name);
     /// let attributes: Vec<_> = type_named("pair")
     ///     .unwrap()
-    ///     .attributes()
+    ///     .attributes(&db)
     ///     .unwrap()
-    ///     .map(|(name, data_type)| (name, data_type.name(&db), data_type.max_character_length(&db)))
+    ///     .map(|field| {
+    ///         let data_type = field.data_type();
+    ///         (field.name(), field.name_is_quoted(), data_type.max_character_length(&db))
+    ///     })
     ///     .collect();
-    /// assert_eq!(
-    ///     attributes,
-    ///     [
-    ///         (TargetName::new("left_side", false), "INT".into(), None),
-    ///         (TargetName::new("Right", true), "VARCHAR".into(), Some(3))
-    ///     ]
-    /// );
-    /// assert!(type_named("mood").unwrap().attributes().is_none());
+    /// assert_eq!(attributes, [(Some("left_side"), false, None), (Some("Right"), true, Some(3))]);
+    /// let right = type_named("pair").unwrap().attributes(&db).unwrap().nth(1).unwrap();
+    /// let ColumnCollation::Named(collation) = right.collation() else {
+    ///     panic!("a declared COLLATE names the collation");
+    /// };
+    /// assert_eq!(collation.name().name(), "C");
+    /// assert!(type_named("mood").unwrap().attributes(&db).is_none());
     /// # Ok(())
     /// # }
     /// ```
-    fn attributes(
-        &self,
-    ) -> Option<impl Iterator<Item = (TargetName<'_>, &<Self::DB as DatabaseLike>::DataType)>>;
+    fn attributes<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<impl Iterator<Item = StructuredField<'db, <Self::DB as DatabaseLike>::DataType>>>;
 }

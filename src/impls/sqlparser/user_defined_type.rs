@@ -4,11 +4,12 @@
 
 use sqlparser::ast::{CreateFunction, DataType};
 
+use super::data_type::composite_fields;
 use crate::{
-    structs::{IdentifierCase, ParserDB, TargetName, UserDefinedType},
+    structs::{IdentifierCase, ParserDB, UserDefinedType},
     traits::{
-        Enumeration, EnumerationKind, EnumerationMember, Metadata, UserDefinedTypeKind,
-        UserDefinedTypeLike,
+        Enumeration, EnumerationKind, EnumerationMember, Metadata, StructuredField,
+        UserDefinedTypeKind, UserDefinedTypeLike,
     },
     utils::object_name::{object_name_identifiers, object_name_last_part, qualifier_of},
 };
@@ -80,11 +81,11 @@ impl UserDefinedTypeLike for UserDefinedType {
     }
 
     #[inline]
-    fn attributes(&self) -> Option<impl Iterator<Item = (TargetName<'_>, &DataType)>> {
-        Some(self.composite_attributes()?.iter().map(|attribute| {
-            let name = TargetName::new(&attribute.name.value, attribute.name.quote_style.is_some());
-            (name, &attribute.data_type)
-        }))
+    fn attributes<'db>(
+        &'db self,
+        database: &'db ParserDB,
+    ) -> Option<impl Iterator<Item = StructuredField<'db, DataType>>> {
+        composite_fields(self, database)
     }
 }
 

@@ -351,7 +351,7 @@ impl DataTypeLike for DataType {
             Self::Object(columns) | Self::Nested(columns) => WrittenFields::Column(columns.iter()),
             stored => {
                 let (user_type, _) = user_type_of(stored, database)?;
-                WrittenFields::Composite(user_type, user_type.composite_attributes()?.iter())
+                return composite_fields(user_type, database);
             }
         };
         Some(FieldsOf { written, database })
@@ -403,9 +403,19 @@ enum WrittenFields<'db> {
 }
 
 /// The fields of a structured type, as the database holding it answers them.
-struct FieldsOf<'db> {
+pub(super) struct FieldsOf<'db> {
     written: WrittenFields<'db>,
     database: &'db ParserDB,
+}
+
+/// The attributes of `user_type` as fields, or `None` when it is no
+/// composite type.
+pub(super) fn composite_fields<'db>(
+    user_type: &'db UserDefinedType,
+    database: &'db ParserDB,
+) -> Option<FieldsOf<'db>> {
+    let attributes = user_type.composite_attributes()?.iter();
+    Some(FieldsOf { written: WrittenFields::Composite(user_type, attributes), database })
 }
 
 impl<'db> Iterator for FieldsOf<'db> {
