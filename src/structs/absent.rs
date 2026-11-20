@@ -297,6 +297,10 @@ impl<DB: DatabaseLike> UserDefinedTypeLike for Absent<DB> {
     fn enumeration(&self) -> Option<Enumeration<impl Iterator<Item = EnumerationMember<'_>>>> {
         self.unreachable::<Option<Enumeration<core::iter::Empty<_>>>>()
     }
+
+    fn attributes(&self) -> Option<impl Iterator<Item = (TargetName<'_>, &DB::DataType)>> {
+        self.unreachable::<Option<core::iter::Empty<_>>>()
+    }
 }
 
 impl<DB: DatabaseLike> IndexLike for Absent<DB> {

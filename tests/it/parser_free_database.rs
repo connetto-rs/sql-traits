@@ -1467,6 +1467,10 @@ impl UserDefinedTypeLike for MemoryUserDefinedType {
             )
         })
     }
+
+    fn attributes(&self) -> Option<impl Iterator<Item = (TargetName<'_>, &MemoryDataType)>> {
+        None::<core::iter::Empty<_>>
+    }
 }
 
 impl RuleLike for MemoryRule {

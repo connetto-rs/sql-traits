@@ -59,8 +59,8 @@ pub use absent::Absent;
 pub use call_resolution::{ArgumentEvidence, CallResolution, SelectedFunction};
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionRef,
-    ColumnDefinitionScope, ColumnQueryScope, ColumnScope, QueryOutput, RangeTableEntry,
-    RelationBinding,
+    ColumnDefinitionScope, ColumnQueryScope, ColumnScope, FunctionResultType, QueryOutput,
+    RangeTableEntry, RelationBinding,
 };
 pub use constraint_deferral::ConstraintDeferral;
 pub use deployment::{

@@ -8,7 +8,7 @@ use sqlparser::ast::{
 
 use super::{
     BaseColumnRef, ColumnOrigin, CteShape, DerivationProfile, DerivedShape, Deriving, FromScope,
-    LookupOutcome, OutputNameSource, RelationKey, ResolvedColumn, WildcardEntry,
+    LookupOutcome, OutputNameSource, RelationKey, ResolvedColumn, ResultColumnType, WildcardEntry,
     derive_query_shape, factor_address,
     modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
@@ -18,7 +18,8 @@ use crate::{
     errors::LookupError,
     structs::{
         ColumnBinding, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionRef,
-        ColumnDefinitionScope, IdentifierCase, RangeTableEntry, RelationBinding, plain_arguments,
+        ColumnDefinitionScope, FunctionResultType, IdentifierCase, RangeTableEntry,
+        RelationBinding, plain_arguments,
     },
     traits::{ColumnLike, CreatedFromQuery, DataTypeLike, DatabaseLike, FunctionLike, TableLike},
     utils::{
@@ -141,6 +142,10 @@ enum DefinitionNode<'query, 'db, DB: DatabaseLike> {
         scope: ScopeCursor,
     },
     Ordinality,
+    FunctionResult {
+        function: &'db DB::Function,
+        data_type: ResultColumnType<'query, 'db, DB, DefinitionId>,
+    },
     SetOperation {
         operator: SetOperator,
         left: DefinitionId,
@@ -251,6 +256,23 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                 }
             }
             DefinitionNode::Ordinality => ColumnDefinition::Ordinality,
+            DefinitionNode::FunctionResult { function, data_type } => {
+                ColumnDefinition::FunctionResult {
+                    function,
+                    data_type: match data_type {
+                        ResultColumnType::Signature(name) => FunctionResultType::Signature(name),
+                        ResultColumnType::RowType(column) => {
+                            FunctionResultType::RowType(ColumnDefinitionRef::new(self, *column))
+                        }
+                        ResultColumnType::Attribute(data_type, database) => {
+                            FunctionResultType::Attribute { data_type, database }
+                        }
+                        ResultColumnType::DefinitionList(data_type) => {
+                            FunctionResultType::DefinitionList(data_type.get())
+                        }
+                    },
+                }
+            }
             DefinitionNode::SetOperation { operator, left, right } => {
                 ColumnDefinition::SetOperation {
                     operator: *operator,
@@ -583,6 +605,20 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             }
             DefinitionNode::Values { cells } => {
                 self.any_defines_array(&self.lists[cells.start..cells.end], database)?
+            }
+            DefinitionNode::FunctionResult { data_type, .. } => {
+                match data_type {
+                    ResultColumnType::Signature(name) => {
+                        PgType::parse(name).is_some_and(|declared| names_array(&declared))
+                    }
+                    ResultColumnType::RowType(column) => self.defines_array(*column, database)?,
+                    ResultColumnType::Attribute(data_type, database) => {
+                        data_type.array_element(database).is_some()
+                    }
+                    ResultColumnType::DefinitionList(data_type) => {
+                        PgType::of(data_type.get()).element().is_some()
+                    }
+                }
             }
             DefinitionNode::ArrayElement { .. }
             | DefinitionNode::Ordinality
@@ -1032,9 +1068,21 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             definitions.push(self.push_definition(DefinitionNode::ArrayElement { array, scope }));
         }
         if with_ordinality {
-            definitions.push(self.push_definition(DefinitionNode::Ordinality));
+            definitions.push(self.ordinality_definition());
         }
         Ok(Some(definitions))
+    }
+
+    fn function_result_definition(
+        &mut self,
+        function: &'db DB::Function,
+        data_type: ResultColumnType<'query, 'db, DB, Self::Definition>,
+    ) -> Self::Definition {
+        self.push_definition(DefinitionNode::FunctionResult { function, data_type })
+    }
+
+    fn ordinality_definition(&mut self) -> Self::Definition {
+        self.push_definition(DefinitionNode::Ordinality)
     }
 
     fn set_definition(

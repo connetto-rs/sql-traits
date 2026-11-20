@@ -51,10 +51,12 @@ use crate::{
 
 pub(crate) mod call_nodes;
 pub(crate) mod definition_graph;
+mod function_results;
 pub(crate) mod modifying;
 pub(crate) mod scoped_roots;
 
 use definition_graph::{AstRef, DefinitionDerivation, ScopeCursor};
+use function_results::{ResultColumnType, collect_function_call};
 
 /// A view whose definition is being derived right now.
 ///
@@ -605,6 +607,16 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
         scope: Self::Cursor,
         database: &'db DB,
     ) -> Result<Option<Vec<Self::Definition>>, LookupError>;
+    /// The definition of a column of the result `function`, called in
+    /// `FROM`, returns, its type declared by `data_type`.
+    fn function_result_definition(
+        &mut self,
+        function: &'db DB::Function,
+        data_type: ResultColumnType<'query, 'db, DB, Self::Definition>,
+    ) -> Self::Definition;
+    /// The definition of the `bigint` row number `WITH ORDINALITY` adds
+    /// after the columns of a function in `FROM`.
+    fn ordinality_definition(&mut self) -> Self::Definition;
     fn set_definition(
         &mut self,
         operator: SetOperator,
@@ -729,6 +741,15 @@ where
     ) -> Result<Option<Vec<Self::Definition>>, LookupError> {
         Ok(None)
     }
+
+    fn function_result_definition(
+        &mut self,
+        _function: &'db DB::Function,
+        _data_type: ResultColumnType<'query, 'db, DB, Self::Definition>,
+    ) {
+    }
+
+    fn ordinality_definition(&mut self) {}
 
     fn set_definition(
         &mut self,
@@ -4757,6 +4778,9 @@ where
     if let Some(call) = unnest_call(factor, deriving.case)
         && let Some(contribution) = collect_unnest(factor, &call, deriving, local_parent, profile)?
     {
+        return Ok(contribution);
+    }
+    if let Some(contribution) = collect_function_call(factor, deriving, profile)? {
         return Ok(contribution);
     }
     match factor.get() {

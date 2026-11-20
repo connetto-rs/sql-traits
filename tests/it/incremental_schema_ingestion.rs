@@ -82,6 +82,7 @@ fn snapshots_preserve_each_incremental_schema_state() {
             ColumnDefinition::Values { .. } => "values".to_owned(),
             ColumnDefinition::Parameter { .. } => "parameter".to_owned(),
             ColumnDefinition::Variable(_) => "variable".to_owned(),
+            ColumnDefinition::FunctionResult { .. } => "function result".to_owned(),
             ColumnDefinition::VariableField(_) => "variable field".to_owned(),
             ColumnDefinition::Opaque => "opaque".to_owned(),
         }
