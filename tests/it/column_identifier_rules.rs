@@ -3,11 +3,13 @@
 //!
 //! Measured on the `sqlite3` shell: a column created as `"Body"` answers
 //! `SELECT body` and `SELECT BODY`, `CREATE TABLE t ("Col" INT, "COL" INT)`
-//! fails with `duplicate column name: COL`, and `ALTER TABLE u RENAME COLUMN
-//! body TO other` renames the column stored as `"Body"`. On MySQL 5.7 a column
-//! created as `` `Body` `` answers both spellings too, whatever
-//! `lower_case_table_names` says. PostgreSQL is the only one of the three that
-//! keeps a quoted column name apart.
+//! fails with `duplicate column name: COL`, `ALTER TABLE u RENAME COLUMN body
+//! TO other` renames the column stored as `"Body"`, and `CREATE TABLE p ("ID"
+//! INTEGER, "Code" TEXT, PRIMARY KEY (id), UNIQUE (code))` keys both columns,
+//! enforcing a foreign key `REFERENCES p` and one `REFERENCES p (CODE)` on
+//! SQLite 3.51.1. On MySQL 5.7 a column created as `` `Body` `` answers both
+//! spellings too, whatever `lower_case_table_names` says. PostgreSQL is the
+//! only one of the three that keeps a quoted column name apart.
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::LookupError, prelude::*};
@@ -107,4 +109,69 @@ fn a_folding_parse_grants_a_column_under_another_spelling() {
         )
         .expect("the grant names the column the folded spelling reaches");
     assert_eq!(db.column_grants().count(), 1);
+}
+
+/// A folding parse keys a column under another spelling and reads the key
+/// back, as SQLite does.
+#[test]
+fn a_folding_parse_keys_a_column_under_another_spelling() -> Result<(), LookupError> {
+    let db = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Folded)
+        .parse::<SQLiteDialect>(
+            "CREATE TABLE p (\"ID\" INTEGER, \"Code\" TEXT, PRIMARY KEY (id), UNIQUE (code));
+             CREATE TABLE c (pid INTEGER REFERENCES p, code TEXT REFERENCES p (CODE));",
+        )
+        .expect("the keys name the columns the folded spellings reach");
+
+    let key: Vec<&str> =
+        table(&db, "p").primary_key_columns(&db)?.map(ColumnLike::column_name).collect();
+    assert_eq!(key, ["ID"]);
+    let referenced = table(&db, "c")
+        .foreign_keys(&db)?
+        .map(|key| Ok(key.referenced_columns(&db)?.map(ColumnLike::column_name).collect()))
+        .collect::<Result<Vec<Vec<&str>>, LookupError>>()?;
+    assert_eq!(referenced, [vec!["ID"], vec!["Code"]]);
+
+    Ok(())
+}
+
+/// A folding parse requires a value of the columns a key or a table-level
+/// `NOT NULL` names under another spelling.
+#[test]
+fn a_folding_parse_requires_a_value_under_another_spelling() -> Result<(), LookupError> {
+    let db = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Folded)
+        .parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (\"ID\" INT, \"Body\" TEXT, \"Note\" TEXT, PRIMARY KEY (id),
+                 CONSTRAINT body_required NOT NULL body);
+             CREATE TABLE u (\"Code\" INT);
+             ALTER TABLE u ADD PRIMARY KEY (code);",
+        )
+        .expect("the key and the requirement name the columns the folded spellings reach");
+
+    let nullable = |table_name: &str, column_name: &str| {
+        table(&db, table_name)
+            .column(column_name, &db, IdentifierCase::Folded)?
+            .expect("the column exists")
+            .is_nullable(&db)
+    };
+    assert!(!nullable("t", "id")?);
+    assert!(!nullable("t", "body")?);
+    assert!(nullable("t", "note")?);
+    assert!(!nullable("u", "code")?);
+
+    Ok(())
+}
+
+/// An exact parse keeps two spellings apart for a key as it does for a column
+/// read.
+#[test]
+fn an_exact_parse_refuses_a_key_on_another_spelling() {
+    let parsed = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::Exact)
+        .parse::<SQLiteDialect>("CREATE TABLE p (ID INTEGER, PRIMARY KEY (id));");
+    assert!(matches!(
+        parsed,
+        Err(sql_traits::errors::Error::IdentifierLookupError(LookupError::ColumnNotFound { .. }))
+    ));
 }

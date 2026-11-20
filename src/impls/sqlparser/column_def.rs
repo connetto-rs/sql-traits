@@ -220,9 +220,12 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
             matches!(option.option, sqlparser::ast::ColumnOption::NotNull)
                 || is_identity(&option.option)
         });
-        let table_holds =
-            crate::structs::generic_db::table_not_null(self.table(), &self.attribute().name)
-                .is_some();
+        let table_holds = crate::structs::generic_db::table_not_null(
+            self.table(),
+            &self.attribute().name,
+            database.identifier_case(),
+        )
+        .is_some();
         Ok(!declared && !table_holds && !self.is_primary_key(database)?)
     }
 

@@ -2089,7 +2089,7 @@ impl ParserDBBuilder {
         if self.dialect().binds_foreign_keys_on_use() {
             bind_to_host_schema(&host.name, host.qualifier(), foreign_key)?;
         } else if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
-            ForeignKeyBinding::of(table, foreign_key).apply(foreign_key);
+            ForeignKeyBinding::of(table, foreign_key, self.identifier_case()).apply(foreign_key);
         }
         Ok(())
     }
@@ -3707,9 +3707,10 @@ fn refuse_unequal_written_lists(
 }
 
 /// Returns the columns of the primary key of `table` in key order, spelled as
-/// the table declares them, which is what a foreign key naming no columns
-/// references, or `None` when the table has no primary key.
-fn primary_key_columns(table: &CreateTable) -> Option<Vec<Ident>> {
+/// the table declares them and matched under `case`, which is what a foreign
+/// key naming no columns references, or `None` when the table has no primary
+/// key.
+fn primary_key_columns(table: &CreateTable, case: IdentifierCase) -> Option<Vec<Ident>> {
     if let Some(column) = table.columns.iter().find(|column| {
         column.options.iter().any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
     }) {
@@ -3727,7 +3728,7 @@ fn primary_key_columns(table: &CreateTable) -> Option<Vec<Ident>> {
                 table
                     .columns
                     .iter()
-                    .find(|column| idents_match(&column.name, written))
+                    .find(|column| case_idents_match(&column.name, written, case))
                     .map_or_else(|| written.clone(), |column| column.name.clone())
             })
             .collect(),
@@ -4149,8 +4150,12 @@ fn refuse_no_inherit_constraints_on_partitioned(
 /// The two spellings of one requirement, written on the column and in the
 /// constraint list, are one constraint carrying one name and one
 /// inheritability, so two different names for them are refused, as is a
-/// `NO INHERIT` one beside any other spelling of the same requirement.
-fn refuse_not_null_conflicts(create_table: &CreateTable) -> Result<(), crate::errors::Error> {
+/// `NO INHERIT` one beside any other spelling of the same requirement. A
+/// constraint names its column under `case`.
+fn refuse_not_null_conflicts(
+    create_table: &CreateTable,
+    case: IdentifierCase,
+) -> Result<(), crate::errors::Error> {
     for column in &create_table.columns {
         let mut named: Vec<String> = Vec::new();
         let mut spelled_no_inherit = false;
@@ -4167,7 +4172,7 @@ fn refuse_not_null_conflicts(create_table: &CreateTable) -> Result<(), crate::er
             let TableConstraint::NotNull(not_null) = constraint else {
                 continue;
             };
-            if !idents_match(&not_null.column, &column.name) {
+            if !case_idents_match(&not_null.column, &column.name, case) {
                 continue;
             }
             spellings += 1;
@@ -4337,12 +4342,13 @@ struct ForeignKeyBinding {
 }
 
 impl ForeignKeyBinding {
-    /// Reads what `foreign_key` keeps of `target`, the table it reaches.
-    fn of(target: &CreateTable, foreign_key: &ForeignKeyConstraint) -> Self {
+    /// Reads what `foreign_key` keeps of `target`, the table it reaches, with
+    /// column names matched under `case`.
+    fn of(target: &CreateTable, foreign_key: &ForeignKeyConstraint, case: IdentifierCase) -> Self {
         Self {
             qualifier: stored_qualifier(&target.name),
             referred_columns: if foreign_key.referred_columns.is_empty() {
-                primary_key_columns(target)
+                primary_key_columns(target, case)
             } else {
                 None
             },
@@ -4394,7 +4400,7 @@ fn bind_foreign_key_targets(
             )
             .ok()
             .flatten()
-            .map(|table| ForeignKeyBinding::of(table, foreign_key))
+            .map(|table| ForeignKeyBinding::of(table, foreign_key, case))
         })
         .collect();
     for (foreign_key, binding) in foreign_keys_of_mut(node).zip(bindings) {
@@ -5019,15 +5025,13 @@ fn table_constraint_has_name(constraint: &TableConstraint, name: &Ident) -> bool
 }
 
 /// Whether an index-shaped constraint names the column among its own.
-fn table_constraint_covers_column(constraint: &TableConstraint, column: &str) -> bool {
+fn table_constraint_covers_column(constraint: &TableConstraint, column: &NamedColumn) -> bool {
     let columns = match constraint {
         TableConstraint::PrimaryKey(primary_key) => &primary_key.columns,
         TableConstraint::Unique(unique) => &unique.columns,
         _ => return false,
     };
-    plain_column_names(columns).iter().any(|named| {
-        identifiers_match(named.value.as_str(), named.quote_style.is_some(), column, false)
-    })
+    plain_column_names(columns).iter().any(|named| column.matches(named))
 }
 
 /// Whether a named option written on a column is a constraint at all.
@@ -5053,14 +5057,17 @@ fn states_not_null(column: &ColumnDef) -> bool {
 }
 
 /// The table-level `NOT NULL` the node holds on `column`, if the constraint
-/// list names one for it.
+/// list names one for it under `case`.
 pub(crate) fn table_not_null<'node>(
     node: &'node CreateTable,
     column: &Ident,
+    case: IdentifierCase,
 ) -> Option<&'node NotNullConstraint> {
     node.constraints.iter().find_map(|constraint| {
         match constraint {
-            TableConstraint::NotNull(not_null) if idents_match(&not_null.column, column) => {
+            TableConstraint::NotNull(not_null)
+                if case_idents_match(&not_null.column, column, case) =>
+            {
                 Some(not_null)
             }
             _ => None,
@@ -5068,12 +5075,16 @@ pub(crate) fn table_not_null<'node>(
     })
 }
 
-/// Whether the node requires `column` to hold a value, in either spelling:
-/// stated on the column or held by a table-level `NOT NULL` naming it.
-pub(crate) fn requires_value(node: &CreateTable, column: &Ident) -> bool {
-    node.columns.iter().find(|declared| idents_match(&declared.name, column)).is_some_and(
-        |declared| states_not_null(declared) || table_not_null(node, &declared.name).is_some(),
-    )
+/// Whether the node requires `column`, named under `case`, to hold a value,
+/// in either spelling: stated on the column or held by a table-level
+/// `NOT NULL` naming it.
+pub(crate) fn requires_value(node: &CreateTable, column: &Ident, case: IdentifierCase) -> bool {
+    node.columns
+        .iter()
+        .find(|declared| case_idents_match(&declared.name, column, case))
+        .is_some_and(|declared| {
+            states_not_null(declared) || table_not_null(node, &declared.name, case).is_some()
+        })
 }
 
 /// Writes down the `NOT NULL` a key, an identity or a serial type implies, so
@@ -5086,19 +5097,20 @@ pub(crate) fn requires_value(node: &CreateTable, column: &Ident) -> bool {
 /// key afterwards leaves the column still requiring a value.
 ///
 /// Called wherever a table node is about to be stored, so every path that
-/// builds or rewrites one upholds the invariant without knowing about it.
-fn record_implied_not_null(create_table: &mut CreateTable) {
-    let required = required_columns(create_table);
+/// builds or rewrites one upholds the invariant without knowing about it. A
+/// key names its columns under `case`.
+fn record_implied_not_null(create_table: &mut CreateTable, case: IdentifierCase) {
+    let required = required_columns(create_table, case);
     for column in &mut create_table.columns {
-        if required.iter().any(|required| idents_match(required, &column.name)) {
+        if required.iter().any(|required| case_idents_match(required, &column.name, case)) {
             state_not_null(column);
         }
     }
 }
 
 /// The columns the node requires a value of, stated or implied by a key or an
-/// identity.
-fn required_columns(create_table: &CreateTable) -> Vec<Ident> {
+/// identity, with a key naming its columns under `case`.
+fn required_columns(create_table: &CreateTable, case: IdentifierCase) -> Vec<Ident> {
     let keyed: Vec<Ident> = create_table
         .constraints
         .iter()
@@ -5115,7 +5127,7 @@ fn required_columns(create_table: &CreateTable) -> Vec<Ident> {
         .columns
         .iter()
         .filter(|column| {
-            keyed.iter().any(|keyed| idents_match(keyed, &column.name))
+            keyed.iter().any(|keyed| case_idents_match(keyed, &column.name, case))
                 || crate::impls::serial_sequence_type(&column.data_type).is_some()
                 || column.options.iter().any(|option| {
                     matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::NotNull)
@@ -5151,7 +5163,8 @@ fn state_not_null(column: &mut ColumnDef) {
     column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
 }
 
-/// Takes a table's copy of a constraint written on a column off that column.
+/// Takes a table's copy of a constraint written on a column off that column,
+/// named under `case`.
 ///
 /// Used on the tables below, whose copy may carry a name of its own, so the
 /// match looks past the name a copy would have been given.
@@ -5159,9 +5172,12 @@ fn remove_copied_column_constraint(
     create_table: &mut CreateTable,
     written_on: &Ident,
     option: &ColumnOptionDef,
+    case: IdentifierCase,
 ) {
-    let Some(column) =
-        create_table.columns.iter_mut().find(|declared| idents_match(&declared.name, written_on))
+    let Some(column) = create_table
+        .columns
+        .iter_mut()
+        .find(|declared| case_idents_match(&declared.name, written_on, case))
     else {
         return;
     };
@@ -6506,7 +6522,7 @@ impl ParserDB {
             builder.tables_mut().remove(position);
         let mut replacement = (*previous_node).clone();
         edit(&previous_node, &mut replacement)?;
-        record_implied_not_null(&mut replacement);
+        record_implied_not_null(&mut replacement, builder.identifier_case());
         // A table keeping its schema stays where it was declared even while a
         // schema rename has taken the old name, so only a move is checked.
         if !schema_qualifiers_match(
@@ -6960,6 +6976,7 @@ impl ParserDB {
         mut builder: ParserDBBuilder,
         carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let case = builder.identifier_case();
         for constraint in constraints {
             Self::validate_key_columns(constraint, create_table, table_metadata, &builder)?;
             match constraint {
@@ -7005,7 +7022,7 @@ impl ParserDB {
                             table_metadata
                                 .column_arcs()
                                 .filter(|col: &&Arc<TableAttribute<CreateTable, ColumnDef>>| {
-                                    identifiers_match(
+                                    case.identifiers_match(
                                         col.column_name(),
                                         col.column_name_is_quoted(),
                                         column_name.value.as_str(),
@@ -7040,7 +7057,7 @@ impl ParserDB {
                 }
                 TableConstraint::NotNull(not_null) => {
                     let declared = table_metadata.column_arcs().any(|declared| {
-                        identifiers_match(
+                        case.identifiers_match(
                             declared.column_name(),
                             declared.column_name_is_quoted(),
                             not_null.column.value.as_str(),
@@ -7147,7 +7164,7 @@ impl ParserDB {
                 continue;
             };
             let declared = table_metadata.column_arcs().any(|declared| {
-                identifiers_match(
+                case.identifiers_match(
                     declared.column_name(),
                     declared.column_name_is_quoted(),
                     column_name.value.as_str(),
@@ -7377,11 +7394,12 @@ impl ParserDB {
             }
             TableConstraint::PrimaryKey(primary_key) if scope.only => {
                 let keyed = plain_column_names(&primary_key.columns);
+                let case = builder.identifier_case();
                 for descendant in inheritance::descendants(builder, stored) {
                     let node = Self::stored_node(builder, &descendant)?;
                     if let Some(column) = node.columns.iter().find(|column| {
-                        keyed.iter().any(|keyed| idents_match(keyed, &column.name))
-                            && !requires_value(node, &column.name)
+                        keyed.iter().any(|keyed| case_idents_match(keyed, &column.name, case))
+                            && !requires_value(node, &column.name, case)
                     }) {
                         return Err(crate::errors::Error::OnlyPrimaryKeyOnNullableColumn {
                             table_name: descendant.name.clone(),
@@ -7392,16 +7410,17 @@ impl ParserDB {
             }
             TableConstraint::NotNull(not_null) => {
                 let node = Self::stored_node(builder, stored)?;
+                let case = builder.identifier_case();
                 if not_null.no_inherit && node.partition_by.is_some() {
                     return Err(crate::errors::Error::NoInheritNotNullOnPartitionedTable {
                         table_name: stored.name.clone(),
                     });
                 }
-                if requires_value(node, &not_null.column) {
+                if requires_value(node, &not_null.column, case) {
                     let existing =
                         Self::not_null_requirement_name(builder, stored, node, &not_null.column);
-                    let existing_no_inherit =
-                        table_not_null(node, &not_null.column).is_some_and(|held| held.no_inherit);
+                    let existing_no_inherit = table_not_null(node, &not_null.column, case)
+                        .is_some_and(|held| held.no_inherit);
                     if existing_no_inherit != not_null.no_inherit {
                         return Err(crate::errors::Error::NotNullNoInheritStatusChange {
                             table_name: stored.name.clone(),
@@ -7444,9 +7463,12 @@ impl ParserDB {
         node: &CreateTable,
         column: &Ident,
     ) -> String {
+        let case = builder.identifier_case();
         constraint_names::names(node, generated_constraint_names(builder, stored))
             .into_iter()
-            .find(|(slot, _)| slot.not_null_of().is_some_and(|held| idents_match(held, column)))
+            .find(|(slot, _)| {
+                slot.not_null_of().is_some_and(|held| case_idents_match(held, column, case))
+            })
             .and_then(|(_, name)| name)
             .map_or_else(|| format!("{}_{}_not_null", stored.name, column.value), Cow::into_owned)
     }
@@ -7483,10 +7505,11 @@ impl ParserDB {
         primary_key: &PrimaryKeyConstraint,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let keyed = plain_column_names(&primary_key.columns);
+        let case = builder.identifier_case();
         for child in inheritance::descendants(&builder, stored) {
             builder = Self::replace_table_node(builder, &child, |_, node| {
                 for column in &mut node.columns {
-                    if keyed.iter().any(|keyed| idents_match(keyed, &column.name)) {
+                    if keyed.iter().any(|keyed| case_idents_match(keyed, &column.name, case)) {
                         state_not_null(column);
                     }
                 }
@@ -7512,6 +7535,7 @@ impl ParserDB {
         validated: bool,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let mut builder = builder;
+        let case = builder.identifier_case();
         let mut frontier = alloc::vec![stored.clone()];
         let mut reached: Vec<StoredTable> = Vec::new();
         while let Some(current) = frontier.pop() {
@@ -7521,18 +7545,16 @@ impl ParserDB {
                 }
                 reached.push(child.clone());
                 let node = Self::stored_node(&builder, &child)?;
-                if requires_value(node, &not_null.column) {
+                if requires_value(node, &not_null.column, case) {
                     continue;
                 }
                 let copy = inheritance::partition_copy(&builder, node, constraint, &mut Vec::new());
                 let recorded = copy.clone();
                 builder = Self::replace_table_node(builder, &child, |_, node| {
                     node.constraints.push(recorded.clone());
-                    for declared in node
-                        .columns
-                        .iter_mut()
-                        .filter(|declared| idents_match(&declared.name, &not_null.column))
-                    {
+                    for declared in node.columns.iter_mut().filter(|declared| {
+                        case_idents_match(&declared.name, &not_null.column, case)
+                    }) {
                         // The child required no value, so it states no `NOT
                         // NULL`.
                         declared
@@ -7588,8 +7610,9 @@ impl ParserDB {
         Self::refuse_repeated_added_key_column(&builder, &stored, &constraint)?;
         stored_expressions::refuse_in_constraint(&builder, &constraint)?;
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
+        let case = builder.identifier_case();
         if let TableConstraint::NotNull(not_null) = &constraint
-            && requires_value(Self::stored_node(&builder, &stored)?, &not_null.column)
+            && requires_value(Self::stored_node(&builder, &stored)?, &not_null.column, case)
         {
             return Ok(builder);
         }
@@ -7902,6 +7925,8 @@ impl ParserDB {
         not_null: &NotNullConstraint,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let node = Self::stored_node(&builder, stored)?;
+        let case = builder.identifier_case();
+        let named = NamedColumn::of(&not_null.column, case);
         let held = TableConstraint::NotNull(not_null.clone());
         if inheritance::requires_a_value(&builder, node, &not_null.column.value) {
             return Err(crate::errors::Error::InheritedConstraintNotDroppable {
@@ -7911,9 +7936,9 @@ impl ParserDB {
         }
         if node.constraints.iter().any(|constraint| {
             matches!(constraint, TableConstraint::PrimaryKey(_))
-                && table_constraint_covers_column(constraint, &not_null.column.value)
+                && table_constraint_covers_column(constraint, &named)
         }) || node.columns.iter().any(|declared| {
-            idents_match(&declared.name, &not_null.column)
+            named.matches(&declared.name)
                 && declared
                     .options
                     .iter()
@@ -7932,11 +7957,9 @@ impl ParserDB {
         // Every spelling of the one requirement goes, option included.
         let builder = Self::replace_table_node(builder, stored, |_, node| {
             node.constraints.retain(|held| {
-                !matches!(held, TableConstraint::NotNull(not_null)
-                    if idents_match(&not_null.column, &column))
+                !matches!(held, TableConstraint::NotNull(not_null) if named.matches(&not_null.column))
             });
-            for declared in
-                node.columns.iter_mut().filter(|declared| idents_match(&declared.name, &column))
+            for declared in node.columns.iter_mut().filter(|declared| named.matches(&declared.name))
             {
                 declared.options.retain(|option| !matches!(option.option, ColumnOption::NotNull));
             }
@@ -7968,6 +7991,7 @@ impl ParserDB {
             // The tables below keep their copies, and each becomes the
             // holder's own now that nothing passes it down.
             let mut builder = builder;
+            let case = builder.identifier_case();
             for (_, child) in inheritance::direct_children(&builder, stored) {
                 let node = Self::stored_node(&builder, &child)?;
                 let Some(copy) = node
@@ -7975,7 +7999,7 @@ impl ParserDB {
                     .iter()
                     .find(|held| {
                         matches!(held, TableConstraint::NotNull(held)
-                            if idents_match(&held.column, column))
+                            if case_idents_match(&held.column, column, case))
                     })
                     .cloned()
                 else {
@@ -7988,6 +8012,7 @@ impl ParserDB {
         }
 
         let mut builder = builder;
+        let case = builder.identifier_case();
         let mut frontier = alloc::vec![(stored.clone(), held.clone())];
         let mut reached: Vec<StoredTable> = Vec::new();
         while let Some((current, passed)) = frontier.pop() {
@@ -8021,7 +8046,7 @@ impl ParserDB {
                     for declared in node
                         .columns
                         .iter_mut()
-                        .filter(|declared| idents_match(&declared.name, column))
+                        .filter(|declared| case_idents_match(&declared.name, column, case))
                     {
                         declared
                             .options
@@ -8053,14 +8078,16 @@ impl ParserDB {
         (written_on, option): (&Ident, &ColumnOptionDef),
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let node = Self::stored_node(&builder, stored)?;
+        let case = builder.identifier_case();
+        let named = NamedColumn::of(written_on, case);
         // A key's implied `NOT NULL` is not its own, so a key-covered column
         // refuses the drop the way `DROP NOT NULL` does.
         if matches!(&option.option, ColumnOption::NotNull)
             && (node.constraints.iter().any(|constraint| {
                 matches!(constraint, TableConstraint::PrimaryKey(_))
-                    && table_constraint_covers_column(constraint, &written_on.value)
+                    && table_constraint_covers_column(constraint, &named)
             }) || node.columns.iter().any(|declared| {
-                idents_match(&declared.name, written_on)
+                named.matches(&declared.name)
                     && declared
                         .options
                         .iter()
@@ -8110,7 +8137,7 @@ impl ParserDB {
                 let Some(held) = node
                     .columns
                     .iter()
-                    .find(|declared| idents_match(&declared.name, written_on))
+                    .find(|declared| named.matches(&declared.name))
                     .and_then(|declared| {
                         declared
                             .options
@@ -8130,7 +8157,7 @@ impl ParserDB {
 
                 let removed = held.clone();
                 builder = Self::replace_table_node(builder, &child, |_, node| {
-                    remove_copied_column_constraint(node, written_on, &removed);
+                    remove_copied_column_constraint(node, written_on, &removed, case);
                     Ok(())
                 })?;
                 frontier.push((child, held));
@@ -9512,7 +9539,10 @@ impl ParserDB {
             .into());
         }
         let set = matches!(operation, AlterColumnOperation::SetNotNull);
-        if set && table_not_null(node, &column.ident()).is_some_and(|held| held.no_inherit) {
+        if set
+            && table_not_null(node, &column.ident(), column.case)
+                .is_some_and(|held| held.no_inherit)
+        {
             return Err(crate::errors::Error::NotNullNoInheritStatusChange {
                 table_name: stored.name.clone(),
                 constraint_name: Self::not_null_requirement_name(
@@ -9525,7 +9555,7 @@ impl ParserDB {
         }
         // Requiring a value the column already requires changes nothing, so
         // only a new requirement has to reach the partitions.
-        if set && !requires_value(node, &column.ident()) {
+        if set && !requires_value(node, &column.ident(), column.case) {
             Self::refuse_only_with_partitions(
                 &builder,
                 &stored,
@@ -9540,7 +9570,7 @@ impl ParserDB {
                 .into_iter()
                 .filter(|child| {
                     Self::stored_node(&builder, child)
-                        .is_ok_and(|node| !requires_value(node, &column.ident()))
+                        .is_ok_and(|node| !requires_value(node, &column.ident(), column.case))
                 })
                 .collect()
         } else {
@@ -9582,7 +9612,7 @@ impl ParserDB {
                 .iter()
                 .find(|constraint| {
                     matches!(constraint, TableConstraint::NotNull(not_null)
-                        if idents_match(&not_null.column, &column.ident()))
+                        if column.matches(&not_null.column))
                 })
                 .cloned()
         };
@@ -9590,7 +9620,7 @@ impl ParserDB {
         let mut builder = Self::replace_table_node(builder, table, |_, node| {
             // A requirement the node already holds, table-level included, is
             // left as written.
-            if set && requires_value(node, &column.ident()) {
+            if set && requires_value(node, &column.ident(), column.case) {
                 return Ok(());
             }
             let column_ident = node
@@ -9617,7 +9647,7 @@ impl ParserDB {
             } else {
                 node.constraints.retain(|constraint| {
                     !matches!(constraint, TableConstraint::NotNull(not_null)
-                        if idents_match(&not_null.column, &column.ident()))
+                        if column.matches(&not_null.column))
                 });
             }
             Ok(())
@@ -9743,7 +9773,7 @@ impl ParserDB {
             AlterColumnOperation::DropNotNull => {
                 if node.constraints.iter().any(|constraint| {
                     matches!(constraint, TableConstraint::PrimaryKey(_))
-                        && table_constraint_covers_column(constraint, &column.name)
+                        && table_constraint_covers_column(constraint, column)
                 }) || declared.is_some_and(|declared| {
                     declared
                         .options
@@ -9765,7 +9795,7 @@ impl ParserDB {
                 }
             }
             AlterColumnOperation::AddGenerated { .. } => {
-                if !requires_value(node, &column.ident()) {
+                if !requires_value(node, &column.ident(), column.case) {
                     return Err(crate::errors::Error::IdentityNeedsRequiredValue {
                         table_name: stored.name.clone(),
                         column_name: column.name.clone(),
@@ -11446,13 +11476,14 @@ impl ParserDB {
                     // from it sees them. A parent has to exist by now, the
                     // way a foreign key target does, which is also what
                     // leaves the edges acyclic.
-                    refuse_not_null_conflicts(&create_table)?;
+                    let case = builder.identifier_case();
+                    refuse_not_null_conflicts(&create_table, case)?;
                     // What the child requires a value of itself stays its own,
                     // whatever a parent requires.
                     let own_not_null: Vec<Ident> = create_table
                         .columns
                         .iter()
-                        .filter(|column| requires_value(&create_table, &column.name))
+                        .filter(|column| requires_value(&create_table, &column.name, case))
                         .map(|column| column.name.clone())
                         .collect();
                     let mut inherited = inheritance::apply_parents(
@@ -11481,7 +11512,7 @@ impl ParserDB {
                         None => None,
                     };
                     refuse_no_inherit_constraints_on_partitioned(&create_table)?;
-                    record_implied_not_null(&mut create_table);
+                    record_implied_not_null(&mut create_table, case);
                     bind_foreign_key_targets(&builder, &mut create_table)?;
                     let name = create_table.name.clone();
                     let mut metadata = TableMetadata::default();
@@ -11502,7 +11533,7 @@ impl ParserDB {
                                 states_not_null(column)
                                     && !own_not_null
                                         .iter()
-                                        .any(|own| idents_match(own, &column.name))
+                                        .any(|own| case_idents_match(own, &column.name, case))
                                     && inheritance::requires_a_value(
                                         &builder,
                                         &create_table,

@@ -219,7 +219,7 @@ pub(super) fn losing_not_null(
                 .columns
                 .iter()
                 .any(|declared| column.matches(&declared.name) && super::states_not_null(declared))
-                || super::table_not_null(parent, &column.ident()).is_some()
+                || super::table_not_null(parent, &column.ident(), column.case).is_some()
         },
     )
 }
