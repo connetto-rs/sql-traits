@@ -5920,8 +5920,8 @@ impl ParserDB {
         )
     }
 
-    /// Whether a view, a materialized view or a sequence holds the relation
-    /// name a grant wrote.
+    /// Whether a table, a view, a materialized view or a sequence holds the
+    /// relation name a grant wrote, under the catalog's identifier case.
     ///
     /// A grant target is a relation, so any of these answers it as readily as
     /// a table, and the caller only needs to know that something holds the
@@ -5934,12 +5934,14 @@ impl ParserDB {
     fn resolve_grant_relation(&self, object_name: &ObjectName) -> Result<Option<()>, LookupError> {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let target = target_name_of_idents(schema_ident, name_ident);
-        if self.view_by_target(target.clone(), self.identifier_case())?.is_some()
-            || self.materialized_view_by_target(target.clone(), self.identifier_case())?.is_some()
+        let case = self.identifier_case();
+        if self.resolve_target_table_strict(&target, case)?.is_some()
+            || self.view_by_target(target.clone(), case)?.is_some()
+            || self.materialized_view_by_target(target.clone(), case)?.is_some()
         {
             return Ok(Some(()));
         }
-        Ok(self.sequence_by_target(target, self.identifier_case())?.map(|_| ()))
+        Ok(self.sequence_by_target(target, case)?.map(|_| ()))
     }
 
     /// Reports the roles, table targets and function targets that this
@@ -6036,9 +6038,7 @@ impl ParserDB {
                 for table_obj in tables {
                     // A view is as legal a target as a table, so only a name
                     // no relation holds is unresolved.
-                    if self.resolve_table_object_name(table_obj)?.is_none()
-                        && self.resolve_grant_relation(table_obj)?.is_none()
-                    {
+                    if self.resolve_grant_relation(table_obj)?.is_none() {
                         unresolved.insert(UnresolvedAccessReference::GrantTable(table_obj));
                     }
                 }
