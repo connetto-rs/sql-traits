@@ -287,6 +287,37 @@ fn the_target_is_looked_up_in_the_schema_of_the_host() {
     )
     .expect("SQLite stores a main key to a temporary table");
     assert_eq!(target_of(&database, "child"), Err(table_not_found("parent")));
+
+    let database = parse(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+         CREATE TEMP TABLE child (x);
+         ALTER TABLE child ADD COLUMN pid REFERENCES parent (id);",
+    )
+    .expect("SQLite adds a temporary key to a main table");
+    assert_eq!(
+        key(&database, temporary_child()).referenced_table(&database),
+        Err(table_not_found("pg_temp.parent"))
+    );
+}
+
+/// SQLite's foreign key clause takes a bare table name, since the target is
+/// always looked up in the schema of the host, and its parser refuses one
+/// qualified with a schema in every spelling.
+#[test]
+fn a_target_qualified_with_a_schema_is_refused() {
+    for sql in [
+        "CREATE TABLE child (pid REFERENCES main.parent (id));",
+        "CREATE TABLE child (pid, FOREIGN KEY (pid) REFERENCES temp.parent (id));",
+        "CREATE TABLE child (x); ALTER TABLE child ADD COLUMN pid REFERENCES main.parent (id);",
+    ] {
+        let error = parse(&format!("CREATE TABLE parent (id INTEGER PRIMARY KEY); {sql}"))
+            .expect_err("SQLite refuses a qualified target");
+        assert!(
+            matches!(&error, Error::QualifiedForeignKeyTarget { host_table, referenced_table }
+                if host_table == "child" && referenced_table.ends_with(".parent")),
+            "{sql}: got {error:?}"
+        );
+    }
 }
 
 /// A column added with `REFERENCES` declares its key the way `CREATE TABLE`

@@ -2191,6 +2191,18 @@ pub enum Error {
         /// Number of columns in the referenced key.
         referenced_columns: usize,
     },
+    #[error(
+        "Foreign key in table `{host_table}` names its target `{referenced_table}` with a schema, which SQLite does not accept."
+    )]
+    /// Error indicating that a foreign key qualifies its target with a schema
+    /// under SQLite, whose foreign key clause takes a bare table name and
+    /// looks it up in the schema of the host table.
+    QualifiedForeignKeyTarget {
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+        /// The target, as the key names it.
+        referenced_table: String,
+    },
     #[error("Host column `{host_column}` not found in table `{host_table}` for foreign key.")]
     /// Error indicating that a foreign key references a host column that does
     /// not exist.

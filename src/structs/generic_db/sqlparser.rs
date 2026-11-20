@@ -2076,21 +2076,39 @@ impl ParserDBBuilder {
     /// the session's path, leaving one that reaches none as written. A
     /// dialect binding keys on use keeps the name and fixes only the schema it
     /// is looked up in.
-    fn bind_foreign_key(&self, host: &StoredTable, foreign_key: &mut ForeignKeyConstraint) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`bind_to_host_schema`] raises.
+    fn bind_foreign_key(
+        &self,
+        host: &StoredTable,
+        foreign_key: &mut ForeignKeyConstraint,
+    ) -> Result<(), crate::errors::Error> {
         if self.dialect().binds_foreign_keys_on_use() {
-            bind_to_host_schema(host.qualifier(), foreign_key);
+            bind_to_host_schema(&host.name, host.qualifier(), foreign_key)?;
         } else if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
             ForeignKeyBinding::of(table, foreign_key).apply(foreign_key);
         }
+        Ok(())
     }
 
     /// Binds every foreign key `column` declares inline on `host`.
-    fn bind_column_foreign_keys(&self, host: &StoredTable, column: &mut ColumnDef) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`Self::bind_foreign_key`] raises.
+    fn bind_column_foreign_keys(
+        &self,
+        host: &StoredTable,
+        column: &mut ColumnDef,
+    ) -> Result<(), crate::errors::Error> {
         for option in &mut column.options {
             if let ColumnOption::ForeignKey(foreign_key) = &mut option.option {
-                self.bind_foreign_key(host, foreign_key);
+                self.bind_foreign_key(host, foreign_key)?;
             }
         }
+        Ok(())
     }
 
     /// The name PostgreSQL gives an index `create_index` leaves unnamed, or
@@ -4343,13 +4361,21 @@ impl ForeignKeyBinding {
 /// Binds every foreign key in `node` to the table it reaches now, the node
 /// itself included, leaving one reaching nothing for the key check to refuse.
 /// A dialect binding keys on use fixes only the schema each is looked up in.
-fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
+///
+/// # Errors
+///
+/// Returns the error [`bind_to_host_schema`] raises for a key of `node`.
+fn bind_foreign_key_targets(
+    builder: &ParserDBBuilder,
+    node: &mut CreateTable,
+) -> Result<(), crate::errors::Error> {
     if builder.dialect().binds_foreign_keys_on_use() {
+        let host_table = node.name.to_string();
         let host_qualifier = stored_qualifier(&node.name);
         for foreign_key in foreign_keys_of_mut(node) {
-            bind_to_host_schema(host_qualifier.clone(), foreign_key);
+            bind_to_host_schema(&host_table, host_qualifier.clone(), foreign_key)?;
         }
-        return;
+        return Ok(());
     }
     let case = builder.identifier_case();
     let bindings: Vec<Option<ForeignKeyBinding>> = foreign_keys_of(node)
@@ -4375,15 +4401,31 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
             binding.apply(foreign_key);
         }
     }
+    Ok(())
 }
 
-/// Qualifies an unqualified foreign key target with `host_qualifier`, the
-/// schema of the table declaring the key, which is where SQLite looks the
-/// target up. A qualified target is kept as written.
-fn bind_to_host_schema(host_qualifier: Option<Ident>, foreign_key: &mut ForeignKeyConstraint) {
-    if let [_] = foreign_key.foreign_table.0.as_slice() {
-        bind_reference(&mut foreign_key.foreign_table, host_qualifier);
-    }
+/// Qualifies a foreign key target with `host_qualifier`, the schema of the
+/// table `host_table` declaring the key, which is where SQLite looks the
+/// target up.
+///
+/// # Errors
+///
+/// Returns [`crate::errors::Error::QualifiedForeignKeyTarget`] for a target
+/// already qualified with a schema, which SQLite's foreign key clause does not
+/// accept.
+fn bind_to_host_schema(
+    host_table: &str,
+    host_qualifier: Option<Ident>,
+    foreign_key: &mut ForeignKeyConstraint,
+) -> Result<(), crate::errors::Error> {
+    let [_] = foreign_key.foreign_table.0.as_slice() else {
+        return Err(crate::errors::Error::QualifiedForeignKeyTarget {
+            host_table: host_table.to_owned(),
+            referenced_table: foreign_key.foreign_table.to_string(),
+        });
+    };
+    bind_reference(&mut foreign_key.foreign_table, host_qualifier);
+    Ok(())
 }
 
 /// The schema qualifier the search path selects for an object name written
@@ -7551,7 +7593,7 @@ impl ParserDB {
             });
         }
         if let TableConstraint::ForeignKey(foreign_key) = &mut constraint {
-            builder.bind_foreign_key(&stored, foreign_key);
+            builder.bind_foreign_key(&stored, foreign_key)?;
         }
 
         let mut builder = Self::alter_table_constraints(builder, &stored, |_, constraints| {
@@ -8840,7 +8882,7 @@ impl ParserDB {
         let (builder, column_sequences) =
             sequences::create_column_sequences(builder, &stored, column_sequences, creator)?;
         sequences::bind_column_defaults(&builder, &stored.name, core::iter::once(&mut column_def))?;
-        builder.bind_column_foreign_keys(&stored, &mut column_def);
+        builder.bind_column_foreign_keys(&stored, &mut column_def)?;
 
         // Read before the parent changes.
         let inheritors = inheritance::descendants(&builder, &stored);
@@ -11425,7 +11467,7 @@ impl ParserDB {
                     };
                     refuse_no_inherit_constraints_on_partitioned(&create_table)?;
                     record_implied_not_null(&mut create_table);
-                    bind_foreign_key_targets(&builder, &mut create_table);
+                    bind_foreign_key_targets(&builder, &mut create_table)?;
                     let name = create_table.name.clone();
                     let mut metadata = TableMetadata::default();
                     metadata.set_owner(creator.owner());
