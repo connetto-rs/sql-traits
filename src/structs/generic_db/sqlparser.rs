@@ -1462,16 +1462,31 @@ impl ParserDBBuilder {
         declaring: &[StoredTable],
         column: &NamedColumn,
     ) -> bool {
+        self.tables_referring_to_column(table, column).next().is_some()
+            || self.policies().iter().any(|(policy, _)| {
+                table.named_by(&policy.table_name)
+                    && column.in_expressions(policy.as_ref(), table, declaring)
+            })
+            || self.triggers().iter().any(|(trigger, _)| {
+                table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column)
+            })
+            || self.rules().iter().any(|(rule, _)| {
+                table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
+            })
+    }
+
+    /// The other tables whose foreign key names `column` of `table` among its
+    /// referenced columns, and so goes with the column. None under a dialect
+    /// binding keys on use, where the key keeps naming the column.
+    fn tables_referring_to_column<'builder>(
+        &'builder self,
+        table: &'builder StoredTable,
+        column: &'builder NamedColumn,
+    ) -> impl Iterator<Item = &'builder CreateTable> {
         let case = self.identifier_case();
-        self.tables().iter().any(|(host, _, _)| {
-            !table.matches(host.as_ref(), case) && refers_to_column(host.as_ref(), table, column)
-        }) || self.policies().iter().any(|(policy, _)| {
-            table.named_by(&policy.table_name)
-                && column.in_expressions(policy.as_ref(), table, declaring)
-        }) || self.triggers().iter().any(|(trigger, _)| {
-            table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column)
-        }) || self.rules().iter().any(|(rule, _)| {
-            table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
+        let keys_bind_on_use = self.dialect().binds_foreign_keys_on_use();
+        self.tables().iter().map(|(host, _, _)| host.as_ref()).filter(move |host| {
+            !keys_bind_on_use && !table.matches(host, case) && refers_to_column(host, table, column)
         })
     }
 
@@ -1512,7 +1527,6 @@ impl ParserDBBuilder {
         declaring: &[StoredTable],
         column: &NamedColumn,
     ) -> Vec<StoredTable> {
-        let case = self.identifier_case();
         self.policies_mut().retain(|(policy, _)| {
             !(table.named_by(&policy.table_name)
                 && column.in_expressions(policy.as_ref(), table, declaring))
@@ -1524,12 +1538,7 @@ impl ParserDBBuilder {
             !(table.named_by(&rule.table_name) && rules::reads_row_column(rule, column))
         });
 
-        self.tables()
-            .iter()
-            .map(|(host, _, _)| host.as_ref())
-            .filter(|host| !table.matches(host, case) && refers_to_column(host, table, column))
-            .map(StoredTable::of)
-            .collect()
+        self.tables_referring_to_column(table, column).map(StoredTable::of).collect()
     }
 
     /// Renames a column in the objects that name it from outside the table's
@@ -2063,19 +2072,23 @@ impl ParserDBBuilder {
         }
     }
 
-    /// Binds a foreign key to the table it reaches through the session's path,
-    /// leaving one that reaches none as written.
-    fn bind_foreign_key(&self, foreign_key: &mut ForeignKeyConstraint) {
-        if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
+    /// Binds a foreign key declared on `host` to the table it reaches through
+    /// the session's path, leaving one that reaches none as written. A
+    /// dialect binding keys on use keeps the name and fixes only the schema it
+    /// is looked up in.
+    fn bind_foreign_key(&self, host: &StoredTable, foreign_key: &mut ForeignKeyConstraint) {
+        if self.dialect().binds_foreign_keys_on_use() {
+            bind_to_host_schema(host.qualifier(), foreign_key);
+        } else if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
             ForeignKeyBinding::of(table, foreign_key).apply(foreign_key);
         }
     }
 
-    /// Binds every foreign key `column` declares inline.
-    fn bind_column_foreign_keys(&self, column: &mut ColumnDef) {
+    /// Binds every foreign key `column` declares inline on `host`.
+    fn bind_column_foreign_keys(&self, host: &StoredTable, column: &mut ColumnDef) {
         for option in &mut column.options {
             if let ColumnOption::ForeignKey(foreign_key) = &mut option.option {
-                self.bind_foreign_key(foreign_key);
+                self.bind_foreign_key(host, foreign_key);
             }
         }
     }
@@ -2543,6 +2556,13 @@ impl StoredTable {
             ident.value.as_str(),
             ident.quote_style.is_some(),
         )
+    }
+
+    /// The qualifier the table is stored under, if any.
+    fn qualifier(&self) -> Option<Ident> {
+        self.schema.as_deref().map(|schema| {
+            if self.schema_quoted { Ident::with_quote('"', schema) } else { Ident::new(schema) }
+        })
     }
 }
 
@@ -3032,18 +3052,35 @@ fn constraint_involves_column(
     table: &StoredTable,
     declaring: &[StoredTable],
     column: &NamedColumn,
+    dialect: SqlparserDialect,
 ) -> bool {
     match constraint {
         TableConstraint::ForeignKey(foreign_key) => {
-            column.in_idents(&foreign_key.columns)
-                || (table.named_by(&foreign_key.foreign_table)
-                    && column.in_idents(&foreign_key.referred_columns))
+            foreign_key_goes_with_column(foreign_key, table, column, dialect)
         }
         TableConstraint::NotNull(not_null) => column.matches(&not_null.column),
         other => {
             column.in_idents(include_of(other)) || column.in_expressions(other, table, declaring)
         }
     }
+}
+
+/// Whether a foreign key on `table` goes when `column` of it is dropped,
+/// which it does when it names the column on either side.
+///
+/// SQLite drops no key with a column. One naming it among its own columns
+/// makes the rebuilt table refuse, as SQLite refuses the drop, and one naming
+/// it among the referenced columns keeps naming it.
+fn foreign_key_goes_with_column(
+    foreign_key: &ForeignKeyConstraint,
+    table: &StoredTable,
+    column: &NamedColumn,
+    dialect: SqlparserDialect,
+) -> bool {
+    !dialect.binds_foreign_keys_on_use()
+        && (column.in_idents(&foreign_key.columns)
+            || (table.named_by(&foreign_key.foreign_table)
+                && column.in_idents(&foreign_key.referred_columns)))
 }
 
 /// Removes a column and everything the table's own node hangs off it.
@@ -3058,15 +3095,17 @@ fn drop_column_from_node(
     table: &StoredTable,
     declaring: &[StoredTable],
     column: &NamedColumn,
+    dialect: SqlparserDialect,
 ) {
     node.columns.retain(|declared| !column.matches(&declared.name));
-    node.constraints
-        .retain(|constraint| !constraint_involves_column(constraint, table, declaring, column));
+    node.constraints.retain(|constraint| {
+        !constraint_involves_column(constraint, table, declaring, column, dialect)
+    });
 
     for declared in &mut node.columns {
-        declared
-            .options
-            .retain(|option| !option_involves_column(&option.option, table, declaring, column));
+        declared.options.retain(|option| {
+            !option_involves_column(&option.option, table, declaring, column, dialect)
+        });
     }
 }
 
@@ -3076,12 +3115,11 @@ fn option_involves_column(
     table: &StoredTable,
     declaring: &[StoredTable],
     column: &NamedColumn,
+    dialect: SqlparserDialect,
 ) -> bool {
     match option {
         ColumnOption::ForeignKey(foreign_key) => {
-            column.in_idents(&foreign_key.columns)
-                || (table.named_by(&foreign_key.foreign_table)
-                    && column.in_idents(&foreign_key.referred_columns))
+            foreign_key_goes_with_column(foreign_key, table, column, dialect)
         }
         other => column.in_expressions(other, table, declaring),
     }
@@ -3586,8 +3624,8 @@ fn key_columns_match(left: &[&Ident], right: &[&Ident], case: IdentifierCase) ->
 /// its primary key and each of its unique constraints, in both the inline and
 /// the table-constraint spelling.
 ///
-/// A `CREATE UNIQUE INDEX` counts too, and lives in the builder rather than on
-/// the node, so it is gathered separately by the caller.
+/// A `CREATE UNIQUE INDEX` counts too, and lives outside the node, so
+/// [`is_candidate_key`] takes those separately.
 fn declared_candidate_keys(table: &CreateTable) -> Vec<Vec<&Ident>> {
     let mut keys: Vec<Vec<&Ident>> = Vec::new();
 
@@ -3611,6 +3649,42 @@ fn declared_candidate_keys(table: &CreateTable) -> Vec<Vec<&Ident>> {
     }
 
     keys
+}
+
+/// Whether `referred` names, in any order, the columns of the primary key of
+/// `table`, of one of its unique constraints, or of one of `unique_indexes`,
+/// the unique indexes built on it by `CREATE UNIQUE INDEX`, which are the
+/// keys a foreign key may reference.
+pub(crate) fn is_candidate_key<'index>(
+    table: &CreateTable,
+    unique_indexes: impl IntoIterator<Item = &'index CreateIndex>,
+    referred: &[&Ident],
+    case: IdentifierCase,
+) -> bool {
+    declared_candidate_keys(table).iter().any(|key| key_columns_match(referred, key, case))
+        || unique_indexes
+            .into_iter()
+            .filter_map(|index| plain_key_columns(&index.columns))
+            .any(|key| key_columns_match(referred, &key, case))
+}
+
+/// Refuses a foreign key whose written column lists differ in length, the one
+/// check SQLite makes of a key when its table is created. A key naming no
+/// referenced columns is left to its uses, as SQLite leaves it.
+fn refuse_unequal_written_lists(
+    host: &CreateTable,
+    foreign_key: &ForeignKeyConstraint,
+) -> Result<(), crate::errors::Error> {
+    let referenced_columns = foreign_key.referred_columns.len();
+    if referenced_columns == 0 || referenced_columns == foreign_key.columns.len() {
+        return Ok(());
+    }
+    Err(crate::errors::Error::ForeignKeyColumnCountMismatch {
+        host_table: host.name.to_string(),
+        host_columns: foreign_key.columns.len(),
+        referenced_table: foreign_key.foreign_table.to_string(),
+        referenced_columns,
+    })
 }
 
 /// Returns the columns of the primary key of `table` in key order, spelled as
@@ -4268,7 +4342,15 @@ impl ForeignKeyBinding {
 
 /// Binds every foreign key in `node` to the table it reaches now, the node
 /// itself included, leaving one reaching nothing for the key check to refuse.
+/// A dialect binding keys on use fixes only the schema each is looked up in.
 fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
+    if builder.dialect().binds_foreign_keys_on_use() {
+        let host_qualifier = stored_qualifier(&node.name);
+        for foreign_key in foreign_keys_of_mut(node) {
+            bind_to_host_schema(host_qualifier.clone(), foreign_key);
+        }
+        return;
+    }
     let case = builder.identifier_case();
     let bindings: Vec<Option<ForeignKeyBinding>> = foreign_keys_of(node)
         .map(|foreign_key| {
@@ -4292,6 +4374,15 @@ fn bind_foreign_key_targets(builder: &ParserDBBuilder, node: &mut CreateTable) {
         if let Some(binding) = binding {
             binding.apply(foreign_key);
         }
+    }
+}
+
+/// Qualifies an unqualified foreign key target with `host_qualifier`, the
+/// schema of the table declaring the key, which is where SQLite looks the
+/// target up. A qualified target is kept as written.
+fn bind_to_host_schema(host_qualifier: Option<Ident>, foreign_key: &mut ForeignKeyConstraint) {
+    if let [_] = foreign_key.foreign_table.0.as_slice() {
+        bind_reference(&mut foreign_key.foreign_table, host_qualifier);
     }
 }
 
@@ -6725,8 +6816,29 @@ impl ParserDB {
             }
         }
 
+        if builder.dialect().binds_foreign_keys_on_use() {
+            refuse_unequal_written_lists(create_table, fk)?;
+        } else {
+            Self::refuse_unreachable_target(&builder, create_table, fk)?;
+        }
+
+        let fk_arc = Arc::new(TableAttribute::new(create_table.clone(), fk.clone()));
+        table_metadata.add_foreign_key(fk_arc.clone());
+        let builder = builder.add_foreign_key(fk_arc, ());
+        Ok(builder)
+    }
+
+    /// Refuses a foreign key whose target the database would not accept when
+    /// the key is declared, which is an absent table, a column it lacks, or a
+    /// column list with no unique key behind it or of another width.
+    fn refuse_unreachable_target(
+        builder: &ParserDBBuilder,
+        create_table: &CreateTable,
+        fk: &ForeignKeyConstraint,
+    ) -> Result<(), crate::errors::Error> {
+        let case = builder.identifier_case();
         let referenced_table_name = fk.foreign_table.to_string();
-        let referenced_table = Self::foreign_key_target(&builder, create_table, fk)?;
+        let referenced_table = Self::foreign_key_target(builder, create_table, fk)?;
         refuse_reference_across_storage(create_table, referenced_table, &referenced_table_name)?;
 
         for ref_col_ident in &fk.referred_columns {
@@ -6742,7 +6854,7 @@ impl ParserDB {
             if !column_exists {
                 return Err(crate::errors::Error::ReferencedColumnNotFoundForForeignKey {
                     referenced_column: ref_col_ident.value.clone(),
-                    referenced_table: referenced_table_name.clone(),
+                    referenced_table: referenced_table_name,
                     host_table: create_table.name.to_string(),
                 });
             }
@@ -6752,24 +6864,13 @@ impl ParserDB {
         // node. A key still naming no columns was bound to a target holding no
         // primary key.
         let referred: Vec<&Ident> = fk.referred_columns.iter().collect();
-        let referenced_width = if referred.is_empty() {
-            None
-        } else {
-            let mut candidates = declared_candidate_keys(referenced_table);
-            candidates.extend(builder.indices().iter().filter_map(|(index, _)| {
-                let node = index.attribute();
-                if !node.unique || !table_matches_object_name(referenced_table, &node.table_name) {
-                    return None;
-                }
-                plain_key_columns(&node.columns)
-            }));
-            candidates
-                .iter()
-                .any(|candidate| key_columns_match(&referred, candidate, case))
-                .then_some(referred.len())
-        };
-
-        let Some(referenced_width) = referenced_width else {
+        let unique_indexes =
+            builder.indices().iter().map(|(index, _)| index.attribute()).filter(|index| {
+                index.unique && table_matches_object_name(referenced_table, &index.table_name)
+            });
+        if referred.is_empty()
+            || !is_candidate_key(referenced_table, unique_indexes, &referred, case)
+        {
             return Err(crate::errors::Error::ReferencedColumnsNotUniqueForForeignKey {
                 referenced_columns: referred
                     .iter()
@@ -6779,24 +6880,20 @@ impl ParserDB {
                 referenced_table: referenced_table_name,
                 host_table: create_table.name.to_string(),
             });
-        };
+        }
 
         // The columns pair up by position, so the two lists must be as long
         // as each other. PostgreSQL asks this after looking for the unique
         // key, so a foreign key failing both reports the missing key.
-        if fk.columns.len() != referenced_width {
+        if fk.columns.len() != referred.len() {
             return Err(crate::errors::Error::ForeignKeyColumnCountMismatch {
                 host_table: create_table.name.to_string(),
                 host_columns: fk.columns.len(),
                 referenced_table: referenced_table_name,
-                referenced_columns: referenced_width,
+                referenced_columns: referred.len(),
             });
         }
-
-        let fk_arc = Arc::new(TableAttribute::new(create_table.clone(), fk.clone()));
-        table_metadata.add_foreign_key(fk_arc.clone());
-        let builder = builder.add_foreign_key(fk_arc, ());
-        Ok(builder)
+        Ok(())
     }
 
     /// Helper function to process table constraints.
@@ -7454,7 +7551,7 @@ impl ParserDB {
             });
         }
         if let TableConstraint::ForeignKey(foreign_key) = &mut constraint {
-            builder.bind_foreign_key(foreign_key);
+            builder.bind_foreign_key(&stored, foreign_key);
         }
 
         let mut builder = Self::alter_table_constraints(builder, &stored, |_, constraints| {
@@ -8508,7 +8605,13 @@ impl ParserDB {
                 }
             }
 
-            if !cascade && builder.is_referenced_from_outside(&doomed) {
+            // SQLite drops a table other tables' foreign keys reference and
+            // leaves those keys naming it, to reach whatever table takes the
+            // name next.
+            if !cascade
+                && !builder.dialect().binds_foreign_keys_on_use()
+                && builder.is_referenced_from_outside(&doomed)
+            {
                 return Err(crate::errors::Error::TableReferenced { table_name });
             }
 
@@ -8547,7 +8650,8 @@ impl ParserDB {
     /// PostgreSQL drops such a key under `CASCADE` and keeps the columns it
     /// was declared on, so each referencing table is rebuilt from its node
     /// with the key cut out. A drop without `CASCADE` has already refused any
-    /// such key, and finds nothing to rebuild.
+    /// such key, and finds nothing to rebuild. A dialect binding keys on use
+    /// keeps every key as written.
     fn remove_tables(
         mut builder: ParserDBBuilder,
         doomed: &[StoredTable],
@@ -8563,6 +8667,9 @@ impl ParserDB {
             );
         }
 
+        if builder.dialect().binds_foreign_keys_on_use() {
+            return Ok(builder);
+        }
         let names_doomed = |foreign_key: &ForeignKeyConstraint| {
             doomed.iter().any(|table| table.named_by(&foreign_key.foreign_table))
         };
@@ -8733,7 +8840,7 @@ impl ParserDB {
         let (builder, column_sequences) =
             sequences::create_column_sequences(builder, &stored, column_sequences, creator)?;
         sequences::bind_column_defaults(&builder, &stored.name, core::iter::once(&mut column_def))?;
-        builder.bind_column_foreign_keys(&mut column_def);
+        builder.bind_column_foreign_keys(&stored, &mut column_def);
 
         // Read before the parent changes.
         let inheritors = inheritance::descendants(&builder, &stored);
@@ -8979,8 +9086,9 @@ impl ParserDB {
             }
 
             builder.take_column_dependents(&stored, &declaring, &column);
+            let dialect = *builder.dialect();
             builder = Self::replace_table_node(builder, &stored, |_, node| {
-                drop_column_from_node(node, &stored, &declaring, &column);
+                drop_column_from_node(node, &stored, &declaring, &column, dialect);
                 Ok(())
             })?;
 
@@ -8994,7 +9102,7 @@ impl ParserDB {
                         && trigger_depends_on_column(trigger, &column))
                 });
                 builder = Self::replace_table_node(builder, child, |_, node| {
-                    drop_column_from_node(node, child, &declaring, &column);
+                    drop_column_from_node(node, child, &declaring, &column, dialect);
                     Ok(())
                 })?;
             }
