@@ -5,7 +5,7 @@ use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use ::sqlparser::ast::{
     Action, CreateTable, CreateTableOptions, Expr, ForValues, ObjectNamePart, PartitionBoundValue,
-    SqlOption, Value, ValueWithSpan,
+    SqlOption, SqliteTableOption, Value, ValueWithSpan,
 };
 
 use crate::{
@@ -222,6 +222,16 @@ impl TableLike for CreateTable {
     #[inline]
     fn is_unlogged(&self) -> bool {
         self.unlogged
+    }
+
+    #[inline]
+    fn is_strict(&self) -> bool {
+        self.sqlite_table_options.options.contains(&SqliteTableOption::Strict)
+    }
+
+    #[inline]
+    fn is_without_rowid(&self) -> bool {
+        self.sqlite_table_options.options.contains(&SqliteTableOption::WithoutRowid)
     }
 
     fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {

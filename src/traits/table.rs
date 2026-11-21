@@ -452,6 +452,66 @@ pub trait TableLike:
     /// ```
     fn is_unlogged(&self) -> bool;
 
+    /// Returns whether this table declares SQLite's `STRICT` option, which
+    /// `pragma_table_list` reports in its `strict` column.
+    ///
+    /// A `STRICT` table refuses a value that its column's declared type cannot
+    /// hold, and every key column but the rowid alias is `NOT NULL`. The
+    /// option holds however it is spelled, ordered or repeated. A table of any
+    /// other dialect never declares it, so the default answers `false`.
+    /// <https://www.sqlite.org/stricttables.html>
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE typed (k TEXT PRIMARY KEY) STRICT;
+    ///      CREATE TABLE loose (k TEXT PRIMARY KEY);",
+    /// )?;
+    /// let lookup = |name| db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// assert!(lookup("typed")?.unwrap().is_strict());
+    /// assert!(!lookup("loose")?.unwrap().is_strict());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_strict(&self) -> bool {
+        false
+    }
+
+    /// Returns whether this table declares SQLite's `WITHOUT ROWID` option,
+    /// which `pragma_table_list` reports in its `wr` column.
+    ///
+    /// A `WITHOUT ROWID` table stores its rows by its primary key, which it
+    /// must declare and whose columns are `NOT NULL`. The option holds however
+    /// it is spelled, ordered or repeated. A table of any other dialect never
+    /// declares it, so the default answers `false`.
+    /// <https://www.sqlite.org/withoutrowid.html>
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE keyed (k TEXT PRIMARY KEY) WITHOUT ROWID, STRICT;
+    ///      CREATE TABLE typed (k TEXT PRIMARY KEY) STRICT;",
+    /// )?;
+    /// let lookup = |name| db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// assert!(lookup("keyed")?.unwrap().is_without_rowid());
+    /// assert!(!lookup("typed")?.unwrap().is_without_rowid());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn is_without_rowid(&self) -> bool {
+        false
+    }
+
     /// Iterates over this table's storage parameters (`pg_class.reloptions`)
     /// as name and value, after every `ALTER TABLE ... SET (...)` and
     /// `ALTER TABLE ... RESET (...)` naming it.
@@ -5022,6 +5082,14 @@ where
 
     fn is_unlogged(&self) -> bool {
         T::is_unlogged(self)
+    }
+
+    fn is_strict(&self) -> bool {
+        T::is_strict(self)
+    }
+
+    fn is_without_rowid(&self) -> bool {
+        T::is_without_rowid(self)
     }
 
     fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {

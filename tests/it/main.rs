@@ -201,6 +201,7 @@ mod sql_text_calls;
 mod sqlite_databases;
 mod sqlite_foreign_key_targets;
 mod sqlite_primary_key_nullability;
+mod sqlite_table_options;
 mod stored_column_references;
 mod stored_identifier_names;
 mod stored_identity_lookup;
