@@ -4,8 +4,8 @@
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    ConstraintCharacteristics, ConstraintReferenceMatchKind, CreateTable, DeferrableInitial,
-    ForeignKeyConstraint, Ident, ObjectName, ReferentialAction,
+    ConstraintReferenceMatchKind, CreateTable, ForeignKeyConstraint, Ident, ObjectName,
+    ReferentialAction,
 };
 
 use crate::{
@@ -98,7 +98,7 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
 
     #[inline]
     fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
-        deferral_of(self.attribute().characteristics)
+        ConstraintDeferral::of(self.attribute().characteristics)
     }
 
     fn host_columns<'db>(
@@ -179,20 +179,6 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     }
 }
 
-/// `NOT DEFERRABLE` outweighs `INITIALLY DEFERRED`, which is how SQLite checks
-/// a key declaring both and a combination every other dialect refuses at
-/// ingestion. Otherwise `INITIALLY DEFERRED` implies `DEFERRABLE`, as in
-/// PostgreSQL.
-fn deferral_of(characteristics: Option<ConstraintCharacteristics>) -> ConstraintDeferral {
-    let characteristics = characteristics.unwrap_or_default();
-    match (characteristics.deferrable, characteristics.initially) {
-        (Some(false), _) => ConstraintDeferral::NotDeferrable,
-        (_, Some(DeferrableInitial::Deferred)) => ConstraintDeferral::InitiallyDeferred,
-        (Some(true), _) => ConstraintDeferral::InitiallyImmediate,
-        (None, _) => ConstraintDeferral::NotDeferrable,
-    }
-}
-
 /// A foreign key as `pg_constraint` stores it, unnamed and with every omitted
 /// clause read as its default.
 #[derive(PartialEq)]
@@ -227,7 +213,7 @@ impl<'key> From<&'key ForeignKeyConstraint> for StoredForeignKey<'key> {
             on_delete: on_delete.unwrap_or(ReferentialAction::NoAction),
             on_update: on_update.unwrap_or(ReferentialAction::NoAction),
             match_kind: match_kind.unwrap_or(ConstraintReferenceMatchKind::Simple),
-            deferral: deferral_of(*characteristics),
+            deferral: ConstraintDeferral::of(*characteristics),
             enforced: characteristics.and_then(|written| written.enforced).unwrap_or(true),
         }
     }

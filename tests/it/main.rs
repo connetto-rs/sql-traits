@@ -39,6 +39,7 @@ mod data_statement_analysis;
 mod declared_type_names;
 mod default_column_references;
 mod default_privileges;
+mod deferrable_key_targets;
 mod definer_helpers;
 mod deployment;
 mod descendant_drops;
