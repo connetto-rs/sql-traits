@@ -36,7 +36,7 @@ mod user_defined_type;
 mod value_flow;
 mod view;
 
-pub(crate) use column_def::{foreign_options_of, serial_sequence_type};
+pub(crate) use column_def::{foreign_options_of, generation_storage, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;

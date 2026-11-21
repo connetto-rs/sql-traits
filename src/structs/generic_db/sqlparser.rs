@@ -10567,24 +10567,16 @@ impl ParserDB {
                 if matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
             {
                 let generated = declared.and_then(|declared| {
-                    declared.options.iter().find_map(|option| {
-                        match &option.option {
-                            ColumnOption::Generated {
-                                generation_expr: Some(_),
-                                generation_expr_mode,
-                                ..
-                            } => Some(generation_expr_mode),
-                            _ => None,
-                        }
-                    })
+                    crate::impls::generation_storage(declared, *builder.dialect())
                 });
                 let reason = match generated {
-                    Some(Some(sqlparser::ast::GeneratedExpressionMode::Stored)) => None,
-                    Some(_) => Some(crate::errors::GenerationExpressionRefusal::Virtual),
+                    Some(sqlparser::ast::GeneratedExpressionMode::Virtual) => {
+                        Some(crate::errors::GenerationExpressionRefusal::Virtual)
+                    }
                     None if !if_exists => {
                         Some(crate::errors::GenerationExpressionRefusal::NotGenerated)
                     }
-                    None => None,
+                    Some(sqlparser::ast::GeneratedExpressionMode::Stored) | None => None,
                 };
                 if let Some(reason) = reason {
                     return Err(crate::errors::Error::GenerationExpressionNotDroppable {
