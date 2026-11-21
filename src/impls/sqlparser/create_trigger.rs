@@ -7,7 +7,9 @@ use sqlparser::ast::{ArgMode, CreateTrigger};
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{ParserDB, TargetName, TriggerEnablement, metadata::TriggerMetadata},
+    structs::{
+        ConstraintDeferral, ParserDB, TargetName, TriggerEnablement, metadata::TriggerMetadata,
+    },
     traits::{DatabaseLike, FunctionLike, Metadata, Relation, TableLike, TriggerLike},
     utils::{
         last_str,
@@ -114,6 +116,11 @@ impl TriggerLike for CreateTrigger {
 
     fn enablement(&self, database: &Self::DB) -> Result<TriggerEnablement, LookupError> {
         Ok(trigger_metadata(self, database)?.enablement())
+    }
+
+    #[inline]
+    fn deferral(&self) -> Option<ConstraintDeferral> {
+        self.is_constraint.then(|| ConstraintDeferral::of(self.characteristics))
     }
 
     /// The function ingestion bound the trigger to, which takes no arguments

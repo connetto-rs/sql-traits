@@ -5,7 +5,9 @@ use core::fmt::Debug;
 use crate::{
     errors::LookupError,
     impls::maintenance_body,
-    structs::{MaintenanceRefusal, TargetName, TriggerEnablement, UndeclaredRowField},
+    structs::{
+        ConstraintDeferral, MaintenanceRefusal, TargetName, TriggerEnablement, UndeclaredRowField,
+    },
     traits::{DatabaseLike, Metadata, Relation},
 };
 
@@ -524,6 +526,50 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// ```
     fn enablement(&self, database: &Self::DB) -> Result<TriggerEnablement, LookupError>;
 
+    /// Returns when a constraint trigger fires, or [`None`] for an ordinary
+    /// trigger, as `pg_trigger.tgconstraint`, `tgdeferrable` and
+    /// `tginitdeferred` record it.
+    ///
+    /// Only `CREATE CONSTRAINT TRIGGER` makes a constraint trigger, and only
+    /// a constraint trigger may declare `DEFERRABLE` and `INITIALLY`, so an
+    /// ordinary trigger has no deferral. The copies of a constraint trigger on
+    /// the partitions below its table answer the deferral of the trigger they
+    /// copy.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE parents (id INT PRIMARY KEY);
+    ///      CREATE FUNCTION f() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;
+    ///      CREATE CONSTRAINT TRIGGER deferred AFTER INSERT ON parents
+    ///        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION f();
+    ///      CREATE CONSTRAINT TRIGGER immediate AFTER INSERT ON parents
+    ///        DEFERRABLE FOR EACH ROW EXECUTE FUNCTION f();
+    ///      CREATE CONSTRAINT TRIGGER fixed AFTER INSERT ON parents
+    ///        FOR EACH ROW EXECUTE FUNCTION f();
+    ///      CREATE TRIGGER plain AFTER INSERT ON parents FOR EACH ROW EXECUTE FUNCTION f();",
+    /// )?;
+    /// let deferrals: Vec<(&str, Option<ConstraintDeferral>)> =
+    ///     db.triggers().map(|trigger| (trigger.name(), trigger.deferral())).collect();
+    /// assert_eq!(
+    ///     deferrals,
+    ///     [
+    ///         ("deferred", Some(ConstraintDeferral::InitiallyDeferred)),
+    ///         ("fixed", Some(ConstraintDeferral::NotDeferrable)),
+    ///         ("immediate", Some(ConstraintDeferral::InitiallyImmediate)),
+    ///         ("plain", None),
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn deferral(&self) -> Option<ConstraintDeferral>;
+
     /// Returns the function the trigger executes.
     ///
     /// # Arguments
@@ -931,6 +977,10 @@ impl<T: TriggerLike> TriggerLike for &T {
         (*self).enablement(database)
     }
 
+    fn deferral(&self) -> Option<ConstraintDeferral> {
+        (*self).deferral()
+    }
+
     fn function<'db>(
         &'db self,
         database: &'db Self::DB,
@@ -1092,6 +1142,25 @@ mod tests {
         assert_eq!(
             trigger.maintenance_assignments(&db).expect("maintenance assignments").count(),
             0
+        );
+    }
+
+    #[test]
+    fn deferral_through_a_reference_answers_the_referenced_trigger() {
+        let db = ParserDB::parse::<GenericDialect>(
+            r"
+            CREATE TABLE parents (id INT);
+            CREATE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql;
+            CREATE CONSTRAINT TRIGGER checked AFTER INSERT ON parents
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION f();
+        ",
+        )
+        .expect("Failed to parse SQL");
+        let trigger = db.triggers().next().expect("No trigger found");
+
+        assert_eq!(
+            <&_ as TriggerLike>::deferral(&trigger),
+            Some(crate::structs::ConstraintDeferral::InitiallyDeferred)
         );
     }
 

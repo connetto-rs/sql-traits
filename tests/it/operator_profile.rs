@@ -800,6 +800,10 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn deferral(&self) -> Option<ConstraintDeferral> {
+        self.unreach()
+    }
+
     fn function<'db>(
         &'db self,
         _database: &'db Self::DB,
