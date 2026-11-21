@@ -1593,7 +1593,10 @@ fn generic_type_changes_store_the_type_and_keep_inheritance_refusals() {
         ),
         (
             "CREATE TABLE p(x int); CREATE TABLE c() INHERITS(p); ALTER TABLE ONLY p ALTER COLUMN x TYPE text;",
-            Err("OnlyRefusedWithChildren { table_name: \"p\", change: AlterColumnType }".to_owned()),
+            Err(
+                "OnlyRefusedWithChildren { table_name: \"p\", change: AlterColumnType, subject_name: Some(\"x\") }"
+                    .to_owned(),
+            ),
         ),
     ] {
         let result = ParserDB::parse::<sqlparser::dialect::GenericDialect>(sql)

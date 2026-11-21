@@ -152,6 +152,7 @@ fn a_child_cannot_stop_requiring_a_value_its_parent_requires() {
             ref table_name,
             ref column_name,
             reason: RequiredValue::EnforcedByParent,
+            ..
         }) if table_name == "chi" && column_name == "id"
     ));
 }
@@ -168,6 +169,7 @@ fn a_child_cannot_stop_requiring_a_value_its_parent_requires_of_a_quoted_column(
             ref table_name,
             ref column_name,
             reason: RequiredValue::EnforcedByParent,
+            ..
         }) if table_name == "chi" && column_name == "Body"
     ));
     assert!(matches!(

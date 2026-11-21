@@ -88,7 +88,7 @@ fn an_alteration_of_an_absent_signature_is_rejected() {
     );
 
     assert!(
-        matches!(result, Err(Error::AlterFunctionNotFound { function_name }) if function_name == "f")
+        matches!(result, Err(Error::AlterFunctionNotFound { function_name, .. }) if function_name == "f")
     );
 }
 

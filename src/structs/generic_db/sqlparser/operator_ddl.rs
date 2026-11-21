@@ -33,6 +33,9 @@ use crate::{
     utils::{
         identifier_resolution::{identifiers_match, is_temporary_schema},
         object_name::{PG_CATALOG, object_name_last_part, qualifier_of},
+        postgres_format_type::format_type,
+        postgres_types::PgType,
+        quote_identifier::quote_identifier,
     },
 };
 
@@ -65,8 +68,11 @@ pub(super) fn create(
     let left = left_arg.map(|left| operand(builder, arrays, left)).transpose()?;
     let right = operand(builder, arrays, right)?;
 
-    let (implementation, called) = binder
-        .function(&function, |args| takes_exactly(left.iter().chain([&right]), arrays, args))?;
+    let (implementation, called) = binder.function(
+        &function,
+        |args| takes_exactly(left.iter().chain([&right]), arrays, args),
+        || left.iter().chain([&right]).map(|input| binder.type_name(input)).collect(),
+    )?;
     let result = called.return_type.as_ref().and_then(|returned| {
         let (FunctionReturnType::DataType(data_type) | FunctionReturnType::SetOf(data_type)) =
             returned;
@@ -99,7 +105,10 @@ pub(super) fn create(
     };
     let held = catalog.operators().position(|held| held.repeats(&operator));
     if held.is_some_and(|position| catalog.operators_slice()[position].implementation.is_some()) {
-        return Err(Error::OperatorAlreadyExists { operator_name: binder.symbol.into() });
+        return Err(Error::OperatorAlreadyExists {
+            operator_name: binder.symbol.into(),
+            schema_move: false,
+        });
     }
 
     let commutator = attributes
@@ -216,9 +225,12 @@ pub(super) fn alter(
     let binder = Binder::new(builder, session, arrays, symbol_of(&name));
     let left = left_type.map(|left| operand(builder, arrays, left)).transpose()?;
     let right = operand(builder, arrays, right_type)?;
-    let position = binder
-        .lookup(catalog, &name, left.as_ref(), &right)
-        .ok_or_else(|| Error::OperatorNotFound { operator_name: binder.symbol.into() })?;
+    let position = binder.lookup(catalog, &name, left.as_ref(), &right).ok_or_else(|| {
+        Error::OperatorNotFound {
+            operator_name: binder.symbol.into(),
+            signature: binder.lookup_signature(&name, left.as_ref(), &right),
+        }
+    })?;
     match operation {
         AlterOperatorOperation::OwnerTo(owner) => {
             if closed_world {
@@ -243,7 +255,10 @@ pub(super) fn alter(
                 .operators()
                 .any(|held| held.is_named_by(&moved, operator.left.as_ref(), &operator.right))
             {
-                return Err(Error::OperatorAlreadyExists { operator_name: binder.symbol.into() });
+                return Err(Error::OperatorAlreadyExists {
+                    operator_name: binder.symbol.into(),
+                    schema_move: true,
+                });
             }
             Arc::make_mut(catalog).move_operator(position, schema);
             Ok(())
@@ -267,13 +282,19 @@ fn set(
     let join_estimator = binder.estimators(&attributes.join, &JOIN_ESTIMATOR_INPUTS)?;
     attributes.check(operator.kind, operator.result.as_ref(), symbol)?;
 
-    let not_found =
-        |name: &ObjectName| Error::OperatorNotFound { operator_name: symbol_of(name).into() };
+    let not_found = |name: &ObjectName, left: Option<&CatalogName>, right: &CatalogName| {
+        Error::OperatorNotFound {
+            operator_name: symbol_of(name).into(),
+            signature: binder.lookup_signature(name, left, right),
+        }
+    };
     let commutator = attributes
         .commutator
         .map(|name| {
             let left = operator.left.as_ref().unwrap_or(&operator.right);
-            binder.lookup(catalog, name, Some(&operator.right), left).ok_or_else(|| not_found(name))
+            binder
+                .lookup(catalog, name, Some(&operator.right), left)
+                .ok_or_else(|| not_found(name, Some(&operator.right), left))
         })
         .transpose()?;
     let negator = attributes
@@ -281,7 +302,7 @@ fn set(
         .map(|name| {
             binder
                 .lookup(catalog, name, operator.left.as_ref(), &operator.right)
-                .ok_or_else(|| not_found(name))
+                .ok_or_else(|| not_found(name, operator.left.as_ref(), &operator.right))
         })
         .transpose()?;
     if negator == Some(position) {
@@ -353,11 +374,17 @@ pub(super) fn drop(
             if drop.if_exists {
                 continue;
             }
-            return Err(Error::OperatorNotFound { operator_name: binder.symbol.into() });
+            return Err(Error::OperatorNotFound {
+                operator_name: binder.symbol.into(),
+                signature: binder.lookup_signature(&signature.name, left.as_ref(), &right),
+            });
         };
         let row = catalog.operators_slice()[position].row;
         if row == OperatorRow::BuiltIn {
-            return Err(Error::OperatorRequiredBySystem { operator_name: binder.symbol.into() });
+            return Err(Error::OperatorRequiredBySystem {
+                operator_name: binder.symbol.into(),
+                signature: binder.identity_signature(catalog, &catalog.operators_slice()[position]),
+            });
         }
         if let (false, Some(holder)) = (cascade, builder.operator_holder(&[row])) {
             let (dependent_kind, dependent_name) = holder.named;
@@ -365,6 +392,7 @@ pub(super) fn drop(
                 operator_name: binder.symbol.into(),
                 dependent_kind,
                 dependent_name,
+                signature: binder.identity_signature(catalog, &catalog.operators_slice()[position]),
             });
         }
         doomed.push(position);
@@ -523,6 +551,7 @@ impl<'b> Binder<'b> {
         &self,
         name: &ObjectName,
         takes: impl Fn(Option<&[OperateFunctionArg]>) -> bool,
+        arguments: impl FnOnce() -> Vec<String>,
     ) -> Result<(CatalogName, &'b CreateFunction), Error> {
         let not_found = || {
             if let Some(schema_name) =
@@ -532,10 +561,11 @@ impl<'b> Binder<'b> {
             }
             Error::OperatorFunctionNotFound {
                 operator_name: self.symbol.into(),
-                function_name: self.builder.dialect().stored_object_name(name).into(),
+                function_name: self.builder.dialect().stored_object_name_parts(name),
+                argument_types: arguments(),
             }
         };
-        let (written, quoted) = object_name_last_part(name).ok_or_else(not_found)?;
+        let (written, quoted) = object_name_last_part(name).unwrap_or(("", false));
         let case = self.builder.identifier_case();
         let find = |identity: CatalogName| {
             self.builder
@@ -571,8 +601,17 @@ impl<'b> Binder<'b> {
             Estimator::Cleared => Estimator::Cleared,
             Estimator::Named(name) => {
                 Estimator::Named(
-                    self.function(name, |args| takes_estimator_inputs(inputs, self.arrays, args))?
-                        .0,
+                    self.function(
+                        name,
+                        |args| takes_estimator_inputs(inputs, self.arrays, args),
+                        || {
+                            inputs
+                                .iter()
+                                .map(|input| format_type(&PgType::Catalog(input)))
+                                .collect()
+                        },
+                    )?
+                    .0,
                 )
             }
         })
@@ -622,6 +661,85 @@ impl<'b> Binder<'b> {
             }
         }
     }
+
+    /// The diagnostic name of an operand, resolving generated array identities.
+    fn type_name(&self, identity: &CatalogName) -> String {
+        let data_type = self
+            .arrays
+            .element_in(
+                identity.schema(),
+                identity.schema_is_quoted(),
+                identity.name(),
+                identity.name_is_quoted(),
+            )
+            .map_or_else(
+                || PgType::from_target(&identity.target_name()),
+                |element| PgType::Array(Box::new(PgType::from_target(&element))),
+            );
+        domains::format_type_for_builder(self.builder, &data_type)
+    }
+
+    /// The operand and operator spelling used when lookup finds no operator.
+    fn lookup_signature(
+        &self,
+        name: &ObjectName,
+        left: Option<&CatalogName>,
+        right: &CatalogName,
+    ) -> String {
+        let name = self.builder.dialect().stored_object_name(name);
+        let right = self.type_name(right);
+        left.map_or_else(
+            || format!("{name} {right}"),
+            |left| format!("{} {name} {right}", self.type_name(left)),
+        )
+    }
+
+    /// The identity PostgreSQL displays for a held operator.
+    fn identity_signature(
+        &self,
+        catalog: &PostgresCatalog,
+        operator: &PostgresCatalogOperator,
+    ) -> String {
+        let visible = self
+            .schemas
+            .iter()
+            .find_map(|(schema, quoted)| {
+                let target = CatalogName::new((schema, *quoted), (operator.target.name(), false));
+                catalog
+                    .operators()
+                    .find(|held| held.is_named_by(&target, operator.left.as_ref(), &operator.right))
+            })
+            .is_some_and(|held| held.repeats(operator));
+        let name =
+            if visible {
+                operator.target.name().to_string()
+            } else {
+                format!(
+                    "{}.{}",
+                    quote_identifier(&self.builder.dialect().stored_spelling(
+                        operator.target.schema(),
+                        operator.target.schema_is_quoted()
+                    )),
+                    operator.target.name()
+                )
+            };
+        let left =
+            operator.left.as_ref().map_or_else(|| "NONE".to_string(), |left| self.type_name(left));
+        format!("{name}({left},{})", self.type_name(&operator.right))
+    }
+}
+
+/// The diagnostic identity of an operator whose dependency prevents a schema
+/// drop.
+pub(super) fn signature(
+    builder: &ParserDBBuilder,
+    catalog: &PostgresCatalog,
+    arrays: &TypeArrays,
+    session: &SessionRoles,
+    operator: &PostgresCatalogOperator,
+) -> String {
+    Binder::new(builder, session, arrays, operator.target.name())
+        .identity_signature(catalog, operator)
 }
 
 /// What a commutator or negator `CREATE OPERATOR` names reaches.

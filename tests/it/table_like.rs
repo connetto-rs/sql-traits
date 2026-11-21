@@ -200,7 +200,7 @@ fn a_copy_can_name_a_table_in_another_schema() {
 fn copying_a_table_the_input_never_created_is_refused() {
     assert!(matches!(
         parse("CREATE TABLE c (LIKE absent_table);"),
-        Err(Error::CopiedTableNotFound { ref copied_table, ref table_name })
+        Err(Error::CopiedTableNotFound { ref copied_table, ref table_name, .. })
             if copied_table == "absent_table" && table_name == "c"
     ));
 }

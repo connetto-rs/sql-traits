@@ -1067,6 +1067,7 @@ fn local_collation_conflict(
                 |name| context.builder.dialect().stored_object_name(name),
             )
             .into_boxed_str(),
+        origin: crate::errors::InheritedColumnConflict::Declaration,
     }))
 }
 
@@ -1103,6 +1104,7 @@ fn inherited_collation_conflict(
                 |name| context.builder.dialect().stored_object_name(name),
             )
             .into_boxed_str(),
+        origin: crate::errors::InheritedColumnConflict::Parents,
     })
 }
 
@@ -1139,6 +1141,7 @@ fn merge_local_columns(
                         .unwrap_or_else(|| "a parent".to_string())
                         .into(),
                     parent_type: columns[position].data_type.to_string().into(),
+                    origin: crate::errors::InheritedColumnConflict::Declaration,
                 });
             }
             if !is_options_only(column)
@@ -1257,10 +1260,77 @@ fn copy_parent_constraint(
         return Err(Error::InheritedConstraintConflict {
             table_name: child_name.to_string(),
             constraint_name: builder.dialect().stored_name(name),
+            reason: if let Some(held) =
+                constraints.iter().find(|held| super::table_constraint_has_name(held, name))
+            {
+                match (held, &copy) {
+                    (TableConstraint::NotNull(_), TableConstraint::NotNull(_)) => {
+                        crate::errors::InheritedConstraintConflictKind::NotNullNameReuse
+                    }
+                    (TableConstraint::NotNull(_), _) | (_, TableConstraint::NotNull(_)) => {
+                        crate::errors::InheritedConstraintConflictKind::CatalogName
+                    }
+                    _ => crate::errors::InheritedConstraintConflictKind::Parents,
+                }
+            } else {
+                constraint_conflict_reason(builder, create_table, &copy, true)
+            },
         });
     }
     constraints.push(copy);
     Ok(())
+}
+
+/// The refusal when an incoming check cannot merge with the child's check.
+pub(super) fn constraint_conflict_reason(
+    builder: &ParserDBBuilder,
+    table: &CreateTable,
+    incoming: &TableConstraint,
+    creating: bool,
+) -> crate::errors::InheritedConstraintConflictKind {
+    use crate::errors::InheritedConstraintConflictKind;
+    if let TableConstraint::NotNull(incoming) = incoming {
+        let no_inherit = table.constraints.iter().any(|held| {
+            matches!(held, TableConstraint::NotNull(held) if held.no_inherit
+                && super::case_idents_match(&held.column, &incoming.column, builder.identifier_case()))
+        });
+        return match (creating, no_inherit) {
+            (true, true) => {
+                InheritedConstraintConflictKind::NotNullNoInherit {
+                    column_name: builder.dialect().stored_name(&incoming.column),
+                }
+            }
+            (false, true) => InheritedConstraintConflictKind::NotNullStatus,
+            (true, false) => InheritedConstraintConflictKind::NotNullNameReuse,
+            (false, false) => InheritedConstraintConflictKind::Definition,
+        };
+    }
+    if creating
+        && table.constraints.iter().any(|held| {
+            matches!(held, TableConstraint::NotNull(_))
+                && declared_name(held) == declared_name(incoming)
+        })
+    {
+        return InheritedConstraintConflictKind::CatalogName;
+    }
+    let TableConstraint::Check(incoming) = incoming else {
+        return InheritedConstraintConflictKind::Definition;
+    };
+    let inherited_expression = stored_expr(&incoming.expr);
+    let no_inherit = table.constraints.iter().any(|constraint| {
+        matches!(constraint, TableConstraint::Check(held)
+            if held.no_inherit && held.name.as_ref().map(stored_name) == incoming.name.as_ref().map(stored_name)
+                && stored_expr(&held.expr) == inherited_expression)
+    });
+    if no_inherit {
+        if creating {
+            InheritedConstraintConflictKind::InheritedNoInherit
+        } else {
+            InheritedConstraintConflictKind::LocalNoInherit
+        }
+    } else {
+        InheritedConstraintConflictKind::Definition
+    }
 }
 
 /// A `NOT NULL` a parent writes on the table states a requirement on the

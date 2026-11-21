@@ -110,7 +110,7 @@ fn only_withholds_no_column_or_requirement_from_partitions() {
         assert!(
             matches!(
                 &error,
-                Error::OnlyRefusedWithChildren { table_name, change: refused }
+                Error::OnlyRefusedWithChildren { table_name, change: refused, .. }
                     if table_name == "orders" && *refused == change
             ),
             "{statement}: {error:?}"

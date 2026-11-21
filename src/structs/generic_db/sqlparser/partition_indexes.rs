@@ -487,7 +487,11 @@ pub(super) fn drop_index(
     let on_dependents = if cascade {
         referenced_keys::OnDependents::Cascade
     } else {
-        referenced_keys::OnDependents::Refuse { key_name: &root_name, table_name: &table_name }
+        referenced_keys::OnDependents::Refuse {
+            key_name: &root_name,
+            table_name: &table_name,
+            dropping_index: true,
+        }
     };
     ParserDB::drop_keys(builder, &removed, on_dependents, |mut builder| {
         for (table, name) in copies.into_iter().rev() {

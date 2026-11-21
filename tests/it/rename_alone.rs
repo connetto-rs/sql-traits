@@ -15,7 +15,7 @@ fn rename_cannot_follow_another_action() {
         "{SETUP} ALTER TABLE probe ALTER COLUMN value SET DEFAULT 4, RENAME COLUMN value TO renamed;"
     ));
     assert!(
-        matches!(result, Err(Error::RenameCommandNotAlone { relation_name }) if relation_name == "probe")
+        matches!(result, Err(Error::RenameCommandNotAlone { relation_name, .. }) if relation_name == "probe")
     );
 }
 
@@ -25,7 +25,7 @@ fn rename_cannot_precede_another_action() {
         "{SETUP} ALTER TABLE probe RENAME COLUMN value TO renamed, ALTER COLUMN renamed SET DEFAULT 4;"
     ));
     assert!(
-        matches!(result, Err(Error::RenameCommandNotAlone { relation_name }) if relation_name == "probe")
+        matches!(result, Err(Error::RenameCommandNotAlone { relation_name, .. }) if relation_name == "probe")
     );
 }
 
@@ -60,7 +60,7 @@ fn combined_rename_forms_are_refused() {
                                 "{setup} {statement}"
                             ));
                             assert!(
-                                matches!(result, Err(Error::RenameCommandNotAlone { relation_name }) if relation_name == "probe"),
+                                matches!(result, Err(Error::RenameCommandNotAlone { relation_name, .. }) if relation_name == "probe"),
                                 "{statement}"
                             );
                         }
@@ -110,7 +110,7 @@ fn relation_renames_cannot_be_combined() {
             ] {
                 let statement = format!("{setup} ALTER TABLE probe {operations};");
                 assert!(
-                    matches!(ParserDB::parse::<PostgreSqlDialect>(&statement), Err(Error::RenameCommandNotAlone { relation_name }) if relation_name == "probe"),
+                    matches!(ParserDB::parse::<PostgreSqlDialect>(&statement), Err(Error::RenameCommandNotAlone { relation_name, .. }) if relation_name == "probe"),
                     "{statement}"
                 );
             }
@@ -125,7 +125,7 @@ fn missing_relation_does_not_bypass_rename_syntax() {
             "ALTER TABLE {qualifier}absent RENAME COLUMN value TO renamed, ADD COLUMN extra int;"
         );
         assert!(
-            matches!(ParserDB::parse::<PostgreSqlDialect>(&statement), Err(Error::RenameCommandNotAlone { relation_name }) if relation_name == "absent"),
+            matches!(ParserDB::parse::<PostgreSqlDialect>(&statement), Err(Error::RenameCommandNotAlone { relation_name, .. }) if relation_name == "absent"),
             "{statement}"
         );
     }
