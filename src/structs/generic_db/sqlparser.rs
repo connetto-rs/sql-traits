@@ -446,8 +446,8 @@ struct PreservedColumnMetadata {
 }
 
 /// An index a table rebuild detaches, with its expression, the operator
-/// selections it held and the identity it was created with.
-type DetachedIndex = (CreateIndex, Expr, operator_carry::Selections, Option<KeyIdentity>);
+/// selections it held, the identity it was created with and its validity.
+type DetachedIndex = (CreateIndex, Expr, operator_carry::Selections, Option<KeyIdentity>, bool);
 
 fn qualify_created_collation_name(
     builder: &ParserDBBuilder,
@@ -1699,6 +1699,7 @@ impl ParserDBBuilder {
                     metadata.expression().clone(),
                     selections,
                     metadata.key_identity(),
+                    metadata.is_valid(),
                 ));
                 return false;
             }
@@ -6532,7 +6533,13 @@ impl ParserDB {
             &create_index.table_name,
             &[ObjectKind::ForeignTable, ObjectKind::VirtualTable],
         )?;
-        if create_index.unique {
+        // `ONLY` keeps the index off the partitions, so none of them can
+        // refuse it, and PostgreSQL marks it invalid while one exists.
+        let has_partitions = inheritance::direct_children(builder, &StoredTable::of(table))
+            .iter()
+            .any(|(kind, _)| *kind == inheritance::ParentKind::PartitionOf);
+        let valid = !(create_index.only && has_partitions);
+        if create_index.unique && !create_index.only {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
         }
         validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
@@ -6551,8 +6558,9 @@ impl ParserDB {
                 reason: "index has no columns".to_string(),
             });
         };
-        let metadata =
-            IndexMetadata::new(expression).with_calls(builder.calls_in(index_arc.attribute()));
+        let metadata = IndexMetadata::new(expression)
+            .with_calls(builder.calls_in(index_arc.attribute()))
+            .with_validity(valid);
         Ok((index_arc, metadata))
     }
 
@@ -6894,7 +6902,7 @@ impl ParserDB {
         foreign_key_types::follow_target_replacement(&mut builder, &previous_node, &replacement);
 
         let renamed = !stored.matches(&replacement, builder.identifier_case());
-        for (mut index, expression, selections, key_identity) in detached_indices {
+        for (mut index, expression, selections, key_identity, valid) in detached_indices {
             if renamed {
                 index.table_name = replacement.name.clone();
             }
@@ -6906,8 +6914,10 @@ impl ParserDB {
             metadata.add_index(index.clone());
             let mut calls = builder.calls_carried(index.attribute(), &mut carried);
             carried.operators.take_index(index.attribute(), selections, &mut calls);
-            let metadata =
-                IndexMetadata::new(expression).with_calls(calls).with_key_identity(key_identity);
+            let metadata = IndexMetadata::new(expression)
+                .with_calls(calls)
+                .with_key_identity(key_identity)
+                .with_validity(valid);
             builder = builder.add_index(index, metadata);
         }
 
@@ -7372,8 +7382,12 @@ impl ParserDB {
                 host_table: create_table.name.to_string(),
             });
         }
-        let unique_indexes =
-            builder.indices().iter().map(|(index, _)| index.attribute()).filter(|index| {
+        let unique_indexes = builder
+            .indices()
+            .iter()
+            .filter(|(_, metadata)| metadata.is_valid())
+            .map(|(index, _)| index.attribute())
+            .filter(|index| {
                 index.unique
                     && table_matches_object_name(
                         builder.namespaces(),
@@ -11592,7 +11606,9 @@ impl ParserDB {
                     }
                     let metadata = metadata.with_key_identity(Some(builder.draw_key_identity()));
                     builder = builder.add_index(Arc::clone(&index), metadata);
-                    builder = partition_indexes::propagate(builder, index.attribute())?;
+                    if !index.attribute().only {
+                        builder = partition_indexes::propagate(builder, index.attribute())?;
+                    }
                 }
                 Statement::AlterView(alter_view) => {
                     builder = views::apply_alter_view(

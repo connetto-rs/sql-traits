@@ -5271,6 +5271,41 @@ fn an_anti_join_reads_its_correlations_by_postgres_name_resolution() {
     );
 }
 
+/// A unique index created only on a partitioned table with a partition
+/// enforces nothing on that partition, so it keys no blocking row.
+#[test]
+fn an_invalid_unique_index_keys_no_blocking_row() {
+    let blocking = "SELECT 1 FROM public.memberships m WHERE m.user_id = permission.grantee_id";
+    let arm = "grants.resource_id WHERE grantee_id = app.user_id";
+    let partitioned = ANTI_JOINS
+        .replace(
+            "  PRIMARY KEY (organization_id, user_id)\n);",
+            "  PRIMARY KEY (organization_id, user_id)\n) PARTITION BY LIST (user_id);
+CREATE TABLE memberships_alice PARTITION OF memberships FOR VALUES IN ('alice');",
+        )
+        .replace(
+            "SELECT 1 FROM public.memberships membership
+      WHERE membership.organization_id = permission.organization_id
+        AND membership.user_id = permission.grantee_id
+        AND membership.state = 'deactivated'",
+            blocking,
+        );
+    for (index, keyed) in [
+        ("CREATE UNIQUE INDEX one_membership ON ONLY memberships (user_id);", ""),
+        ("CREATE UNIQUE INDEX one_membership ON memberships (user_id);", "keyed "),
+    ] {
+        let database = postgres(&format!("{partitioned}{index}"));
+        let deployment = deployment();
+        let set =
+            answer(&database, &deployment, "public", "resources_with", &[]).expect("answered");
+        assert_eq!(
+            render(&set),
+            format!("{arm} AND NOT EXISTS ({keyed}memberships WHERE user_id = grants.grantee_id)"),
+            "{index}"
+        );
+    }
+}
+
 #[test]
 fn an_anti_join_of_any_other_shape_refuses_the_answer() {
     for blocking in [

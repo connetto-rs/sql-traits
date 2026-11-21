@@ -269,6 +269,49 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
     /// ```
     fn is_unique(&self) -> bool;
 
+    /// Returns whether the index is valid, as `pg_index.indisvalid` reports,
+    /// which an index created `ON ONLY` a partitioned table holding a
+    /// partition is not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE r (id int) PARTITION BY RANGE (id);
+    ///      CREATE INDEX before_partitions ON ONLY r (id);
+    ///      CREATE TABLE r1 PARTITION OF r FOR VALUES FROM (0) TO (10);
+    ///      CREATE INDEX after_partitions ON ONLY r (id);",
+    /// )?;
+    /// let mut valid = db
+    ///     .indexes()
+    ///     .map(|index| Ok((index.name(), index.is_valid(&db)?)))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// valid.sort();
+    /// assert_eq!(
+    ///     valid,
+    ///     [
+    ///         (Some("after_partitions"), false),
+    ///         (Some("before_partitions"), true),
+    ///         (Some("r1_id_idx"), true),
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_valid(&self, _database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(true)
+    }
+
     /// Returns whether every entry of the index is a plain column, written
     /// with or without parentheses, and none is an expression.
     ///

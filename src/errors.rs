@@ -3542,6 +3542,15 @@ pub enum Error {
         /// Name of the index.
         index_name: String,
     },
+    #[error("index \"{index_name}\" is not valid")]
+    /// Error indicating that an adopted index is invalid.
+    ///
+    /// PostgreSQL refuses `ADD CONSTRAINT USING INDEX` with an index created
+    /// `ON ONLY` a partitioned table that holds a partition.
+    AdoptedIndexInvalid {
+        /// Name of the index.
+        index_name: String,
+    },
     #[error("\"{index_name}\" is a partial index")]
     /// Error indicating that an adopted index is partial.
     ///

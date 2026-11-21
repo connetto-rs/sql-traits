@@ -174,9 +174,10 @@ fn explicit_operator_class(
     target: &CreateTable,
     foreign_key: &ForeignKeyConstraint,
 ) -> bool {
-    builder.indices().iter().any(|(index, _)| {
+    builder.indices().iter().any(|(index, metadata)| {
         let index = index.attribute();
         index.unique
+            && metadata.is_valid()
             && table_matches_object_name(builder.namespaces(), target, &index.table_name)
             && index.columns.len() == foreign_key.referred_columns.len()
             && index.columns.iter().any(|column| column.operator_class.is_some())

@@ -3932,7 +3932,7 @@ fn rows_named<DB: DatabaseLike, N: Visit + ?Sized>(
 }
 
 /// Whether `columns` hold every column of the primary key of `table`, or of
-/// a unique key of it over plain columns with no predicate.
+/// a valid unique key of it over plain columns with no predicate.
 fn holds_key<'db, DB: DatabaseLike>(
     table: &'db DB::Table,
     columns: &[&'db DB::Column],
@@ -3952,7 +3952,10 @@ fn holds_key<'db, DB: DatabaseLike>(
         }
     }
     for index in table.indices(database)?.filter(|index| index.is_unique()) {
-        if plain_key(index, database)? && held(&mut index.columns(database)?) {
+        if index.is_valid(database)?
+            && plain_key(index, database)?
+            && held(&mut index.columns(database)?)
+        {
             return Ok(true);
         }
     }

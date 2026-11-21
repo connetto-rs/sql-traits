@@ -74,6 +74,11 @@ impl IndexLike for TableAttribute<CreateTable, CreateIndex> {
     }
 
     #[inline]
+    fn is_valid(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(self.metadata(database)?.is_valid())
+    }
+
+    #[inline]
     fn name(&self) -> Option<&str> {
         written_name(self.attribute()).map(|(name, _)| name)
     }

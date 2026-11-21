@@ -243,6 +243,7 @@ fn bound_key(
     for (index, index_metadata) in builder.indices() {
         let index = index.attribute();
         if index.unique
+            && index_metadata.is_valid()
             && table_matches_object_name(builder.namespaces(), target, &index.table_name)
             && plain_key_columns(&index.columns)
                 .is_some_and(|columns| key_columns_match(&referred, &columns, case))
