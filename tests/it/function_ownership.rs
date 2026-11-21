@@ -312,7 +312,7 @@ fn an_owner_change_to_an_absent_function_is_reported() {
     .expect_err("absent is never created");
 
     assert!(
-        matches!(&error, Error::AlterFunctionNotFound { function_name } if function_name == "absent"),
+        matches!(&error, Error::AlterFunctionNotFound { function_name, .. } if function_name == "absent"),
         "got {error:?}"
     );
 }
@@ -420,7 +420,7 @@ fn the_function_is_checked_before_the_role() {
     .expect_err("absent is never created");
 
     assert!(
-        matches!(&error, Error::AlterFunctionNotFound { function_name } if function_name == "absent"),
+        matches!(&error, Error::AlterFunctionNotFound { function_name, .. } if function_name == "absent"),
         "got {error:?}"
     );
 }

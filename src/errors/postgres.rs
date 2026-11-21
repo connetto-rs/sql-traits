@@ -6,9 +6,13 @@ use alloc::string::String;
 pub use sqlstate::SqlState;
 use sqlstate::pg;
 
-use super::{AttachIndexRefusal, Error, LookupError};
+use super::{
+    AttachIndexRefusal, Error, LookupError, SequenceIntegerRefusal, SequenceParameterError,
+};
 use crate::utils::quote_identifier::quote_identifier;
 
+mod alterations_transactions;
+mod inheritance_operators;
 mod keys_triggers_grants;
 mod lookup_columns;
 mod persistence_partitions;
@@ -438,7 +442,7 @@ impl Error {
             | Self::VirtualTableContentColumnsUnknown { .. }
             | Self::VirtualTableRenameBlocked { .. }
             | Self::RepeatedIndexColumn { .. }
-            | Self::NotValidRefused { .. }
+            | Self::NotValidRefused { kind: None, .. }
             | Self::AggregateOwnerUnsupported { .. }
             | Self::MovedFunctionCallAmbiguous { .. }
             | Self::AggregateAlterationUnsupported { .. }
@@ -455,83 +459,8 @@ impl Error {
             | Self::UnsupportedAlterTableOperation { .. }
             | Self::FunctionBodyBlocksColumnRename { .. }
             | Self::FunctionBodyStatementUnsupported { command_tag: None, .. }
-            | Self::AmbiguousDropFunction { .. }
-            | Self::AmbiguousAlterFunction { .. }
-            | Self::AmbiguousDropProcedure { .. }
-            | Self::AmbiguousRoutineSignature { .. }
-            | Self::DropExtensionNotFound { .. }
-            | Self::AlterFunctionExtensionNotFound { .. }
-            | Self::SchemaNotEmpty { .. }
-            | Self::RenameTableNotFound { .. }
-            | Self::AlterTableNotFound { .. }
-            | Self::AlterIndexNotFound { .. }
-            | Self::AlterPolicyNotFound { .. }
-            | Self::AlterFunctionNotFound { .. }
-            | Self::AlterRoleNotFound { .. }
-            | Self::DropConstraintNotFound { .. }
-            | Self::ValidateConstraintNotFound { .. }
-            | Self::ConstraintNotValidatable { .. }
-            | Self::NotValidConstraintConflict { .. }
-            | Self::NoOpenTransaction { .. }
-            | Self::SavepointNotFound { .. }
-            | Self::ReferencedTableNotFoundForForeignKey { .. }
-            | Self::ParentTableNotFound { .. }
-            | Self::CopiedTableNotFound { .. }
-            | Self::InheritsFromNonTable { .. }
-            | Self::InheritedColumnNotDroppable { .. }
-            | Self::InheritedColumnNotRenamable { .. }
-            | Self::ColumnAddedToPartition { .. }
-            | Self::IdentityAddedToPartitionColumn { .. }
-            | Self::IdentityAddedToOnlyPartitionedTable { .. }
-            | Self::InheritedColumnTypeNotAlterable { .. }
-            | Self::InheritedConstraintNotDroppable { .. }
-            | Self::RequiredValueNotDroppable { .. }
-            | Self::OnlyRefusedWithChildren { .. }
-            | Self::InheritedConstraintConflict { .. }
-            | Self::NoInheritCheckOnPartitionedTable { .. }
-            | Self::OnlyForeignKeyOnPartitionedTable { .. }
-            | Self::NoInheritNotNullOnPartitionedTable { .. }
-            | Self::ConflictingNotNullConstraintNames { .. }
-            | Self::ConflictingNoInheritNotNull { .. }
-            | Self::NotNullConstraintAlreadyExists { .. }
-            | Self::NotNullNoInheritStatusChange { .. }
-            | Self::OnlyPrimaryKeyOnNullableColumn { .. }
-            | Self::IdentityNeedsRequiredValue { .. }
-            | Self::InheritedColumnTypeConflict { .. }
-            | Self::InheritedColumnCollationConflict { .. }
-            | Self::CollationCannotBeCopied { .. }
-            | Self::CollationNotFound { .. }
-            | Self::CollationAlreadyExists { .. }
-            | Self::OperatorRightArgumentRequired { .. }
-            | Self::OperatorFunctionNotFound { .. }
-            | Self::OperatorAlreadyExists { .. }
-            | Self::OperatorOwnNegator { .. }
-            | Self::OperatorAttributeNeedsBoolean { .. }
-            | Self::OperatorAttributeNeedsBinary { .. }
-            | Self::OperatorLinkTaken { .. }
-            | Self::OperatorFunctionNotExecutable { .. }
-            | Self::OperatorNotFound { .. }
-            | Self::OperatorRequiredBySystem { .. }
-            | Self::OperatorReferenced { .. }
-            | Self::OperatorAttributeAlreadySet { .. }
-            | Self::AlterActionUnsupportedOnRelation { action: None, .. }
-            | Self::GenerationExpressionNotDroppable { .. }
             | Self::DatabaseOutsideSqlite { .. }
-            | Self::RenameCommandNotAlone { .. }
-            | Self::AdoptedIndexInvalid { .. }
-            | Self::ReplicaIdentityIndexNotFound { .. }
-            | Self::ReplicaIdentityIndexOfOtherTable { .. }
-            | Self::ReplicaIdentityIndexRefused { .. }
-            | Self::KeyReferenced { .. }
-            | Self::AdoptedIndexNotUnique { .. }
-            | Self::AdoptedIndexPartial { .. }
-            | Self::AdoptedIndexExpressions { .. }
-            | Self::AdoptedIndexNotFound { .. }
-            | Self::AdoptedIndexWrongTable { .. }
-            | Self::AdoptedIndexAlreadyConstrained { .. }
-            | Self::AdoptedIndexOnPartitionedTable
-            | Self::AdoptedIndexSorting { .. }
-            | Self::IndexRequiredByConstraint { .. } => None,
+            | Self::AlterActionUnsupportedOnRelation { action: None, .. } => None,
             Self::IndexRequiredByParent { index_name, parent_index_name } => {
                 Some(PostgresError::new(
                     pg::DEPENDENT_OBJECTS_STILL_EXIST,
@@ -633,6 +562,118 @@ impl Error {
                     ),
                 ))
             }
+            Self::ReplicaIdentityIndexNotFound { table_name, index_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!(
+                        "index {} for table {} does not exist",
+                        quoted(index_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::ReplicaIdentityIndexOfOtherTable { table_name, index_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "{} is not an index for table {}",
+                        quoted(index_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::ReplicaIdentityIndexRefused { index_name, reason, .. } => {
+                Some(alterations_transactions::replica_identity_refused(index_name, reason))
+            }
+            Self::KeyReferenced { key_name, dropping_index: true, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop index {} because other objects depend on it",
+                        quote_identifier(key_name)
+                    ),
+                ))
+            }
+            Self::KeyReferenced { key_name, table_name, dropping_index: false, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop constraint {key_name} on table {} because other objects depend on it",
+                        quote_identifier(table_name)
+                    ),
+                ))
+            }
+            Self::IndexRequiredByConstraint { index_name, table_name } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop index {} because constraint {index_name} on table {} requires it",
+                        quote_identifier(index_name),
+                        quote_identifier(table_name)
+                    ),
+                ))
+            }
+            Self::AdoptedIndexNotUnique { index_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{} is not a unique index", quoted(index_name)),
+                ))
+            }
+            Self::AdoptedIndexInvalid { index_name } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("index {} is not valid", quoted(index_name)),
+                ))
+            }
+            Self::AdoptedIndexPartial { index_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{} is a partial index", quoted(index_name)),
+                ))
+            }
+            Self::AdoptedIndexExpressions { index_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("index {} contains expressions", quoted(index_name)),
+                ))
+            }
+            Self::AdoptedIndexNotFound { index_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("index {} does not exist", quoted(index_name)),
+                ))
+            }
+            Self::AdoptedIndexWrongTable { index_name, table_name } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!(
+                        "index {} does not belong to table {}",
+                        quoted(index_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::AdoptedIndexAlreadyConstrained { index_name } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("index {} is already associated with a constraint", quoted(index_name)),
+                ))
+            }
+            Self::AdoptedIndexOnPartitionedTable => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "ALTER TABLE / ADD CONSTRAINT USING INDEX is not supported on partitioned tables",
+                ))
+            }
+            Self::AdoptedIndexSorting { index_name, column_number } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "index {} column number {column_number} does not have default sorting behavior",
+                        quoted(index_name)
+                    ),
+                ))
+            }
             #[cfg(feature = "git")]
             Self::GitError(..) => None,
             #[cfg(feature = "std")]
@@ -644,7 +685,8 @@ impl Error {
                 ))
             }
             Self::TemporaryMaterializedView { written_token, .. }
-            | Self::PartitionCommandNotAlone { written_token, .. } => {
+            | Self::PartitionCommandNotAlone { written_token, .. }
+            | Self::RenameCommandNotAlone { written_token, .. } => {
                 Some(PostgresError::new(
                     pg::SYNTAX_ERROR,
                     format!("syntax error at or near {}", quoted(written_token)),
@@ -1171,6 +1213,129 @@ impl Error {
                     format!("option {} provided more than once", quoted(option_name)),
                 ))
             }
+            Self::AmbiguousDropFunction { function_name }
+            | Self::AmbiguousAlterFunction { function_name } => {
+                Some(PostgresError::new(
+                    pg::AMBIGUOUS_FUNCTION,
+                    format!("function name {} is not unique", quoted(function_name)),
+                ))
+            }
+            Self::AmbiguousDropProcedure { procedure_name } => {
+                Some(PostgresError::new(
+                    pg::AMBIGUOUS_FUNCTION,
+                    format!("procedure name {} is not unique", quoted(procedure_name)),
+                ))
+            }
+            Self::AmbiguousRoutineSignature { routine_name, procedure, .. } => {
+                let kind = if *procedure { "procedure" } else { "routine" };
+                Some(PostgresError::new(
+                    pg::AMBIGUOUS_FUNCTION,
+                    format!("{kind} name {} is not unique", quoted(routine_name)),
+                ))
+            }
+            Self::DropExtensionNotFound { extension_name }
+            | Self::AlterFunctionExtensionNotFound { extension_name, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("extension {} does not exist", quoted(extension_name)),
+                ))
+            }
+            Self::SchemaNotEmpty { schema_name } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!("cannot drop schema {schema_name} because other objects depend on it"),
+                ))
+            }
+            Self::RenameTableNotFound { table_name }
+            | Self::AlterTableNotFound { table_name }
+            | Self::AlterPolicyTableNotFound { table_name }
+            | Self::AlterIndexNotFound { index_name: table_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!("relation {} does not exist", quoted(table_name)),
+                ))
+            }
+            Self::AlterPolicyRelationNotTable { table_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{} is not a table", quoted(table_name)),
+                ))
+            }
+            Self::AlterPolicyNotFound { policy_name, table_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!(
+                        "policy {} for table {} does not exist",
+                        quoted(policy_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::AlterFunctionNotFound { function_name, argument_types } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_FUNCTION,
+                    match argument_types {
+                        Some(types) => {
+                            format!("function {function_name}({}) does not exist", types.join(", "))
+                        }
+                        None => {
+                            format!("could not find a function named {}", quoted(function_name))
+                        }
+                    },
+                ))
+            }
+            Self::AlterRoleNotFound { role_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("role {} does not exist", quoted(role_name)),
+                ))
+            }
+            Self::DropConstraintNotFound { table_name, constraint_name }
+            | Self::ValidateConstraintNotFound { table_name, constraint_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!(
+                        "constraint {} of relation {} does not exist",
+                        quoted(constraint_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::ConstraintNotValidatable { table_name, constraint_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "cannot validate constraint {} of relation {}",
+                        quoted(constraint_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::NotValidRefused { kind: Some(kind), .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!("{} constraints cannot be marked NOT VALID", constraint_keyword(*kind)),
+                ))
+            }
+            Self::NotValidConstraintConflict { table_name, constraint_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    format!(
+                        "constraint {} conflicts with NOT VALID constraint on relation {}",
+                        quoted(constraint_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::NoOpenTransaction { statement } => {
+                alterations_transactions::no_transaction(statement)
+            }
+            Self::SavepointNotFound { savepoint_name } => {
+                Some(PostgresError::new(
+                    pg::S_E_INVALID_SPECIFICATION,
+                    format!("savepoint {} does not exist", quoted(savepoint_name)),
+                ))
+            }
             Self::DropSchemaNotFound { schema_name }
             | Self::AlterSchemaNotFound { schema_name }
             | Self::AlterFunctionSchemaNotFound { schema_name, .. }
@@ -1178,6 +1343,358 @@ impl Error {
                 Some(PostgresError::new(
                     pg::INVALID_SCHEMA_NAME,
                     format!("schema {} does not exist", quoted(schema_name)),
+                ))
+            }
+            Self::ReferencedTableNotFoundForForeignKey { referenced_table: name, .. }
+            | Self::ParentTableNotFound { parent_table: name, .. }
+            | Self::CopiedTableNotFound { copied_table: name, object_kind: None, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!("relation {} does not exist", quoted(name)),
+                ))
+            }
+            Self::CopiedTableNotFound { copied_table, object_kind: Some(kind), .. } => {
+                match kind {
+                    super::ObjectKind::View
+                    | super::ObjectKind::MaterializedView
+                    | super::ObjectKind::Type => None,
+                    _ => {
+                        Some(PostgresError::new(
+                            pg::WRONG_OBJECT_TYPE,
+                            format!("relation {} is invalid in LIKE clause", quoted(copied_table)),
+                        ))
+                    }
+                }
+            }
+            Self::InheritsFromNonTable {
+                parent_name,
+                object_kind:
+                    super::ObjectKind::Type | super::ObjectKind::Index | super::ObjectKind::UniqueIndex,
+                ..
+            } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("cannot open relation {}", quoted(parent_name)),
+                ))
+            }
+            Self::InheritsFromNonTable { parent_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "inherited relation {} is not a table or foreign table",
+                        quoted(parent_name)
+                    ),
+                ))
+            }
+            Self::InheritedColumnNotDroppable { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!("cannot drop inherited column {}", quoted(column_name)),
+                ))
+            }
+            Self::InheritedColumnNotRenamable { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!("cannot rename inherited column {}", quoted(column_name)),
+                ))
+            }
+            Self::ColumnAddedToPartition { .. } => {
+                Some(PostgresError::new(pg::WRONG_OBJECT_TYPE, "cannot add column to a partition"))
+            }
+            Self::IdentityAddedToPartitionColumn { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    "cannot add identity to a column of a partition",
+                ))
+            }
+            Self::IdentityAddedToOnlyPartitionedTable { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    "cannot add identity to a column of only the partitioned table",
+                ))
+            }
+            Self::GenerationExpressionNotDroppable { table_name, column_name, reason } => {
+                Some(inheritance_operators::generation_drop(*reason, column_name, table_name))
+            }
+            Self::InheritedColumnTypeNotAlterable { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!("cannot alter inherited column {}", quoted(column_name)),
+                ))
+            }
+            Self::InheritedConstraintNotDroppable { table_name, constraint_name }
+            | Self::RequiredValueNotDroppable {
+                table_name,
+                constraint_name: Some(constraint_name),
+                ..
+            } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!(
+                        "cannot drop inherited constraint {} of relation {}",
+                        quoted(constraint_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::OnlyRefusedWithChildren { change, subject_name, .. } => {
+                Some(inheritance_operators::only(*change, subject_name.as_deref()))
+            }
+            Self::InheritedConstraintConflict { table_name, constraint_name, reason } => {
+                inheritance_operators::constraint_conflict(reason, constraint_name, table_name)
+            }
+            Self::NoInheritCheckOnPartitionedTable { table_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!(
+                        "cannot add NO INHERIT constraint to partitioned table {}",
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::OnlyForeignKeyOnPartitionedTable { table_name, referenced_table } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "cannot use ONLY for foreign key on partitioned table {} referencing relation {}",
+                        quoted(table_name),
+                        quoted(referenced_table)
+                    ),
+                ))
+            }
+            Self::NoInheritNotNullOnPartitionedTable { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "not-null constraints on partitioned tables cannot be NO INHERIT",
+                ))
+            }
+            Self::ConflictingNotNullConstraintNames { first_name, second_name, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!(
+                        "conflicting not-null constraint names {} and {}",
+                        quoted(first_name),
+                        quoted(second_name)
+                    ),
+                ))
+            }
+            Self::ConflictingNoInheritNotNull { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!(
+                        "conflicting NO INHERIT declaration for not-null constraint on column {}",
+                        quoted(column_name)
+                    ),
+                ))
+            }
+            Self::NotNullConstraintAlreadyExists {
+                table_name,
+                column_name,
+                constraint_name,
+                ..
+            } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!(
+                        "cannot create not-null constraint {} on column {} of table {}",
+                        quoted(constraint_name),
+                        quoted(column_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::NotNullNoInheritStatusChange { table_name, constraint_name, set_not_null } => {
+                Some(PostgresError::new(
+                    if *set_not_null {
+                        pg::FEATURE_NOT_SUPPORTED
+                    } else {
+                        pg::OBJECT_NOT_IN_PREREQUISITE_STATE
+                    },
+                    format!(
+                        "cannot change NO INHERIT status of NOT NULL constraint {} on relation {}",
+                        quoted(constraint_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::OnlyPrimaryKeyOnNullableColumn { table_name, column_name } => {
+                Some(PostgresError::new(
+                    pg::INTERNAL_ERROR,
+                    format!(
+                        "column {} of table {} is not marked NOT NULL",
+                        quoted(column_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::RequiredValueNotDroppable { column_name, reason, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    match reason {
+                        super::RequiredValue::CoveredByKey => {
+                            format!("column {} is in a primary key", quoted(column_name))
+                        }
+                        super::RequiredValue::EnforcedByParent => {
+                            format!(
+                                "column {} is marked NOT NULL in parent table",
+                                quoted(column_name)
+                            )
+                        }
+                        super::RequiredValue::InReplicaIdentity => {
+                            format!(
+                                "column {} is in index used as replica identity",
+                                quoted(column_name)
+                            )
+                        }
+                    },
+                ))
+            }
+            Self::IdentityNeedsRequiredValue { table_name, column_name } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!(
+                        "column {} of relation {} must be declared NOT NULL before identity can be added",
+                        quoted(column_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::InheritedColumnTypeConflict { column_name, child_table, origin, .. } => {
+                Some(PostgresError::new(
+                    pg::DATATYPE_MISMATCH,
+                    inheritance_operators::column_conflict(
+                        *origin,
+                        column_name,
+                        child_table,
+                        "type",
+                    ),
+                ))
+            }
+            Self::InheritedColumnCollationConflict { column_name, child_table, origin, .. } => {
+                Some(PostgresError::new(
+                    pg::COLLATION_MISMATCH,
+                    inheritance_operators::column_conflict(
+                        *origin,
+                        column_name,
+                        child_table,
+                        "collation",
+                    ),
+                ))
+            }
+            Self::CollationCannotBeCopied { collation_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    format!("collation {} cannot be copied", quoted(collation_name)),
+                ))
+            }
+            Self::CollationNotFound { collation_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!(
+                        "collation {} for encoding \"UTF8\" does not exist",
+                        quoted(collation_name)
+                    ),
+                ))
+            }
+            Self::CollationAlreadyExists { collation_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!("collation {} already exists", quoted(collation_name)),
+                ))
+            }
+            Self::OperatorRightArgumentRequired { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FUNCTION_DEFINITION,
+                    "operator right argument type must be specified",
+                ))
+            }
+            Self::OperatorFunctionNotFound { function_name, argument_types, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_FUNCTION,
+                    format!(
+                        "function {}({}) does not exist",
+                        function_name.join("."),
+                        argument_types.join(", ")
+                    ),
+                ))
+            }
+            Self::OperatorAlreadyExists { operator_name, schema_move } => {
+                Some(if *schema_move {
+                    PostgresError::new(
+                        pg::UNIQUE_VIOLATION,
+                        "duplicate key value violates unique constraint \"pg_operator_oprname_l_r_n_index\"",
+                    )
+                } else {
+                    PostgresError::new(
+                        pg::DUPLICATE_FUNCTION,
+                        format!("operator {operator_name} already exists"),
+                    )
+                })
+            }
+            Self::OperatorOwnNegator { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FUNCTION_DEFINITION,
+                    "operator cannot be its own negator",
+                ))
+            }
+            Self::OperatorAttributeNeedsBoolean { attribute, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FUNCTION_DEFINITION,
+                    format!(
+                        "only boolean operators can {}",
+                        inheritance_operators::attribute_requirement(*attribute)
+                    ),
+                ))
+            }
+            Self::OperatorAttributeNeedsBinary { attribute, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FUNCTION_DEFINITION,
+                    format!(
+                        "only binary operators can {}",
+                        inheritance_operators::attribute_requirement(*attribute)
+                    ),
+                ))
+            }
+            Self::OperatorLinkTaken { attribute, linked_name, linked_to, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FUNCTION_DEFINITION,
+                    format!(
+                        "{attribute} operator {linked_name} is already the {attribute} of operator {linked_to}"
+                    ),
+                ))
+            }
+            Self::OperatorFunctionNotExecutable { function_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INSUFFICIENT_PRIVILEGE,
+                    format!("permission denied for function {function_name}"),
+                ))
+            }
+            Self::OperatorNotFound { signature, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_FUNCTION,
+                    format!("operator does not exist: {signature}"),
+                ))
+            }
+            Self::OperatorRequiredBySystem { signature, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop operator {signature} because it is required by the database system"
+                    ),
+                ))
+            }
+            Self::OperatorReferenced { signature, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!("cannot drop operator {signature} because other objects depend on it"),
+                ))
+            }
+            Self::OperatorAttributeAlreadySet { attribute, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FUNCTION_DEFINITION,
+                    format!(
+                        "operator attribute \"{attribute}\" cannot be changed if it has already been set"
+                    ),
                 ))
             }
             Self::RoleNotFoundForGrant { role_name }
@@ -1777,6 +2294,37 @@ impl LookupError {
             | Self::FunctionBodyUnavailable { .. }
             | Self::FunctionBodyUnresolvable { .. }
             | Self::FunctionBodyUnparsable { .. } => None,
+        }
+    }
+}
+
+impl Error {
+    /// The token PostgreSQL reports this syntax error at, as written, for an
+    /// error that carries one.
+    pub(crate) fn written_token_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::InvalidIndex { written_token, .. }
+            | Self::InvalidPrimaryKey { written_token, .. }
+            | Self::IdentifierLookupError(LookupError::InvalidSetting { written_token })
+            | Self::ProcedureBodyUnsupported { written_token, .. }
+            | Self::TemporaryMaterializedView { written_token, .. }
+            | Self::UnloggedTemporaryTable { written_token, .. }
+            | Self::PartitionCommandNotAlone { written_token, .. }
+            | Self::RenameCommandNotAlone { written_token, .. }
+            | Self::InvalidSessionRole { written_token, .. }
+            | Self::NonLiteralSetting { written_token, .. }
+            | Self::MaterializedViewCannotBeReplaced { written_token, .. }
+            | Self::ViewIfNotExistsUnsupported { written_token, .. }
+            | Self::FunctionBodySyntaxUnsupported { written_token, .. }
+            | Self::InvalidSequenceParameters {
+                reason:
+                    SequenceParameterError::NotABigint {
+                        refusal: SequenceIntegerRefusal::UnexpectedToken { written_token },
+                        ..
+                    },
+                ..
+            } => Some(written_token),
+            _ => None,
         }
     }
 }

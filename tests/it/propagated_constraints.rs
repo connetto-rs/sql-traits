@@ -761,7 +761,7 @@ fn a_child_constraint_unmergeable_with_an_inherited_one_is_refused() {
             "CREATE TABLE par (id INT, CONSTRAINT c6 CHECK (id > 0));
              CREATE TABLE chi (id INT, CONSTRAINT c6 CHECK (id > 0) NO INHERIT) INHERITS (par);"
         ),
-        Err(Error::InheritedConstraintConflict { ref table_name, ref constraint_name })
+        Err(Error::InheritedConstraintConflict { ref table_name, ref constraint_name, .. })
             if table_name == "chi" && constraint_name == "c6"
     ));
 
@@ -771,7 +771,7 @@ fn a_child_constraint_unmergeable_with_an_inherited_one_is_refused() {
              CREATE TABLE chi (CONSTRAINT lc CHECK (id > 0) NO INHERIT) INHERITS (par);
              ALTER TABLE par ADD CONSTRAINT lc CHECK (id > 0);"
         ),
-        Err(Error::InheritedConstraintConflict { ref table_name, ref constraint_name })
+        Err(Error::InheritedConstraintConflict { ref table_name, ref constraint_name, .. })
             if table_name == "chi" && constraint_name == "lc"
     ));
 
@@ -879,7 +879,7 @@ fn only_refuses_a_foreign_key_on_a_partitioned_table() {
              CREATE TABLE root (id INT) PARTITION BY RANGE (id);
              ALTER TABLE ONLY root ADD CONSTRAINT f1 FOREIGN KEY (id) REFERENCES tgt (id);"
         ),
-        Err(Error::OnlyForeignKeyOnPartitionedTable { ref table_name }) if table_name == "root"
+        Err(Error::OnlyForeignKeyOnPartitionedTable { ref table_name, .. }) if table_name == "root"
     ));
 }
 

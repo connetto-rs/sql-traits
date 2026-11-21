@@ -39,7 +39,7 @@ fn refused_for(result: Result<ParserDB, Error>, key: &str, table: &str, referenc
     assert!(
         matches!(
             &error,
-            Some(Error::KeyReferenced { key_name, table_name, referencing_table })
+            Some(Error::KeyReferenced { key_name, table_name, referencing_table, .. })
                 if (key_name.as_str(), table_name.as_str(), referencing_table.as_str())
                     == (key, table, referencing)
         ),

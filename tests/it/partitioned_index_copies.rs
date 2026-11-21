@@ -401,7 +401,7 @@ fn foreign_key_copy_drop_dependencies() -> Result<(), Error> {
     );
     let result = ParserDB::parse::<PostgreSqlDialect>(&format!("{setup}DROP INDEX pix;"));
     assert!(
-        matches!(&result, Err(Error::KeyReferenced { key_name, table_name, referencing_table }) if key_name == "pix" && table_name == "r" && referencing_table == "f"),
+        matches!(&result, Err(Error::KeyReferenced { key_name, table_name, referencing_table, dropping_index: true }) if key_name == "pix" && table_name == "r" && referencing_table == "f"),
         "{result:?}"
     );
     for cascade in ["", " CASCADE"] {
@@ -466,7 +466,7 @@ fn foreign_key_descendant_and_detached_dependencies() -> Result<(), Error> {
     );
     let result = ParserDB::parse::<PostgreSqlDialect>(&format!("{setup}DROP INDEX pix;"));
     assert!(
-        matches!(&result, Err(Error::KeyReferenced { key_name, table_name, referencing_table }) if key_name == "pix" && table_name == "r" && referencing_table == "f"),
+        matches!(&result, Err(Error::KeyReferenced { key_name, table_name, referencing_table, dropping_index: true }) if key_name == "pix" && table_name == "r" && referencing_table == "f"),
         "{result:?}"
     );
     let database =
@@ -489,7 +489,7 @@ fn foreign_key_descendant_and_detached_dependencies() -> Result<(), Error> {
     assert_eq!(table.foreign_keys(&database)?.count(), 1);
     let result = ParserDB::parse::<PostgreSqlDialect>(&format!("{setup}DROP INDEX r1_id_idx;"));
     assert!(
-        matches!(&result, Err(Error::KeyReferenced { key_name, table_name, referencing_table }) if key_name == "r1_id_idx" && table_name == "r1" && referencing_table == "f"),
+        matches!(&result, Err(Error::KeyReferenced { key_name, table_name, referencing_table, dropping_index: true }) if key_name == "r1_id_idx" && table_name == "r1" && referencing_table == "f"),
         "{result:?}"
     );
     let database =

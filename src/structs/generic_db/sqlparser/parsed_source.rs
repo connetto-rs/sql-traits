@@ -1,13 +1,13 @@
 //! Native parsing with each statement's opening-token location.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use sqlparser::{
     ast::{Statement, comments::Comments},
     dialect::Dialect,
     keywords::Keyword,
     parser::{Parser, ParserError},
-    tokenizer::{Location, Token},
+    tokenizer::{Location, Token, Tokenizer},
 };
 
 /// The statements of one SQL text, with the comments and line starts that
@@ -78,5 +78,62 @@ impl ParsedSource {
         let line_starts =
             core::iter::once(0).chain(sql.match_indices('\n').map(|(at, _)| at + 1)).collect();
         Ok(Self { statements, comments: parser.into_comments(), line_starts })
+    }
+}
+
+/// The text of `text` from `start` up to `end`, the start of the statement
+/// after, or to the end of the text for the last statement.
+pub(super) fn statement_text(text: SourceText<'_>, start: Location, end: Option<Location>) -> &str {
+    let length = text.sql.len();
+    let from = text.offset(start).unwrap_or(length);
+    let to = end.and_then(|end| text.offset(end)).unwrap_or(length);
+    text.sql.get(from..to.max(from)).unwrap_or_default()
+}
+
+/// Respells `token`, a keyword in its uppercase spelling, as the first word of
+/// `statement` spelling that keyword, which is how PostgreSQL echoes the token
+/// a syntax error is reported at. A token no word of `statement` spells, or a
+/// statement the tokenizer refuses, leaves `token` as it is.
+pub(super) fn respell_written_token(token: &mut String, statement: &str, dialect: &dyn Dialect) {
+    let Ok(tokens) = Tokenizer::new(dialect, statement).tokenize() else { return };
+    let written = tokens.into_iter().find_map(|candidate| {
+        match candidate {
+            Token::Word(word)
+                if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(token) =>
+            {
+                Some(word.value)
+            }
+            _ => None,
+        }
+    });
+    if let Some(written) = written {
+        *token = written;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    use super::*;
+
+    /// A keyword is respelled as the failing statement writes it, never from a
+    /// statement before or after it.
+    #[test]
+    fn written_token_comes_from_its_own_statement() {
+        let sql = "create temp table a (id int);\nCREATE Temp\n  MATERIALIZED VIEW v AS SELECT 1;\nselect 1";
+        let dialect = PostgreSqlDialect {};
+        let source = ParsedSource::parse(sql, &dialect).expect("the statements parse");
+        let text = SourceText { sql, line_starts: &source.line_starts };
+        let starts: Vec<Location> = source.statements.iter().map(|(_, start)| *start).collect();
+        let statement = statement_text(text, starts[1], starts.get(2).copied());
+        assert_eq!(statement, "CREATE Temp\n  MATERIALIZED VIEW v AS SELECT 1;\n");
+        let mut token = String::from("TEMP");
+        respell_written_token(&mut token, statement, &dialect);
+        assert_eq!(token, "Temp");
+        let mut absent = String::from("UNLOGGED");
+        respell_written_token(&mut absent, statement, &dialect);
+        assert_eq!(absent, "UNLOGGED");
+        assert_eq!(statement_text(text, starts[2], None), "select 1");
     }
 }

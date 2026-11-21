@@ -414,6 +414,41 @@ impl core::fmt::Display for InheritedChange {
     }
 }
 
+/// Where incompatible inherited column definitions meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InheritedColumnConflict {
+    /// A child declares an inherited column.
+    Declaration,
+    /// Two parents declare the same column.
+    Parents,
+    /// A parent adds a column already declared by a child.
+    Addition,
+}
+
+/// Why constraints sharing a name cannot merge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum InheritedConstraintConflictKind {
+    /// Their definitions differ.
+    Definition,
+    /// Two parents supply checks with different expressions.
+    Parents,
+    /// A check and a not-null constraint collide in the constraint catalog.
+    CatalogName,
+    /// PostgreSQL accepts an inherited not-null constraint under this name.
+    NotNullNameReuse,
+    /// Adding a parent requirement would change the child's inheritability.
+    NotNullStatus,
+    /// A child marks an inherited not-null requirement `NO INHERIT`.
+    NotNullNoInherit {
+        /// Stored name of the column requiring a value.
+        column_name: String,
+    },
+    /// A new table declares an inherited check as `NO INHERIT`.
+    InheritedNoInherit,
+    /// A parent adds a check the child declares as `NO INHERIT`.
+    LocalNoInherit,
+}
+
 /// Why a column may not stop requiring a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RequiredValue {
@@ -2003,6 +2038,8 @@ pub enum Error {
         copied_table: String,
         /// Stored name of the table doing the copying.
         table_name: String,
+        /// The kind holding the source name, when a relation exists.
+        object_kind: Option<ObjectKind>,
     },
     #[error("Cannot drop column `{column_name}` of table `{table_name}` because it is inherited.")]
     /// Error indicating that a table tried to drop a column it receives from
@@ -2102,6 +2139,8 @@ pub enum Error {
         table_name: String,
         /// The change that cannot stop at the named table.
         change: InheritedChange,
+        /// Stored name of the column or constraint being changed.
+        subject_name: Option<String>,
     },
     #[error(
         "Constraint `{constraint_name}` of table `{table_name}` conflicts with the constraint of the same name a parent passes down."
@@ -2115,6 +2154,8 @@ pub enum Error {
         table_name: String,
         /// Stored name the two constraints share.
         constraint_name: String,
+        /// The conflict preventing the merge.
+        reason: InheritedConstraintConflictKind,
     },
     #[error("Cannot add a `NO INHERIT` check to partitioned table `{table_name}`.")]
     /// Error indicating that a `NO INHERIT` check was written on a partitioned
@@ -2131,6 +2172,8 @@ pub enum Error {
     OnlyForeignKeyOnPartitionedTable {
         /// Stored name of the partitioned table.
         table_name: String,
+        /// Stored name of the referenced relation.
+        referenced_table: String,
     },
     #[error("Cannot add a `NO INHERIT` not-null constraint to partitioned table `{table_name}`.")]
     /// Error indicating that a `NO INHERIT` table-level `NOT NULL` was written
@@ -2197,6 +2240,8 @@ pub enum Error {
         table_name: String,
         /// Stored name of the requirement the column already holds.
         constraint_name: String,
+        /// Whether `ALTER COLUMN SET NOT NULL` requests the change.
+        set_not_null: bool,
     },
     #[error(
         "Column `{column_name}` of table `{table_name}` must require a value before `ONLY` may add a primary key above it."
@@ -2224,6 +2269,9 @@ pub enum Error {
         column_name: String,
         /// What keeps the requirement in place.
         reason: RequiredValue,
+        /// Stored name of an inherited not-null constraint, when inheritance
+        /// supplies it.
+        constraint_name: Option<String>,
     },
     #[error("Index `{index_name}` for table `{table_name}` does not exist.")]
     /// Error indicating that `ALTER TABLE ... REPLICA IDENTITY USING INDEX`
@@ -2283,6 +2331,8 @@ pub enum Error {
         parent_table: Box<str>,
         /// Type the parent declares.
         parent_type: Box<str>,
+        /// Where the definitions meet.
+        origin: InheritedColumnConflict,
     },
     #[error(
         "Column `{column_name}` of table `{child_table}` has collation `{child_collation}`, conflicting with collation `{parent_collation}` inherited from `{parent_table}`."
@@ -2300,6 +2350,8 @@ pub enum Error {
         parent_table: Box<str>,
         /// Stored collation name the parent declares.
         parent_collation: Box<str>,
+        /// Where the definitions meet.
+        origin: InheritedColumnConflict,
     },
     #[error("Collation `{collation_name}` cannot be copied.")]
     /// Error indicating that a built-in collation cannot be copied.
@@ -2326,15 +2378,17 @@ pub enum Error {
         /// Symbol of the operator the statement creates.
         operator_name: Box<str>,
     },
-    #[error("Function `{function_name}` named by operator `{operator_name}` not found.")]
+    #[error("Function `{}` named by operator `{operator_name}` not found.", .function_name.join("."))]
     /// Error indicating that the function, restriction estimator or join
     /// estimator an operator names takes no arguments of exactly the types the
     /// operator requires.
     OperatorFunctionNotFound {
         /// Symbol of the operator the statement creates or alters.
         operator_name: Box<str>,
-        /// Stored name of the function.
-        function_name: Box<str>,
+        /// Stored parts of the function name, outermost first.
+        function_name: Vec<String>,
+        /// Argument types in PostgreSQL's display spelling.
+        argument_types: Vec<String>,
     },
     #[error("Operator `{operator_name}` already exists.")]
     /// Error indicating that an operator of the same schema, symbol and
@@ -2342,6 +2396,8 @@ pub enum Error {
     OperatorAlreadyExists {
         /// Symbol of the operator the statement creates or moves.
         operator_name: Box<str>,
+        /// Whether moving an operator to another schema finds the collision.
+        schema_move: bool,
     },
     #[error("Operator `{operator_name}` cannot be its own negator.")]
     /// Error indicating that an operator names itself as its negator.
@@ -2402,6 +2458,8 @@ pub enum Error {
     OperatorNotFound {
         /// Symbol of the operator as written.
         operator_name: Box<str>,
+        /// The operator and operand types in PostgreSQL's lookup spelling.
+        signature: String,
     },
     #[error(
         "Operator `{operator_name}` cannot be dropped because the database system requires it."
@@ -2412,6 +2470,8 @@ pub enum Error {
     OperatorRequiredBySystem {
         /// Symbol of the built-in operator.
         operator_name: Box<str>,
+        /// The operator's displayed identity and operand types.
+        signature: String,
     },
     #[error(
         "Operator `{operator_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
@@ -2437,6 +2497,8 @@ pub enum Error {
         /// The column or the check as `table.name`, or the name of the other
         /// object.
         dependent_name: String,
+        /// The operator's displayed identity and operand types.
+        signature: String,
     },
     #[error("Operator attribute {attribute} of `{operator_name}` cannot be changed once set.")]
     /// Error indicating that `ALTER OPERATOR ... SET` names a commutator or
@@ -3416,6 +3478,9 @@ pub enum Error {
         table_name: String,
         /// Name of the table whose foreign key depends on it.
         referencing_table: String,
+        /// Whether a `DROP INDEX` drops the key, rather than an `ALTER TABLE
+        /// ... DROP CONSTRAINT`, which PostgreSQL's message tells apart.
+        dropping_index: bool,
     },
     #[error(
         "Cannot alter type of column `{column_name}` of table `{table_name}`: {dependent_kind} `{dependent_name}` uses it."
@@ -3855,6 +3920,8 @@ pub enum Error {
     RenameCommandNotAlone {
         /// Relation the statement alters.
         relation_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error("Table `{table_name}` cannot inherit from partition `{parent_name}`.")]
     /// Error indicating that `INHERITS` names a partition, whose columns
@@ -5126,6 +5193,10 @@ pub enum Error {
     AmbiguousRoutineSignature {
         /// The signature with stored names and diagnostic type spellings.
         signature: String,
+        /// Qualified name of the routine, as stored.
+        routine_name: String,
+        /// Whether the statement names a procedure rather than any routine.
+        procedure: bool,
     },
     #[error("Schema `{schema_name}` not found for DROP SCHEMA statement.")]
     /// Error indicating that a DROP SCHEMA statement references a schema
@@ -5170,6 +5241,20 @@ pub enum Error {
     AlterPolicyNotFound {
         /// Name of the policy, as stored.
         policy_name: String,
+        /// Name of the table, as stored.
+        table_name: String,
+    },
+    #[error("Table `{table_name}` not found for ALTER POLICY statement.")]
+    /// An `ALTER POLICY` statement names a table that does not exist.
+    AlterPolicyTableNotFound {
+        /// Qualified name of the table, as stored.
+        table_name: String,
+    },
+    #[error("Relation `{table_name}` is not a table for ALTER POLICY statement.")]
+    /// An `ALTER POLICY` statement names a relation that is not a table.
+    AlterPolicyRelationNotTable {
+        /// Name of the relation, as stored.
+        table_name: String,
     },
     #[error("Function `{function_name}` not found for ALTER FUNCTION statement.")]
     /// Error indicating that an ALTER FUNCTION statement carrying a security
@@ -5178,6 +5263,8 @@ pub enum Error {
     AlterFunctionNotFound {
         /// Qualified name of the function, as stored.
         function_name: String,
+        /// Input types in PostgreSQL's diagnostic spelling, when specified.
+        argument_types: Option<Vec<String>>,
     },
     #[error(
         "Function name `{function_name}` is not unique: an `ALTER FUNCTION` naming no argument list cannot say which one to alter."
@@ -5287,6 +5374,8 @@ pub enum Error {
         table_name: String,
         /// The constraint as the table holds it.
         constraint: String,
+        /// Name of the conflicting constraint, as stored.
+        constraint_name: String,
     },
     #[error("Schema `{schema_name}` not found for ALTER SCHEMA statement.")]
     /// Error indicating that an ALTER SCHEMA statement references a schema

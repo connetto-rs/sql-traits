@@ -1310,6 +1310,7 @@ fn rename_constraint_of(
             &stored,
             scope,
             InheritedChange::RenameConstraint,
+            Some(old),
         )?;
     }
     if locate(node, recorded, new, case).is_some() {

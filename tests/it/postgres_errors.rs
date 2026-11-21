@@ -5,12 +5,15 @@
 use sql_traits::prelude::*;
 use sqlparser::dialect::{Dialect, PostgreSqlDialect};
 
+mod alterations_transactions;
+mod inheritance_operators;
 mod keys_triggers_grants;
 mod lookup_columns;
 mod persistence_partitions;
 mod roles_functions_schemas;
 mod types_settings;
 mod views_constraints_functions;
+mod written_tokens;
 
 /// Asserts that `ParserDB` refuses `sql` under PostgreSQL with an error
 /// answering `sqlstate` and `message`, as PostgreSQL 18 refuses its last

@@ -183,7 +183,7 @@ fn an_alteration_refuses_an_estimate_postgres_refuses() {
          ALTER FUNCTION f(TEXT) ROWS 5;",
     );
     assert!(
-        matches!(&absent, Err(Error::AlterFunctionNotFound { function_name }) if function_name == "f"),
+        matches!(&absent, Err(Error::AlterFunctionNotFound { function_name, .. }) if function_name == "f"),
         "got {absent:?}"
     );
 }
