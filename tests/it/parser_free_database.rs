@@ -1312,6 +1312,14 @@ impl FunctionLike for MemoryFunction {
         Ok(None)
     }
 
+    /// This catalog records no extension membership.
+    fn extension<'db>(
+        &self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db MemoryExtension>, LookupError> {
+        Ok(None)
+    }
+
     /// This catalog records no grants, so every function keeps PostgreSQL's
     /// default.
     fn is_executable_by_public(&self, _database: &Self::DB) -> Result<bool, LookupError> {
