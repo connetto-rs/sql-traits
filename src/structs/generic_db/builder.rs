@@ -797,21 +797,20 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         table: Arc<P::Table>,
         metadata: Meta<P::Table>,
     ) -> Result<Self, LookupError> {
+        self.ensure_table_lookup_invariants(table.as_ref())?;
         let identity = self.draw_relation_identity();
-        self.add_table_with_identity(table, metadata, identity)
+        Ok(self.insert_table_with_identity(table, metadata, identity))
     }
 
-    /// Adds a table under the identity it already holds, for a statement that
-    /// replaces the table's node.
-    pub(crate) fn add_table_with_identity(
+    /// Inserts after [`Self::ensure_table_lookup_invariants`] succeeds.
+    pub(crate) fn insert_table_with_identity(
         mut self,
         table: Arc<P::Table>,
         metadata: Meta<P::Table>,
         identity: RelationIdentity,
-    ) -> Result<Self, LookupError> {
-        self.ensure_table_lookup_invariants(table.as_ref())?;
+    ) -> Self {
         self.tables.push((table, metadata, identity));
-        Ok(self)
+        self
     }
 
     /// Adds multiple tables with their metadata to the builder.
