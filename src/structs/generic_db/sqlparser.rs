@@ -7043,7 +7043,6 @@ impl ParserDB {
     /// Helper function to process column options.
     fn process_column_options(
         column: &Arc<TableAttribute<CreateTable, ColumnDef>>,
-        column_position: usize,
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
@@ -7058,6 +7057,10 @@ impl ParserDB {
                 Some(ColumnOption::OnConflict(keyword)) => Some(*keyword),
                 _ => None,
             };
+            if let ColumnOption::ForeignKey(foreign_key) = &option.option {
+                Self::validate_foreign_key_deferral(&builder, create_table, foreign_key)?;
+                continue;
+            }
             match option.option.clone() {
                 ColumnOption::Check(check_constraint) => {
                     builder = Self::add_check_constraint(
@@ -7066,26 +7069,6 @@ impl ParserDB {
                         table_metadata,
                         builder,
                         carried,
-                    )?;
-                }
-                // The same constraint written inline on the column rather than
-                // as a table constraint, so it takes the same path: both
-                // spellings must resolve their target and read back their name
-                // alike.
-                ColumnOption::ForeignKey(mut foreign_key) => {
-                    foreign_key.name.clone_from(&option.name);
-                    foreign_key.columns.push(column.attribute().name.clone());
-                    builder = Self::process_foreign_key_table_constraint(
-                        &foreign_key,
-                        constraint_names::Slot::Column {
-                            column: column_position,
-                            option: position,
-                            def: column.attribute(),
-                            held: option,
-                        },
-                        create_table,
-                        table_metadata,
-                        builder,
                     )?;
                 }
                 ColumnOption::Unique(mut unique_constraint) => {
@@ -7211,15 +7194,13 @@ impl ParserDB {
         Ok(referenced_table)
     }
 
-    /// Helper function to process a foreign key table constraint.
-    fn process_foreign_key_table_constraint(
-        fk: &ForeignKeyConstraint,
-        slot: constraint_names::Slot<'_>,
-        create_table: &Arc<CreateTable>,
-        table_metadata: &mut TableMetadata<CreateTable>,
-        builder: ParserDBBuilder,
-    ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        if let Some(characteristics) = fk.characteristics
+    /// Validates the deferral options without resolving the foreign-key target.
+    fn validate_foreign_key_deferral(
+        builder: &ParserDBBuilder,
+        create_table: &CreateTable,
+        foreign_key: &ForeignKeyConstraint,
+    ) -> Result<(), crate::errors::Error> {
+        if let Some(characteristics) = foreign_key.characteristics
             && characteristics.deferrable == Some(false)
             && characteristics.initially == Some(DeferrableInitial::Deferred)
             && !builder.dialect().is_sqlite()
@@ -7228,7 +7209,58 @@ impl ParserDB {
                 table_name: create_table.name.to_string(),
             });
         }
+        Ok(())
+    }
 
+    /// Resolves and installs the foreign keys after table-name validation.
+    fn process_foreign_keys(
+        create_table: &Arc<CreateTable>,
+        table_metadata: &mut TableMetadata<CreateTable>,
+        mut builder: ParserDBBuilder,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        for (column_position, column) in create_table.columns.iter().enumerate() {
+            for (option_position, option) in column.options.iter().enumerate() {
+                if let ColumnOption::ForeignKey(foreign_key) = &option.option {
+                    let mut foreign_key = foreign_key.clone();
+                    foreign_key.name.clone_from(&option.name);
+                    foreign_key.columns.push(column.name.clone());
+                    builder = Self::process_foreign_key_table_constraint(
+                        &foreign_key,
+                        constraint_names::Slot::Column {
+                            column: column_position,
+                            option: option_position,
+                            def: column,
+                            held: option,
+                        },
+                        create_table,
+                        table_metadata,
+                        builder,
+                    )?;
+                }
+            }
+        }
+        for (position, constraint) in create_table.constraints.iter().enumerate() {
+            if let TableConstraint::ForeignKey(foreign_key) = constraint {
+                builder = Self::process_foreign_key_table_constraint(
+                    foreign_key,
+                    constraint_names::Slot::Table(position, constraint),
+                    create_table,
+                    table_metadata,
+                    builder,
+                )?;
+            }
+        }
+        Ok(builder)
+    }
+
+    /// Resolves and installs a foreign-key constraint.
+    fn process_foreign_key_table_constraint(
+        fk: &ForeignKeyConstraint,
+        slot: constraint_names::Slot<'_>,
+        create_table: &Arc<CreateTable>,
+        table_metadata: &mut TableMetadata<CreateTable>,
+        builder: ParserDBBuilder,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let case = builder.identifier_case();
         let postgres = matches!(builder.dialect(), SqlparserDialect::PostgreSql);
         let mut host_columns = Vec::new();
@@ -7424,7 +7456,7 @@ impl ParserDB {
         carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let case = builder.identifier_case();
-        for (position, constraint) in constraints.iter().enumerate() {
+        for constraint in constraints {
             Self::validate_key_columns(constraint, create_table, table_metadata, &builder)?;
             match constraint {
                 TableConstraint::Unique(uc) => {
@@ -7436,14 +7468,8 @@ impl ParserDB {
                         carried,
                     )?;
                 }
-                TableConstraint::ForeignKey(fk) => {
-                    builder = Self::process_foreign_key_table_constraint(
-                        fk,
-                        constraint_names::Slot::Table(position, constraint),
-                        create_table,
-                        table_metadata,
-                        builder,
-                    )?;
+                TableConstraint::ForeignKey(foreign_key) => {
+                    Self::validate_foreign_key_deferral(&builder, create_table, foreign_key)?;
                 }
                 TableConstraint::Check(check) => {
                     builder = Self::add_check_constraint(
@@ -7693,12 +7719,11 @@ impl ParserDB {
             table_metadata.add_column(Arc::new(TableAttribute::new(create_table.clone(), column)));
         }
 
-        for (column_position, column) in table_metadata.clone().column_arcs().enumerate() {
+        for column in table_metadata.clone().column_arcs() {
             let preserved_identity = preserved_column_identity(column.attribute(), preserved);
             carried.operators.build_column(preserved_identity);
             builder = Self::process_column_options(
                 column,
-                column_position,
                 &create_table,
                 &mut table_metadata,
                 builder,
@@ -7739,12 +7764,20 @@ impl ParserDB {
             builder,
             &mut carried,
         )?;
+        if !matches!(origin, TableOrigin::Declaration(..))
+            || (!builder.dialect().is_sqlite()
+                && create_table.query.is_none()
+                && table_metadata.virtual_source().is_none())
+        {
+            builder.ensure_table_lookup_invariants(&create_table)?;
+        }
+        builder = Self::process_foreign_keys(&create_table, &mut table_metadata, builder)?;
         Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
         referenced_keys::settle_key_creations(&mut builder, &create_table, &mut table_metadata);
 
-        Ok(builder.add_table_with_identity(create_table, table_metadata, identity)?)
+        Ok(builder.insert_table_with_identity(create_table, table_metadata, identity))
     }
 
     /// Records on `table_metadata` the calls and operator selections of the
@@ -12200,12 +12233,17 @@ impl ParserDB {
                     {
                         continue;
                     }
+                    if dialect.is_sqlite() {
+                        builder.ensure_table_lookup_invariants(&create_table)?;
+                    }
                     // SQLite refuses a taken name before the module reads its
                     // arguments.
                     let declaration = match &virtual_source {
                         Some(source) => {
                             validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
-                            builder.ensure_table_lookup_invariants(&create_table)?;
+                            if !dialect.is_sqlite() {
+                                builder.ensure_table_lookup_invariants(&create_table)?;
+                            }
                             virtual_tables::declare_columns(
                                 &builder,
                                 &mut create_table,
@@ -12241,7 +12279,9 @@ impl ParserDB {
                     let query_columns = table_as::query_columns(&builder, &create_table)?;
                     if create_table.query.is_some() {
                         validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
-                        builder.ensure_table_lookup_invariants(&create_table)?;
+                        if !dialect.is_sqlite() && virtual_source.is_none() {
+                            builder.ensure_table_lookup_invariants(&create_table)?;
+                        }
                     }
                     // The query's columns are the table's own, so they are in
                     // place before anything below reads the column list.

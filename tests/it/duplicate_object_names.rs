@@ -330,6 +330,152 @@ fn a_repeated_table_name_is_still_a_lookup_conflict() {
     );
 }
 
+fn assert_duplicate_parent(sql: &str) {
+    for refused in [parse(sql), ParserDB::parse::<sqlparser::dialect::GenericDialect>(sql)] {
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::IdentifierLookupError(LookupError::TableLookupConflict {
+                    table, conflicting_table, ..
+                })) if table == "parent" && conflicting_table == "parent"
+            ),
+            "got {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_table_with_inline_self_reference() {
+    assert_duplicate_parent(
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY, parent_id integer REFERENCES parent (id));",
+    );
+}
+
+#[test]
+fn duplicate_table_with_table_level_self_reference() {
+    assert_duplicate_parent(
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY, parent_id integer,
+             FOREIGN KEY (parent_id) REFERENCES parent);",
+    );
+}
+
+#[test]
+fn duplicate_table_with_qualified_self_reference() {
+    assert_duplicate_parent(
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY,
+             parent_id integer REFERENCES public.parent (id));",
+    );
+}
+
+#[test]
+fn duplicate_table_partition_with_self_reference() {
+    assert_duplicate_parent(
+        "CREATE TABLE root (id integer PRIMARY KEY, parent_id integer) PARTITION BY RANGE (id);
+         CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent PARTITION OF root
+             (FOREIGN KEY (parent_id) REFERENCES parent (id)) FOR VALUES FROM (0) TO (10);",
+    );
+}
+
+#[test]
+fn duplicate_table_with_other_reference() {
+    assert_duplicate_parent(
+        "CREATE TABLE other (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY, parent_id integer REFERENCES other (id));",
+    );
+}
+
+#[test]
+fn duplicate_table_with_self_reference_in_mysql_and_sqlite() {
+    for sql in [
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY, parent_id integer REFERENCES parent (id));",
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY, parent_id integer,
+             FOREIGN KEY (parent_id) REFERENCES parent);",
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer PRIMARY KEY,
+             parent_id integer REFERENCES public.parent (id));",
+    ] {
+        for refused in [
+            ParserDB::parse::<sqlparser::dialect::MySqlDialect>(sql),
+            ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(sql),
+        ] {
+            assert!(
+                matches!(
+                    &refused,
+                    Err(Error::IdentifierLookupError(LookupError::TableLookupConflict {
+                        table, conflicting_table, ..
+                    })) if table == "parent" && conflicting_table == "parent"
+                ),
+                "got {refused:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sqlite_duplicate_precedes_column_and_query_validation() {
+    for declaration in [
+        "CREATE TABLE parent (id integer, id integer);",
+        "CREATE TABLE parent (id integer PRIMARY KEY, second integer PRIMARY KEY);",
+        "CREATE TABLE parent (id integer NULL NOT NULL);",
+        "CREATE TABLE parent (id integer DEFAULT missing);",
+        "CREATE TABLE parent (id integer CHECK (missing > 0));",
+        "CREATE TABLE parent (id integer GENERATED ALWAYS AS (missing + 1) STORED);",
+        "CREATE TABLE parent AS SELECT missing;",
+    ] {
+        let sql = format!("CREATE TABLE parent (id integer PRIMARY KEY); {declaration}");
+        let refused = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(&sql);
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::IdentifierLookupError(LookupError::TableLookupConflict {
+                    table, conflicting_table, ..
+                })) if table == "parent" && conflicting_table == "parent"
+            ),
+            "got {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn postgres_unknown_collation_precedes_duplicate_table() {
+    let refused = parse(
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id text COLLATE nonexistent_collation);",
+    );
+    assert!(matches!(&refused, Err(Error::CollationNotFound { .. })), "got {refused:?}");
+}
+
+#[test]
+fn postgres_missing_key_column_precedes_duplicate_table() {
+    let refused = parse(
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer, PRIMARY KEY (missing));",
+    );
+    assert!(
+        matches!(&refused, Err(Error::IdentifierLookupError(LookupError::ColumnNotFound { .. }))),
+        "got {refused:?}"
+    );
+}
+
+#[test]
+fn postgres_invalid_deferral_precedes_duplicate_table() {
+    let refused = parse(
+        "CREATE TABLE parent (id integer PRIMARY KEY);
+         CREATE TABLE parent (id integer REFERENCES parent(id) NOT DEFERRABLE INITIALLY DEFERRED);",
+    );
+    assert!(
+        matches!(&refused, Err(Error::InitiallyDeferredNotDeferrable { .. })),
+        "got {refused:?}"
+    );
+}
+
 /// An index the statement does not name takes the first free name PostgreSQL
 /// would give it, so any number of them may sit on one table.
 #[test]
