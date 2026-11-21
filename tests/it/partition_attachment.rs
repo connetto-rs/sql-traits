@@ -217,6 +217,23 @@ fn a_foreign_key_is_matched_by_what_postgresql_stores_rather_than_by_its_spellin
     }
 }
 
+/// PostgreSQL keeps one of each key here, since unquoted names fold.
+#[test]
+fn a_key_the_attached_table_holds_under_another_spelling_is_kept_rather_than_doubled() {
+    let database = database(
+        "CREATE TABLE r (id INT PRIMARY KEY);
+         CREATE TABLE p (pid INT, a INT, k INT, FOREIGN KEY (pid) REFERENCES r (id),
+             UNIQUE (a, k), PRIMARY KEY (k)) PARTITION BY LIST (k);
+         CREATE TABLE c (pid INT, a INT, k INT NOT NULL,
+             CONSTRAINT ck FOREIGN KEY (PID) REFERENCES R (ID),
+             CONSTRAINT uk UNIQUE (A, K), CONSTRAINT pk PRIMARY KEY (K));
+         ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);",
+    );
+
+    assert_eq!(unique_index_names(&database, "c"), ["pk", "uk"]);
+    assert_eq!(foreign_key_names(&database, "c"), ["ck"]);
+}
+
 #[test]
 fn a_unique_constraint_does_not_stand_in_for_the_roots_primary_key() {
     let database = database(
