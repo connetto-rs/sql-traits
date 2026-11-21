@@ -364,7 +364,7 @@ fn is_key(constraint: &TableConstraint) -> bool {
 }
 
 /// The table constraint a key or foreign key written on `column` stands for.
-fn table_form(column: &Ident, option: &ColumnOptionDef) -> Option<TableConstraint> {
+pub(super) fn table_form(column: &Ident, option: &ColumnOptionDef) -> Option<TableConstraint> {
     let key_column = || {
         vec![IndexColumn {
             column: OrderByExpr {
@@ -401,7 +401,11 @@ fn table_form(column: &Ident, option: &ColumnOptionDef) -> Option<TableConstrain
 /// Whether two keys or foreign keys enforce the same thing, whatever each is
 /// called and however it spells the names it holds, which is how PostgreSQL
 /// matches an index or a foreign key.
-fn same_key(builder: &ParserDBBuilder, left: &TableConstraint, right: &TableConstraint) -> bool {
+pub(super) fn same_key(
+    builder: &ParserDBBuilder,
+    left: &TableConstraint,
+    right: &TableConstraint,
+) -> bool {
     let case = builder.identifier_case();
     match (left, right) {
         (TableConstraint::ForeignKey(left), TableConstraint::ForeignKey(right)) => {

@@ -11,6 +11,7 @@
 //! up an already complete parent.
 
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
     vec::Vec,
@@ -463,12 +464,7 @@ pub(super) fn is_copy_of_option(held: &ColumnOptionDef, written: &ColumnOptionDe
     without_generated_option_name(held) == without_generated_option_name(written)
 }
 
-/// Whether a parent still writes the same constraint on the same column.
-///
-/// Read from the parents rather than recorded, which is enough because a copy
-/// written on a column always arrives with the column and so is never the
-/// child's own. A table with two parents keeps its copy until the last of them
-/// stops writing it.
+/// Whether a parent supplies a constraint written on the child's column.
 pub(super) fn receives_column_constraint(
     builder: &ParserDBBuilder,
     child: &CreateTable,
@@ -476,6 +472,10 @@ pub(super) fn receives_column_constraint(
     option: &ColumnOptionDef,
 ) -> bool {
     let case = builder.identifier_case();
+    if matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_)) {
+        return super::attach_partition::table_form(written_on, option)
+            .is_some_and(|held| receives_partition_key(builder, child, &held));
+    }
     parents_with_kind(child).any(|(kind, name)| {
         option_passes_down(kind, &option.option)
             && builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
@@ -771,6 +771,42 @@ pub(super) fn is_copy_of(held: &TableConstraint, passed: &TableConstraint) -> bo
     without_generated_name(held) == without_generated_name(passed)
 }
 
+/// Primary and unique keys with their positions in either constraint location.
+pub(super) fn partition_keys(
+    node: &CreateTable,
+) -> impl Iterator<Item = (super::constraint_names::Position, Cow<'_, TableConstraint>)> {
+    use super::constraint_names::Position;
+    let columns = node.columns.iter().enumerate().flat_map(|(column, declared)| {
+        declared.options.iter().enumerate().filter_map(move |(position, option)| {
+            if !matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_)) {
+                return None;
+            }
+            super::attach_partition::table_form(&declared.name, option)
+                .map(|key| (Position::Column(column, position), Cow::Owned(key)))
+        })
+    });
+    let constraints = node.constraints.iter().enumerate().filter_map(|(position, constraint)| {
+        matches!(constraint, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_))
+            .then_some((Position::Table(position), Cow::Borrowed(constraint)))
+    });
+    columns.chain(constraints)
+}
+
+/// Whether the partition's parent supplies this key in either constraint
+/// location.
+fn receives_partition_key(
+    builder: &ParserDBBuilder,
+    child: &CreateTable,
+    held: &TableConstraint,
+) -> bool {
+    child.partition_of.as_ref().is_some_and(|name| {
+        builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
+            partition_keys(parent)
+                .any(|(_, passed)| super::attach_partition::same_key(builder, held, &passed))
+        })
+    })
+}
+
 /// The name the constraint is declared under, when the kind writes one.
 pub(super) fn declared_name(constraint: &TableConstraint) -> Option<&Ident> {
     match constraint {
@@ -798,6 +834,9 @@ pub(super) fn receives_constraint(
     child: &CreateTable,
     held: &TableConstraint,
 ) -> bool {
+    if matches!(held, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_)) {
+        return receives_partition_key(builder, child, held);
+    }
     parents_with_kind(child).any(|(kind, name)| {
         builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
             parent

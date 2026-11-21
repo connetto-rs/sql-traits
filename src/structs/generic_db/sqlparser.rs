@@ -8334,6 +8334,10 @@ impl ParserDB {
                 Ok(())
             })?;
 
+        if matches!(dropped, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_)) {
+            return Self::drop_partition_key_copies(builder, stored, dropped);
+        }
+
         if scope.only && inheritance::passes_down(inheritance::ParentKind::Inherits, &dropped) {
             // The tables below keep their copies, and each becomes the holder's
             // own now that nothing passes it down. A grandchild is untouched,
@@ -8563,11 +8567,6 @@ impl ParserDB {
 
     /// Drops a constraint written on one of the table's columns.
     ///
-    /// Nothing has to be recorded about where such a copy came from, unlike one
-    /// in the constraint list: a child's copy always arrives with the column it
-    /// is written on, so it can never be the child's own, and whether a parent
-    /// still writes it is read from the parents.
-    ///
     /// # Errors
     ///
     /// Returns [`crate::errors::Error::RequiredValueNotDroppable`] for a
@@ -8629,6 +8628,12 @@ impl ParserDB {
                 Ok(())
             })?;
 
+        if let Some(key) = attach_partition::table_form(written_on, option).filter(|key| {
+            matches!(key, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_))
+        }) {
+            return Self::drop_partition_key_copies(builder, stored, key);
+        }
+
         // `ONLY` stops the walk for a check or a `NOT NULL`, whose copies stay
         // with their holders. A key or a foreign key reaches only partitions,
         // which never keep a copy without the parent's.
@@ -8687,6 +8692,46 @@ impl ParserDB {
             }
         }
 
+        Ok(builder)
+    }
+
+    /// Removes an inherited primary or unique key from every partition below
+    /// its owner.
+    fn drop_partition_key_copies(
+        mut builder: ParserDBBuilder,
+        stored: &StoredTable,
+        dropped: TableConstraint,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let mut frontier = alloc::vec![(stored.clone(), dropped)];
+        while let Some((parent, passed)) = frontier.pop() {
+            for (kind, child) in inheritance::direct_children(&builder, &parent) {
+                if kind != inheritance::ParentKind::PartitionOf {
+                    continue;
+                }
+                let node = Self::stored_node(&builder, &child)?;
+                let Some((position, held)) =
+                    inheritance::partition_keys(node).find_map(|(position, key)| {
+                        attach_partition::same_key(&builder, &key, &passed)
+                            .then(|| (position, key.into_owned()))
+                    })
+                else {
+                    continue;
+                };
+                builder =
+                    Self::replace_table_node_removing(builder, &child, position, |_, node| {
+                        match position {
+                            constraint_names::Position::Table(position) => {
+                                node.constraints.remove(position);
+                            }
+                            constraint_names::Position::Column(column, option) => {
+                                node.columns[column].options.remove(option);
+                            }
+                        }
+                        Ok(())
+                    })?;
+                frontier.push((child, held));
+            }
+        }
         Ok(builder)
     }
 
