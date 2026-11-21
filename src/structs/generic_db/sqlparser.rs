@@ -12343,7 +12343,7 @@ impl ParserDB {
                     {
                         continue;
                     }
-                    if dialect.is_sqlite() {
+                    if dialect.is_sqlite() && virtual_source.is_none() {
                         builder.ensure_table_lookup_invariants(&create_table)?;
                     }
                     // SQLite refuses a taken name before the module reads its
@@ -12351,9 +12351,7 @@ impl ParserDB {
                     let declaration = match &virtual_source {
                         Some(source) => {
                             validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
-                            if !dialect.is_sqlite() {
-                                builder.ensure_table_lookup_invariants(&create_table)?;
-                            }
+                            builder.ensure_table_lookup_invariants(&create_table)?;
                             virtual_tables::declare_columns(
                                 &builder,
                                 &mut create_table,
