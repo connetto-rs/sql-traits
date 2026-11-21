@@ -313,6 +313,38 @@ fn a_detached_partition_keeps_the_key_its_copy_held() {
 }
 
 #[test]
+fn cascade_preserves_constraints_written_at_the_other_level() {
+    let database = parse(
+        "CREATE TABLE r (id INT PRIMARY KEY);
+         CREATE TABLE c (
+             x INT REFERENCES r,
+             y INT UNIQUE,
+             CONSTRAINT positive CHECK (y > 0),
+             FOREIGN KEY (y) REFERENCES r
+         );
+         ALTER TABLE r DROP CONSTRAINT r_pkey CASCADE;",
+    )
+    .expect("both foreign keys cascade");
+    assert_eq!(foreign_keys(&database, "c"), 0);
+    assert_eq!(unique_keys(&database, "c"), 1);
+}
+
+#[test]
+fn detaching_preserves_a_partitions_local_primary_key_reference() {
+    let detached = format!(
+        "{UNIQUE_THEN_PRIMARY}
+         CREATE TABLE c (x INT) PARTITION BY RANGE (x);
+         CREATE TABLE c1 (x INT REFERENCES r);
+         ALTER TABLE c ATTACH PARTITION c1 FOR VALUES FROM (0) TO (10);
+         ALTER TABLE c DETACH PARTITION c1;
+         ALTER TABLE r DROP CONSTRAINT u;"
+    );
+    let database = parse(&detached).expect("the older unique key is free");
+    assert_eq!(foreign_keys(&database, "c1"), 1);
+    refused_for(parse(&format!("{detached} ALTER TABLE r DROP CONSTRAINT pk;")), "pk", "r", "c1");
+}
+
+#[test]
 fn a_type_change_binds_the_key_again_to_the_oldest() {
     let referenced = format!(
         "{UNIQUE_THEN_PRIMARY}
