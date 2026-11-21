@@ -101,6 +101,7 @@ mod function_dependents;
 mod function_moves;
 mod generated_names;
 mod grantors;
+mod index_access_methods;
 mod inheritance;
 mod key_nullability;
 mod leading_comments;
@@ -7904,6 +7905,7 @@ impl ParserDB {
         };
         constraint_using_index::adopt(&mut builder, &stored, &mut constraint)?;
         Self::refuse_repeated_added_key_column(&builder, &stored, &constraint)?;
+        index_access_methods::refuse_in_constraint(&builder, &constraint)?;
         stored_expressions::refuse_in_constraint(&builder, &constraint)?;
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
         let case = builder.identifier_case();
@@ -11052,6 +11054,7 @@ impl ParserDB {
                     }
                 }
                 Statement::CreateIndex(mut create_index) => {
+                    index_access_methods::refuse_in_index(&builder, &create_index)?;
                     if let Some(index_name) = create_index.name.as_ref() {
                         require_named(index_name, crate::errors::ObjectKind::Index)?;
                     }
@@ -11817,6 +11820,9 @@ impl ParserDB {
                         domains::bind_type(&builder, &mut column.data_type, &type_arrays)?;
                     }
                     stored_expressions::refuse_in_table(&builder, &create_table)?;
+                    for constraint in &create_table.constraints {
+                        index_access_methods::refuse_in_constraint(&builder, constraint)?;
+                    }
 
                     if create_table.unlogged && create_table.partition_by.is_some() {
                         return Err(crate::errors::Error::UnloggedPartitionedTable {
