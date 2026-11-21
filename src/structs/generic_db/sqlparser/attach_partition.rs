@@ -139,7 +139,7 @@ pub(super) fn attach_partition(
     }
     triggers::clone_onto_partition(&mut builder, &root, &partition)?;
 
-    let mut frontier = vec![(partition, received)];
+    let mut frontier = vec![(partition.clone(), received)];
     while let Some((table, mut received)) = frontier.pop() {
         builder = apply(builder, &table, &mut received)?;
         if received.passed_on.is_empty() {
@@ -156,7 +156,7 @@ pub(super) fn attach_partition(
         }
     }
 
-    Ok(builder)
+    super::partition_indexes::receive_all(builder, &root, &partition)
 }
 
 /// Refuses a foreign table reaching a unique index of the root or of one of

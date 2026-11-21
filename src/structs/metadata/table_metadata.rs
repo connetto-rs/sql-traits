@@ -2,7 +2,7 @@
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
-use sqlparser::ast::{Action, ColumnDef, CreateTable, Privileges};
+use sqlparser::ast::{Action, ColumnDef, CreateTable, Ident, Privileges};
 
 use super::ExpressionCalls;
 use crate::{
@@ -76,6 +76,8 @@ pub struct TableMetadata<T: TableLike> {
     /// it follows from their nodes and is read when it is asked for. Held as
     /// renderings for the same reason the columns above are held as names.
     inherited_constraints: Vec<String>,
+    /// Index names paired with their immediate partition parent's index names.
+    partition_indexes: Vec<(Ident, Ident)>,
     /// The rendering of each table constraint the table holds without having
     /// checked the rows it held when the constraint was added.
     ///
@@ -151,6 +153,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             inherited_column_names: Vec::new(),
             inherited_not_null: Vec::new(),
             inherited_constraints: Vec::new(),
+            partition_indexes: Vec::new(),
             unvalidated_constraints: Vec::new(),
             generated_constraint_names: Vec::new(),
             key_creations: Vec::new(),
@@ -407,6 +410,16 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub fn set_inherited_constraints(&mut self, inherited_constraints: Vec<String>) {
         self.inherited_constraints = inherited_constraints;
+    }
+
+    /// Returns index attachments to the table's partition parent.
+    pub(crate) fn partition_indexes(&self) -> &[(Ident, Ident)] {
+        &self.partition_indexes
+    }
+
+    /// Returns index attachments to update during partition lifecycle changes.
+    pub(crate) fn partition_indexes_mut(&mut self) -> &mut Vec<(Ident, Ident)> {
+        &mut self.partition_indexes
     }
 
     /// Returns the rendering of each table constraint the table holds

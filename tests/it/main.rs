@@ -140,6 +140,7 @@ mod partition_bounds;
 mod partition_detachment;
 mod partition_keys;
 mod partition_triggers;
+mod partitioned_index_copies;
 mod per_object_grants;
 mod persisted_names_and_collations;
 mod plpgsql_dynamic_execution;
