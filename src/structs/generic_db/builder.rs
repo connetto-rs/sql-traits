@@ -279,6 +279,43 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         .into_database(P::default_ingestion(&self.dialect))
     }
 
+    /// Builds a database containing the types needed for coercion.
+    pub(crate) fn types_database(&self, ingestion: P::Ingestion) -> GenericDB<P> {
+        Self {
+            dialect: self.dialect.clone(),
+            catalog_name: self.catalog_name.clone(),
+            role_settings: Vec::new(),
+            views: Vec::new(),
+            materialized_views: Vec::new(),
+            sequences: Vec::new(),
+            dropped_sequences: Vec::new(),
+            tables: Vec::new(),
+            columns: Vec::new(),
+            indices: Vec::new(),
+            materialized_view_indices: Vec::new(),
+            unique_indices: Vec::new(),
+            foreign_keys: Vec::new(),
+            functions: Vec::new(),
+            builtins: Builtins::none(),
+            triggers: Vec::new(),
+            rules: Vec::new(),
+            extensions: Vec::new(),
+            domains: self.domains.clone(),
+            user_defined_types: self.user_defined_types.clone(),
+            policies: Vec::new(),
+            check_constraints: Vec::new(),
+            roles: Vec::new(),
+            role_memberships: Vec::new(),
+            schemas: self.schemas.clone(),
+            table_grants: Vec::new(),
+            column_grants: Vec::new(),
+            search_path: self.search_path.clone(),
+            identifier_case: self.identifier_case,
+            identities: self.identities,
+        }
+        .into_database(ingestion)
+    }
+
     /// Returns a mutable reference to the tables list.
     pub(crate) fn tables_mut(&mut self) -> &mut Vec<Identified<P::Table, RelationIdentity>> {
         &mut self.tables

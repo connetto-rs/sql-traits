@@ -98,6 +98,21 @@ impl Catalog {
         }))
     }
 
+    /// Builds the type catalog used by foreign key equality checks.
+    fn types_database(&self, access_resolution: AccessResolution) -> ParserDB {
+        self.builder.types_database(Arc::new(ParserIngestion {
+            access_resolution,
+            active_postgres_catalog: Arc::clone(&self.postgres),
+            type_arrays: Arc::clone(&self.type_arrays),
+            collation_metadata: Vec::new(),
+            unresolved_function_grants: Vec::new(),
+            role_alterations: Vec::new(),
+            session_roles: SessionRoles::default(),
+            session_settings: SessionSettings::default(),
+            default_privileges: DefaultPrivileges::default(),
+        }))
+    }
+
     fn apply(
         self,
         statement: Statement,
@@ -109,6 +124,13 @@ impl Catalog {
         // A drop without `CASCADE` may leave a default drawing from a dropped
         // sequence.
         let cascade = matches!(statement, Statement::Drop { cascade: true, .. });
+        let changed_table = super::foreign_key_types::changed_table(&statement).cloned();
+        let first_foreign_key = if matches!(&statement, Statement::CreateTable(table) if !table.or_replace)
+        {
+            self.builder.foreign_keys().len()
+        } else {
+            0
+        };
         let mut catalog = ParserDB::apply_statements(
             self,
             access_resolution,
@@ -127,9 +149,38 @@ impl Catalog {
         {
             catalog.builder.settle_operators_on_built_ins();
         }
+        let changed_tables = changed_table
+            .filter(|_| {
+                matches!(catalog.builder.dialect(), SqlparserDialect::PostgreSql)
+                    && !catalog.builder.foreign_keys().is_empty()
+            })
+            .map(|table| super::foreign_key_types::changed_tables(&catalog.builder, &table))
+            .filter(|tables| {
+                super::foreign_key_types::needs_validation(
+                    &catalog.builder,
+                    tables,
+                    first_foreign_key,
+                )
+            });
         if catalog.builder.has_unsettled_calls() {
             let database = catalog.snapshot(access_resolution);
             catalog.builder.settle_calls(&database, refuse)?;
+            if let Some(tables) = &changed_tables {
+                super::foreign_key_types::validate(
+                    &database,
+                    &catalog.builder,
+                    tables,
+                    first_foreign_key,
+                )?;
+            }
+        } else if let Some(tables) = &changed_tables {
+            let database = catalog.types_database(access_resolution);
+            super::foreign_key_types::validate(
+                &database,
+                &catalog.builder,
+                tables,
+                first_foreign_key,
+            )?;
         }
         Ok(catalog)
     }

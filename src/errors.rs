@@ -2265,6 +2265,27 @@ pub enum Error {
     /// foreign key column.
     #[error("invalid ON DELETE action for foreign key constraint containing generated column")]
     InvalidForeignKeyDeleteActionForGeneratedColumn,
+    /// PostgreSQL refuses a foreign key whose column types cannot compare
+    /// through its referenced key.
+    #[error("foreign key constraint \"{constraint_name}\" cannot be implemented")]
+    ForeignKeyCannotBeImplemented {
+        /// Name of the foreign key constraint.
+        constraint_name: Box<str>,
+        /// Name of the referencing table.
+        host_table: Box<str>,
+        /// Name of the referencing column.
+        host_column: Box<str>,
+        /// Name of the referenced table.
+        referenced_table: Box<str>,
+        /// Name of the referenced column.
+        referenced_column: Box<str>,
+    },
+    /// A stored PostgreSQL foreign key is missing its constraint name.
+    #[error("foreign key on table \"{host_table}\" has no recorded constraint name")]
+    ForeignKeyNameMissing {
+        /// Name of the referencing table.
+        host_table: Box<str>,
+    },
     #[error(
         "Cannot use the deferrable primary key of table `{referenced_table}` for the foreign key in table `{host_table}`."
     )]
