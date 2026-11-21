@@ -462,7 +462,8 @@ pub trait ColumnLike:
 
     /// Returns the collation rule used for string comparison.
     ///
-    /// A returned `Named` value always carries the declared `COLLATE` name. The
+    /// A returned `Named` value always carries the declared `COLLATE` name,
+    /// the last one written when SQLite accepts several. The
     /// backend-specific facts are `None` when the implementation has no catalog
     /// source for them. `ParserDB` fills PostgreSQL determinism from
     /// `CREATE COLLATION`, but it does not infer MySQL padding from a name.
