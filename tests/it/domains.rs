@@ -326,7 +326,7 @@ fn dropping_a_domain_a_column_uses_is_refused() {
     assert!(
         matches!(
             &error,
-            Error::DomainHasDependents { domain_name, dependent_kind: ObjectKind::Column, dependent_name }
+            Error::DomainHasDependents { domain_name, dependent_kind: ObjectKind::Column, dependent_name, .. }
                 if domain_name == "span" && dependent_name == "t.x"
         ),
         "{error:?}"
@@ -446,7 +446,17 @@ fn drop_domain_drops_every_named_domain() {
 #[test]
 fn dropping_a_catalog_type_as_a_domain_is_refused_even_if_exists() {
     let error = parse("DROP DOMAIN IF EXISTS name;").expect_err("`name` is a catalog type");
-    assert!(matches!(error, Error::DropDomainNotFound { .. }), "{error:?}");
+    assert!(
+        matches!(
+            error,
+            Error::RelationKindMismatch {
+                expected_kind: ObjectKind::Domain,
+                actual_kind: ObjectKind::Type,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]

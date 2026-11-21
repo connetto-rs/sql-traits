@@ -23,6 +23,7 @@ pub mod identifier_resolution;
 pub(crate) mod numeric_literal;
 pub(crate) mod object_name;
 pub(crate) mod operator_typing;
+pub(crate) mod postgres_format_type;
 mod postgres_null_returning;
 pub(crate) mod postgres_types;
 pub(crate) mod quote_identifier;

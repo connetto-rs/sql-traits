@@ -229,6 +229,7 @@ fn resolve_parent<'builder>(
                 object_kind,
                 relation_name: builder.dialect().stored_object_name_last(parent_name),
                 operation: AlterTableOperation::Inherit { parent: parent_name.clone() }.to_string(),
+                action: Some(crate::errors::RelationAlterAction::Command("INHERIT")),
             })
         }
         None => Err(absent_parent(builder, child_name, parent_name)),
@@ -240,6 +241,9 @@ fn absent_parent(
     child_name: &ObjectName,
     parent_name: &ObjectName,
 ) -> Error {
+    if let Some(schema_name) = super::missing_schema::missing_schema_name(builder, parent_name) {
+        return Error::SchemaNotFound { schema_name };
+    }
     Error::ParentTableNotFound {
         parent_table: builder.dialect().stored_object_name(parent_name),
         child_table: builder.dialect().stored_object_name_last(child_name),

@@ -210,8 +210,8 @@ impl SessionChange {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidSessionRole`] for a value list PostgreSQL
-    /// refuses, which is more than one value or a value naming no role.
+    /// Returns [`Error::MultipleSessionRoles`] for more than one value and
+    /// [`Error::InvalidSessionRole`] for a value naming no role.
     pub(super) fn of(
         statement: &Statement,
         hex_strings_may_be_integers: bool,
@@ -239,9 +239,11 @@ impl SessionChange {
                 let Some(parameter) = Parameter::of(variable) else {
                     return Ok(None);
                 };
-                let invalid = || Error::InvalidSessionRole { statement: statement.to_string() };
                 let [value] = values.as_slice() else {
-                    return Err(invalid());
+                    return Err(Error::MultipleSessionRoles {
+                        statement: statement.to_string(),
+                        setting: variable.to_string().to_ascii_lowercase(),
+                    });
                 };
                 let role = match value {
                     Expr::Identifier(ident)
@@ -251,8 +253,16 @@ impl SessionChange {
                         None
                     }
                     value => {
-                        let (name, quoted) = search_path_entry(value, hex_strings_may_be_integers)
-                            .map_err(|_| invalid())?;
+                        let Ok((name, quoted)) =
+                            search_path_entry(value, hex_strings_may_be_integers)
+                        else {
+                            return Err(Error::InvalidSessionRole {
+                                statement: statement.to_string(),
+                                written_token: crate::utils::setting_syntax::setting_syntax_token(
+                                    value,
+                                ),
+                            });
+                        };
                         Some(NamedRole::of(Ident {
                             value: name.into_owned(),
                             quote_style: quoted.then_some('"'),
@@ -572,8 +582,9 @@ impl DefaultPrivileges {
     /// Returns [`Error::InvalidDefaultPrivilege`] for a privilege the object
     /// type does not have, [`Error::DefaultPrivilegesInSchema`] for `IN
     /// SCHEMA` on `SCHEMAS` or `LARGE OBJECTS`,
-    /// [`Error::SchemaNotFoundForDefaultPrivileges`] for a schema the input
-    /// never creates and, under the closed world,
+    /// [`Error::QualifiedDefaultPrivilegesSchema`] for a qualified schema
+    /// name, [`Error::SchemaNotFoundForDefaultPrivileges`] for a schema the
+    /// input never creates and, under the closed world,
     /// [`Error::RoleNotFoundForGrant`] for a role it never creates.
     pub(super) fn alter(
         &mut self,
@@ -641,7 +652,7 @@ impl DefaultPrivileges {
         for schema in &schemas {
             // PostgreSQL's grammar takes a bare schema name here.
             let [ObjectNamePart::Identifier(ident)] = schema.0.as_slice() else {
-                return Err(Error::SchemaNotFoundForDefaultPrivileges {
+                return Err(Error::QualifiedDefaultPrivilegesSchema {
                     schema_name: builder.dialect().stored_object_name(schema),
                 });
             };

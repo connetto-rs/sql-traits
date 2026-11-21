@@ -166,9 +166,13 @@ fn reached<'name>(
         Some(reached) => Ok(Some(reached)),
         None if if_exists => Ok(None),
         None => {
+            if let Some(schema_name) = super::missing_schema::missing_schema_name(builder, name) {
+                return Err(Error::SchemaNotFound { schema_name });
+            }
             Err(Error::RelationNotFound {
                 object_kind: expected,
                 object_name: builder.dialect().stored_object_name(name),
+                drop_statement: false,
             })
         }
     }
@@ -184,5 +188,6 @@ fn kind_mismatch(
         object_name: builder.dialect().stored_object_name_last(name),
         expected_kind: expected,
         actual_kind: actual,
+        context: crate::errors::RelationKindContext::Statement,
     }
 }

@@ -103,6 +103,7 @@ pub(super) fn create(
             object_kind: ObjectKind::Index,
             conflicting_kind,
             object_name: builder.dialect().stored_name(index_name),
+            type_collision: false,
         });
     }
 

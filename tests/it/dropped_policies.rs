@@ -49,7 +49,7 @@ fn a_statement_naming_a_table_the_policy_is_not_on_is_refused() {
     .expect_err("b carries no policy called p");
 
     assert!(
-        matches!(&error, Error::DropPolicyNotFound { policy_name } if policy_name == "p"),
+        matches!(&error, Error::DropPolicyNotFound { policy_name, .. } if policy_name == "p"),
         "got {error:?}"
     );
 }
@@ -119,7 +119,7 @@ fn a_table_name_no_lookup_can_denote_matches_no_policy() {
     .expect_err("a three-part name denotes no table");
 
     assert!(
-        matches!(&error, Error::DropPolicyNotFound { policy_name } if policy_name == "docs_sel"),
+        matches!(&error, Error::DropPolicyNotFound { policy_name, .. } if policy_name == "docs_sel"),
         "got {error:?}"
     );
 }

@@ -9,6 +9,7 @@ use sqlstate::pg;
 use super::{Error, LookupError};
 
 mod lookup_columns;
+mod types_settings;
 
 /// An error as PostgreSQL 18 reports it, its SQLSTATE beside its primary
 /// message, without the detail, hint or position it may add.
@@ -294,49 +295,7 @@ impl Error {
             | Self::PartitionBoundInvalid { .. }
             | Self::PartitionBoundOverlaps { .. }
             | Self::PartitionNotAttachable { .. }
-            | Self::NoSchemaSelectedForCollation { .. }
-            | Self::RoleNotFoundForPolicy { .. }
-            | Self::DropRoleNotFound { .. }
-            | Self::DropIndexNotFound { .. }
-            | Self::DropTriggerNotFound { .. }
-            | Self::DropPolicyNotFound { .. }
-            | Self::RoleReferenced { .. }
-            | Self::RoleInUseBySession { .. }
-            | Self::RoleNotFoundForSession { .. }
-            | Self::InvalidSessionRole { .. }
-            | Self::NonLiteralSetting { .. }
-            | Self::InvalidTimeZone { .. }
-            | Self::SchemaNotFoundForDefaultPrivileges { .. }
-            | Self::DefaultPrivilegesInSchema { .. }
-            | Self::InvalidDefaultPrivilege { .. }
-            | Self::SchemaAlreadyExists { .. }
-            | Self::RelationNameAlreadyTaken { .. }
-            | Self::RelationNotFound { .. }
-            | Self::DropDomainNotFound { .. }
-            | Self::TypeNotFound { .. }
-            | Self::DomainHasDependents { .. }
-            | Self::TypeDropRequiredBy { .. }
-            | Self::TypeHasDependents { .. }
-            | Self::RelationKindMismatch { .. }
-            | Self::TypeRequiredBySystem { .. }
-            | Self::TypeIsOnlyShell { .. }
-            | Self::TypeIsRowType { .. }
-            | Self::CannotAlterArrayType { .. }
-            | Self::EnumLabelExists { .. }
-            | Self::EnumLabelNotFound { .. }
-            | Self::NotAnEnum { .. }
-            | Self::RangeSubtypeRequired { .. }
-            | Self::DuplicateEnumLabel { .. }
-            | Self::DuplicateCompositeAttribute { .. }
-            | Self::ConstraintUnsupportedOnForeignTable { .. }
-            | Self::RepeatedKeyColumn { .. }
-            | Self::ForeignOptionsOnTableColumn { .. }
-            | Self::RepeatedForeignOption { .. }
-            | Self::DropSchemaNotFound { .. }
-            | Self::AlterSchemaNotFound { .. }
-            | Self::AlterFunctionSchemaNotFound { .. }
             | Self::AlterActionUnsupportedOnRelation { .. }
-            | Self::MissingDefaultOperatorClass { .. }
             | Self::ForeignKeyCannotBeImplemented { .. }
             | Self::GenerationExpressionNotDroppable { .. }
             | Self::DatabaseOutsideSqlite { .. }
@@ -367,18 +326,315 @@ impl Error {
             | Self::MultiplePrimaryKeys { .. }
             | Self::AttachIndexNotSupported { .. }
             | Self::AttachIndexRefused { .. }
-            | Self::StorageParameterNotNamed { .. }
-            | Self::UnrecognizedStorageParameter { .. }
-            | Self::UnrecognizedStorageParameterNamespace { .. }
-            | Self::RepeatedStorageParameter { .. }
-            | Self::InvalidStorageParameterValue { .. }
-            | Self::StorageParameterOutOfBounds { .. }
             | Self::FunctionRowsNotPositive { .. }
             | Self::FunctionRowsWithoutSet { .. } => None,
+            Self::StorageParameterNotNamed { option, .. } => {
+                Some(types_settings::storage_option_not_named(option))
+            }
+            Self::UnrecognizedStorageParameter { parameter_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("unrecognized parameter {}", quoted(parameter_name)),
+                ))
+            }
+            Self::UnrecognizedStorageParameterNamespace { namespace } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("unrecognized parameter namespace {}", quoted(namespace)),
+                ))
+            }
+            Self::RepeatedStorageParameter { parameter_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("parameter {} specified more than once", quoted(parameter_name)),
+                ))
+            }
+            Self::InvalidStorageParameterValue { parameter_name, value_type, value } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!(
+                        "invalid value for {value_type} option {}: {value}",
+                        quoted(parameter_name)
+                    ),
+                ))
+            }
+            Self::StorageParameterOutOfBounds { parameter_name, value, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("value {value} out of bounds for option {}", quoted(parameter_name)),
+                ))
+            }
+            Self::MissingDefaultOperatorClass { type_name, access_method } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!(
+                        "data type {type_name} has no default operator class for access method \"{access_method}\""
+                    ),
+                ))
+            }
             #[cfg(feature = "git")]
             Self::GitError(..) => None,
             #[cfg(feature = "std")]
             Self::IoError(..) => None,
+            Self::NoSchemaSelectedForCollation { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_SCHEMA_NAME,
+                    "no schema has been selected to create in",
+                ))
+            }
+            Self::RoleNotFoundForPolicy { role_name, .. }
+            | Self::DropRoleNotFound { role_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("role {} does not exist", quoted(role_name)),
+                ))
+            }
+            Self::DropIndexNotFound { index_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("index {} does not exist", quoted(index_name)),
+                ))
+            }
+            Self::DropTriggerNotFound { trigger_name, table_name, table_exists } => {
+                table_name.as_ref().map(|table_name| {
+                    if *table_exists {
+                        PostgresError::new(
+                            pg::UNDEFINED_OBJECT,
+                            format!(
+                                "trigger {} for table {} does not exist",
+                                quoted(trigger_name),
+                                quoted(table_name),
+                            ),
+                        )
+                    } else {
+                        PostgresError::new(
+                            pg::UNDEFINED_TABLE,
+                            format!("relation {} does not exist", quoted(table_name)),
+                        )
+                    }
+                })
+            }
+            Self::DropPolicyNotFound { policy_name, table_name, table_exists } => {
+                Some(if *table_exists {
+                    PostgresError::new(
+                        pg::UNDEFINED_OBJECT,
+                        format!(
+                            "policy {} for table {} does not exist",
+                            quoted(policy_name),
+                            quoted(table_name),
+                        ),
+                    )
+                } else {
+                    PostgresError::new(
+                        pg::UNDEFINED_TABLE,
+                        format!("relation {} does not exist", quoted(table_name)),
+                    )
+                })
+            }
+            Self::RoleReferenced { role_name } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "role {} cannot be dropped because some objects depend on it",
+                        quoted(role_name)
+                    ),
+                ))
+            }
+            Self::RoleInUseBySession { refusal, .. } => Some(types_settings::role_in_use(*refusal)),
+            Self::RoleNotFoundForSession { role_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("role {} does not exist", quoted(role_name)),
+                ))
+            }
+            Self::InvalidSessionRole { written_token: token, .. }
+            | Self::NonLiteralSetting { written_token: token, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!("syntax error at or near {}", quoted(token)),
+                ))
+            }
+            Self::MultipleSessionRoles { setting, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("SET {setting} takes only one argument"),
+                ))
+            }
+            Self::InvalidTimeZone { value, reason } => {
+                Some(types_settings::timezone(value, *reason))
+            }
+            Self::QualifiedDefaultPrivilegesSchema { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "syntax error at or near \".\""))
+            }
+            Self::SchemaNotFoundForDefaultPrivileges { schema_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_SCHEMA_NAME,
+                    format!("schema {} does not exist", quoted(schema_name)),
+                ))
+            }
+            Self::DefaultPrivilegesInSchema { object_type } => {
+                Some(PostgresError::new(
+                    pg::INVALID_GRANT_OPERATION,
+                    format!("cannot use IN SCHEMA clause when using GRANT/REVOKE ON {object_type}"),
+                ))
+            }
+            Self::InvalidDefaultPrivilege { privilege, object_type } => {
+                Some(types_settings::default_privilege(privilege, object_type))
+            }
+            Self::SchemaAlreadyExists { schema_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_SCHEMA,
+                    format!("schema {} already exists", quoted(schema_name)),
+                ))
+            }
+            Self::RelationNameAlreadyTaken { type_collision, object_name, .. } => {
+                Some(types_settings::name_taken(*type_collision, object_name))
+            }
+            Self::RelationNotFound { object_kind, object_name, drop_statement } => {
+                Some(types_settings::relation_missing(object_name, *object_kind, *drop_statement))
+            }
+            Self::DropDomainNotFound { domain_name: type_name }
+            | Self::TypeNotFound { type_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("type {} does not exist", quoted(type_name)),
+                ))
+            }
+            Self::DomainHasDependents { type_display: type_name, .. }
+            | Self::TypeDropRequiredBy {
+                type_display: type_name,
+                requiring_kind: super::ObjectKind::Operator | super::ObjectKind::Cast,
+                ..
+            }
+            | Self::TypeHasDependents { type_display: type_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!("cannot drop type {type_name} because other objects depend on it"),
+                ))
+            }
+            Self::RelationKindMismatch { object_name, expected_kind, context, .. } => {
+                Some(types_settings::kind_mismatch(object_name, *expected_kind, *context))
+            }
+            Self::TypeRequiredBySystem { type_display: type_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop type {type_name} because it is required by the database system"
+                    ),
+                ))
+            }
+            Self::TypeIsOnlyShell { type_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("type {} is only a shell", quoted(type_name)),
+                ))
+            }
+            Self::TypeDropRequiredBy {
+                type_display: type_name,
+                requiring_kind,
+                requiring_display: requiring_name,
+                ..
+            } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop type {type_name} because {} {requiring_name} requires it",
+                        types_settings::kind(*requiring_kind)
+                    ),
+                ))
+            }
+            Self::TypeIsRowType { type_display: type_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{type_name} is a table's row type"),
+                ))
+            }
+            Self::CannotAlterArrayType { type_display: array_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("cannot alter array type {array_name}"),
+                ))
+            }
+            Self::EnumLabelExists { label, .. } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!("enum label {} already exists", quoted(label)),
+                ))
+            }
+            Self::EnumLabelNotFound { label, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("{} is not an existing enum label", quoted(label)),
+                ))
+            }
+            Self::NotAnEnum { type_display: type_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{type_name} is not an enum"),
+                ))
+            }
+            Self::RangeSubtypeRequired { empty_attributes, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    if *empty_attributes {
+                        "syntax error at or near \")\""
+                    } else {
+                        "type attribute \"subtype\" is required"
+                    },
+                ))
+            }
+            Self::DuplicateEnumLabel { .. } => {
+                Some(PostgresError::new(
+                    pg::UNIQUE_VIOLATION,
+                    "duplicate key value violates unique constraint \"pg_enum_typid_label_index\"",
+                ))
+            }
+            Self::DuplicateCompositeAttribute { attribute, .. } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_COLUMN,
+                    format!("column {} specified more than once", quoted(attribute)),
+                ))
+            }
+            Self::ConstraintUnsupportedOnForeignTable { constraint, .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "{} constraints are not supported on foreign tables",
+                        types_settings::constraint(*constraint)
+                    ),
+                ))
+            }
+            Self::RepeatedKeyColumn { column_name, constraint, .. } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_COLUMN,
+                    format!(
+                        "column {} appears twice in {} constraint",
+                        quoted(column_name),
+                        types_settings::constraint(*constraint)
+                    ),
+                ))
+            }
+            Self::ForeignOptionsOnTableColumn { table_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{} is not a foreign table", quoted(table_name)),
+                ))
+            }
+            Self::RepeatedForeignOption { option_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!("option {} provided more than once", quoted(option_name)),
+                ))
+            }
+            Self::DropSchemaNotFound { schema_name }
+            | Self::AlterSchemaNotFound { schema_name }
+            | Self::AlterFunctionSchemaNotFound { schema_name, .. }
+            | Self::SchemaNotFound { schema_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_SCHEMA_NAME,
+                    format!("schema {} does not exist", quoted(schema_name)),
+                ))
+            }
             Self::UnknownColumn { reference } | Self::ForeignColumnReference { reference, .. } => {
                 Some(reference.postgres_error())
             }

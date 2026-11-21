@@ -431,7 +431,7 @@ fn drop_foreign_table_drops_only_a_foreign_table() {
     }
     assert!(matches!(
         refusal("DROP FOREIGN TABLE nowhere;"),
-        Error::RelationNotFound { object_kind: ObjectKind::ForeignTable, object_name } if object_name == "nowhere"
+        Error::RelationNotFound { object_kind: ObjectKind::ForeignTable, object_name, .. } if object_name == "nowhere"
     ));
 
     // A name of another kind anywhere in the list refuses the whole statement.

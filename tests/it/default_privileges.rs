@@ -565,7 +565,7 @@ fn postgresql_refusals_are_kept() {
         ),
         (
             "ALTER DEFAULT PRIVILEGES IN SCHEMA public.nested GRANT SELECT ON TABLES TO PUBLIC;",
-            "SchemaNotFoundForDefaultPrivileges",
+            "QualifiedDefaultPrivilegesSchema",
         ),
         (
             "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON LARGE OBJECTS TO PUBLIC;",
@@ -594,7 +594,7 @@ fn postgresql_refusals_are_kept() {
         ("SET SESSION AUTHORIZATION nosuch;", "RoleNotFoundForSession"),
         ("CREATE ROLE r; SET role = 'NONE';", "RoleNotFoundForSession"),
         ("CREATE ROLE r; SET role = 1;", "RoleNotFoundForSession"),
-        ("CREATE ROLE r; SET role = r, r;", "InvalidSessionRole"),
+        ("CREATE ROLE r; SET role = r, r;", "MultipleSessionRoles"),
         ("CREATE ROLE r; SET session_authorization = 1 + 1;", "InvalidSessionRole"),
         (
             "CREATE ROLE anon;

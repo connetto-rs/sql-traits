@@ -115,6 +115,7 @@ mod key_nullability;
 mod leading_comments;
 mod like;
 mod materialized_view_indexes;
+mod missing_schema;
 mod operator_carry;
 mod operator_ddl;
 mod parse_options;
@@ -584,6 +585,10 @@ fn create_collation_deterministic(
             column_metadata_for_collation_name(source, collations, catalog, search_path)
                 .map(|metadata| metadata.postgres_deterministic())
                 .ok_or_else(|| {
+                    if let Some(schema_name) = missing_schema::missing_schema_name(builder, source)
+                    {
+                        return crate::errors::Error::SchemaNotFound { schema_name };
+                    }
                     crate::errors::Error::CollationNotFound {
                         collation_name: dialect.stored_object_name(source).into_boxed_str(),
                     }
@@ -1177,16 +1182,17 @@ fn should_validate_missing_collations(dialect: SqlparserDialect) -> bool {
 }
 
 fn column_metadata_for_collations(
+    builder: &ParserDBBuilder,
     column: &ColumnDef,
     collations: &[CreatedCollationMetadata],
     catalog: &PostgresCatalog,
     search_path: &[(String, bool)],
     preserved: &[PreservedColumnMetadata],
-    validate_missing: bool,
 ) -> Result<ColumnMetadata, crate::errors::Error> {
     if let Some(metadata) = preserved_column_metadata_for_column(column, preserved) {
         return Ok(metadata);
     }
+    let validate_missing = should_validate_missing_collations(*builder.dialect());
     let Some(name) = column_collation_name(column, validate_missing)? else {
         return Ok(ColumnMetadata::default().with_postgres_default_collation());
     };
@@ -1194,6 +1200,9 @@ fn column_metadata_for_collations(
         .map_or_else(
             || {
                 if validate_missing {
+                    if let Some(schema_name) = missing_schema::missing_schema_name(builder, name) {
+                        return Err(crate::errors::Error::SchemaNotFound { schema_name });
+                    }
                     Err(crate::errors::Error::CollationNotFound {
                         collation_name: SqlparserDialect::PostgreSql
                             .stored_object_name(name)
@@ -2010,6 +2019,7 @@ impl ParserDBBuilder {
         table: &CreateTable,
         name: &ObjectName,
         refused: &[ObjectKind],
+        context: crate::errors::RelationKindContext,
     ) -> Result<(), crate::errors::Error> {
         let actual_kind = self.stored_table_kind(table);
         if refused.contains(&actual_kind) {
@@ -2017,6 +2027,7 @@ impl ParserDBBuilder {
                 object_name: self.dialect().stored_object_name_last(name),
                 expected_kind: ObjectKind::Table,
                 actual_kind,
+                context,
             });
         }
         Ok(())
@@ -2339,7 +2350,13 @@ impl ParserDBBuilder {
                 object_name: self.dialect().stored_object_name_last(&create_index.table_name),
                 expected_kind: ObjectKind::Table,
                 actual_kind,
+                context: crate::errors::RelationKindContext::Index,
             });
+        }
+        if let Some(schema_name) =
+            missing_schema::missing_schema_name(self, &create_index.table_name)
+        {
+            return Err(crate::errors::Error::SchemaNotFound { schema_name });
         }
         Err(crate::errors::Error::TableNotFoundForIndex {
             table_name: self.dialect().stored_object_name(&create_index.table_name),
@@ -2407,6 +2424,7 @@ impl ParserDBBuilder {
                     object_name: self.dialect().stored_object_name_last(name),
                     expected_kind: ObjectKind::Index,
                     actual_kind,
+                    context: crate::errors::RelationKindContext::Statement,
                 })
             }
         }
@@ -4151,6 +4169,20 @@ fn schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bo
         || declared_schema(builder, name, quoted).is_some()
 }
 
+/// Refuses an alteration whose qualified target names an absent PostgreSQL
+/// schema.
+fn require_alter_schema(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+) -> Result<(), crate::errors::Error> {
+    if *builder.dialect() == SqlparserDialect::PostgreSql
+        && let Some(schema_name) = missing_schema::missing_schema_name(builder, name)
+    {
+        return Err(crate::errors::Error::SchemaNotFound { schema_name });
+    }
+    Ok(())
+}
+
 fn collation_schema_is_declared(builder: &ParserDBBuilder, name: &str, quoted: bool) -> bool {
     identifiers_match(name, quoted, "pg_catalog", false)
         || schema_is_declared(builder, name, quoted)
@@ -4483,6 +4515,7 @@ fn refuse_alter_foreign_table_of_other_kind(
         object_name: builder.dialect().stored_object_name_last(&alter_table.name),
         expected_kind: ObjectKind::ForeignTable,
         actual_kind,
+        context: crate::errors::RelationKindContext::Statement,
     })
 }
 
@@ -5117,6 +5150,7 @@ fn skip_existing_index(
         object_kind: ObjectKind::Index,
         conflicting_kind,
         object_name: builder.dialect().stored_name(index_name),
+        type_collision: false,
     })
 }
 
@@ -5429,6 +5463,8 @@ fn validate_relation_names(
                 object_kind: *object_kind,
                 conflicting_kind,
                 object_name: builder.dialect().stored_name(name),
+                type_collision: matches!(conflicting_kind, ObjectKind::Type | ObjectKind::Domain)
+                    && holder.is_none(),
             });
         }
     }
@@ -5603,6 +5639,9 @@ fn validate_access_targets_against_builder(
                 && views::holds_view(builder, table_obj).is_none()
                 && !sequences::holds_sequence(builder, table_obj)
             {
+                if let Some(schema_name) = missing_schema::missing_schema_name(builder, table_obj) {
+                    return Err(crate::errors::Error::SchemaNotFound { schema_name });
+                }
                 return Err(crate::errors::Error::TableNotFoundForGrant {
                     table_name: builder.dialect().stored_object_name(table_obj),
                 });
@@ -7016,6 +7055,7 @@ impl ParserDB {
             table,
             &create_index.table_name,
             &[ObjectKind::ForeignTable, ObjectKind::VirtualTable],
+            crate::errors::RelationKindContext::Index,
         )?;
         index_access_methods::refuse_in_index(builder, &create_index)?;
         if *builder.dialect() == SqlparserDialect::PostgreSql {
@@ -7065,6 +7105,7 @@ impl ParserDB {
             if if_exists {
                 return Ok(builder);
             }
+            require_alter_schema(&builder, old_name)?;
             return Err(crate::errors::Error::RenameTableNotFound {
                 table_name: builder.dialect().stored_object_name(old_name),
             });
@@ -7082,6 +7123,13 @@ impl ParserDB {
                 object_kind: ObjectKind::Table,
                 conflicting_kind,
                 object_name: builder.dialect().stored_name(new_ident),
+                type_collision: relation_name_holder(
+                    &builder,
+                    new_ident,
+                    qualifier_of(&target.name).named(),
+                    None,
+                )
+                .is_none(),
             });
         }
         let changing_schema = !schema_qualifiers_match(
@@ -7673,6 +7721,11 @@ impl ParserDB {
             |key| builder.relation_key_is_held(key, case),
         )?;
         let Some(referenced_table) = referenced_table else {
+            if let Some(schema_name) =
+                missing_schema::missing_schema_name(builder, &fk.foreign_table)
+            {
+                return Err(crate::errors::Error::SchemaNotFound { schema_name });
+            }
             // A view holding the name is a different complaint: the relation
             // exists and simply cannot be referenced, which is what the
             // database reports.
@@ -7681,6 +7734,7 @@ impl ParserDB {
                     object_name: builder.dialect().stored_object_name_last(&fk.foreign_table),
                     expected_kind: ObjectKind::Table,
                     actual_kind,
+                    context: crate::errors::RelationKindContext::ForeignKey,
                 });
             }
             return Err(crate::errors::Error::ReferencedTableNotFoundForForeignKey {
@@ -7692,6 +7746,7 @@ impl ParserDB {
             referenced_table,
             &fk.foreign_table,
             &[ObjectKind::ForeignTable],
+            crate::errors::RelationKindContext::ForeignKey,
         )?;
         Ok(referenced_table)
     }
@@ -8239,7 +8294,6 @@ impl ParserDB {
         };
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
-        let validate_missing = should_validate_missing_collations(*builder.dialect());
 
         for column in create_table.columns.clone() {
             table_metadata.add_column(Arc::new(TableAttribute::new(create_table.clone(), column)));
@@ -8260,12 +8314,12 @@ impl ParserDB {
             let mut calls = builder.calls_carried(column.attribute(), &mut carried);
             carried.operators.take_column(preserved_identity, column.attribute(), &mut calls);
             let metadata = column_metadata_for_collations(
+                &builder,
                 column.attribute(),
                 collations,
                 catalog,
                 &search_path,
                 preserved,
-                validate_missing,
             )?
             .with_calls(calls);
             let metadata = origin.declared_column(&column.attribute().name, metadata);
@@ -9006,6 +9060,9 @@ impl ParserDB {
             if if_exists {
                 return Ok(builder);
             }
+            if let Some(schema_name) = missing_schema::missing_schema_name(&builder, name) {
+                return Err(crate::errors::Error::SchemaNotFound { schema_name });
+            }
             return Err(crate::errors::Error::DropIndexNotFound {
                 index_name: builder.dialect().stored_object_name_last(name),
             });
@@ -9472,6 +9529,7 @@ impl ParserDB {
             if if_exists {
                 return Ok(builder);
             }
+            require_alter_schema(&builder, table_name)?;
             return Err(crate::errors::Error::AlterTableNotFound {
                 table_name: builder.dialect().stored_object_name(table_name),
             });
@@ -9515,6 +9573,7 @@ impl ParserDB {
             Some(resolved) => Ok(Some(StoredTable::of(resolved))),
             None if scope.if_exists => Ok(None),
             None => {
+                require_alter_schema(builder, table_name)?;
                 Err(crate::errors::Error::AlterTableNotFound {
                     table_name: builder.dialect().stored_object_name(table_name),
                 })
@@ -9612,7 +9671,12 @@ impl ParserDB {
                             .as_deref()
                             .unwrap_or_default()
                             .iter()
-                            .map(ToString::to_string)
+                            .map(|argument| {
+                                domains::format_type_for_builder(
+                                    builder,
+                                    &crate::utils::postgres_types::PgType::of(&argument.data_type),
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join(", "),
                     ),
@@ -9638,6 +9702,7 @@ impl ParserDB {
         let matching = Self::functions_named(builder, func_desc, arrays, RoutineKeyword::Function)?;
 
         let Some(&position) = matching.first() else {
+            require_alter_schema(builder, &func_desc.name)?;
             return Err(crate::errors::Error::AlterFunctionNotFound {
                 function_name: builder.dialect().stored_object_name(&func_desc.name),
             });
@@ -10296,6 +10361,7 @@ impl ParserDB {
                         object_kind,
                         relation_name: dialect.stored_object_name_last(&alter_table.name),
                         operation: operation.to_string(),
+                        action: views::alter_action(&operation, object_kind),
                     });
                 }
             }
@@ -10876,12 +10942,12 @@ impl ParserDB {
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
         let inherited_metadata = column_metadata_for_collations(
+            &builder,
             &inherited_def,
             context.created,
             context.catalog,
             &search_path,
             &[],
-            should_validate_missing_collations(*builder.dialect()),
         )?;
 
         let case = builder.identifier_case();
@@ -12178,6 +12244,11 @@ impl ParserDB {
                             if drop_function.if_exists {
                                 continue;
                             }
+                            if let Some(schema_name) =
+                                missing_schema::missing_schema_name(&builder, &func_desc.name)
+                            {
+                                return Err(crate::errors::Error::SchemaNotFound { schema_name });
+                            }
                             return Err(if routine == RoutineKeyword::Procedure {
                                 crate::errors::Error::DropProcedureNotFound {
                                     procedure_name: builder
@@ -12289,6 +12360,13 @@ impl ParserDB {
                             Some(table) => targets.push(StoredTable::of(table)),
                             None if if_exists => {}
                             None if expected_kind == ObjectKind::Table => {
+                                if let Some(schema_name) =
+                                    missing_schema::missing_schema_name(&builder, name)
+                                {
+                                    return Err(crate::errors::Error::SchemaNotFound {
+                                        schema_name,
+                                    });
+                                }
                                 return Err(crate::errors::Error::DropTableNotFound {
                                     table_name: builder.dialect().stored_object_name_last(name),
                                 });
@@ -12297,6 +12375,7 @@ impl ParserDB {
                                 return Err(crate::errors::Error::RelationNotFound {
                                     object_kind: expected_kind,
                                     object_name: dialect.stored_object_name_last(name),
+                                    drop_statement: true,
                                 });
                             }
                         }
@@ -12376,6 +12455,7 @@ impl ParserDB {
                         continue;
                     }
                     let Some(slot) = builder.index_position(&name)? else {
+                        require_alter_schema(&builder, &name)?;
                         return Err(crate::errors::Error::AlterIndexNotFound {
                             index_name: builder.dialect().stored_object_name(&name),
                         });
@@ -12404,6 +12484,7 @@ impl ParserDB {
                             object_kind: ObjectKind::Index,
                             conflicting_kind,
                             object_name: dialect.stored_name(new_ident),
+                            type_collision: false,
                         });
                     }
 
@@ -12474,8 +12555,24 @@ impl ParserDB {
                         if drop_policy.if_exists {
                             continue;
                         }
+                        if let Some(schema_name) =
+                            missing_schema::missing_schema_name(&builder, &drop_policy.table_name)
+                        {
+                            return Err(crate::errors::Error::SchemaNotFound { schema_name });
+                        }
                         return Err(crate::errors::Error::DropPolicyNotFound {
                             policy_name: dialect.stored_name(&drop_policy.name),
+                            table_name: if builder
+                                .relation_reached(&drop_policy.table_name)
+                                .is_some()
+                            {
+                                dialect.stored_object_name_last(&drop_policy.table_name)
+                            } else {
+                                dialect.stored_object_name(&drop_policy.table_name)
+                            },
+                            table_exists: builder
+                                .relation_reached(&drop_policy.table_name)
+                                .is_some(),
                         });
                     };
 
@@ -12513,6 +12610,13 @@ impl ParserDB {
                         if session_roles.runs_as(role_ident) {
                             return Err(crate::errors::Error::RoleInUseBySession {
                                 role_name: dialect.stored_name(role_ident),
+                                refusal: if session_roles.creating_role()
+                                    == Some(stored_role_name(role_ident).as_str())
+                                {
+                                    crate::errors::SessionRoleRefusal::DropCurrent
+                                } else {
+                                    crate::errors::SessionRoleRefusal::DropSession
+                                },
                             });
                         }
                         if builder.is_role_referenced(role_ident)
@@ -12547,6 +12651,13 @@ impl ParserDB {
                     if session_roles.runs_as(&name) {
                         return Err(crate::errors::Error::RoleInUseBySession {
                             role_name: dialect.stored_name(&name),
+                            refusal: if session_roles.session_role()
+                                == Some(stored_role_name(&name).as_str())
+                            {
+                                crate::errors::SessionRoleRefusal::RenameSession
+                            } else {
+                                crate::errors::SessionRoleRefusal::RenameCurrent
+                            },
                         });
                     }
 
@@ -13403,7 +13514,13 @@ impl ParserDB {
                                 object_name: dialect.stored_object_name_last(&policy.table_name),
                                 expected_kind: crate::errors::ObjectKind::Table,
                                 actual_kind,
+                                context: crate::errors::RelationKindContext::Statement,
                             });
+                        }
+                        if let Some(schema_name) =
+                            missing_schema::missing_schema_name(&builder, &policy.table_name)
+                        {
+                            return Err(crate::errors::Error::SchemaNotFound { schema_name });
                         }
                         return Err(crate::errors::Error::TableNotFoundForPolicy {
                             table_name: builder.dialect().stored_object_name(&policy.table_name),
@@ -13414,6 +13531,7 @@ impl ParserDB {
                         table,
                         &policy.table_name,
                         &[ObjectKind::ForeignTable],
+                        crate::errors::RelationKindContext::Statement,
                     )?;
                     builder.bind_table_reference(&mut policy.table_name);
                     column_references::refuse_in_expressions(
@@ -13985,6 +14103,7 @@ impl ParserDB {
                                 builder.identifier_case(),
                             )
                     }) else {
+                        require_alter_schema(&builder, &table_name)?;
                         return Err(crate::errors::Error::AlterPolicyNotFound {
                             policy_name: builder.dialect().stored_name(&name),
                         });

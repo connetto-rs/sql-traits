@@ -525,6 +525,11 @@ impl<'b> Binder<'b> {
         takes: impl Fn(Option<&[OperateFunctionArg]>) -> bool,
     ) -> Result<(CatalogName, &'b CreateFunction), Error> {
         let not_found = || {
+            if let Some(schema_name) =
+                super::missing_schema::missing_schema_name(self.builder, name)
+            {
+                return Error::SchemaNotFound { schema_name };
+            }
             Error::OperatorFunctionNotFound {
                 operator_name: self.symbol.into(),
                 function_name: self.builder.dialect().stored_object_name(name).into(),

@@ -226,6 +226,11 @@ impl Reached {
         builder: &ParserDBBuilder,
     ) -> Result<(), Error> {
         if access_resolution == AccessResolution::ClosedWorld {
+            if let Some(schema_name) =
+                super::missing_schema::missing_schema_name(builder, &signature.name)
+            {
+                return Err(Error::SchemaNotFound { schema_name });
+            }
             return Err(Error::FunctionNotFoundForGrant {
                 function_name: builder.dialect().stored_object_name(&signature.name),
             });

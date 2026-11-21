@@ -144,7 +144,7 @@ fn constraint_collision_matrix() {
                     let numbered = kind != "idx" || matches!(holder, "pkey" | "key" | "excl");
                     let expected = format!("{candidate}{}", if numbered { "1" } else { "" });
                     let matches = if relation_collision {
-                        matches!(&result, Err(Error::RelationNameAlreadyTaken { object_kind: ObjectKind::UniqueIndex, conflicting_kind: ObjectKind::UniqueIndex, object_name }) if object_name == &candidate)
+                        matches!(&result, Err(Error::RelationNameAlreadyTaken { object_kind: ObjectKind::UniqueIndex, conflicting_kind: ObjectKind::UniqueIndex, object_name, type_collision: false }) if object_name == &candidate)
                     } else if constraint_collision {
                         matches!(&result, Err(Error::ConstraintAlreadyExists { table_name, constraint_name }) if table_name == "r" && constraint_name == &candidate)
                     } else {
@@ -227,6 +227,7 @@ fn later_named_constraints_collide_in_creation_order() {
                             object_kind: ObjectKind::UniqueIndex,
                             conflicting_kind: ObjectKind::UniqueIndex,
                             object_name,
+                            type_collision: false,
                         }) if object_name == candidate
                     ),
                     "{sql}"
@@ -358,6 +359,7 @@ fn grouped_alterations_follow_constraint_passes() {
                                 object_kind: ObjectKind::UniqueIndex,
                                 conflicting_kind: ObjectKind::UniqueIndex,
                                 object_name,
+                                type_collision: false,
                             }) if object_name == candidate
                         ),
                         "{sql}"

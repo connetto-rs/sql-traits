@@ -3405,7 +3405,9 @@ mod tests {
             CREATE TABLE t (name TEXT COLLATE app.ci);
             ",
         );
-        assert!(matches!(result, Err(Error::CollationNotFound { .. })));
+        assert!(
+            matches!(result, Err(Error::SchemaNotFound { schema_name }) if schema_name == "app")
+        );
     }
 
     #[test]

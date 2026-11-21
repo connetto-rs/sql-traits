@@ -234,7 +234,7 @@ fn a_value_postgresql_does_not_read_as_a_literal_is_refused() {
         assert!(
             matches!(
                 refusal(&format!("CREATE ROLE r; {sql}")),
-                Error::NonLiteralSetting { statement } if statement == rendered
+                Error::NonLiteralSetting { statement, .. } if statement == rendered
             ),
             "{sql} is refused"
         );

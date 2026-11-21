@@ -52,7 +52,7 @@ use super::{
     view_rewrites::{self, Rename},
 };
 use crate::{
-    errors::{Error, LookupError, ObjectKind},
+    errors::{Error, KeyConstraint, LookupError, ObjectKind},
     impls::{SqlparserDialect, dql::query_output_names},
     structs::{
         IdentifierCase, MaterializedView, View, ViewDeclaration, metadata::ViewMetadata,
@@ -190,6 +190,7 @@ pub(super) fn create_view(
             object_kind: kind,
             conflicting_kind,
             object_name: builder.dialect().stored_name(name_ident),
+            type_collision: relation_name_holder(&builder, name_ident, schema, None).is_none(),
         });
     }
     if node.materialized {
@@ -442,12 +443,19 @@ pub(super) fn drop_views(
                     object_name: builder.dialect().stored_object_name_last(name),
                     expected_kind,
                     actual_kind,
+                    context: crate::errors::RelationKindContext::Statement,
                 });
             }
             None if !if_exists => {
+                if let Some(schema_name) =
+                    super::missing_schema::missing_schema_name(&builder, name)
+                {
+                    return Err(Error::SchemaNotFound { schema_name });
+                }
                 return Err(Error::RelationNotFound {
                     object_kind: expected_kind,
                     object_name: builder.dialect().stored_object_name_last(name),
+                    drop_statement: true,
                 });
             }
             None => {}
@@ -497,6 +505,7 @@ pub(super) fn refuse_dropping_other_kind(
                 object_name: builder.dialect().stored_object_name_last(name),
                 expected_kind,
                 actual_kind,
+                context: crate::errors::RelationKindContext::Statement,
             })
         }
         _ => Ok(()),
@@ -564,6 +573,7 @@ pub(super) fn alter_view(
                 object_kind: kind,
                 relation_name: builder.dialect().stored_object_name_last(name),
                 operation: other.to_string(),
+                action: alter_action(other, kind),
             })
         }
     }
@@ -616,15 +626,22 @@ pub(super) fn apply_alter_view(
                             object_name: builder.dialect().stored_object_name_last(name),
                             expected_kind: kind,
                             actual_kind,
+                            context: crate::errors::RelationKindContext::Statement,
                         })
                     }
                 }
             }
             None if *if_exists => Ok(builder),
             None => {
+                if let Some(schema_name) =
+                    super::missing_schema::missing_schema_name(&builder, name)
+                {
+                    return Err(Error::SchemaNotFound { schema_name });
+                }
                 Err(Error::RelationNotFound {
                     object_kind: kind,
                     object_name: builder.dialect().stored_object_name(name),
+                    drop_statement: false,
                 })
             }
         };
@@ -643,11 +660,12 @@ pub(super) fn apply_alter_view(
         AlterViewOperation::RenameColumn { old_column_name, new_column_name } => {
             rename_view_column(builder, name, kind, old_column_name, new_column_name)
         }
-        AlterViewOperation::AlterColumn { .. } if *materialized => {
+        AlterViewOperation::AlterColumn { op, .. } if *materialized => {
             Err(Error::AlterActionUnsupportedOnRelation {
                 object_kind: kind,
                 relation_name: builder.dialect().stored_object_name_last(name),
                 operation: operation.to_string(),
+                action: Some(crate::errors::RelationAlterAction::Command(column_action(op))),
             })
         }
         AlterViewOperation::AlterColumn { column_name, .. } => {
@@ -697,6 +715,7 @@ fn rename_column_of_other_kind(
                 object_kind: actual_kind,
                 relation_name: builder.dialect().stored_object_name_last(name),
                 operation: operation.to_string(),
+                action: Some(crate::errors::RelationAlterAction::RenameColumns),
             })
         }
         _ => {
@@ -706,6 +725,86 @@ fn rename_column_of_other_kind(
             })
         }
     }
+}
+
+/// The PostgreSQL action tag for a column alteration.
+fn column_action(operation: &AlterColumnOperation) -> &'static str {
+    match operation {
+        AlterColumnOperation::SetNotNull => "ALTER COLUMN ... SET NOT NULL",
+        AlterColumnOperation::DropNotNull => "ALTER COLUMN ... DROP NOT NULL",
+        AlterColumnOperation::SetDefault { .. } => "ALTER COLUMN ... SET DEFAULT",
+        AlterColumnOperation::DropDefault => "ALTER COLUMN ... DROP DEFAULT",
+        AlterColumnOperation::SetDataType { .. } => "ALTER COLUMN ... SET DATA TYPE",
+        AlterColumnOperation::AddGenerated { .. } => "ALTER COLUMN ... ADD IDENTITY",
+        AlterColumnOperation::GenericOptions { .. } => "ALTER COLUMN ... OPTIONS",
+        AlterColumnOperation::DropExpression { .. } => "ALTER COLUMN ... DROP EXPRESSION",
+    }
+}
+
+/// The PostgreSQL refusal represented by an unsupported alteration.
+pub(super) fn alter_action(
+    operation: &AlterTableOperation,
+    kind: ObjectKind,
+) -> Option<crate::errors::RelationAlterAction> {
+    use sqlparser::ast::TableConstraint;
+
+    use crate::errors::RelationAlterAction;
+    if kind == ObjectKind::VirtualTable {
+        return None;
+    }
+    Some(match operation {
+        AlterTableOperation::RenameColumn { .. } => RelationAlterAction::RenameColumns,
+        AlterTableOperation::AddConstraint { constraint, .. }
+            if kind == ObjectKind::ForeignTable =>
+        {
+            match constraint {
+                TableConstraint::Unique(_) => {
+                    RelationAlterAction::ForeignConstraint(KeyConstraint::Unique)
+                }
+                TableConstraint::PrimaryKey(_) => {
+                    RelationAlterAction::ForeignConstraint(KeyConstraint::PrimaryKey)
+                }
+                TableConstraint::ForeignKey(_) => {
+                    RelationAlterAction::ForeignConstraint(KeyConstraint::ForeignKey)
+                }
+                _ => RelationAlterAction::Command("ADD CONSTRAINT"),
+            }
+        }
+        other => {
+            RelationAlterAction::Command(match other {
+                AlterTableOperation::AddConstraint { .. } => "ADD CONSTRAINT",
+                AlterTableOperation::AddColumn { .. } => "ADD COLUMN",
+                AlterTableOperation::DropColumn { .. } => "DROP COLUMN",
+                AlterTableOperation::DropConstraint { .. } => "DROP CONSTRAINT",
+                AlterTableOperation::AlterColumn { op, .. } => column_action(op),
+                AlterTableOperation::EnableRowLevelSecurity => "ENABLE ROW SECURITY",
+                AlterTableOperation::DisableRowLevelSecurity => "DISABLE ROW SECURITY",
+                AlterTableOperation::ForceRowLevelSecurity => "FORCE ROW SECURITY",
+                AlterTableOperation::NoForceRowLevelSecurity => "NO FORCE ROW SECURITY",
+                AlterTableOperation::EnableTrigger { .. } => "ENABLE TRIGGER",
+                AlterTableOperation::DisableTrigger { .. } => "DISABLE TRIGGER",
+                AlterTableOperation::EnableAlwaysTrigger { .. } => "ENABLE ALWAYS TRIGGER",
+                AlterTableOperation::EnableReplicaTrigger { .. } => "ENABLE REPLICA TRIGGER",
+                AlterTableOperation::EnableRule { .. } => "ENABLE RULE",
+                AlterTableOperation::DisableRule { .. } => "DISABLE RULE",
+                AlterTableOperation::EnableAlwaysRule { .. } => "ENABLE ALWAYS RULE",
+                AlterTableOperation::EnableReplicaRule { .. } => "ENABLE REPLICA RULE",
+                AlterTableOperation::AttachPartitionOf { .. } => "ATTACH PARTITION",
+                AlterTableOperation::DetachPartitionOf { .. } => "DETACH PARTITION",
+                AlterTableOperation::ReplicaIdentity { .. } => "REPLICA IDENTITY",
+                AlterTableOperation::Inherit { .. } => "INHERIT",
+                AlterTableOperation::NoInherit { .. } => "NO INHERIT",
+                AlterTableOperation::SetLogged => "SET LOGGED",
+                AlterTableOperation::SetUnlogged => "SET UNLOGGED",
+                AlterTableOperation::ValidateConstraint { .. } => "VALIDATE CONSTRAINT",
+                AlterTableOperation::GenericOptions { .. } => "OPTIONS",
+                AlterTableOperation::SetOptionsParens { .. } => "SET",
+                AlterTableOperation::ResetOptions { .. } => "RESET",
+                AlterTableOperation::OwnerTo { .. } => "OWNER",
+                _ => return None,
+            })
+        }
+    })
 }
 
 /// Checks that the plain view `name` exposes `column_name`, for a column
@@ -936,6 +1035,7 @@ fn rename_view(
             object_kind: kind,
             conflicting_kind,
             object_name: builder.dialect().stored_name(new_ident),
+            type_collision: relation_name_holder(&builder, new_ident, schema, None).is_none(),
         });
     }
 

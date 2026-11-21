@@ -89,6 +89,10 @@ pub(super) fn apply_like(
     };
 
     let Some(copied) = builder.resolve_table_object_name(source_name)? else {
+        if let Some(schema_name) = super::missing_schema::missing_schema_name(builder, source_name)
+        {
+            return Err(Error::SchemaNotFound { schema_name });
+        }
         let object_kind = builder.relation_reached(source_name).map(|(kind, _)| kind);
         return Err(Error::CopiedTableNotFound {
             copied_table: if object_kind.is_some() {
