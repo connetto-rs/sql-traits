@@ -3,7 +3,7 @@
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
-use sqlparser::ast::{Expr, Query};
+use sqlparser::ast::{Expr, GeneratedExpressionMode, Query};
 
 use crate::{
     errors::LookupError,
@@ -920,6 +920,49 @@ pub trait ColumnLike:
     /// # }
     /// ```
     fn generation_expression(&self) -> Option<&Expr>;
+
+    /// Returns whether a computed column keeps its value in the row or
+    /// derives it on every read, or `None` for any other column.
+    ///
+    /// A written `VIRTUAL` or `STORED` answers in every dialect. Without one
+    /// the column is virtual in SQLite, MySQL, PostgreSQL and the generic
+    /// dialect, and any other dialect answers `None`, which
+    /// [`Self::generation_expression`] tells apart from a column computing
+    /// nothing.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance the column belongs
+    ///   to.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::GeneratedExpressionMode, dialect::SQLiteDialect};
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE t (
+    ///          base INT,
+    ///          calculated INT AS (base + 1),
+    ///          cached INT AS (base + 1) STORED
+    ///      );",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let storage = |name| {
+    ///     table
+    ///         .column(name, &db, IdentifierCase::AsWritten)
+    ///         .map(|column| column.expect("column exists").generation_storage(&db))
+    /// };
+    /// assert_eq!(storage("calculated")?, Some(GeneratedExpressionMode::Virtual));
+    /// assert_eq!(storage("cached")?, Some(GeneratedExpressionMode::Stored));
+    /// assert_eq!(storage("base")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn generation_storage(&self, database: &Self::DB) -> Option<GeneratedExpressionMode>;
 
     /// Returns the functions one call in the column's default or generation
     /// expression may reach, resolved under the search path of the statement
@@ -2067,6 +2110,11 @@ where
     }
 
     #[inline]
+    fn generation_storage(&self, database: &Self::DB) -> Option<GeneratedExpressionMode> {
+        (*self).generation_storage(database)
+    }
+
+    #[inline]
     fn functions_reached_by<'db, 'call>(
         &'db self,
         call: impl Into<WrittenCall<'call>>,
@@ -2180,6 +2228,11 @@ where
     #[inline]
     fn generation_expression(&self) -> Option<&Expr> {
         (**self).generation_expression()
+    }
+
+    #[inline]
+    fn generation_storage(&self, database: &Self::DB) -> Option<GeneratedExpressionMode> {
+        (**self).generation_storage(database)
     }
 
     #[inline]

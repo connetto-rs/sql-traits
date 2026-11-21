@@ -16,8 +16,8 @@ use sql_traits::{
 use sqlparser::{
     ast::{
         Action, ArgMode, ConstraintReferenceMatchKind, Expr, FunctionCalledOnNull,
-        FunctionDefinitionSetParam, FunctionSecurity, Grantee, ReferentialAction, TriggerEvent,
-        TriggerObjectKind, TriggerPeriod,
+        FunctionDefinitionSetParam, FunctionSecurity, GeneratedExpressionMode, Grantee,
+        ReferentialAction, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
     dialect::{Dialect, PostgreSqlDialect},
 };
@@ -309,6 +309,10 @@ impl<P: EmptyKinds> ColumnLike for NoneKind<P> {
     }
 
     fn generation_expression(&self) -> Option<&Expr> {
+        self.unreach()
+    }
+
+    fn generation_storage(&self, _database: &Self::DB) -> Option<GeneratedExpressionMode> {
         self.unreach()
     }
 
