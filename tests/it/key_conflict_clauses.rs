@@ -40,6 +40,17 @@ fn a_column_primary_key_keeps_its_conflict_clause_like_the_table_spelling() {
 }
 
 #[test]
+fn a_column_primary_key_keeps_its_conflict_clause_past_its_direction() {
+    assert_eq!(
+        unique_key_conflict_clauses(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY DESC ON CONFLICT REPLACE);
+             CREATE TABLE u (a INTEGER PRIMARY KEY ASC ON CONFLICT IGNORE AUTOINCREMENT);"
+        ),
+        [Some(Keyword::REPLACE), Some(Keyword::IGNORE)]
+    );
+}
+
+#[test]
 fn a_column_unique_keeps_its_conflict_clause_like_the_table_spelling() {
     let column =
         unique_key_conflict_clauses("CREATE TABLE t (a INTEGER UNIQUE ON CONFLICT IGNORE);");

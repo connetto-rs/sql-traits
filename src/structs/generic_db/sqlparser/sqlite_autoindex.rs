@@ -20,7 +20,7 @@ use super::{
     ParserDBBuilder, case_idents_match,
     constraint_names::{Slot, slots},
     key_nullability::is_integer_primary_key,
-    object_name_last_identifier,
+    object_name_last_identifier, stored_column_collation_name,
 };
 use crate::{
     structs::{IdentifierCase, TableMetadata},
@@ -246,20 +246,9 @@ pub(super) fn key_entry<'node>(
     }
 }
 
-/// The collation `column` declares, the last one written winning, else
-/// `BINARY`.
+/// The collation `column` declares, else `BINARY`.
 fn declared_collation(column: &ColumnDef) -> &str {
-    column
-        .options
-        .iter()
-        .rev()
-        .find_map(|option| {
-            match &option.option {
-                ColumnOption::Collation(name) => Some(collation_name(name)),
-                _ => None,
-            }
-        })
-        .unwrap_or("BINARY")
+    stored_column_collation_name(column).map_or("BINARY", collation_name)
 }
 
 /// The collation `name` spells, its last part.

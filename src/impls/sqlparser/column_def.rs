@@ -176,7 +176,8 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     ) -> Result<ColumnCollation<'db>, LookupError> {
         let metadata = held_column_metadata(self, database)?;
         let mut unknown = false;
-        for option in &self.attribute().options {
+        // SQLite, the only dialect accepting several, compares under the last.
+        for option in self.attribute().options.iter().rev() {
             match &option.option {
                 ColumnOption::Collation(name) => {
                     let named = NamedColumnCollation::new(target_name_of_object_name(name))
@@ -2024,6 +2025,19 @@ mod tests {
         assert_eq!(collation.name().schema(), None);
         assert_eq!(collation.postgres_deterministic(), Some(true));
         assert_eq!(collation.mysql_padding(), None);
+    }
+
+    /// SQLite compares a column under the last `COLLATE` written on it.
+    #[test]
+    fn collation_sqlite_takes_the_last_collate() {
+        let db =
+            parse_with::<SQLiteDialect>("CREATE TABLE t (a TEXT COLLATE NOCASE COLLATE RTRIM);");
+        let column = column_named(&db, "a");
+        let ColumnCollation::Named(collation) = column.collation(&db).expect("collation metadata")
+        else {
+            panic!("expected a named collation");
+        };
+        assert_eq!(collation.name().name(), "RTRIM");
     }
 
     #[test]

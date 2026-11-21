@@ -650,8 +650,10 @@ fn column_collation_name(
     Ok(collation)
 }
 
+/// The collation `column` is written with, the last one winning as in SQLite,
+/// the only dialect that accepts several.
 pub(super) fn stored_column_collation_name(column: &ColumnDef) -> Option<&ObjectName> {
-    column.options.iter().find_map(|option| {
+    column.options.iter().rev().find_map(|option| {
         match &option.option {
             ColumnOption::Collation(name) => Some(name),
             _ => None,
@@ -7065,10 +7067,14 @@ impl ParserDB {
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let options = &column.attribute().options;
         for (position, option) in options.iter().enumerate() {
-            // sqlparser reads a column's conflict clause as an option of its
-            // own, and SQLite binds it to the constraint written right before
-            // it.
-            let conflict_clause = match options.get(position + 1).map(|next| &next.option) {
+            // sqlparser reads the direction SQLite lets a column's primary
+            // key carry, and the conflict clause after it, as options of their
+            // own, and SQLite binds both to the constraint written before them.
+            let mut following = options[position + 1..].iter().map(|next| &next.option).peekable();
+            let sort = following
+                .next_if(|next| key_nullability::written_direction(next).is_some())
+                .and_then(key_nullability::written_direction);
+            let conflict_clause = match following.next() {
                 Some(ColumnOption::OnConflict(keyword)) => Some(*keyword),
                 _ => None,
             };
@@ -7112,11 +7118,6 @@ impl ParserDB {
                     );
                 }
                 ColumnOption::PrimaryKey(primary_key) => {
-                    // SQLite writes the direction of a column's key right
-                    // after it, as an option sqlparser keeps apart.
-                    let sort = options
-                        .get(position + 1)
-                        .and_then(|next| key_nullability::written_direction(&next.option));
                     let primary_key_unique_constraint = UniqueConstraint {
                         name: option.name.clone(),
                         index_name: None,
