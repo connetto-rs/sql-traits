@@ -112,7 +112,8 @@ pub enum Returned<S> {
 /// <conditions>]`, the rows the conditions keep for the grantee they name,
 /// the caller gate they write, the restrictions and bounds the rest of them
 /// reduce to, the caps they write, the rows of other tables each row has to
-/// name, and the rows of other tables whose existence takes a row away.
+/// name, the rows of other tables whose existence takes a row away, and the
+/// sets of other helpers a row has to stay outside.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
@@ -126,6 +127,8 @@ pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) caps: Arc<[RowCap<'db, DB>]>,
     /// Shared as [`caps`](Self::caps) is.
     pub(crate) anti_joins: Arc<[AntiJoin<'db, DB>]>,
+    /// Shared as [`caps`](Self::caps) is.
+    pub(crate) exclusions: Arc<[ExcludedSet<'db, DB>]>,
     /// Shared as [`caps`](Self::caps) is.
     pub(crate) joined_rows: Arc<[JoinedRow<'db, DB>]>,
 }
@@ -187,6 +190,18 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     #[must_use]
     pub fn anti_joins(&self) -> &[AntiJoin<'db, DB>] {
         &self.anti_joins
+    }
+
+    /// The sets of other helpers a row's column has to stay outside, every
+    /// one of them, in the order the condition writes them. Empty in every
+    /// answer of [`FunctionLike::helper_set`], which refuses an arm writing
+    /// one (see [`FunctionLike::helper_set_with_exclusions`]).
+    ///
+    /// [`FunctionLike::helper_set`]: crate::traits::FunctionLike::helper_set
+    /// [`FunctionLike::helper_set_with_exclusions`]: crate::traits::FunctionLike::helper_set_with_exclusions
+    #[must_use]
+    pub fn exclusions(&self) -> &[ExcludedSet<'db, DB>] {
+        &self.exclusions
     }
 
     /// The rows the arm joins, in the order the body joins them, each of
@@ -291,6 +306,59 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
     }
 
     /// The helper returning the grantees.
+    #[must_use]
+    pub fn function(&self) -> &'db DB::Function {
+        self.function
+    }
+
+    /// The arguments the arm passes to [`function`](Self::function), the
+    /// helper's own arguments substituted.
+    #[must_use]
+    pub fn arguments(&self) -> &[Value] {
+        &self.arguments
+    }
+
+    /// What [`function`](Self::function) returns for
+    /// [`arguments`](Self::arguments).
+    #[must_use]
+    pub fn set(&self) -> &HelperSet<'db, DB> {
+        &self.set
+    }
+}
+
+/// `<column> NOT IN (SELECT <function>(<arguments>))`, a conjunct of a grant
+/// arm's condition keeping a row only where its column holds no value the
+/// helper returns. PostgreSQL evaluates the other spellings alike, `NOT
+/// (<column> IN (...))`, `<column> <> ALL (<set>)` and `NOT (<column> = ANY
+/// (<set>))`, `<set>` being `(SELECT <function>(<arguments>))` or
+/// `ARRAY(SELECT <function>(<arguments>))`.
+///
+/// The column is one of the arm's table, and each argument is a literal or
+/// an argument of the helper, as for a [`GranteeSet`]. The helper's owner
+/// executes the function excluded, so the caller needs no `EXECUTE` on it.
+///
+/// The conjunct is `NULL`, which drops the row, where the column holds
+/// `NULL` and the helper returns any row, and where the helper returns
+/// `NULL` but not the column's value. A row holding `NULL` is kept where
+/// the helper returns no row. A consumer subtracting the set as a set of
+/// keys keeps those rows unless it proves the column `NOT NULL` and every
+/// column the set returns `NOT NULL`.
+#[derive(Debug)]
+pub struct ExcludedSet<'db, DB: DatabaseLike> {
+    pub(crate) column: &'db DB::Column,
+    pub(crate) function: &'db DB::Function,
+    pub(crate) arguments: Vec<Value>,
+    pub(crate) set: Box<HelperSet<'db, DB>>,
+}
+
+impl<'db, DB: DatabaseLike> ExcludedSet<'db, DB> {
+    /// The column of the arm's table compared with the set.
+    #[must_use]
+    pub fn column(&self) -> &'db DB::Column {
+        self.column
+    }
+
+    /// The helper returning the values excluded.
     #[must_use]
     pub fn function(&self) -> &'db DB::Function {
         self.function
