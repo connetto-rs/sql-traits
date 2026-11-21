@@ -110,7 +110,7 @@ fn range_data(values: &[PartitionBoundValue]) -> Vec<RangeDatum> {
 }
 
 /// Reads the text PostgreSQL keeps for a storage parameter's value.
-fn parameter_value(value: &Expr) -> Cow<'_, str> {
+pub(crate) fn parameter_value(value: &Expr) -> Cow<'_, str> {
     match value {
         Expr::Value(ValueWithSpan {
             value:

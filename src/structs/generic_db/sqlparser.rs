@@ -131,6 +131,7 @@ mod postgres_18_functions;
 mod postgres_builtins;
 mod postgres_catalog;
 mod procedures;
+mod storage_parameters;
 use procedures::RoutineKeyword;
 mod range_constructors;
 mod referenced_keys;
@@ -6866,7 +6867,9 @@ impl ParserDB {
             &[ObjectKind::ForeignTable, ObjectKind::VirtualTable],
         )?;
         index_access_methods::refuse_in_index(builder, &create_index)?;
-        if *builder.dialect() != SqlparserDialect::PostgreSql {
+        if *builder.dialect() == SqlparserDialect::PostgreSql {
+            storage_parameters::index(&create_index)?;
+        } else {
             validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
         }
         index_opclasses::index(&create_index, Some(table), builder)?;
@@ -9601,9 +9604,11 @@ impl ParserDB {
             return Ok(builder);
         };
         let node = Self::stored_node(&builder, &stored)?;
-        if node.partition_by.is_some() {
+        if *builder.dialect() == SqlparserDialect::PostgreSql {
+            storage_parameters::table(node, &options)?;
+        } else if node.partition_by.is_some() {
             return Err(crate::errors::Error::StorageParametersOnPartitionedTable {
-                table_name: stored.name.clone(),
+                table_name: stored.name,
             });
         }
         // Another dialect's table options, such as MySQL's `ENGINE`, leave the
@@ -12882,6 +12887,9 @@ impl ParserDB {
                     inherited.constraints.retain(|rendering| !merged.contains(rendering));
                     if matches!(dialect, SqlparserDialect::PostgreSql) {
                         refuse_unlogged_partitioned(&create_table)?;
+                        if let CreateTableOptions::With(options) = &create_table.table_options {
+                            storage_parameters::table(&create_table, options)?;
+                        }
                         validate_distinct_columns(&create_table, case)?;
                         Self::take_over_table_shell(&mut builder, &create_table)?;
                         let table_kind = relation_kind(foreign_source.is_some());

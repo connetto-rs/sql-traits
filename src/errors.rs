@@ -2762,6 +2762,57 @@ pub enum Error {
         /// Reason why the index is invalid.
         reason: String,
     },
+    #[error(
+        "Storage parameter `{option}` of relation `{relation_name}` must be a name with an optional value."
+    )]
+    /// PostgreSQL rejects a malformed storage option with syntax-error SQLSTATE
+    /// `42601`.
+    StorageParameterNotNamed {
+        /// The rendered storage option.
+        option: String,
+        /// The relation named by the statement.
+        relation_name: String,
+    },
+    #[error("unrecognized parameter \"{parameter_name}\"")]
+    /// PostgreSQL refuses an unknown storage parameter with SQLSTATE `22023`.
+    UnrecognizedStorageParameter {
+        /// The parameter name without its namespace.
+        parameter_name: String,
+    },
+    #[error("unrecognized parameter namespace \"{namespace}\"")]
+    /// PostgreSQL refuses an unknown parameter namespace with SQLSTATE `22023`.
+    UnrecognizedStorageParameterNamespace {
+        /// The namespace supplied.
+        namespace: String,
+    },
+    #[error("parameter \"{parameter_name}\" specified more than once")]
+    /// PostgreSQL refuses a repeated storage parameter with SQLSTATE `22023`.
+    RepeatedStorageParameter {
+        /// The parameter name without its namespace.
+        parameter_name: String,
+    },
+    #[error("invalid value for {value_type} option \"{parameter_name}\": {value}")]
+    /// PostgreSQL refuses a storage parameter's value type with SQLSTATE
+    /// `22023`.
+    InvalidStorageParameterValue {
+        /// The parameter name without its namespace.
+        parameter_name: String,
+        /// PostgreSQL's name for the required type.
+        value_type: &'static str,
+        /// The supplied value.
+        value: String,
+    },
+    #[error("value {value} out of bounds for option \"{parameter_name}\"")]
+    /// PostgreSQL refuses a storage parameter outside its bounds with SQLSTATE
+    /// `22023`.
+    StorageParameterOutOfBounds {
+        /// The parameter name without its namespace.
+        parameter_name: String,
+        /// The supplied value.
+        value: String,
+        /// PostgreSQL's detail describing the inclusive bounds.
+        detail: String,
+    },
     #[error("access method \"{access_method}\" does not support unique indexes")]
     /// PostgreSQL refuses unique indexes whose access method lacks uniqueness
     /// support.
