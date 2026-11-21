@@ -1,6 +1,6 @@
 //! Adoption of standalone indexes by key constraints.
 
-use sqlparser::ast::{CreateIndex, KeyOrIndexDisplay, NullsDistinctOption};
+use sqlparser::ast::{CreateIndex, Ident, KeyOrIndexDisplay, NullsDistinctOption};
 
 use super::{
     IndexSlot, ParserDB, ParserDBBuilder, PrimaryKeyConstraint, StoredTable, TableConstraint,
@@ -12,16 +12,10 @@ use crate::{errors::Error, utils::identifier_resolution::stored_ident_name};
 pub(super) fn validate_adoption(
     builder: &ParserDBBuilder,
     stored: &StoredTable,
-    constraint: &TableConstraint,
-) -> Result<Option<usize>, Error> {
-    let (TableConstraint::PrimaryKeyUsingIndex(adoption)
-    | TableConstraint::UniqueUsingIndex(adoption)) = constraint
-    else {
-        return Ok(None);
-    };
+    index_name: &Ident,
+) -> Result<usize, Error> {
     let table = ParserDB::stored_node(builder, stored)?;
     let schema = table_schema_qualifier(table);
-    let index_name = &adoption.index_name;
     if constraint_names::index_name_held(builder, index_name, schema)
         || super::index_name_holder(builder, index_name, schema)
             == Some(super::ObjectKind::UniqueIndex)
@@ -56,7 +50,7 @@ pub(super) fn validate_adoption(
     if table.partition_by.is_some() {
         return Err(Error::AdoptedIndexOnPartitionedTable);
     }
-    Ok(Some(position))
+    Ok(position)
 }
 
 /// Materializes an adopted index as an ordinary key constraint.
@@ -65,9 +59,6 @@ pub(super) fn adopt(
     stored: &StoredTable,
     constraint: &mut TableConstraint,
 ) -> Result<(), Error> {
-    let Some(position) = validate_adoption(builder, stored, constraint)? else {
-        return Ok(());
-    };
     let primary = matches!(constraint, TableConstraint::PrimaryKeyUsingIndex(_));
     let (TableConstraint::PrimaryKeyUsingIndex(adoption)
     | TableConstraint::UniqueUsingIndex(adoption)) = constraint
@@ -75,6 +66,7 @@ pub(super) fn adopt(
         return Ok(());
     };
     let index_name = &adoption.index_name;
+    let position = validate_adoption(builder, stored, index_name)?;
     let index = builder.indices()[position].0.attribute();
     let key = adoption.name.as_ref().unwrap_or(index_name);
     let identity = replica_identity::created_index_name(index)

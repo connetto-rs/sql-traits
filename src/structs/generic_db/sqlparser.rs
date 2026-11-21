@@ -2206,12 +2206,19 @@ impl ParserDBBuilder {
     ) -> Result<(), crate::errors::Error> {
         if self.dialect().binds_foreign_keys_on_use() {
             bind_to_host_schema(&host.name, host.qualifier(), foreign_key)?;
-        } else if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
+        } else {
+            self.bind_foreign_key_at_declaration(foreign_key);
+        }
+        Ok(())
+    }
+
+    /// Binds a foreign key to the referenced table visible at declaration.
+    fn bind_foreign_key_at_declaration(&self, foreign_key: &mut ForeignKeyConstraint) {
+        if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
             let primary_key_valid = referenced_keys::primary_key_is_valid(self, table);
             ForeignKeyBinding::of(table, foreign_key, primary_key_valid, self.identifier_case())
                 .apply(foreign_key);
         }
-        Ok(())
     }
 
     /// Binds every foreign key `column` declares inline on `host`.
@@ -10043,12 +10050,12 @@ impl ParserDB {
             let mut operation = match action {
                 alter_passes::Work::Operation(operation) => operation,
                 alter_passes::Work::ColumnConstraint { column, position, option } => {
-                    let position = work.option_position(&column, position);
+                    let (column, position) = work.option_position(column, position);
                     builder = alter_passes::install_column_constraint(
                         builder,
                         &alter_table.name,
                         scope,
-                        &column,
+                        column,
                         position,
                         option,
                         persistence_before_change,
@@ -10541,7 +10548,7 @@ impl ParserDB {
             });
         }
         let deferred = if matches!(builder.dialect(), SqlparserDialect::PostgreSql) {
-            alter_passes::DeferredColumn::extract(column_def)
+            alter_passes::DeferredColumn::extract(column_def, stored)
         } else {
             None
         };
