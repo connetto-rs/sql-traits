@@ -298,6 +298,50 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn returns_set(&self) -> bool;
 
+    /// Returns the number of rows the planner expects the function to
+    /// return, mirroring `pg_proc.prorows`, or [`None`] for a function that
+    /// returns no set.
+    ///
+    /// A set-returning function declared without `ROWS` answers PostgreSQL's
+    /// default of 1000, which `pg_dump` leaves unwritten, so a declared
+    /// `ROWS 1000` answers the same. `ALTER FUNCTION ... ROWS` applies in
+    /// statement order, and `CREATE OR REPLACE FUNCTION` takes the
+    /// replacement's declaration. A builtin
+    /// [`ParserDB`](crate::structs::ParserDB) registers in `pg_catalog`
+    /// answers its estimate in PostgreSQL 18, so `unnest(anyarray)` answers
+    /// 100.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE FUNCTION one() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+    /// CREATE FUNCTION unsized() RETURNS SETOF INT LANGUAGE sql AS 'SELECT 1';
+    /// CREATE FUNCTION sized() RETURNS SETOF INT LANGUAGE sql ROWS 10 AS 'SELECT 1';
+    /// CREATE FUNCTION altered() RETURNS SETOF INT LANGUAGE sql AS 'SELECT 1';
+    /// ALTER FUNCTION altered() ROWS 5;
+    /// ",
+    /// )?;
+    /// let estimated_rows = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .estimated_rows()
+    /// };
+    /// assert_eq!(estimated_rows("one"), None);
+    /// assert_eq!(estimated_rows("unsized"), Some(1000.0));
+    /// assert_eq!(estimated_rows("sized"), Some(10.0));
+    /// assert_eq!(estimated_rows("altered"), Some(5.0));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn estimated_rows(&self) -> Option<f32>;
+
     /// Returns the mode of each argument, in declaration order, mirroring
     /// `pg_proc.proargmodes`. An argument declared without a mode is
     /// [`ArgMode::In`].

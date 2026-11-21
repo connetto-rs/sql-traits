@@ -51,7 +51,9 @@ use crate::{
             PolicyMetadata, UniqueIndexMetadata,
         },
     },
-    traits::{ColumnLike, DatabaseLike, IndexLike, SequenceLike, TableLike, ViewLike},
+    traits::{
+        ColumnLike, DatabaseLike, FunctionLike, IndexLike, SequenceLike, TableLike, ViewLike,
+    },
     utils::{
         columns_in_expression,
         identifier_resolution::{
@@ -59,6 +61,7 @@ use crate::{
             stored_ident_name, stored_identifier,
         },
         last_str, normalize_postgres_type_cow, normalize_sqlparser_type,
+        numeric_literal::float4_option,
         object_name::{
             Namespaces, PG_CATALOG, Qualifier, RelationKey, SearchPathChange, TEMPORARY_SCHEMA,
             is_search_path_parameter, object_name_identifiers, object_name_last_part,
@@ -3392,6 +3395,30 @@ fn apply_configuration_parameter(
     } else {
         stored.push(parameter);
     }
+}
+
+/// Refuses the `ROWS` estimate `rows` of `function` the way `CREATE FUNCTION`
+/// and `ALTER FUNCTION` do, first when it is not positive once stored as a
+/// `float4`, then when the function returns no set.
+///
+/// # Errors
+///
+/// Returns [`crate::errors::Error::FunctionRowsNotPositive`] or
+/// [`crate::errors::Error::FunctionRowsWithoutSet`].
+fn check_rows_estimate(function: &CreateFunction, rows: &Expr) -> Result<(), crate::errors::Error> {
+    let function_name = || last_str(&function.name).to_string();
+    if !float4_option(rows).is_some_and(|estimate| estimate > 0.0) {
+        return Err(crate::errors::Error::FunctionRowsNotPositive {
+            function_name: function_name(),
+            rows: rows.to_string(),
+        });
+    }
+    if !function.returns_set() {
+        return Err(crate::errors::Error::FunctionRowsWithoutSet {
+            function_name: function_name(),
+        });
+    }
+    Ok(())
 }
 
 /// Returns the argument types that make up a function's identity.
@@ -10210,6 +10237,9 @@ impl ParserDB {
                         settle_search_path_parameter(&mut parameter, &builder)?;
                         apply_configuration_parameter(&mut create_function.set_params, parameter);
                     }
+                    if let Some(rows) = &create_function.rows {
+                        check_rows_estimate(&create_function, rows)?;
+                    }
                     signature_types::bind_signature(&builder, &mut create_function, &type_arrays);
                     let case = builder.identifier_case();
                     let existing = builder.functions().iter().position(|(existing, _)| {
@@ -12379,6 +12409,7 @@ impl ParserDB {
                                         | AlterFunctionAction::Security { .. }
                                         | AlterFunctionAction::Set(_)
                                         | AlterFunctionAction::Reset(_)
+                                        | AlterFunctionAction::Rows(_)
                                 )
                             });
                             if !tracked {
@@ -12393,6 +12424,11 @@ impl ParserDB {
 
                             let position =
                                 Self::alter_function_target(&builder, &func_desc, &type_arrays)?;
+                            for action in &actions {
+                                if let AlterFunctionAction::Rows(rows) = action {
+                                    check_rows_estimate(&builder.functions()[position].0, rows)?;
+                                }
+                            }
                             let function_arc = &mut builder.functions_mut()[position].0;
                             let stale = Arc::clone(function_arc);
                             let function = Arc::make_mut(function_arc);
@@ -12423,6 +12459,9 @@ impl ParserDB {
                                         function.set_params.retain(|stored| {
                                             !parameter_names_match(&stored.name, &name)
                                         });
+                                    }
+                                    AlterFunctionAction::Rows(rows) => {
+                                        function.rows = Some(rows);
                                     }
                                     _ => {}
                                 }

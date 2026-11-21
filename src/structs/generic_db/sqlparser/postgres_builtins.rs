@@ -1,7 +1,13 @@
 //! The functions PostgreSQL 18 provides in `pg_catalog`, which a schema calls
 //! without declaring them.
 
-use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::ops::Range;
 
 use once_cell::race::OnceBox;
@@ -153,8 +159,8 @@ impl AggregateState {
 /// One `pg_proc` row: the function's name, its parameters as
 /// `pg_get_function_arguments` spells them, its result as
 /// `pg_get_function_result` does, its strictness, volatility, leakproof
-/// status, kind and language, and for an aggregate the `NULL` facts of its
-/// state.
+/// status, kind and language, its row estimate `pg_proc.prorows`, and for an
+/// aggregate the `NULL` facts of its state.
 ///
 /// A tuple struct, so a row is built by its constructor rather than by a
 /// function only const evaluation ever runs.
@@ -168,6 +174,7 @@ pub(super) struct PostgresBuiltin(
     pub(super) Leakage,
     pub(super) Kind,
     pub(super) Language,
+    pub(super) f32,
     pub(super) Option<AggregateState>,
 );
 
@@ -180,7 +187,8 @@ impl PostgresBuiltin {
     /// The declaration in `pg_catalog`, so a user function may shadow it the
     /// way the server allows.
     fn function(&self) -> Option<CreateFunction> {
-        let Self(name, arguments, result, null_input, volatility, leakage, _, language, _) = *self;
+        let Self(name, arguments, result, null_input, volatility, leakage, _, language, rows, _) =
+            *self;
         let name = ObjectName(vec![
             ObjectNamePart::Identifier(Ident::new(PG_CATALOG)),
             ObjectNamePart::Identifier(stored_ident(name)),
@@ -195,12 +203,15 @@ impl PostgresBuiltin {
         )
         .map(|mut function| {
             function.leakproof = matches!(leakage, Leakage::Leakproof).then_some(true);
+            // `pg_proc.prorows` is zero for a function returning no set.
+            function.rows =
+                (rows > 0.0).then(|| Expr::value(Value::Number(rows.to_string(), false)));
             function
         })
     }
 
     fn metadata(&self) -> FunctionMetadata {
-        let Self(name, arguments, _, _, _, _, kind, _, aggregate_state) = *self;
+        let Self(name, arguments, _, _, _, _, kind, _, _, aggregate_state) = *self;
         let mut metadata = FunctionMetadata::default();
         if let Some(positions) =
             null_returning_positions(name, |types| arguments.split(", ").eq(types.iter().copied()))

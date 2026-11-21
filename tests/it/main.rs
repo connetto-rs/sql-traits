@@ -80,6 +80,7 @@ mod function_referenced_tables;
 mod function_references;
 mod function_resolution;
 mod function_result_columns;
+mod function_rows_estimate;
 mod function_signature;
 mod function_signature_types;
 mod function_unqualified_names;
