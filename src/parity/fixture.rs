@@ -423,7 +423,7 @@ static EMBEDDED: &[Embedded] = &embedded![
     "partitioned" known,
     "policy_for_role_without_privilege",
     "restrictive_to_role",
-    "select_for_update" known,
+    "select_for_update",
     "self_referential" known,
     "separator_mismatch" known,
     "to_role_member",
