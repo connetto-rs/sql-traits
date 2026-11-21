@@ -6,7 +6,7 @@ mod database;
 mod profile;
 mod sqlparser;
 
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::fmt::Debug;
 
 pub use builder::GenericDBBuilder;
@@ -18,7 +18,8 @@ pub use sqlparser::{
     PostgresCatalogType, SqlparserProfile, UnresolvedAccessReference,
 };
 pub(crate) use sqlparser::{
-    ConstraintObject, OperatorRow, is_candidate_key, key_excludes_null, table_not_null,
+    ConstraintObject, InstalledForeignKey, OperatorRow, ResolvedForeignKey, is_candidate_key,
+    key_excludes_null, table_not_null,
 };
 
 use crate::{
@@ -101,6 +102,8 @@ pub struct GenericDB<P: SchemaProfile> {
     unique_indices: Vec<Stored<P::UniqueIndex>>,
     /// List of foreign keys in the database.
     foreign_keys: Vec<Stored<P::ForeignKey>>,
+    /// PostgreSQL foreign keys with resolved columns and assigned names.
+    installed_foreign_keys: Vec<Arc<InstalledForeignKey>>,
     /// List of functions created in the database.
     functions: Vec<Stored<P::Function>>,
     /// Functions by normalized `(schema, name)`, values their storage slots.
@@ -167,6 +170,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("materialized_view_indices", &self.materialized_view_indices.len())
             .field("unique_indices", &self.unique_indices.len())
             .field("foreign_keys", &self.foreign_keys.len())
+            .field("installed_foreign_keys", &self.installed_foreign_keys.len())
             .field("functions", &self.functions.len())
             .field("builtins", &self.builtins.len())
             .field("triggers", &self.triggers.len())
@@ -212,6 +216,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             materialized_view_indices: self.materialized_view_indices.clone(),
             unique_indices: self.unique_indices.clone(),
             foreign_keys: self.foreign_keys.clone(),
+            installed_foreign_keys: self.installed_foreign_keys.clone(),
             functions: self.functions.clone(),
             triggers: self.triggers.clone(),
             rules: self.rules.clone(),

@@ -127,7 +127,7 @@ impl Catalog {
         let changed_table = super::foreign_key_types::changed_table(&statement).cloned();
         let first_foreign_key = if matches!(&statement, Statement::CreateTable(table) if !table.or_replace)
         {
-            self.builder.foreign_keys().len()
+            self.builder.installed_foreign_keys().len()
         } else {
             0
         };
@@ -152,7 +152,7 @@ impl Catalog {
         let changed_tables = changed_table
             .filter(|_| {
                 matches!(catalog.builder.dialect(), SqlparserDialect::PostgreSql)
-                    && !catalog.builder.foreign_keys().is_empty()
+                    && !catalog.builder.installed_foreign_keys().is_empty()
             })
             .map(|table| super::foreign_key_types::changed_tables(&catalog.builder, &table))
             .filter(|tables| {

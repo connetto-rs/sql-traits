@@ -1,10 +1,15 @@
 //! PostgreSQL foreign-key equality compatibility.
 
-use alloc::{boxed::Box, string::ToString, vec::Vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, CreateTable, Expr, ForeignKeyConstraint, ObjectName,
-    Statement,
+    AlterColumnOperation, AlterTableOperation, ColumnDef, CreateTable, Expr, ForeignKeyConstraint,
+    Ident, ObjectName, Statement,
 };
 
 use super::{ParserDB, ParserDBBuilder, StoredTable, inheritance};
@@ -12,11 +17,89 @@ use crate::{
     errors::Error,
     structs::{TableAttribute, TypeKind},
     utils::{
-        coercion::{Proof, base, can_coerce, canonical_owned, facts},
+        coercion::{Proof, base, can_coerce, canonical, facts},
         object_name::table_matches_object_name,
         postgres_types::PgType,
     },
 };
+
+/// A column captured by foreign-key resolution.
+#[derive(Clone, Debug)]
+pub(super) struct BoundColumn {
+    pub(super) name: Ident,
+    pub(super) data_type: PgType,
+}
+
+impl BoundColumn {
+    /// Captures the column's declared identity and type.
+    pub(super) fn of(column: &ColumnDef) -> Self {
+        Self { name: column.name.clone(), data_type: PgType::of(&column.data_type) }
+    }
+}
+
+/// The columns compared by one foreign-key equality operator.
+#[derive(Clone, Debug)]
+pub(super) struct ColumnPair {
+    pub(super) host: BoundColumn,
+    pub(super) referenced: BoundColumn,
+}
+
+/// The resolved relations and columns of a PostgreSQL foreign key.
+#[derive(Clone, Debug)]
+pub(super) struct BoundForeignKey {
+    pub(super) key: Arc<TableAttribute<CreateTable, ForeignKeyConstraint>>,
+    pub(super) target: Arc<CreateTable>,
+    pub(super) columns: Vec<ColumnPair>,
+}
+
+/// A resolved PostgreSQL foreign key awaiting its installation name.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedForeignKey {
+    pub(super) binding: BoundForeignKey,
+    pub(super) position: super::constraint_names::Position,
+    pub(super) rendering: String,
+}
+
+/// A PostgreSQL foreign key with resolved columns and an installed name.
+#[derive(Clone, Debug)]
+pub(crate) struct InstalledForeignKey {
+    pub(super) binding: BoundForeignKey,
+    pub(super) name: Box<str>,
+}
+
+impl ResolvedForeignKey {
+    /// Installs the resolved key under its assigned name.
+    pub(super) fn install(self, name: String) -> InstalledForeignKey {
+        InstalledForeignKey { binding: self.binding, name: name.into_boxed_str() }
+    }
+}
+
+/// Carries incoming column bindings through replacement of their resolved
+/// target.
+pub(super) fn follow_target_replacement(
+    builder: &mut ParserDBBuilder,
+    previous: &Arc<CreateTable>,
+    replacement: &Arc<CreateTable>,
+) {
+    let case = builder.identifier_case();
+    for installed in builder
+        .installed_foreign_keys_mut()
+        .iter_mut()
+        .filter(|installed| Arc::ptr_eq(&installed.binding.target, previous))
+    {
+        let binding = &mut Arc::make_mut(installed).binding;
+        binding.target = replacement.clone();
+        for column in &replacement.columns {
+            for pair in binding
+                .columns
+                .iter_mut()
+                .filter(|pair| super::case_idents_match(&pair.referenced.name, &column.name, case))
+            {
+                pair.referenced = BoundColumn::of(column);
+            }
+        }
+    }
+}
 
 /// Returns the table whose foreign-key types a statement can change.
 pub(super) fn changed_table(statement: &Statement) -> Option<&ObjectName> {
@@ -78,10 +161,10 @@ pub(super) fn needs_validation(
     first_foreign_key: usize,
 ) -> bool {
     builder
-        .foreign_keys()
+        .installed_foreign_keys()
         .iter()
         .skip(first_foreign_key)
-        .any(|(key, ())| affected(builder, key, changed_tables))
+        .any(|key| affected(builder, &key.binding.key, changed_tables))
 }
 
 /// Whether a matching unique index names an operator class the model cannot
@@ -106,114 +189,36 @@ fn explicit_operator_class(
     })
 }
 
-/// Refuses foreign keys whose columns have no compatible equality operator.
+/// Refuses installed foreign keys whose columns lack compatible equality.
 pub(super) fn validate(
     database: &ParserDB,
     builder: &ParserDBBuilder,
     changed_tables: &[StoredTable],
     first_foreign_key: usize,
 ) -> Result<(), Error> {
-    for (foreign_key, ()) in builder.foreign_keys().iter().skip(first_foreign_key) {
-        if !affected(builder, foreign_key, changed_tables) {
-            continue;
-        }
-        let target = builder
-            .tables()
-            .iter()
-            .find(|(table, _, _)| {
-                table_matches_object_name(
-                    builder.namespaces(),
-                    table.as_ref(),
-                    &foreign_key.attribute().foreign_table,
-                )
-            })
-            .map(|(table, _, _)| table.as_ref())
-            .ok_or_else(|| {
-                Error::ReferencedTableNotFoundForForeignKey {
-                    referenced_table: foreign_key.attribute().foreign_table.to_string(),
-                    host_table: foreign_key.table().name.to_string(),
-                }
-            })?;
-        if explicit_operator_class(builder, target, foreign_key.attribute()) {
-            continue;
-        }
-        for (host_name, referenced_name) in
-            foreign_key.attribute().columns.iter().zip(&foreign_key.attribute().referred_columns)
+    for installed in builder.installed_foreign_keys().iter().skip(first_foreign_key) {
+        let binding = &installed.binding;
+        let foreign_key = &binding.key;
+        if !affected(builder, foreign_key, changed_tables)
+            || explicit_operator_class(builder, &binding.target, foreign_key.attribute())
         {
-            let host = foreign_key
-                .table()
-                .columns
-                .iter()
-                .find(|column| {
-                    super::case_idents_match(&column.name, host_name, builder.identifier_case())
-                })
-                .ok_or_else(|| {
-                    Error::HostColumnNotFoundForForeignKey {
-                        host_column: host_name.value.clone(),
-                        host_table: foreign_key.table().name.to_string(),
-                    }
-                })?;
-            let referenced = target
-                .columns
-                .iter()
-                .find(|column| {
-                    super::case_idents_match(
-                        &column.name,
-                        referenced_name,
-                        builder.identifier_case(),
-                    )
-                })
-                .ok_or_else(|| {
-                    Error::ReferencedColumnNotFoundForForeignKey {
-                        referenced_column: referenced_name.value.clone(),
-                        referenced_table: target.name.to_string(),
-                        host_table: foreign_key.table().name.to_string(),
-                    }
-                })?;
-            let host_type = canonical_owned(database, PgType::of(&host.data_type));
-            let referenced_type = canonical_owned(database, PgType::of(&referenced.data_type));
+            continue;
+        }
+        for pair in &binding.columns {
+            let host_type = canonical(database, &pair.host.data_type);
+            let referenced_type = canonical(database, &pair.referenced.data_type);
             if compatible(database, &host_type, &referenced_type) == Proof::No {
                 return Err(Error::ForeignKeyCannotBeImplemented {
-                    constraint_name: constraint_name(builder, foreign_key)?,
+                    constraint_name: installed.name.clone(),
                     host_table: foreign_key.table().name.to_string().into_boxed_str(),
-                    host_column: host.name.value.as_str().into(),
-                    referenced_table: target.name.to_string().into_boxed_str(),
-                    referenced_column: referenced.name.value.as_str().into(),
+                    host_column: pair.host.name.value.as_str().into(),
+                    referenced_table: binding.target.name.to_string().into_boxed_str(),
+                    referenced_column: pair.referenced.name.value.as_str().into(),
                 });
             }
         }
     }
     Ok(())
-}
-
-/// Resolves the name recorded for a stored foreign key.
-fn constraint_name(
-    builder: &ParserDBBuilder,
-    foreign_key: &TableAttribute<CreateTable, ForeignKeyConstraint>,
-) -> Result<Box<str>, Error> {
-    builder
-        .tables()
-        .iter()
-        .find(|(table, _, _)| core::ptr::eq(table.as_ref(), foreign_key.table()))
-        .and_then(|(table, metadata, _)| {
-            let position =
-                metadata.foreign_keys().position(|stored| core::ptr::eq(stored, foreign_key))?;
-            super::constraint_names::names(
-                table,
-                metadata.recorded_constraint_names(),
-                builder.identifier_case(),
-            )
-            .into_iter()
-            .filter(|(slot, _)| slot.is_foreign_key())
-            .nth(position)
-            .and_then(|(_, name)| name)
-        })
-        .map(|name| name.into_owned().into_boxed_str())
-        .ok_or_else(|| {
-            Error::ForeignKeyNameMissing {
-                host_table: foreign_key.table().name.to_string().into_boxed_str(),
-            }
-        })
 }
 /// Proves equality support after flattening domain types.
 fn compatible(database: &ParserDB, host: &PgType, referenced: &PgType) -> Proof {
