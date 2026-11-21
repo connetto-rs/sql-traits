@@ -628,6 +628,14 @@ impl TableLike for MemoryTable {
         false
     }
 
+    fn is_strict(&self) -> bool {
+        false
+    }
+
+    fn is_without_rowid(&self) -> bool {
+        false
+    }
+
     fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
         std::iter::empty()
     }

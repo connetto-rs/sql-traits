@@ -8,16 +8,13 @@
 //! <https://www.sqlite.org/lang_createtable.html#the_primary_key>
 
 use sqlparser::{
-    ast::{
-        ColumnDef, ColumnOption, CreateTable, DataType, Expr, ObjectNamePart, SqliteTableOption,
-        TableConstraint,
-    },
+    ast::{ColumnDef, ColumnOption, CreateTable, DataType, Expr, ObjectNamePart, TableConstraint},
     keywords::Keyword,
     tokenizer::Token,
 };
 
 use super::case_idents_match;
-use crate::{impls::SqlparserDialect, structs::IdentifierCase};
+use crate::{impls::SqlparserDialect, structs::IdentifierCase, traits::TableLike};
 
 /// Whether the catalog records `NOT NULL` on `column`, a column of the primary
 /// key of `table`, because of that key, with the key naming its columns under
@@ -33,13 +30,8 @@ pub(super) fn key_states_not_null(
     case: IdentifierCase,
 ) -> bool {
     !dialect.is_sqlite()
-        || declares(table, SqliteTableOption::WithoutRowid)
-        || (declares(table, SqliteTableOption::Strict) && !is_rowid_alias(table, column, case))
-}
-
-/// Whether `table` lists `option` among its SQLite table options.
-fn declares(table: &CreateTable, option: SqliteTableOption) -> bool {
-    table.sqlite_table_options.options.contains(&option)
+        || table.is_without_rowid()
+        || (table.is_strict() && !is_rowid_alias(table, column, case))
 }
 
 /// Whether `column`, a column of the primary key of `table`, can never hold
@@ -65,7 +57,7 @@ pub(crate) fn key_excludes_null(
 /// in a table-level key does.
 /// <https://www.sqlite.org/lang_createtable.html#rowid>
 fn is_rowid_alias(table: &CreateTable, column: &ColumnDef, case: IdentifierCase) -> bool {
-    if declares(table, SqliteTableOption::WithoutRowid) || !declares_integer(&column.data_type) {
+    if table.is_without_rowid() || !declares_integer(&column.data_type) {
         return false;
     }
     let keyed_on_column =
