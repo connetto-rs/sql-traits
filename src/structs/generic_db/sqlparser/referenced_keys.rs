@@ -425,11 +425,11 @@ pub(super) fn settle_key_creations(
 /// # Errors
 ///
 /// Returns the error `bind` meets.
-pub(super) fn bind_noting_primary_key<T>(
+pub(super) fn bind_noting_primary_key<T, BindingError>(
     target: &mut T,
     of: for<'target> fn(&'target T) -> Vec<&'target ForeignKeyConstraint>,
-    bind: impl FnOnce(&mut T) -> Result<(), Error>,
-) -> Result<Vec<ForeignKeyConstraint>, Error> {
+    bind: impl FnOnce(&mut T) -> Result<(), BindingError>,
+) -> Result<Vec<ForeignKeyConstraint>, BindingError> {
     let named_none: Vec<bool> =
         of(target).iter().map(|foreign_key| foreign_key.referred_columns.is_empty()).collect();
     bind(target)?;

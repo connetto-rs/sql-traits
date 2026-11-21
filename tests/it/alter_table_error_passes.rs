@@ -1523,15 +1523,19 @@ fn alteration_refuses_shell_column_type() {
 }
 
 #[test]
-fn deferred_foreign_key_refuses_missing_referenced_column() {
-    let result = ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE target(id int PRIMARY KEY); CREATE TABLE probe(z int);
-         ALTER TABLE probe ADD COLUMN x int REFERENCES target(absent);",
-    );
-    assert_eq!(
-        result.err().map(|error| format!("{error:?}")),
-        Some("ReferencedColumnNotFoundForForeignKey { referenced_column: \"absent\", referenced_table: \"target\", host_table: \"probe\" }".to_owned())
-    );
+fn deferred_foreign_key_binds_implicit_primary_key() -> Result<(), sql_traits::errors::Error> {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA keys; CREATE TABLE keys.target(id int PRIMARY KEY); CREATE TABLE probe(z int);
+         ALTER TABLE probe ADD COLUMN x int REFERENCES keys.target;",
+    )?;
+    let references = database
+        .tables()
+        .filter(|table| table.name.to_string() == "probe")
+        .flat_map(|table| table.columns.iter().filter(|column| column.name.value == "x"))
+        .flat_map(|column| column.options.iter().map(|option| option.option.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(references, ["REFERENCES keys.target (id)"]);
+    Ok(())
 }
 
 #[test]
@@ -1569,4 +1573,39 @@ fn generic_replica_identity_keeps_last_setting() -> Result<(), sql_traits::error
         assert_eq!(identities, [expected]);
     }
     Ok(())
+}
+
+#[test]
+fn generic_type_changes_store_the_type_and_keep_inheritance_refusals() {
+    for (sql, expected) in [
+        (
+            "CREATE TABLE probe(x int); ALTER TABLE probe ALTER COLUMN x TYPE text;",
+            Ok(vec!["TEXT".to_owned()]),
+        ),
+        (
+            "CREATE TABLE probe(x int); ALTER TABLE probe ALTER COLUMN x SET DATA TYPE text;",
+            Ok(vec!["TEXT".to_owned()]),
+        ),
+        (
+            "CREATE TABLE p(x int); CREATE TABLE c() INHERITS(p); ALTER TABLE c ALTER COLUMN x TYPE text;",
+            Err("InheritedColumnTypeNotAlterable { table_name: \"c\", column_name: \"x\" }"
+                .to_owned()),
+        ),
+        (
+            "CREATE TABLE p(x int); CREATE TABLE c() INHERITS(p); ALTER TABLE ONLY p ALTER COLUMN x TYPE text;",
+            Err("OnlyRefusedWithChildren { table_name: \"p\", change: AlterColumnType }".to_owned()),
+        ),
+    ] {
+        let result = ParserDB::parse::<sqlparser::dialect::GenericDialect>(sql)
+            .map(|database| {
+                database
+                    .tables()
+                    .flat_map(|table| {
+                        table.columns.iter().map(|column| column.data_type.to_string())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|error| format!("{error:?}"));
+        assert_eq!(result, expected, "{sql}");
+    }
 }

@@ -448,16 +448,16 @@ pub(super) fn install_column_constraint(
         persistence,
         &option,
     )?;
-    let bound_to_primary = referenced_keys::bind_noting_primary_key(
+    let Ok(bound_to_primary) = referenced_keys::bind_noting_primary_key(
         &mut option,
         referenced_keys::option_foreign_keys,
         |option| {
             if let ColumnOption::ForeignKey(key) = &mut option.option {
-                builder.bind_foreign_key(stored, key)?;
+                builder.bind_foreign_key_at_declaration(key);
             }
-            Ok(())
+            Ok::<(), core::convert::Infallible>(())
         },
-    )?;
+    );
     builder = ParserDB::alter_table_column_def(
         builder,
         table_name,
