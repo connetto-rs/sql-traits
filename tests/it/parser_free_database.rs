@@ -2353,7 +2353,8 @@ fn constraints_without_validation_records_report_validated() -> Result<(), Looku
 }
 
 /// A catalog that records no index clauses reports every index as written
-/// without `USING`, `INCLUDE`, `WHERE`, `NULLS NOT DISTINCT` or key options.
+/// without `USING`, `INCLUDE`, `WHERE`, `NULLS NOT DISTINCT` or key options,
+/// and as no SQLite index.
 #[test]
 fn indexes_without_clause_records_report_none_written() -> Result<(), LookupError> {
     let catalog = catalog();
@@ -2369,6 +2370,7 @@ fn indexes_without_clause_records_report_none_written() -> Result<(), LookupErro
     assert_eq!(index.include_column_names().count(), 0);
     assert_eq!(index.predicate(), None);
     assert!(index.nulls_distinct());
+    assert!(index.sqlite_index_columns(&catalog)?.is_none());
     let keys: Vec<_> = index.keys(&catalog)?.collect();
     assert_eq!(keys, [IndexKey::new(&Expr::Identifier("id".into()))]);
     Ok(())

@@ -206,15 +206,19 @@ fn rowid_table_key_constraints_append_the_rowid() {
 }
 
 /// `PRIMARY KEY DESC` written on a column sorts descending, and on an
-/// `INTEGER` column makes an index rather than the rowid alias.
+/// `INTEGER` column makes an index rather than the rowid alias, which
+/// `AUTOINCREMENT` after the key leaves the alias.
 #[test]
 fn a_column_primary_key_keeps_its_direction() {
     let database = build(
         "CREATE TABLE t(a TEXT PRIMARY KEY DESC, b);
-         CREATE TABLE i(a INTEGER PRIMARY KEY DESC, b);",
+         CREATE TABLE i(a INTEGER PRIMARY KEY DESC, b);
+         CREATE TABLE k(id INTEGER PRIMARY KEY AUTOINCREMENT, a TEXT UNIQUE);",
     );
     assert_eq!(constraint_rows(&database, "t", 0), expected(&["0|a|1|BINARY|1", "-1||0|BINARY|0"]));
     assert_eq!(constraint_rows(&database, "i", 0), expected(&["0|a|1|BINARY|1", "-1||0|BINARY|0"]));
+    assert!(!builds_index(&database, constraint(&database, "k", 0)));
+    assert_eq!(constraint_rows(&database, "k", 1), expected(&["1|a|0|BINARY|1", "-1||0|BINARY|0"]));
 }
 
 /// Key constraints listing the same columns under the same collations share

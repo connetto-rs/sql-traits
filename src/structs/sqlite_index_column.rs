@@ -15,6 +15,8 @@ pub enum SqliteIndexed<'db, C> {
     Rowid,
 }
 
+// A `Copy` value is cloned only through a generic `Clone` bound.
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<C> Clone for SqliteIndexed<'_, C> {
     #[inline]
     fn clone(&self) -> Self {
@@ -62,6 +64,8 @@ pub struct SqliteIndexColumn<'db, C> {
     key: bool,
 }
 
+// A `Copy` value is cloned only through a generic `Clone` bound.
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl<C> Clone for SqliteIndexColumn<'_, C> {
     #[inline]
     fn clone(&self) -> Self {

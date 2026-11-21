@@ -123,13 +123,12 @@ fn primary_key_record<'db>(
     columns: &[&'db Column],
     case: IdentifierCase,
 ) -> Vec<Entry<'db>> {
-    let Some(first) = metadata
+    let first = metadata
         .sqlite_primary_key_autoindex()
-        .and_then(|autoindex| metadata.sqlite_autoindex_first(autoindex))
-    else {
-        return Vec::new();
-    };
-    let mut record = key_record(&first.attribute().columns, table, columns, case);
+        .and_then(|autoindex| metadata.sqlite_autoindex_first(autoindex));
+    let mut record = first.map_or_else(Vec::new, |first| {
+        key_record(&first.attribute().columns, table, columns, case)
+    });
     drop_repeated_entries(&mut record);
     record
 }
