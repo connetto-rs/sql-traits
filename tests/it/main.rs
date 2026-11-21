@@ -2,6 +2,7 @@
 //! directory is a module declared here, and `support` holds the helpers several
 //! of them share.
 
+mod storage_parameter_validation;
 #[path = "../support/mod.rs"]
 mod support;
 

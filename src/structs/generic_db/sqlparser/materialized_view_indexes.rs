@@ -70,6 +70,7 @@ pub(super) fn create(
     )?;
     stored_expressions::refuse_in_index(&builder, &create_index)?;
     super::index_access_methods::refuse_in_index(&builder, &create_index)?;
+    super::storage_parameters::index(&builder, &create_index)?;
     if *builder.dialect() != super::SqlparserDialect::PostgreSql {
         views::require_indexed_columns(
             &builder,

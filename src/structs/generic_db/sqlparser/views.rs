@@ -101,6 +101,12 @@ pub(super) fn create_view(
 ) -> Result<ParserDBBuilder, Error> {
     let kind = declared_kind(&node);
     require_named_in_catalog(&mut node.name, kind, builder.catalog_name())?;
+    if node.materialized
+        && let sqlparser::ast::CreateTableOptions::With(options) = &node.options
+    {
+        refuse_plain_view_options(&node.name, options)?;
+        super::storage_parameters::heap(&builder, options)?;
+    }
 
     if node.materialized && node.or_replace {
         return Err(Error::MaterializedViewCannotBeReplaced {
@@ -804,6 +810,7 @@ fn set_view_options(
 ) -> Result<ParserDBBuilder, Error> {
     if kind == ObjectKind::MaterializedView {
         refuse_plain_view_options(name, options)?;
+        super::storage_parameters::heap(&builder, options)?;
     }
     if kind == ObjectKind::View
         && let Some(position) = plain_view_position(&builder, name)

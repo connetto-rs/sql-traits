@@ -38,6 +38,7 @@ mod view;
 
 pub(crate) use column_def::{foreign_options_of, generation_storage, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
+pub(crate) use create_table::parameter_value;
 pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;
 pub(crate) use dynamic_sites::{BodyNames, SiteKey, SiteSource};
