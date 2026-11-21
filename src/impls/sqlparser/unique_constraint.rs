@@ -14,8 +14,8 @@ use crate::{
     errors::{LookupError, ObjectKind},
     impls::SqlparserDialect,
     structs::{
-        ConstraintObject, IndexKey, ParserDB, TableAttribute, WrittenCall,
-        metadata::UniqueIndexMetadata,
+        ConstraintObject, IndexKey, ParserDB, SqliteIndexColumn, TableAttribute, WrittenCall,
+        generic_db::constraint_index_record, metadata::UniqueIndexMetadata,
     },
     traits::{DatabaseLike, IndexLike, Metadata, Relation, TableIndexLike, TableLike},
 };
@@ -115,8 +115,8 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         match database.dialect() {
             SqlparserDialect::SQLite => {
                 Ok(super::create_table::table_metadata(self.table(), database)?
-                    .sqlite_autoindex_name(self)
-                    .map(Cow::Borrowed))
+                    .sqlite_autoindex(self)
+                    .map(|autoindex| Cow::Borrowed(autoindex.name())))
             }
             SqlparserDialect::PostgreSql => self.constraint_name(database),
             _ => Ok(self.name().map(Cow::Borrowed)),
@@ -191,5 +191,27 @@ impl TableIndexLike for TableAttribute<CreateTable, UniqueConstraint> {
     {
         self.metadata(database)?;
         included_columns(&self.attribute().include, self.table(), database)
+    }
+
+    #[inline]
+    fn sqlite_index_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<
+        Option<
+            impl Iterator<Item = SqliteIndexColumn<'db, TableAttribute<CreateTable, ColumnDef>>>,
+        >,
+        LookupError,
+    >
+    where
+        Self: 'db,
+    {
+        self.metadata(database)?;
+        if *database.dialect() != SqlparserDialect::SQLite {
+            return Ok(None);
+        }
+        let metadata = super::create_table::table_metadata(self.table(), database)?;
+        let record = constraint_index_record(self, metadata, database.identifier_case());
+        Ok(record.map(IntoIterator::into_iter))
     }
 }

@@ -10,9 +10,10 @@ use super::index_clauses::{
 };
 use crate::{
     errors::{LookupError, ObjectKind},
+    impls::SqlparserDialect,
     structs::{
-        IndexKey, MaterializedViewIndex, ParserDB, TableAttribute, WrittenCall,
-        metadata::IndexMetadata,
+        IndexKey, MaterializedViewIndex, ParserDB, SqliteIndexColumn, TableAttribute, WrittenCall,
+        generic_db::created_index_record, metadata::IndexMetadata,
     },
     traits::{DatabaseLike, IndexLike, Metadata, Relation, TableIndexLike, TableLike},
     utils::object_name::{object_name_last_part, qualifier_of},
@@ -173,6 +174,29 @@ impl TableIndexLike for TableAttribute<CreateTable, CreateIndex> {
     {
         self.metadata(database)?;
         included_columns(&self.attribute().include, self.table(), database)
+    }
+
+    #[inline]
+    fn sqlite_index_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<
+        Option<
+            impl Iterator<Item = SqliteIndexColumn<'db, TableAttribute<CreateTable, ColumnDef>>>,
+        >,
+        LookupError,
+    >
+    where
+        Self: 'db,
+    {
+        self.metadata(database)?;
+        if *database.dialect() != SqlparserDialect::SQLite {
+            return Ok(None);
+        }
+        let metadata = super::create_table::table_metadata(self.table(), database)?;
+        let keys = &self.attribute().columns;
+        let record = created_index_record(keys, self.table(), metadata, database.identifier_case());
+        Ok(Some(record.into_iter()))
     }
 }
 
