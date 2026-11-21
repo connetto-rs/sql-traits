@@ -290,12 +290,14 @@ fn refuse_unattachable(
         return Err(Error::TemporaryPartitionOfPermanent {
             table_name: builder.dialect().stored_object_name_last(&partition_node.name),
             parent_name: builder.dialect().stored_object_name_last(&root_node.name),
+            attach: true,
         });
     }
     if !partition_node.is_temporary() && root_node.is_temporary() {
         return Err(Error::PermanentRelationInheritsTemporary {
             table_name: builder.dialect().stored_object_name_last(&partition_node.name),
             parent_name: builder.dialect().stored_object_name_last(&root_node.name),
+            partition: Some(true),
         });
     }
 

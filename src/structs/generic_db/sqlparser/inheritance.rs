@@ -1588,12 +1588,14 @@ fn bind_parents(builder: &ParserDBBuilder, create_table: &mut CreateTable) -> Re
             return Err(Error::PermanentRelationInheritsTemporary {
                 table_name: stored_child_name(),
                 parent_name: builder.dialect().stored_object_name_last(&parent.name),
+                partition: (kind == ParentKind::PartitionOf).then_some(false),
             });
         }
         if !parent.is_temporary() && child_temporary && kind == ParentKind::PartitionOf {
             return Err(Error::TemporaryPartitionOfPermanent {
                 table_name: stored_child_name(),
                 parent_name: builder.dialect().stored_object_name_last(&parent.name),
+                attach: false,
             });
         }
         match kind {
@@ -1613,6 +1615,7 @@ fn bind_parents(builder: &ParserDBBuilder, create_table: &mut CreateTable) -> Re
                 return Err(Error::InheritsFromPartition {
                     table_name: stored_child_name(),
                     parent_name: builder.dialect().stored_object_name_last(&parent.name),
+                    altering: false,
                 });
             }
             ParentKind::PartitionOf | ParentKind::Inherits => {}

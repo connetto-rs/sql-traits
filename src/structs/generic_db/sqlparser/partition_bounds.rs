@@ -25,7 +25,7 @@ use super::{ParserDB, ParserDBBuilder, StoredTable, inheritance, partition_keys}
 use crate::{
     errors::{Error, InvalidBound},
     traits::PartitionStrategy,
-    utils::walk::walk,
+    utils::{postgres_format_type::format_type, postgres_types::PgType, walk::walk},
 };
 
 /// The type a key column's values are read as, for the types the model can
@@ -488,9 +488,11 @@ fn read_range_side(
     kinds: &[Option<KeyKind>],
     columns: &[Option<&ColumnDef>],
     side: &[PartitionBoundValue],
+    upper: bool,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<Option<Vec<RangeEntry>>, InvalidBound> {
     if side.len() != kinds.len() {
-        return Err(InvalidBound::ValueCount { expected: kinds.len(), found: side.len() });
+        return Err(InvalidBound::ValueCount { expected: kinds.len(), found: side.len(), upper });
     }
     let mut entries = Some(Vec::with_capacity(side.len()));
     let mut infinity = None;
@@ -506,15 +508,19 @@ fn read_range_side(
                     return Err(InvalidBound::NullInRange);
                 }
                 if infinity.is_some() {
-                    return Err(InvalidBound::ValueAfterInfinity);
+                    return Err(InvalidBound::ValueAfterInfinity {
+                        maximum: matches!(infinity, Some(PartitionBoundValue::MaxValue)),
+                    });
                 }
-                read_value(kinds[at], columns[at], expr)?.map(RangeEntry::Value)
+                read_value(kinds[at], columns[at], expr, dialect)?.map(RangeEntry::Value)
             }
         };
         match (&infinity, value) {
             (Some(PartitionBoundValue::MinValue), PartitionBoundValue::MaxValue)
             | (Some(PartitionBoundValue::MaxValue), PartitionBoundValue::MinValue) => {
-                return Err(InvalidBound::ValueAfterInfinity);
+                return Err(InvalidBound::ValueAfterInfinity {
+                    maximum: matches!(infinity, Some(PartitionBoundValue::MaxValue)),
+                });
             }
             (None, PartitionBoundValue::MinValue | PartitionBoundValue::MaxValue) => {
                 infinity = Some(value.clone());
@@ -535,6 +541,7 @@ fn read_value(
     kind: Option<KeyKind>,
     column: Option<&ColumnDef>,
     expr: &Expr,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<Option<Datum>, InvalidBound> {
     let (Some(kind), Some(column)) = (kind, column) else {
         return Ok(None);
@@ -542,13 +549,39 @@ fn read_value(
     match read(kind, expr) {
         Reading::Known(datum) => Ok(Some(datum)),
         Reading::Undecided => Ok(None),
-        Reading::Invalid => {
-            Err(InvalidBound::ValueNotOfKeyType {
-                value: expr.to_string(),
-                type_name: column.data_type.to_string(),
-            })
-        }
+        Reading::Invalid => Err(invalid_value(kind, column, expr, dialect)),
     }
+}
+
+fn invalid_value(
+    kind: KeyKind,
+    column: &ColumnDef,
+    expr: &Expr,
+    dialect: crate::impls::SqlparserDialect,
+) -> InvalidBound {
+    let type_name = format_type(&PgType::of(&column.data_type));
+    let value = literal(expr).map(|(_, value)| value);
+    let Value::SingleQuotedString(text) = value.unwrap_or(&Value::Null) else {
+        return if matches!(value, Some(Value::Boolean(_)))
+            || matches!(kind, KeyKind::Date | KeyKind::Timestamp)
+        {
+            InvalidBound::ValueCannotCast {
+                type_name,
+                column_name: dialect.stored_name(&column.name),
+            }
+        } else {
+            InvalidBound::ValueOutOfRange { value: expr.to_string(), type_name, quoted: false }
+        };
+    };
+    if matches!(kind, KeyKind::Date | KeyKind::Timestamp) {
+        return InvalidBound::DateTimeOutOfRange { value: text.clone() };
+    }
+    if matches!(kind, KeyKind::Integer { .. })
+        && text.trim().trim_start_matches(['+', '-']).bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return InvalidBound::ValueOutOfRange { value: text.clone(), type_name, quoted: true };
+    }
+    InvalidBound::ValueNotOfKeyType { value: text.clone(), type_name }
 }
 
 /// Reads a bound as the key of a table partitioned by `strategy`, refusing
@@ -557,6 +590,7 @@ fn read_bound(
     strategy: PartitionStrategy,
     columns: &[Option<&ColumnDef>],
     bound: &ForValues,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<ReadBound, InvalidBound> {
     let kinds: Vec<Option<KeyKind>> =
         columns.iter().map(|column| column.and_then(key_kind)).collect();
@@ -564,8 +598,8 @@ fn read_bound(
         (PartitionStrategy::Hash, ForValues::Default) => Err(InvalidBound::DefaultOnHash),
         (_, ForValues::Default) => Ok(ReadBound::Default),
         (PartitionStrategy::Range, ForValues::From { from, to }) => {
-            let from = read_range_side(&kinds, columns, from)?;
-            let to = read_range_side(&kinds, columns, to)?;
+            let from = read_range_side(&kinds, columns, from, false, dialect)?;
+            let to = read_range_side(&kinds, columns, to, true, dialect)?;
             if let (Some(from), Some(to)) = (&from, &to)
                 && from >= to
             {
@@ -588,6 +622,7 @@ fn read_bound(
                     kinds.first().copied().flatten(),
                     columns.first().copied().flatten(),
                     value,
+                    dialect,
                 )?);
             }
             Ok(ReadBound::List { null, values: read })
@@ -681,17 +716,16 @@ fn validate_against_key(
             reason,
         }
     };
-    let new = read_bound(strategy, columns, bound).map_err(invalid)?;
+    let new = read_bound(strategy, columns, bound, *builder.dialect()).map_err(invalid)?;
     let partitions = inheritance::direct_children(builder, &StoredTable::of(root))
         .into_iter()
         .filter(|(kind, _)| *kind == inheritance::ParentKind::PartitionOf);
     for (_, sibling) in partitions {
         let sibling_node = ParserDB::stored_node(builder, &sibling)?;
         // A sibling's bound was checked when it was given, so it reads.
-        let sibling_read = sibling_node
-            .for_values
-            .as_ref()
-            .and_then(|sibling_bound| read_bound(strategy, columns, sibling_bound).ok());
+        let sibling_read = sibling_node.for_values.as_ref().and_then(|sibling_bound| {
+            read_bound(strategy, columns, sibling_bound, *builder.dialect()).ok()
+        });
         let other_partition = builder.dialect().stored_object_name_last(&sibling_node.name);
         match sibling_read.and_then(|sibling_read| clash(&new, &sibling_read)) {
             Some(Clash::Overlap) => {
