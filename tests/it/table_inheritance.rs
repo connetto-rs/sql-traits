@@ -432,7 +432,7 @@ fn a_partition_names_only_columns_its_parent_declares() {
         assert!(
             matches!(
                 &error,
-                Error::IdentifierLookupError(LookupError::ColumnNotFound { table_name, column_name })
+                Error::IdentifierLookupError(LookupError::ColumnNotFound { table_name, column_name, .. })
                     if table_name == "orders" && column_name == "missing"
             ),
             "{written}: {error:?}"

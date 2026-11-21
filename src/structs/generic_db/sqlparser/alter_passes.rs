@@ -386,6 +386,7 @@ pub(super) fn prepare(
                 return Err(LookupError::ColumnNotFound {
                     table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
                     column_name: dialect.stored_spelling(&column.name, column.quoted),
+                    site: crate::errors::ColumnLookupSite::Relation,
                 }
                 .into());
             }

@@ -268,7 +268,7 @@ fn a_missing_relation_or_column_is_refused() {
         assert!(
             matches!(
                 &refused,
-                Error::IdentifierLookupError(LookupError::ColumnNotFound { table_name, column_name })
+                Error::IdentifierLookupError(LookupError::ColumnNotFound { table_name, column_name, .. })
                     if table_name == relation && column_name == "missing"
             ),
             "{statement}: {refused:?}",

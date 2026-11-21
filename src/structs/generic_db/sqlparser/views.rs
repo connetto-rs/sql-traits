@@ -738,9 +738,15 @@ pub(super) fn require_exposed_column(
         materialized_view_position(builder, name)
             .map(|at| builder.materialized_views()[at].0.declaration())
     };
-    plain()
-        .or_else(materialized)
-        .map_or(Ok(()), |declaration| require_exposed(builder, declaration, column_name))
+    plain().or_else(materialized).map_or(Ok(()), |declaration| {
+        require_exposed(
+            builder,
+            declaration,
+            column_name,
+            crate::errors::ColumnLookupSite::Relation,
+            Some(name),
+        )
+    })
 }
 
 /// Refuses `column_name` when the view `declaration` describes exposes no
@@ -749,6 +755,8 @@ fn require_exposed(
     builder: &ParserDBBuilder,
     declaration: &ViewDeclaration,
     column_name: &Ident,
+    site: crate::errors::ColumnLookupSite,
+    relation_name: Option<&ObjectName>,
 ) -> Result<(), Error> {
     let (names, enumerable) = output_names(builder, declaration)?;
     let exposed = names.iter().any(|(exposed, quoted)| {
@@ -756,10 +764,16 @@ fn require_exposed(
     });
     if enumerable && !exposed {
         return Err(LookupError::ColumnNotFound {
-            table_name: builder
-                .dialect()
-                .stored_spelling(declaration.name(), declaration.name_is_quoted()),
+            table_name: relation_name.map_or_else(
+                || {
+                    builder
+                        .dialect()
+                        .stored_spelling(declaration.name(), declaration.name_is_quoted())
+                },
+                |name| builder.dialect().stored_object_name(name),
+            ),
             column_name: builder.dialect().stored_name(column_name),
+            site,
         }
         .into());
     }
@@ -789,7 +803,15 @@ pub(super) fn require_indexed_columns(
             }
         })
         .chain(include)
-        .try_for_each(|name| require_exposed(builder, declaration, name))
+        .try_for_each(|name| {
+            require_exposed(
+                builder,
+                declaration,
+                name,
+                crate::errors::ColumnLookupSite::Column,
+                None,
+            )
+        })
 }
 
 /// Sets the options an `ALTER TABLE ... SET (...)` names on a view, leaving
@@ -1173,6 +1195,7 @@ fn rename_view_column(
                 .dialect()
                 .stored_spelling(declaration.name(), declaration.name_is_quoted()),
             column_name: builder.dialect().stored_name(old_name),
+            site: crate::errors::ColumnLookupSite::Column,
         }
         .into());
     };

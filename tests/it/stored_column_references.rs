@@ -48,7 +48,7 @@ fn an_unknown_column_is_refused() {
         assert!(
             matches!(
                 &parsed,
-                Err(Error::UnknownColumn { reference }) if reference.contains("nosuch")
+                Err(Error::UnknownColumn { reference }) if reference.to_string().contains("nosuch")
             ),
             "{statement}\ngot {parsed:?}"
         );

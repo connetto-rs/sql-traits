@@ -79,7 +79,7 @@ fn create_table_checks_each_key_column_before_the_next() {
     let error = parse("CREATE TABLE t (b INT, UNIQUE (z, b, b));").expect_err("z is not declared");
     assert!(
         matches!(&error, Error::IdentifierLookupError(LookupError::ColumnNotFound {
-            table_name, column_name }) if table_name == "t" && column_name == "z"),
+            table_name, column_name, .. }) if table_name == "t" && column_name == "z"),
         "got {error:?}"
     );
     assert_repeated("CREATE TABLE t (b INT, UNIQUE (b, b, z));", "t", "b", KeyConstraint::Unique);
@@ -151,7 +151,7 @@ fn mysql_refuses_a_repeat_in_every_key_checking_each_column_in_turn() {
         .expect_err("z is not declared");
     assert!(
         matches!(&error, Error::IdentifierLookupError(LookupError::ColumnNotFound {
-            table_name, column_name }) if table_name == "t" && column_name == "z"),
+            table_name, column_name, .. }) if table_name == "t" && column_name == "z"),
         "got {error:?}"
     );
 

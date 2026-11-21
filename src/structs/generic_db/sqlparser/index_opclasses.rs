@@ -72,7 +72,12 @@ pub(super) fn index(
     let method = Method::of(index.using.as_ref(), builder);
     let require_column = |name: &Ident| -> Result<(), Error> {
         if let Some(table) = table {
-            Ok(super::validate_declared_column(name, table, builder)?)
+            Ok(super::validate_declared_column(
+                name,
+                table,
+                builder,
+                crate::errors::ColumnLookupSite::Column,
+            )?)
         } else {
             super::views::require_exposed_column(builder, &index.table_name, name)
         }

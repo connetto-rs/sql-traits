@@ -160,6 +160,7 @@ pub(super) fn require_composite_attribute(
     Err(LookupError::ColumnNotFound {
         table_name: builder.dialect().stored_object_name(relation_name),
         column_name: builder.dialect().stored_name(attribute),
+        site: crate::errors::ColumnLookupSite::Relation,
     }
     .into())
 }

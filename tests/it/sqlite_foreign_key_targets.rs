@@ -163,6 +163,7 @@ fn a_referenced_column_the_target_lacks_is_reported_on_read() {
         Err(LookupError::ColumnNotFound {
             table_name: "parent".to_owned(),
             column_name: "nope".to_owned(),
+            site: sql_traits::errors::ColumnLookupSite::ForeignKey,
         })
     );
 }
@@ -432,6 +433,7 @@ fn dropping_a_referenced_column_keeps_the_keys_naming_it() {
         Err(LookupError::ColumnNotFound {
             table_name: "parent".to_owned(),
             column_name: "code".to_owned(),
+            site: sql_traits::errors::ColumnLookupSite::ForeignKey,
         })
     );
 
@@ -445,6 +447,7 @@ fn dropping_a_referenced_column_keeps_the_keys_naming_it() {
         Err(LookupError::ColumnNotFound {
             table_name: "tree".to_owned(),
             column_name: "code".to_owned(),
+            site: sql_traits::errors::ColumnLookupSite::ForeignKey,
         })
     );
 }

@@ -5452,13 +5452,23 @@ fn validate_index_columns(
     let refuses_repeats = refuses_repeated_index_columns(*builder.dialect());
     for (position, column) in columns.iter().enumerate() {
         if let Expr::Identifier(name) = &column.column.expr {
-            validate_declared_column(name, create_table, builder)?;
+            validate_declared_column(
+                name,
+                create_table,
+                builder,
+                crate::errors::ColumnLookupSite::Column,
+            )?;
         }
         if refuses_repeats && let Some(name) = repeated_key_column(columns, position, case) {
             return Err(repeated_index_column(create_table, name));
         }
     }
-    Ok(validate_include_columns(include, create_table, builder)?)
+    Ok(validate_include_columns(
+        include,
+        create_table,
+        builder,
+        crate::errors::ColumnLookupSite::Column,
+    )?)
 }
 
 /// Whether the dialect refuses a primary key or unique constraint naming one
@@ -5531,8 +5541,9 @@ fn validate_include_columns(
     include: &[Ident],
     create_table: &CreateTable,
     builder: &ParserDBBuilder,
+    site: crate::errors::ColumnLookupSite,
 ) -> Result<(), LookupError> {
-    include.iter().try_for_each(|name| validate_declared_column(name, create_table, builder))
+    include.iter().try_for_each(|name| validate_declared_column(name, create_table, builder, site))
 }
 
 /// Checks that `create_table` declares the column `name` spells.
@@ -5540,6 +5551,7 @@ fn validate_declared_column(
     name: &Ident,
     create_table: &CreateTable,
     builder: &ParserDBBuilder,
+    site: crate::errors::ColumnLookupSite,
 ) -> Result<(), LookupError> {
     if NamedColumn::of(name, builder.identifier_case()).declared_by(create_table) {
         Ok(())
@@ -5547,6 +5559,7 @@ fn validate_declared_column(
         Err(LookupError::ColumnNotFound {
             table_name: builder.dialect().stored_object_name_last(&create_table.name),
             column_name: builder.dialect().stored_name(name),
+            site,
         })
     }
 }
@@ -8016,6 +8029,7 @@ impl ParserDB {
                                 .dialect()
                                 .stored_object_name_last(&create_table.name),
                             column_name: builder.dialect().stored_name(&not_null.column),
+                            site: crate::errors::ColumnLookupSite::Relation,
                         }
                         .into());
                     }
@@ -8102,7 +8116,13 @@ impl ParserDB {
         let resolve_inherited =
             |name: &Ident| create_table_transform::key_column(builder, create_table, name);
         let resolve_local = |name: &Ident| {
-            validate_declared_column(name, create_table, builder).map_err(Into::into)
+            validate_declared_column(
+                name,
+                create_table,
+                builder,
+                crate::errors::ColumnLookupSite::Key,
+            )
+            .map_err(Into::into)
         };
         let resolve: &dyn Fn(&Ident) -> Result<(), crate::errors::Error> =
             if inherited { &resolve_inherited } else { &resolve_local };
@@ -11003,6 +11023,7 @@ impl ParserDB {
                 return Err(LookupError::ColumnNotFound {
                     table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                     column_name: builder.dialect().stored_name(column_name),
+                    site: crate::errors::ColumnLookupSite::Relation,
                 }
                 .into());
             }
@@ -11148,6 +11169,7 @@ impl ParserDB {
             return Err(LookupError::ColumnNotFound {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 column_name: builder.dialect().stored_name(old_column_name),
+                site: crate::errors::ColumnLookupSite::Column,
             }
             .into());
         }
@@ -11273,6 +11295,7 @@ impl ParserDB {
             return Err(LookupError::ColumnNotFound {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 column_name: builder.dialect().stored_name(column_name),
+                site: crate::errors::ColumnLookupSite::Relation,
             }
             .into());
         }
@@ -11467,6 +11490,7 @@ impl ParserDB {
             return Err(LookupError::ColumnNotFound {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 column_name: builder.dialect().stored_name(column_name),
+                site: crate::errors::ColumnLookupSite::Relation,
             }
             .into());
         }
