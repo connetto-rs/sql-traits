@@ -8131,10 +8131,9 @@ impl ParserDB {
     /// Drops a named constraint from a table, taking it out of every table that
     /// received it.
     ///
-    /// A constraint reaches a table either in its constraint list or written on
-    /// one of its columns, and the statement names one without saying which, so
-    /// both are searched. The two are removed from different places and travel
-    /// by different routes, so each has its own body below.
+    /// A key a foreign key depends on is refused, or under `CASCADE` dropped
+    /// after those foreign keys, so the table is never rebuilt holding a
+    /// foreign key whose key is gone.
     fn alter_table_drop_constraint(
         builder: ParserDBBuilder,
         table_name: &ObjectName,
@@ -8148,70 +8147,147 @@ impl ParserDB {
         };
 
         let node = Self::stored_node(&builder, &stored)?;
-        let located = constraint_names::locate(
+        let key = constraint_names::locate(
             node,
             generated_constraint_names(&builder, &stored),
             name,
             builder.identifier_case(),
-        );
-        let Some(position) = located else {
-            if if_exists {
-                return Ok(builder);
-            }
-            return Err(crate::errors::Error::DropConstraintNotFound {
-                table_name: node.name.to_string(),
-                constraint_name: name.value.clone(),
-            });
+        )
+        .and_then(|position| {
+            constraint_names::slots(node)
+                .into_iter()
+                .find(|slot| slot.position() == position && slot.is_unique_key())
+        });
+        let Some(key) = key else {
+            return Self::drop_named_constraint(builder, &stored, scope, name, if_exists);
         };
-        // A foreign key the drop takes along first may sit before the key in
-        // the same node, so the key is found again by what it holds.
-        let held = referenced_keys::HeldConstraint::at(node, position);
-        let remove = |builder: ParserDBBuilder| {
-            let node = Self::stored_node(&builder, &stored)?;
-            let Some(position) = held.and_then(|held| held.position_in(node)) else {
-                return Err(crate::errors::Error::DropConstraintNotFound {
-                    table_name: node.name.to_string(),
-                    constraint_name: name.value.clone(),
-                });
-            };
-            match position {
-                constraint_names::Position::Table(position) => {
-                    let dropped = node.constraints[position].clone();
-                    if let TableConstraint::NotNull(not_null) = &dropped {
-                        return Self::drop_not_null_constraint(
-                            builder, &stored, scope, name, not_null,
-                        );
-                    }
-                    Self::drop_table_constraint(builder, &stored, scope, name, position, dropped)
-                }
-                constraint_names::Position::Column(column, option) => {
-                    let written_on = node.columns[column].name.clone();
-                    let held = node.columns[column].options[option].clone();
-                    Self::drop_column_constraint(
-                        builder,
-                        &stored,
-                        scope,
-                        name,
-                        (column, option),
-                        (&written_on, &held),
-                    )
-                }
-            }
-        };
-        let is_key = constraint_names::slots(node)
-            .into_iter()
-            .any(|slot| slot.position() == position && slot.is_unique_key());
-        if !is_key {
-            return remove(builder);
-        }
-        let removed = referenced_keys::removed_keys(&builder, &stored, position, scope.only);
+        let removed = referenced_keys::removed_keys(&builder, &stored, key, scope.only)?;
         let key_name = stored_ident_name(name);
         let on_dependents = if cascade {
             referenced_keys::OnDependents::Cascade
         } else {
             referenced_keys::OnDependents::Refuse { key_name: &key_name, table_name: &stored.name }
         };
-        Self::drop_keys(builder, &removed, on_dependents, remove)
+        Self::drop_keys(builder, &removed, on_dependents, |builder| {
+            Self::drop_named_constraint(builder, &stored, scope, name, if_exists)
+        })
+    }
+
+    /// Drops the constraint of `stored` that `name` reaches.
+    ///
+    /// A constraint reaches a table either in its constraint list or written on
+    /// one of its columns, and the statement names one without saying which, so
+    /// both are searched. The two are removed from different places and travel
+    /// by different routes, so each has its own body below.
+    fn drop_named_constraint(
+        builder: ParserDBBuilder,
+        stored: &StoredTable,
+        scope: AlterTableScope,
+        name: &Ident,
+        if_exists: bool,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let node = Self::stored_node(&builder, stored)?;
+        match constraint_names::locate(
+            node,
+            generated_constraint_names(&builder, stored),
+            name,
+            builder.identifier_case(),
+        ) {
+            Some(constraint_names::Position::Table(position)) => {
+                let dropped = node.constraints[position].clone();
+                if let TableConstraint::NotNull(not_null) = &dropped {
+                    return Self::drop_not_null_constraint(builder, stored, scope, name, not_null);
+                }
+                return Self::drop_table_constraint(
+                    builder, stored, scope, name, position, dropped,
+                );
+            }
+            Some(constraint_names::Position::Column(column, option)) => {
+                let written_on = node.columns[column].name.clone();
+                let held = node.columns[column].options[option].clone();
+                return Self::drop_column_constraint(
+                    builder,
+                    stored,
+                    scope,
+                    name,
+                    (column, option),
+                    (&written_on, &held),
+                );
+            }
+            None => {}
+        }
+
+        if if_exists {
+            return Ok(builder);
+        }
+        Err(crate::errors::Error::DropConstraintNotFound {
+            table_name: node.name.to_string(),
+            constraint_name: name.value.clone(),
+        })
+    }
+
+    /// Applies `DROP INDEX` to the index `name` reaches.
+    ///
+    /// An index a constraint owns is refused. A unique index a foreign key
+    /// depends on is refused, or under `CASCADE` dropped after those foreign
+    /// keys.
+    fn drop_index(
+        builder: ParserDBBuilder,
+        name: &ObjectName,
+        if_exists: bool,
+        cascade: bool,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        if let Some(index_name) = object_name_last_identifier(name)
+            && let Some((stored, _)) = constraint_names::key_index_owner(&builder, name, index_name)
+        {
+            return Err(crate::errors::Error::IndexRequiredByConstraint {
+                index_name: index_name.value.clone(),
+                table_name: stored.name,
+            });
+        }
+        let stored_name = |name: &ObjectName| {
+            object_name_last_identifier(name)
+                .map(|ident| stored_ident_name(ident).into_owned())
+                .unwrap_or_default()
+        };
+        let (removed, table_name) = match builder.index_position(name)? {
+            Some(IndexSlot::Table(at)) => {
+                let (index, metadata) = &builder.indices()[at];
+                let table_name = stored_name(&index.attribute().table_name);
+                (metadata.key_identity().into_iter().collect::<Vec<_>>(), table_name)
+            }
+            Some(IndexSlot::MaterializedView(_)) | None => (Vec::new(), String::new()),
+        };
+        if removed.is_empty() {
+            return Self::drop_named_index(builder, name, if_exists);
+        }
+        let index_name = stored_name(name);
+        let on_dependents = if cascade {
+            referenced_keys::OnDependents::Cascade
+        } else {
+            referenced_keys::OnDependents::Refuse { key_name: &index_name, table_name: &table_name }
+        };
+        Self::drop_keys(builder, &removed, on_dependents, |builder| {
+            Self::drop_named_index(builder, name, if_exists)
+        })
+    }
+
+    /// Removes the index `name` reaches.
+    fn drop_named_index(
+        mut builder: ParserDBBuilder,
+        name: &ObjectName,
+        if_exists: bool,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let Some(position) = builder.index_position(name)? else {
+            if if_exists {
+                return Ok(builder);
+            }
+            return Err(crate::errors::Error::DropIndexNotFound {
+                index_name: last_str(name).to_string(),
+            });
+        };
+        builder.remove_index_at(position);
+        Ok(builder)
     }
 
     /// Drops a constraint held in the table's own constraint list.
@@ -10757,56 +10833,7 @@ impl ParserDB {
                     ..
                 } => {
                     for name in names {
-                        if let Some(index_name) = object_name_last_identifier(&name)
-                            && let Some((stored, _)) =
-                                constraint_names::key_index_owner(&builder, &name, index_name)
-                        {
-                            return Err(crate::errors::Error::IndexRequiredByConstraint {
-                                index_name: index_name.value.clone(),
-                                table_name: stored.name,
-                            });
-                        }
-                        let Some(position) = builder.index_position(&name)? else {
-                            if if_exists {
-                                continue;
-                            }
-                            return Err(crate::errors::Error::DropIndexNotFound {
-                                index_name: last_str(&name).to_string(),
-                            });
-                        };
-
-                        let IndexSlot::Table(at) = position else {
-                            builder.remove_index_at(position);
-                            continue;
-                        };
-                        let Some(identity) = builder.indices()[at].1.key_identity() else {
-                            builder.remove_index_at(position);
-                            continue;
-                        };
-                        let Some(table_name) = builder
-                            .resolve_bound_table_name(
-                                &builder.indices()[at].0.attribute().table_name,
-                            )?
-                            .map(|node| StoredTable::of(node).name)
-                        else {
-                            builder.remove_index_at(position);
-                            continue;
-                        };
-                        let index_name = object_name_last_identifier(&name)
-                            .map(|ident| stored_ident_name(ident).into_owned())
-                            .unwrap_or_default();
-                        let on_dependents = if cascade {
-                            referenced_keys::OnDependents::Cascade
-                        } else {
-                            referenced_keys::OnDependents::Refuse {
-                                key_name: &index_name,
-                                table_name: &table_name,
-                            }
-                        };
-                        builder =
-                            Self::drop_keys(builder, &[identity], on_dependents, |builder| {
-                                Ok(Self::remove_key_index(builder, identity))
-                            })?;
+                        builder = Self::drop_index(builder, &name, if_exists, cascade)?;
                     }
                 }
                 Statement::AlterIndex {

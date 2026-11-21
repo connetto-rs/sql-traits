@@ -8,7 +8,7 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 
 fn parse(sql: &str) -> Result<ParserDB, Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -342,4 +342,76 @@ fn a_type_change_binds_the_key_again_to_the_oldest() {
         "r",
         "c",
     );
+}
+
+#[test]
+fn a_unique_column_holds_the_key_naming_it() {
+    refused_for(
+        parse(
+            "CREATE TABLE r (id INT CONSTRAINT u UNIQUE);
+             CREATE TABLE c (x INT REFERENCES r (id));
+             ALTER TABLE r DROP CONSTRAINT u;",
+        ),
+        "u",
+        "r",
+        "c",
+    );
+}
+
+#[test]
+fn keys_over_other_columns_are_free() {
+    let created = "CREATE TABLE r (
+             id INT PRIMARY KEY,
+             code INT,
+             name TEXT,
+             CONSTRAINT positive CHECK (id > 0),
+             CONSTRAINT code_key UNIQUE (code)
+         );
+         CREATE UNIQUE INDEX name_ix ON r (name);
+         CREATE TABLE c (x INT REFERENCES r (code));";
+    parse(&format!("{created} ALTER TABLE r DROP CONSTRAINT r_pkey; DROP INDEX name_ix;"))
+        .expect("neither key covers the referenced column");
+    refused_for(
+        parse(&format!("{created} ALTER TABLE r DROP CONSTRAINT code_key;")),
+        "code_key",
+        "r",
+        "c",
+    );
+}
+
+#[test]
+fn only_does_not_soften_the_refusal() {
+    refused_for(
+        parse(
+            "CREATE TABLE r (id INT CONSTRAINT pk PRIMARY KEY);
+             CREATE TABLE c (x INT REFERENCES r (id));
+             ALTER TABLE ONLY r DROP CONSTRAINT pk;",
+        ),
+        "pk",
+        "r",
+        "c",
+    );
+}
+
+#[test]
+fn a_host_type_change_binds_a_table_level_key_again() {
+    let changed = format!(
+        "{UNIQUE_THEN_PRIMARY}
+         CREATE TABLE c (x INT, FOREIGN KEY (x) REFERENCES r);
+         ALTER TABLE c ALTER COLUMN x TYPE BIGINT;"
+    );
+    parse(&format!("{changed} ALTER TABLE r DROP CONSTRAINT pk;"))
+        .expect("the primary key is free");
+    refused_for(parse(&format!("{changed} ALTER TABLE r DROP CONSTRAINT u;")), "u", "r", "c");
+}
+
+#[test]
+fn sqlite_drops_an_index_a_foreign_key_reads() {
+    ParserDB::parse::<SQLiteDialect>(
+        "CREATE TABLE r (id INT);
+         CREATE UNIQUE INDEX ix ON r (id);
+         CREATE TABLE c (x INT REFERENCES r (id));
+         DROP INDEX ix;",
+    )
+    .expect("SQLite checks a foreign key's target only when rows change");
 }

@@ -17,7 +17,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    IndexSlot, ParserDB, ParserDBBuilder, StoredTable,
+    ParserDB, ParserDBBuilder, StoredTable,
     constraint_names::{self, Position, Slot},
     inheritance::{self, ParentKind},
     key_columns_match, plain_key_columns,
@@ -54,7 +54,7 @@ struct Dependence {
 
 /// A constraint as a table node holds it and where it sat, so it is found
 /// again after an edit moved it.
-pub(super) struct HeldConstraint {
+struct HeldConstraint {
     /// The constraint, which a rebuild leaves equal.
     written: Written,
     /// Where it sat when it was read.
@@ -99,20 +99,12 @@ impl HeldConstraint {
         Self { written: Written::of(slot), position: slot.position() }
     }
 
-    /// The constraint at `position` of `node`.
-    pub(super) fn at(node: &CreateTable, position: Position) -> Option<Self> {
-        constraint_names::slots(node)
-            .into_iter()
-            .find(|slot| slot.position() == position)
-            .map(Self::of)
-    }
-
     /// Where the constraint sits in `node`, if it still does.
     ///
     /// One still at the position it was read from is the one there, which
     /// tells it from an equal one written earlier. One that moved is the
     /// first equal one.
-    pub(super) fn position_in(&self, node: &CreateTable) -> Option<Position> {
+    fn position_in(&self, node: &CreateTable) -> Option<Position> {
         let holding: Vec<Position> = constraint_names::slots(node)
             .into_iter()
             .filter(|slot| self.written.is_held_at(*slot))
@@ -278,64 +270,63 @@ fn dependences(builder: &ParserDBBuilder) -> Vec<Dependence> {
                 continue;
             };
             let primary = names_primary_key(builder, node, slot, &key);
-            if let Some(bound) = bound_key(builder, foreign_key, primary) {
-                found.push(Dependence {
+            found.extend(bound_key(builder, foreign_key, primary).map(|bound| {
+                Dependence {
                     host: StoredTable::of(node),
                     held: HeldConstraint::of(slot),
                     key: bound,
-                });
-            }
+                }
+            }));
         }
     }
     found
 }
 
-/// The identity of the key at `position` of `table`, with those of the copies
-/// the partitions below hold of it unless `only` keeps them.
+/// The identity of the key at `slot` of `node`, the stored table `table`,
+/// with those of the copies the partitions below hold of it unless `only`
+/// keeps them.
+///
+/// # Errors
+///
+/// Returns the error reaching a table below `table` meets.
 pub(super) fn removed_keys(
     builder: &ParserDBBuilder,
     table: &StoredTable,
-    position: Position,
+    slot: Slot<'_>,
     only: bool,
-) -> Vec<KeyIdentity> {
+) -> Result<Vec<KeyIdentity>, Error> {
     let case = builder.identifier_case();
-    let identity_of = |node: &CreateTable, key: &str| {
+    let identity_of = |node: &CreateTable, slot: Slot<'_>| {
+        let key = constraint_names::keyed_slots(node)
+            .into_iter()
+            .find(|(held, _)| held.position() == slot.position())
+            .map(|(_, key)| key);
         metadata_of(builder, node)?
             .key_creations()
             .iter()
-            .find(|created| created.slot == key)
+            .find(|created| Some(&created.slot) == key.as_ref())
             .map(|created| created.identity)
     };
-    let Ok(node) = ParserDB::stored_node(builder, table) else {
-        return Vec::new();
-    };
-    let Some((slot, key)) = constraint_names::keyed_slots(node)
-        .into_iter()
-        .find(|(slot, _)| slot.position() == position)
-    else {
-        return Vec::new();
-    };
-    let mut removed: Vec<KeyIdentity> = identity_of(node, &key).into_iter().collect();
+    let node = ParserDB::stored_node(builder, table)?;
+    let mut removed: Vec<KeyIdentity> = identity_of(node, slot).into_iter().collect();
     if only {
-        return removed;
+        return Ok(removed);
     }
     let mut frontier = alloc::vec![(table.clone(), slot)];
     while let Some((current, passed)) = frontier.pop() {
         for (kind, child) in inheritance::direct_children(builder, &current) {
-            let Ok(child_node) = ParserDB::stored_node(builder, &child) else {
-                continue;
-            };
-            let Some((copy, copy_key)) = constraint_names::keyed_slots(child_node)
+            let child_node = ParserDB::stored_node(builder, &child)?;
+            let Some(copy) = constraint_names::slots(child_node)
                 .into_iter()
-                .find(|(held, _)| held.is_unique_key() && copies(kind, *held, passed, case))
+                .find(|held| held.is_unique_key() && copies(kind, *held, passed, case))
             else {
                 continue;
             };
-            removed.extend(identity_of(child_node, &copy_key));
+            removed.extend(identity_of(child_node, copy));
             frontier.push((child, copy));
         }
     }
-    removed
+    Ok(removed)
 }
 
 /// Gives each primary key and unique constraint of `node` holding no identity
@@ -425,24 +416,9 @@ pub(super) fn record_primary_key_references(
     table: &StoredTable,
     bound: &[ForeignKeyConstraint],
 ) {
-    if bound.is_empty() {
-        return;
-    }
-    let case = builder.identifier_case();
-    let Some((node, metadata, _)) =
-        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
-    else {
-        return;
-    };
-    let mut references = metadata.primary_key_references().to_vec();
-    for (slot, key) in constraint_names::keyed_slots(node) {
-        if foreign_key_of(slot).is_some_and(|foreign_key| bound.contains(foreign_key))
-            && !references.contains(&key)
-        {
-            references.push(key);
-        }
-    }
-    metadata.set_primary_key_references(references);
+    add_primary_key_references(builder, table, |_, _, slot, _| {
+        foreign_key_of(slot).is_some_and(|foreign_key| bound.contains(foreign_key))
+    });
 }
 
 /// Records on `table` each foreign key it receives that depends on the
@@ -451,29 +427,40 @@ pub(super) fn keep_received_primary_key_references(
     builder: &mut ParserDBBuilder,
     table: &StoredTable,
 ) {
+    add_primary_key_references(builder, table, |builder, node, slot, key| {
+        foreign_key_of(slot).is_some() && names_primary_key(builder, node, slot, key)
+    });
+}
+
+/// Records on `table` that each foreign key `names` picks depends on the
+/// primary key.
+fn add_primary_key_references(
+    builder: &mut ParserDBBuilder,
+    table: &StoredTable,
+    names: impl Fn(&ParserDBBuilder, &CreateTable, Slot<'_>, &str) -> bool,
+) {
     let case = builder.identifier_case();
-    let Some(node) = builder
+    let reader: &ParserDBBuilder = builder;
+    let picked: Vec<String> = reader
         .tables()
         .iter()
-        .find(|(stored, _, _)| table.matches(stored, case))
-        .map(|(node, _, _)| node)
-    else {
-        return;
-    };
-    let kept: Vec<String> = constraint_names::keyed_slots(node)
-        .into_iter()
-        .filter(|(slot, key)| {
-            foreign_key_of(*slot).is_some() && names_primary_key(builder, node, *slot, key)
+        .filter(|(stored, _, _)| table.matches(stored, case))
+        .flat_map(|(node, _, _)| {
+            constraint_names::keyed_slots(node)
+                .into_iter()
+                .filter(|(slot, key)| names(reader, node, *slot, key))
+                .map(|(_, key)| key)
         })
-        .map(|(_, key)| key)
         .collect();
-    if let Some((_, metadata, _)) =
-        builder.tables_mut().iter_mut().find(|(stored, _, _)| table.matches(stored, case))
+    for (_, metadata, _) in
+        builder.tables_mut().iter_mut().filter(|(stored, _, _)| table.matches(stored, case))
     {
         let mut references = metadata.primary_key_references().to_vec();
-        references.extend(
-            kept.into_iter().filter(|key| !metadata.primary_key_references().contains(key)),
-        );
+        for key in &picked {
+            if !references.contains(key) {
+                references.push(key.clone());
+            }
+        }
         metadata.set_primary_key_references(references);
     }
 }
@@ -515,8 +502,8 @@ pub(super) fn forget_primary_key_references(
         })
         .collect();
     for (host, key) in forgotten {
-        if let Some((_, metadata, _)) =
-            builder.tables_mut().iter_mut().find(|(stored, _, _)| host.matches(stored, case))
+        for (_, metadata, _) in
+            builder.tables_mut().iter_mut().filter(|(stored, _, _)| host.matches(stored, case))
         {
             let references = metadata
                 .primary_key_references()
@@ -577,20 +564,5 @@ impl ParserDB {
             builder = Self::drop_cascaded_constraint(builder, &host, position, &name)?;
         }
         drop(builder)
-    }
-
-    /// Removes the index on a table created with `identity`.
-    pub(super) fn remove_key_index(
-        mut builder: ParserDBBuilder,
-        identity: KeyIdentity,
-    ) -> ParserDBBuilder {
-        if let Some(at) = builder
-            .indices()
-            .iter()
-            .position(|(_, metadata)| metadata.key_identity() == Some(identity))
-        {
-            builder.remove_index_at(IndexSlot::Table(at));
-        }
-        builder
     }
 }
