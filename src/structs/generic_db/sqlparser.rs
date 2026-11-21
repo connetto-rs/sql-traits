@@ -30,9 +30,9 @@ use sqlparser::{
         GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn,
         MySQLColumnPosition, NotNullConstraint, ObjectName, ObjectNamePart, OperateFunctionArg,
         OrderByExpr, OrderByOptions, Owner, PrimaryKeyConstraint, Privileges, Query,
-        RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption, Statement,
-        TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit, VisitMut,
-        Visitor, VisitorMut, helpers::stmt_create_table::CreateTableBuilder,
+        ReferentialAction, RenameTableNameKind, ResetConfig, RoleOption, SchemaName, SqlOption,
+        Statement, TableConstraint, TriggerEvent, UniqueConstraint, Value, ValueWithSpan, Visit,
+        VisitMut, Visitor, VisitorMut, helpers::stmt_create_table::CreateTableBuilder,
     },
     dialect::Dialect,
 };
@@ -7063,6 +7063,44 @@ impl ParserDB {
                     host_table: create_table.name.to_string(),
                 });
             }
+        }
+
+        let generated_action_refusal = if matches!(
+            fk.on_update,
+            Some(
+                ReferentialAction::Cascade
+                    | ReferentialAction::SetNull
+                    | ReferentialAction::SetDefault
+            )
+        ) {
+            Some(crate::errors::Error::InvalidForeignKeyUpdateActionForGeneratedColumn)
+        } else if matches!(
+            fk.on_delete,
+            Some(ReferentialAction::SetNull | ReferentialAction::SetDefault)
+        ) {
+            Some(crate::errors::Error::InvalidForeignKeyDeleteActionForGeneratedColumn)
+        } else {
+            None
+        };
+        if let Some(refusal) = generated_action_refusal
+            && matches!(builder.dialect(), SqlparserDialect::PostgreSql)
+            && create_table.columns.iter().any(|column| {
+                column.options.iter().any(|option| {
+                    matches!(
+                        option.option,
+                        ColumnOption::Generated { generation_expr: Some(_), .. }
+                    )
+                }) && fk.columns.iter().any(|referencing| {
+                    case.identifiers_match(
+                        &column.name.value,
+                        column.name.quote_style.is_some(),
+                        &referencing.value,
+                        referencing.quote_style.is_some(),
+                    )
+                })
+            })
+        {
+            return Err(refusal);
         }
 
         if builder.dialect().binds_foreign_keys_on_use() {

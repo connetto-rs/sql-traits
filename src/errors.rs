@@ -2175,6 +2175,14 @@ pub enum Error {
         /// Name of the host table containing the foreign key.
         host_table: String,
     },
+    /// PostgreSQL refuses update actions that assign an expression-generated
+    /// foreign key column.
+    #[error("invalid ON UPDATE action for foreign key constraint containing generated column")]
+    InvalidForeignKeyUpdateActionForGeneratedColumn,
+    /// PostgreSQL refuses delete actions that assign an expression-generated
+    /// foreign key column.
+    #[error("invalid ON DELETE action for foreign key constraint containing generated column")]
+    InvalidForeignKeyDeleteActionForGeneratedColumn,
     #[error(
         "Cannot use the deferrable primary key of table `{referenced_table}` for the foreign key in table `{host_table}`."
     )]

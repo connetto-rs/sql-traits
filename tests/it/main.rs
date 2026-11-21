@@ -86,6 +86,7 @@ mod function_signature_types;
 mod function_unqualified_names;
 mod function_volatility;
 mod fuzz_crashes;
+mod generated_column_key_actions;
 mod generated_constraint_names;
 mod generated_index_names;
 mod golden_fingerprints;
