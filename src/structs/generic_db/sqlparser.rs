@@ -7078,8 +7078,9 @@ impl ParserDB {
     }
 
     /// Refuses a foreign key whose target the database would not accept when
-    /// the key is declared, which is an absent table, a column it lacks, or a
-    /// column list with no unique key behind it or of another width.
+    /// the key is declared, which is an absent table, a column it lacks, a
+    /// column named twice, or a column list with no unique key behind it or of
+    /// another width.
     fn refuse_unreachable_target(
         builder: &ParserDBBuilder,
         create_table: &CreateTable,
@@ -7107,6 +7108,21 @@ impl ParserDB {
                     host_table: create_table.name.to_string(),
                 });
             }
+        }
+
+        if matches!(builder.dialect(), SqlparserDialect::PostgreSql | SqlparserDialect::Generic)
+            && fk.referred_columns.iter().enumerate().any(|(position, column)| {
+                fk.referred_columns[..position].iter().any(|previous| {
+                    case.identifiers_match(
+                        previous.value.as_str(),
+                        previous.quote_style.is_some(),
+                        column.value.as_str(),
+                        column.quote_style.is_some(),
+                    )
+                })
+            })
+        {
+            return Err(crate::errors::Error::DuplicateReferencedColumnsForForeignKey);
         }
 
         // A `CREATE UNIQUE INDEX` counts and lives in the builder, not the

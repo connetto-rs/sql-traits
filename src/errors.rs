@@ -2159,6 +2159,10 @@ pub enum Error {
         /// Name of the host table containing the foreign key.
         host_table: String,
     },
+    #[error("foreign key referenced-columns list must not contain duplicates")]
+    /// PostgreSQL refuses a foreign key whose referenced column list repeats a
+    /// column.
+    DuplicateReferencedColumnsForForeignKey,
     #[error(
         "No unique constraint on table `{referenced_table}` matches the columns `{referenced_columns}` a foreign key in table `{host_table}` points at."
     )]
