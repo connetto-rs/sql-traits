@@ -159,6 +159,7 @@ mod reader_identifier_rules;
 mod recursive_cte_identifier_context;
 mod reference_binding;
 mod reference_hierarchies;
+mod referenced_key_drops;
 mod relation_identity;
 mod relation_lookup_identifier_case;
 mod renamed_table_references;

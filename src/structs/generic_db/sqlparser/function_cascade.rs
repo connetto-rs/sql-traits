@@ -161,7 +161,7 @@ impl ParserDB {
 
     /// Drops the constraint at `position` of `table`, its copies below it
     /// with it, a refusal naming it `name`.
-    fn drop_cascaded_constraint(
+    pub(super) fn drop_cascaded_constraint(
         builder: ParserDBBuilder,
         table: &StoredTable,
         position: Position,

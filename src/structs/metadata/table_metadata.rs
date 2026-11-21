@@ -8,7 +8,7 @@ use super::ExpressionCalls;
 use crate::{
     impls::PrivilegeKind,
     structs::{
-        ForeignTableSource, RevokedPrivilege, StoredReplicaIdentity, TableAttribute,
+        ForeignTableSource, KeyIdentity, RevokedPrivilege, StoredReplicaIdentity, TableAttribute,
         VirtualTableSource,
     },
     traits::{ColumnLike, DatabaseLike, TableLike},
@@ -25,6 +25,16 @@ pub(crate) struct GeneratedConstraintName {
     /// Whether the name is also the name of the constraint's index, which no
     /// other relation of the schema may then take.
     pub(crate) names_index: bool,
+}
+
+/// The identity a key the table holds was given when it arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyCreation {
+    /// Which constraint of the table node it is, keyed the way
+    /// [`GeneratedConstraintName::slot`] is.
+    pub(crate) slot: String,
+    /// The identity, ordered as the keys were created.
+    pub(crate) identity: KeyIdentity,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +86,18 @@ pub struct TableMetadata<T: TableLike> {
     /// The name PostgreSQL gave each constraint the table holds without one,
     /// fixed when the constraint arrived and kept through every later rename.
     generated_constraint_names: Vec<GeneratedConstraintName>,
+    /// The identity each primary key and unique constraint of the table was
+    /// given when it arrived, which orders them as PostgreSQL's object
+    /// identifiers do.
+    key_creations: Vec<KeyCreation>,
+    /// The slot of each foreign key the table declared naming no referenced
+    /// columns, keyed the way [`GeneratedConstraintName::slot`] is.
+    ///
+    /// Such a key depends on the primary key of the table it references
+    /// whatever older key covers the same columns, while one naming its
+    /// columns depends on the oldest. Held because binding the key spells its
+    /// columns out the way `confkey` does.
+    primary_key_references: Vec<String>,
     /// Whether a constraint may have arrived since the names were last given.
     constraint_names_pending: bool,
     /// Whether Row Level Security is enabled for the table.
@@ -131,6 +153,8 @@ impl<T: TableLike> Default for TableMetadata<T> {
             inherited_constraints: Vec::new(),
             unvalidated_constraints: Vec::new(),
             generated_constraint_names: Vec::new(),
+            key_creations: Vec::new(),
+            primary_key_references: Vec::new(),
             constraint_names_pending: false,
             rls_enabled: false,
             rls_forced: false,
@@ -434,6 +458,32 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub(crate) fn set_generated_constraint_names(&mut self, names: Vec<GeneratedConstraintName>) {
         self.generated_constraint_names = names;
+    }
+
+    /// Returns the identity each key of the table was given when it arrived.
+    #[inline]
+    pub(crate) fn key_creations(&self) -> &[KeyCreation] {
+        &self.key_creations
+    }
+
+    /// Records the identity each key of the table was given when it arrived.
+    #[inline]
+    pub(crate) fn set_key_creations(&mut self, creations: Vec<KeyCreation>) {
+        self.key_creations = creations;
+    }
+
+    /// Returns the slot of each foreign key the table declared naming no
+    /// referenced columns.
+    #[inline]
+    pub(crate) fn primary_key_references(&self) -> &[String] {
+        &self.primary_key_references
+    }
+
+    /// Records the slot of each foreign key the table declared naming no
+    /// referenced columns.
+    #[inline]
+    pub(crate) fn set_primary_key_references(&mut self, slots: Vec<String>) {
+        self.primary_key_references = slots;
     }
 
     /// Returns whether a constraint may still be waiting for its name.

@@ -46,8 +46,14 @@ pub struct RelationIdentity(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ColumnIdentity(u64);
 
+/// The identity of a primary key, unique constraint or unique index, ordered
+/// as the keys were created, which is the order PostgreSQL's object
+/// identifiers give them and the one it picks a foreign key's key by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct KeyIdentity(u64);
+
 /// The counter every identity of one ingestion is drawn from, one serving
-/// both kinds so no relation and no column ever share a number.
+/// every kind so no two objects ever share a number.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct IdentityCounter {
     next: u64,
@@ -68,5 +74,11 @@ impl IdentityCounter {
     /// Hands out an identity no relation or column has held before.
     pub(crate) fn column(&mut self) -> ColumnIdentity {
         ColumnIdentity(self.draw())
+    }
+
+    /// Hands out an identity no object has held before, after every one
+    /// handed out so far.
+    pub(crate) fn key(&mut self) -> KeyIdentity {
+        KeyIdentity(self.draw())
     }
 }

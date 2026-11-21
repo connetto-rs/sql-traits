@@ -2928,6 +2928,25 @@ pub enum Error {
         column_name: String,
     },
     #[error(
+        "Cannot drop `{key_name}` of table `{table_name}`: a foreign key of table `{referencing_table}` depends on it."
+    )]
+    /// Error indicating that an `ALTER TABLE ... DROP CONSTRAINT` or a `DROP
+    /// INDEX` statement names the key a foreign key checks its rows against,
+    /// without saying `CASCADE`.
+    ///
+    /// A foreign key depends on one key of the table it references, chosen
+    /// when it is declared. That is the primary key for a foreign key naming
+    /// no columns and otherwise the oldest key over its columns, so another
+    /// key over the same columns stays free to drop.
+    KeyReferenced {
+        /// Name of the key or unique index being dropped.
+        key_name: String,
+        /// Name of the table holding it.
+        table_name: String,
+        /// Name of the table whose foreign key depends on it.
+        referencing_table: String,
+    },
+    #[error(
         "Cannot alter type of column `{column_name}` of table `{table_name}`: {dependent_kind} `{dependent_name}` uses it."
     )]
     /// Error indicating that an `ALTER TABLE ... ALTER COLUMN ... TYPE`

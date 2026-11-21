@@ -25,7 +25,10 @@ use super::{
 };
 use crate::{
     errors::{Error, InheritedChange, ObjectKind},
-    structs::{IdentifierCase, TableMetadata, metadata::GeneratedConstraintName},
+    structs::{
+        IdentifierCase, TableMetadata,
+        metadata::{GeneratedConstraintName, KeyCreation},
+    },
     utils::{identifier_resolution::stored_ident_name, walk::walk_expressions},
 };
 
@@ -370,19 +373,59 @@ pub(super) fn locate(
         .map(Slot::position)
 }
 
-/// Carries the generated names across a rebuild of the node.
+/// A record kept per constraint of a table node, keyed by the slot the
+/// constraint fills.
+pub(super) trait SlotRecord: Clone {
+    /// The key of the slot the record belongs to.
+    fn slot(&self) -> &str;
+
+    /// The record moved to the slot keyed `slot`.
+    fn moved_to(&self, slot: String) -> Self;
+}
+
+impl SlotRecord for GeneratedConstraintName {
+    fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    fn moved_to(&self, slot: String) -> Self {
+        Self { slot, ..self.clone() }
+    }
+}
+
+impl SlotRecord for KeyCreation {
+    fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    fn moved_to(&self, slot: String) -> Self {
+        Self { slot, identity: self.identity }
+    }
+}
+
+impl SlotRecord for String {
+    fn slot(&self) -> &str {
+        self
+    }
+
+    fn moved_to(&self, slot: String) -> Self {
+        slot
+    }
+}
+
+/// Carries the records kept per constraint across a rebuild of the node.
 ///
 /// An edit that rewrites constraints in place, which is what a column rename
-/// does, keeps the number of slots, so the names follow position, and so do
+/// does, keeps the number of slots, so the records follow position, and so do
 /// the survivors of an edit removing the slot at `removed`, which leaves them
 /// in order. An edit that otherwise adds or removes one leaves the
 /// survivors' renderings alone, so those are recognised by key.
-pub(super) fn follow(
-    recorded: &[GeneratedConstraintName],
+pub(super) fn follow<R: SlotRecord>(
+    recorded: &[R],
     previous: &CreateTable,
     replacement: &CreateTable,
     removed: Option<Position>,
-) -> Vec<GeneratedConstraintName> {
+) -> Vec<R> {
     let previous_slots = slots(previous);
     let gone = removed
         .and_then(|removed| previous_slots.iter().position(|slot| slot.position() == removed));
@@ -398,14 +441,27 @@ pub(super) fn follow(
             .iter()
             .zip(&after)
             .filter_map(|(before, after)| {
-                recorded.iter().find(|generated| generated.slot == *before).map(|generated| {
-                    GeneratedConstraintName { slot: after.clone(), ..generated.clone() }
-                })
+                recorded
+                    .iter()
+                    .find(|record| record.slot() == before)
+                    .map(|record| record.moved_to(after.clone()))
             })
             .collect()
     } else {
-        recorded.iter().filter(|generated| after.contains(&generated.slot)).cloned().collect()
+        recorded
+            .iter()
+            .filter(|record| after.iter().any(|key| key == record.slot()))
+            .cloned()
+            .collect()
     }
+}
+
+/// Every constraint the node holds, in the order of [`slots`], with the key
+/// the records kept per constraint name it by.
+pub(super) fn keyed_slots(node: &CreateTable) -> Vec<(Slot<'_>, String)> {
+    let slots = slots(node);
+    let keys = keys(&slots);
+    slots.into_iter().zip(keys).collect()
 }
 
 /// Whether a constraint of the schema `node` sits in, other than those still
