@@ -74,6 +74,7 @@ pub(super) fn create(
         &create_index.columns,
         &create_index.include,
     )?;
+    super::btree_opclasses::index(&create_index, None, &builder)?;
     let Some(expression) = ParserDB::create_index_expression(&create_index.columns) else {
         return Err(Error::InvalidIndex {
             index_name: create_index
