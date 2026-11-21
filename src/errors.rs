@@ -695,9 +695,6 @@ pub enum UnattachablePartition {
     },
     /// The table lacks the partitioned table's shape.
     Shape(ChildMismatch),
-    /// The table holds a primary key on other columns than the partitioned
-    /// table's.
-    OtherPrimaryKey,
     /// The table is a foreign table and the partitioned table holds a unique
     /// index, which a foreign table cannot carry.
     ForeignTableUnderUniqueIndex,
@@ -717,7 +714,6 @@ impl core::fmt::Display for UnattachablePartition {
                 write!(f, "column `{column_name}` is an identity column")
             }
             Self::Shape(mismatch) => mismatch.fmt(f),
-            Self::OtherPrimaryKey => f.write_str("it holds a primary key of its own"),
             Self::ForeignTableUnderUniqueIndex => {
                 f.write_str("it is a foreign table and the partitioned table holds a unique index")
             }
@@ -1628,6 +1624,12 @@ pub enum Error {
         /// The reference as written.
         reference: String,
         /// Name of the table the expression is declared on.
+        table_name: String,
+    },
+    /// PostgreSQL refuses more than one primary key on a table.
+    #[error("multiple primary keys for table \"{table_name}\" are not allowed")]
+    MultiplePrimaryKeys {
+        /// Name of the table holding the primary keys.
         table_name: String,
     },
     #[error("Invalid primary key in table `{table_name}`: {reason}")]

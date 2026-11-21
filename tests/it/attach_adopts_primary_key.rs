@@ -2,10 +2,7 @@
 //! Expectations were measured on PostgreSQL 18.7.
 #![expect(clippy::expect_used, reason = "Test schemas and catalog lookups must succeed")]
 
-use sql_traits::{
-    errors::{Error, UnattachablePartition},
-    prelude::*,
-};
+use sql_traits::{errors::Error, prelude::*};
 use sqlparser::dialect::PostgreSqlDialect;
 
 const ATTACHED: &str = "CREATE TABLE r (id INT PRIMARY KEY) PARTITION BY RANGE(id);
@@ -77,8 +74,7 @@ fn different_primary_key_is_refused() {
         matches!(parse("CREATE TABLE r (id INT PRIMARY KEY, v INT NOT NULL) PARTITION BY RANGE(id);
 CREATE TABLE r1 (id INT NOT NULL, v INT PRIMARY KEY);
 ALTER TABLE r ATTACH PARTITION r1 FOR VALUES FROM (0) TO (10);"),
-        Err(Error::PartitionNotAttachable { table_name, partition_name, reason: UnattachablePartition::OtherPrimaryKey })
-        if table_name == "r" && partition_name == "r1")
+        Err(Error::MultiplePrimaryKeys { table_name }) if table_name == "r1")
     );
 }
 

@@ -3852,6 +3852,38 @@ fn is_deferrable_key(table: &CreateTable, referred: &[&Ident], case: IdentifierC
         .any(|key| key.deferrable && key_columns_match(referred, &key.columns, case))
 }
 
+/// Refuses a second primary key, including one a partition receives.
+fn refuse_multiple_primary_keys(
+    builder: &ParserDBBuilder,
+    table: &CreateTable,
+    parent: Option<&CreateTable>,
+) -> Result<(), crate::errors::Error> {
+    if !matches!(builder.dialect(), SqlparserDialect::PostgreSql) {
+        return Ok(());
+    }
+    let mut primary_keys = core::iter::once(table)
+        .chain(parent)
+        .flat_map(|node| {
+            node.columns
+                .iter()
+                .flat_map(|column| &column.options)
+                .map(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+                .chain(node.constraints.iter().map(|constraint| {
+                    matches!(
+                        constraint,
+                        TableConstraint::PrimaryKey(_) | TableConstraint::PrimaryKeyUsingIndex(_)
+                    )
+                }))
+        })
+        .filter(|primary_key| *primary_key);
+    if primary_keys.nth(1).is_some() {
+        return Err(crate::errors::Error::MultiplePrimaryKeys {
+            table_name: table.table_name().to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Whether the primary key of `table` is deferrable.
 fn has_deferrable_primary_key(table: &CreateTable) -> bool {
     let column_key = table.columns.iter().flat_map(|column| &column.options).find_map(|option| {
@@ -7559,6 +7591,7 @@ impl ParserDB {
             );
         }
         validate_distinct_columns(&create_table, builder.identifier_case())?;
+        refuse_multiple_primary_keys(&builder, &create_table, None)?;
         let table_kind = if table_metadata.foreign_source().is_some() {
             ObjectKind::ForeignTable
         } else {
@@ -8008,6 +8041,16 @@ impl ParserDB {
             );
         }
 
+        Self::add_constraint_below(builder, stored, constraint, validated)
+    }
+
+    /// Passes an added constraint to its inheritors.
+    fn add_constraint_below(
+        mut builder: ParserDBBuilder,
+        stored: StoredTable,
+        constraint: TableConstraint,
+        validated: bool,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let mut frontier = alloc::vec![(stored, constraint)];
         let mut reached: Vec<StoredTable> = Vec::new();
 
@@ -8026,6 +8069,21 @@ impl ParserDB {
                 // it. Asked before a name is built, since the copy is then
                 // never made.
                 let node = Self::stored_node(&builder, &child)?;
+                if kind == inheritance::ParentKind::PartitionOf
+                    && matches!(passed, TableConstraint::PrimaryKey(_))
+                    && let Some((column, option, held)) =
+                        Self::matching_column_primary_key(&builder, &child, node, &passed)
+                {
+                    let inherited = held.clone();
+                    builder = Self::replace_table_node(builder, &child, |_, replacement| {
+                        replacement.columns[column].options.remove(option);
+                        replacement.constraints.push(held);
+                        Ok(())
+                    })?;
+                    inheritance::mark_inherited_constraint(&mut builder, &child, &inherited);
+                    frontier.push((child, inherited));
+                    continue;
+                }
                 if let Some(held) =
                     node.constraints.iter().find(|held| inheritance::is_copy_of(held, &passed))
                 {
@@ -8094,6 +8152,38 @@ impl ParserDB {
             });
         }
         Ok(())
+    }
+
+    /// Finds a column primary key that a partition can adopt for its parent.
+    fn matching_column_primary_key(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        node: &CreateTable,
+        passed: &TableConstraint,
+    ) -> Option<(usize, usize, TableConstraint)> {
+        let (column, option, mut constraint) =
+            node.columns.iter().enumerate().find_map(|(column, definition)| {
+                definition.options.iter().enumerate().find_map(|(option, held)| {
+                    if !matches!(held.option, ColumnOption::PrimaryKey(_)) {
+                        return None;
+                    }
+                    let constraint = attach_partition::table_form(&definition.name, held)?;
+                    attach_partition::same_key(builder, &constraint, passed)
+                        .then_some((column, option, constraint))
+                })
+            })?;
+        let name = constraint_names::names(
+            node,
+            generated_constraint_names(builder, stored),
+            builder.identifier_case(),
+        )
+        .into_iter()
+        .find(|(slot, _)| slot.position() == constraint_names::Position::Column(column, option))
+        .and_then(|(_, name)| name);
+        if let TableConstraint::PrimaryKey(primary_key) = &mut constraint {
+            primary_key.name = name.map(|name| Ident::with_quote('"', name.into_owned()));
+        }
+        Some((column, option, constraint))
     }
 
     /// Refuses a primary key or unique constraint that `ALTER TABLE ... ADD`

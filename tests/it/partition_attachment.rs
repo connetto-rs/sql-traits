@@ -555,9 +555,6 @@ fn the_columns_have_to_match_the_roots() {
         ("CREATE TABLE p (a INT, b INT) PARTITION BY LIST (a);
           CREATE TABLE c (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED);",
          shape(ChildMismatch::MustNotBeGenerated { column_name: column("b") })),
-        ("CREATE TABLE p (id INT, b INT, PRIMARY KEY (id)) PARTITION BY LIST (id);
-          CREATE TABLE c (id INT NOT NULL, b INT PRIMARY KEY);",
-         UnattachablePartition::OtherPrimaryKey),
     ];
     for (setup, expected) in cases {
         let sql = format!("{setup} {attach}");
@@ -578,6 +575,14 @@ fn the_columns_have_to_match_the_roots() {
         assert!(message.contains(&named), "{message} does not name {named}");
         assert_eq!(refusal(&sql), expected, "{setup}");
     }
+    assert!(matches!(
+        parse(
+            "CREATE TABLE p (id INT, b INT, PRIMARY KEY (id)) PARTITION BY LIST (id);
+CREATE TABLE c (id INT NOT NULL, b INT PRIMARY KEY);
+ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);"
+        ),
+        Err(Error::MultiplePrimaryKeys { table_name }) if table_name == "c"
+    ));
 
     // A generated column may compute its value its own way, and an explicit
     // default collation is the default.
