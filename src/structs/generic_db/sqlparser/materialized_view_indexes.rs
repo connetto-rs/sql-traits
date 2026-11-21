@@ -12,8 +12,8 @@ use alloc::{string::ToString, sync::Arc, vec::Vec};
 use sqlparser::ast::{CreateIndex, Ident, ObjectName, ObjectNamePart};
 
 use super::{
-    NamedColumn, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, column_references,
-    generated_names, refuse_index_in_another_schema, relation_name_holder, rename_column_idents,
+    NamedColumn, ParserDB, ParserDBBuilder, SchemaQualifier, StoredTable, generated_names,
+    refuse_index_in_another_schema, relation_name_holder, rename_column_idents,
     rename_column_in_expressions, schema_qualifiers_match, stored_expressions, stored_ident,
     stored_view_qualifier, views,
 };
@@ -68,12 +68,16 @@ pub(super) fn create(
         builder.namespaces(),
         builder.identifier_case(),
     )?;
-    views::require_indexed_columns(
-        &builder,
-        position,
-        &create_index.columns,
-        &create_index.include,
-    )?;
+    stored_expressions::refuse_in_index(&builder, &create_index)?;
+    super::index_access_methods::refuse_in_index(&builder, &create_index)?;
+    if *builder.dialect() != super::SqlparserDialect::PostgreSql {
+        views::require_indexed_columns(
+            &builder,
+            position,
+            &create_index.columns,
+            &create_index.include,
+        )?;
+    }
     super::index_opclasses::index(&create_index, None, &builder)?;
     let Some(expression) = ParserDB::create_index_expression(&create_index.columns) else {
         return Err(Error::InvalidIndex {
@@ -84,8 +88,6 @@ pub(super) fn create(
             reason: "index has no columns".into(),
         });
     };
-    stored_expressions::refuse_in_index(&builder, &create_index)?;
-    column_references::refuse_in_index(&builder, &create_index)?;
 
     if let Some(ObjectNamePart::Identifier(index_name)) =
         create_index.name.as_ref().and_then(|name| name.0.last())

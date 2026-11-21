@@ -9,8 +9,7 @@
 use alloc::vec::Vec;
 
 use sqlparser::ast::{
-    CreateIndex, Expr, Ident, ObjectName, Query, SelectItem, TableAlias, TableFactor,
-    TableWithJoins,
+    Expr, Ident, ObjectName, Query, SelectItem, TableAlias, TableFactor, TableWithJoins,
 };
 
 use super::{
@@ -118,24 +117,4 @@ pub(super) fn refuse_in_expressions<'e>(
     let mut query = wrapping_query(wrapping_select(projection, from, None));
     views::bind_definition(builder, &mut query);
     refuse_in_query(builder, &query)
-}
-
-/// Refuses the first column reference of the expressions or the predicate of
-/// `create_index` that reaches nothing in the relation it indexes, whose name
-/// is bound. A bare column entry is checked where the index is validated.
-///
-/// # Errors
-///
-/// Returns [`Error::UnknownColumn`] naming the reference as written.
-pub(super) fn refuse_in_index(
-    builder: &ParserDBBuilder,
-    create_index: &CreateIndex,
-) -> Result<(), Error> {
-    let expressions = create_index
-        .columns
-        .iter()
-        .map(|entry| &entry.column.expr)
-        .filter(|expression| !matches!(expression, Expr::Identifier(_)))
-        .chain(&create_index.predicate);
-    refuse_in_expressions(builder, &create_index.table_name, &[None], expressions)
 }

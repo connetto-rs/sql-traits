@@ -36,6 +36,7 @@ mod comment_on_documentation;
 mod constraint_renames;
 mod constraint_using_index;
 mod constraint_validation;
+mod create_index_error_order;
 mod create_index_on_only;
 mod creation_identifier_case;
 mod data_statement_analysis;

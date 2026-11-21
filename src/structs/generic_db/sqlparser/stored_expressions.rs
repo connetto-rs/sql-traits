@@ -153,10 +153,28 @@ pub(super) fn refuse_in_index(
     if !postgres(builder) {
         return Ok(());
     }
-    for column in &create_index.columns {
-        refuse(&column.column.expr, ExpressionPlace::IndexExpression)?;
+    if let Some(predicate) = &create_index.predicate {
+        refuse(predicate, ExpressionPlace::IndexPredicate)?;
+        super::column_references::refuse_in_expressions(
+            builder,
+            &create_index.table_name,
+            &[None],
+            core::iter::once(predicate),
+        )?;
     }
-    refuse(&create_index.predicate, ExpressionPlace::IndexPredicate)
+    for column in &create_index.columns {
+        let expression = &column.column.expr;
+        refuse(expression, ExpressionPlace::IndexExpression)?;
+        if !matches!(expression, Expr::Identifier(_)) {
+            super::column_references::refuse_in_expressions(
+                builder,
+                &create_index.table_name,
+                &[None],
+                core::iter::once(expression),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a subquery in the default or the checks of `create_domain`, and a
