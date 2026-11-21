@@ -9175,7 +9175,7 @@ impl ParserDB {
     }
 
     /// Removes an inherited primary or unique key from every partition below
-    /// its owner.
+    /// its owner, leaving a key a partition added itself.
     fn drop_partition_key_copies(
         mut builder: ParserDBBuilder,
         stored: &StoredTable,
@@ -9190,7 +9190,9 @@ impl ParserDB {
                 let node = Self::stored_node(&builder, &child)?;
                 let Some((position, held)) =
                     inheritance::partition_keys(node).find_map(|(position, key)| {
-                        attach_partition::same_key(&builder, &key, &passed)
+                        let received = matches!(position, constraint_names::Position::Column(..))
+                            || inheritance::records_inherited_constraint(&builder, &child, &key);
+                        (received && attach_partition::same_key(&builder, &key, &passed))
                             .then(|| (position, key.into_owned()))
                     })
                 else {
