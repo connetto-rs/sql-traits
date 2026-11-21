@@ -142,7 +142,7 @@ fn a_view_holding_the_name_is_not_a_target() {
         let database = parse(sql).expect("SQLite stores a key whose name a view holds");
         assert_eq!(
             target_of(&database, "child"),
-            Err(LookupError::TableNotFound { object_name: "parent".to_owned() }),
+            Err(LookupError::ReferencedRelationWrongKind { object_name: "parent".to_owned() }),
             "{sql}"
         );
     }

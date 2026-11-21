@@ -69,6 +69,7 @@ fn a_folding_parse_refuses_a_quoted_case_variant() {
         table,
         conflicting_table,
         case,
+        same_stored_identity,
     })) = refused
     else {
         panic!("expected a conflict, got {refused:?}")
@@ -77,7 +78,7 @@ fn a_folding_parse_refuses_a_quoted_case_variant() {
     assert_eq!(conflicting_table, "docs");
     assert_eq!(case, IdentifierCase::Folded);
     assert!(
-        LookupError::TableLookupConflict { table, conflicting_table, case }
+        LookupError::TableLookupConflict { table, conflicting_table, case, same_stored_identity }
             .to_string()
             .contains("folded")
     );

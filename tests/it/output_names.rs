@@ -227,6 +227,7 @@ fn duplicate_output_names_are_ambiguous_only_for_different_values() {
         Err(LookupError::AmbiguousTableLookup {
             object_name: "id".to_owned(),
             candidates: vec!["id".to_owned(), "id + 1".to_owned()],
+            site: sql_traits::errors::AmbiguousLookupSite::OrderBy,
         })
     );
     for sql in [

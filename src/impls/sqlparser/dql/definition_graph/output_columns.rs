@@ -118,6 +118,7 @@ fn match_output<'entries>(
     entries: &'entries [OutputEntry<'_, '_>],
     key: &Ident,
     case: IdentifierCase,
+    site: crate::errors::AmbiguousLookupSite,
     dialect: crate::impls::SqlparserDialect,
 ) -> Result<OutputMatch<'entries>, LookupError> {
     let matches = || {
@@ -159,7 +160,11 @@ fn match_output<'entries>(
         .collect::<Vec<_>>();
     candidates.sort_unstable();
     candidates.dedup();
-    Err(LookupError::AmbiguousTableLookup { object_name: dialect.stored_name(key), candidates })
+    Err(LookupError::AmbiguousTableLookup {
+        object_name: dialect.stored_name(key),
+        candidates,
+        site,
+    })
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
@@ -398,8 +403,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         entries: &'scope [OutputEntry<'query, 'db>],
         key: &Ident,
         case: IdentifierCase,
+        site: crate::errors::AmbiguousLookupSite,
     ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
-        Ok(match match_output(entries, key, case, self.dialect)? {
+        Ok(match match_output(entries, key, case, site, self.dialect)? {
             OutputMatch::Found { definition, name, quoted } => {
                 Some((
                     self.definition(definition),
@@ -482,11 +488,22 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
         match &self.queries[query.0].outputs {
             QueryOutputs::Select(scope) => {
-                self.resolve_output_first(self.select_cursor(*scope), key)
+                self.resolve_output_first(
+                    self.select_cursor(*scope),
+                    key,
+                    crate::errors::AmbiguousLookupSite::OrderBy,
+                )
             }
             QueryOutputs::Merged(entries) => {
                 match unwrap_nested(key) {
-                    Expr::Identifier(name) => self.output_binding(entries, name, self.case),
+                    Expr::Identifier(name) => {
+                        self.output_binding(
+                            entries,
+                            name,
+                            self.case,
+                            crate::errors::AmbiguousLookupSite::OrderBy,
+                        )
+                    }
                     _ => Ok(None),
                 }
             }
@@ -497,11 +514,12 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         &'scope self,
         cursor: ScopeCursor,
         key: &Expr,
+        site: crate::errors::AmbiguousLookupSite,
     ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
         let key = unwrap_nested(key);
         let scope = &self.scopes[cursor.scope.0];
         if let Expr::Identifier(name) = key
-            && let Some(bound) = self.output_binding(&scope.outputs, name, scope.data.case)?
+            && let Some(bound) = self.output_binding(&scope.outputs, name, scope.data.case, site)?
         {
             return Ok(Some(bound));
         }
@@ -526,9 +544,12 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             )? {
                 LookupOutcome::Found(resolved) => return Ok(Some(self.bound(&resolved))),
                 LookupOutcome::Stop | LookupOutcome::SearchParent => {
-                    if let Some(bound) =
-                        self.output_binding(&scope.outputs, name, scope.data.case)?
-                    {
+                    if let Some(bound) = self.output_binding(
+                        &scope.outputs,
+                        name,
+                        scope.data.case,
+                        crate::errors::AmbiguousLookupSite::GroupBy,
+                    )? {
                         return Ok(Some(bound));
                     }
                 }
