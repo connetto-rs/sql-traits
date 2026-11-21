@@ -20,7 +20,7 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     ArrayElemTypeDef, CharacterLength, CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef,
     CreateTable, DataType, ExactNumberInfo, Expr, Ident, ObjectName, TableConstraint, TimezoneInfo,
-    Value,
+    Value, VisitorMut,
 };
 
 use super::{
@@ -31,7 +31,11 @@ use crate::{
     errors::Error,
     structs::IdentifierCase,
     traits::TableLike,
-    utils::{identifier_resolution::stored_ident_name, is_identity, walk::walk_expressions_mut},
+    utils::{
+        identifier_resolution::stored_ident_name,
+        is_identity,
+        walk::{walk_expressions_mut, walk_mut},
+    },
 };
 
 /// Which spelling links a child to a table it takes its shape from.
@@ -416,22 +420,42 @@ fn stored_check(check: &mut CheckConstraint) {
 /// Two checks are the same check when these agree, so moving parentheses that
 /// change the tree still tells them apart.
 pub(super) fn stored_expr(expr: &Expr) -> Expr {
-    let mut stored = expr.clone();
+    let mut stored = parsed_expr(expr);
     let _: ControlFlow<()> = walk_expressions_mut(&mut stored, |expr| {
-        match expr {
-            Expr::Nested(inner) => {
-                let placeholder = Expr::Value(Value::Null.into());
-                *expr = core::mem::replace(inner.as_mut(), placeholder);
-            }
-            Expr::Identifier(ident) => *ident = stored_name(ident),
-            Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
-                *expr = Expr::Identifier(stored_name(&parts[parts.len() - 1]));
-            }
-            _ => {}
+        if let Expr::CompoundIdentifier(parts) = expr
+            && let Some(column) = parts.pop()
+        {
+            *expr = Expr::Identifier(column);
         }
         ControlFlow::Continue(())
     });
     stored
+}
+
+/// The expression tree PostgreSQL's parser builds.
+pub(super) fn parsed_expr(expr: &Expr) -> Expr {
+    let mut parsed = expr.clone();
+    let _: ControlFlow<()> = walk_mut(&mut parsed, &mut ParsedExpression);
+    parsed
+}
+
+/// Identifier folding and parentheses omitted by PostgreSQL's grammar.
+struct ParsedExpression;
+
+impl VisitorMut for ParsedExpression {
+    type Break = ();
+
+    fn post_visit_ident(&mut self, ident: &mut Ident) -> ControlFlow<()> {
+        *ident = stored_name(ident);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
+        if let Expr::Nested(inner) = expr {
+            *expr = core::mem::replace(inner.as_mut(), Expr::Value(Value::Null.into()));
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 /// Whether the option a table holds is its copy of the one a parent writes.
