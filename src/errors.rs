@@ -3155,6 +3155,14 @@ pub enum Error {
         /// The other database the statement named.
         database_name: String,
     },
+    #[error("SQL applied into database `{database_name}` needs the SQLite dialect.")]
+    /// Error indicating that SQL was applied into a named database under a
+    /// dialect other than SQLite, the one engine whose databases store the
+    /// definition of each object without naming the database.
+    DatabaseOutsideSqlite {
+        /// The database the SQL was applied into.
+        database_name: String,
+    },
     #[error("Materialized view `{view_name}` cannot be declared `TEMP`.")]
     /// Error indicating that the input writes `CREATE TEMP MATERIALIZED
     /// VIEW`, which the parser accepts and PostgreSQL rejects as a syntax

@@ -5954,6 +5954,67 @@ impl ParserDBIngestor {
         self.apply_parsed(sql, source)
     }
 
+    /// Applies `sql` the way [`Self::apply_sql`] does, as text SQLite stores
+    /// in the database `database`, so each table, index, view, trigger and
+    /// virtual table it names without a database is created in `database`.
+    ///
+    /// SQLite stores the definition of every object without the database
+    /// that holds it, in `main`, `temp` or an attached database alike, so
+    /// this places a definition read from `sqlite_temp_schema` or
+    /// `aux.sqlite_schema` back where SQLite holds it. A name the text
+    /// qualifies keeps its database, and under `main` this is
+    /// [`Self::apply_sql`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DatabaseOutsideSqlite`] under any dialect other than
+    /// SQLite, and otherwise the errors [`Self::apply_sql`] returns, among
+    /// them the error for a database that is neither `main`, `temp` nor
+    /// attached.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Ident, dialect::SQLiteDialect};
+    ///
+    /// let database = ParseOptions::default()
+    ///     .with_identifier_case(IdentifierCase::Folded)
+    ///     .ingestor::<SQLiteDialect>("main".to_owned())
+    ///     .apply_sql("ATTACH ':memory:' AS aux")?
+    ///     .apply_sql_in(&Ident::new("aux"), "CREATE TABLE sample(value VARCHAR( 10 ))")?
+    ///     .finish();
+    /// let table = database
+    ///     .table_by_target(
+    ///         TargetName::new("sample", false).with_schema("aux", false),
+    ///         IdentifierCase::Folded,
+    ///     )?
+    ///     .expect("sample is stored in aux");
+    /// let column = table.column("value", &database, IdentifierCase::Folded)?.expect("declared");
+    /// assert_eq!(column.declared_type_text(&database)?, Some("VARCHAR( 10 )"));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    ///
+    /// [`Error::DatabaseOutsideSqlite`]: crate::errors::Error::DatabaseOutsideSqlite
+    pub fn apply_sql_in(self, database: &Ident, sql: &str) -> Result<Self, crate::errors::Error> {
+        let builder = &self.catalog.builder;
+        if !builder.dialect().is_sqlite() {
+            return Err(crate::errors::Error::DatabaseOutsideSqlite {
+                database_name: database.value.clone(),
+            });
+        }
+        let mut source = ParsedSource::parse(sql, builder.dialect().sqlparser_dialect())?;
+        if !builder.namespaces().is_default(
+            (&database.value, database.quote_style.is_some()),
+            builder.identifier_case(),
+        ) {
+            for (statement, _) in &mut source.statements {
+                sqlite_databases::place_created_object(statement, database);
+            }
+        }
+        self.apply_parsed(sql, source)
+    }
+
     /// Applies one statement to the current schema.
     ///
     /// The statement carries no text, so the comments above it document
