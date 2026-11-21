@@ -410,7 +410,7 @@ static EMBEDDED: &[Embedded] = &embedded![
     "bare_boolean_column",
     "blind_update" known,
     "blind_update_check_abort",
-    "column_grant_body" known,
+    "column_grant_body",
     "column_grant_id",
     "column_grant_write" known,
     "composite_key",
