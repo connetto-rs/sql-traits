@@ -261,7 +261,7 @@ pub(crate) enum SearchPathChange<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`LookupError::InvalidObjectName`] for an entry PostgreSQL refuses.
+/// Returns [`LookupError::InvalidSetting`] for an entry PostgreSQL refuses.
 pub(crate) fn search_path_change(
     statement: &Statement,
     hex_strings_may_be_integers: bool,
@@ -306,18 +306,15 @@ pub(crate) fn search_path_change(
 ///
 /// # Errors
 ///
-/// Returns [`LookupError::InvalidObjectName`] for a value PostgreSQL refuses
+/// Returns [`LookupError::InvalidSetting`] for a value PostgreSQL refuses
 /// in a `search_path` list, such as `a.b`, `a + b` or `-'app'`.
 pub(crate) fn search_path_entry(
     value: &Expr,
     hex_strings_may_be_integers: bool,
 ) -> Result<(Cow<'_, str>, bool), LookupError> {
     setting_value(value, hex_strings_may_be_integers).ok_or_else(|| {
-        LookupError::InvalidObjectName {
-            object_name: value.to_string(),
-            reason: "PostgreSQL accepts only names, strings, numbers and booleans in \
-                     search_path"
-                .to_string(),
+        LookupError::InvalidSetting {
+            written_token: crate::utils::setting_syntax::setting_syntax_token(value),
         }
     })
 }
@@ -936,6 +933,7 @@ pub(crate) fn resolve_one_relation<'a, R>(
             Err(LookupError::AmbiguousTableLookup {
                 object_name: dialect.stored_target_name(target),
                 candidates: rendered,
+                site: crate::errors::AmbiguousLookupSite::Relation,
             })
         }
     }

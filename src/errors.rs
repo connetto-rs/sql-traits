@@ -9,6 +9,10 @@ use crate::{
     traits::PartitionStrategy,
 };
 
+mod postgres;
+
+pub use postgres::{PostgresError, SqlState};
+
 /// Kind of database object a metadata lookup was made for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
@@ -952,33 +956,6 @@ pub enum ColumnReference {
     },
 }
 
-impl ColumnReference {
-    /// Records the stored parts and scope of a refused column reference.
-    pub(crate) fn unresolved(
-        dialect: crate::impls::SqlparserDialect,
-        parts: &[sqlparser::ast::Ident],
-        catalog: &str,
-        relation_found: bool,
-        inaccessible: bool,
-    ) -> Self {
-        let joined =
-            || parts.iter().map(|part| dialect.stored_name(part)).collect::<Vec<_>>().join(".");
-        if parts.len() > 4 {
-            return Self::Improper { reference: joined() };
-        }
-        if parts.len() == 4 && dialect.stored_name(&parts[0]) != catalog {
-            return Self::CrossDatabase { reference: joined() };
-        }
-        let column_name = parts.last().map(|part| dialect.stored_name(part)).unwrap_or_default();
-        let relation_name =
-            parts.len().checked_sub(2).map(|position| dialect.stored_name(&parts[position]));
-        if !relation_found && let Some(relation_name) = relation_name {
-            return Self::Relation { relation_name, inaccessible };
-        }
-        Self::Column { column_name, relation_name }
-    }
-}
-
 impl core::fmt::Display for ColumnReference {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -994,6 +971,21 @@ impl core::fmt::Display for ColumnReference {
     }
 }
 
+/// The namespace in which a lookup matched multiple objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AmbiguousLookupSite {
+    /// A relation lookup under a caller-selected identifier comparison.
+    Relation,
+    /// A column exposed by multiple inputs.
+    Column,
+    /// A select-list name in `ORDER BY`.
+    OrderBy,
+    /// A select-list name in `GROUP BY`.
+    GroupBy,
+    /// A select-list name in `DISTINCT ON`.
+    DistinctOn,
+}
+
 /// Errors produced by identifier-aware lookup and resolution APIs.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LookupError {
@@ -1005,13 +997,21 @@ pub enum LookupError {
         /// Human-readable reason describing why the object name is invalid.
         reason: String,
     },
-    /// Table resolution matched multiple candidates.
+    /// A setting value contains a token PostgreSQL's scalar grammar refuses.
+    #[error("Invalid setting value at `{written_token}`.")]
+    InvalidSetting {
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
+    },
+    /// Relation or column resolution matched multiple candidates.
     #[error("Ambiguous table lookup `{object_name}`; candidates: {candidates:?}")]
     AmbiguousTableLookup {
         /// The stored name requested by the lookup.
         object_name: String,
         /// Deterministically ordered list of matching candidates.
         candidates: Vec<String>,
+        /// The namespace in which the name was ambiguous.
+        site: AmbiguousLookupSite,
     },
     /// Function resolution by name matched more than one declaration, which
     /// happens when a name carries several argument lists.
@@ -1036,6 +1036,18 @@ pub enum LookupError {
         /// Stored, optionally qualified name requested by the lookup.
         object_name: String,
     },
+    /// The target relation cannot carry triggers.
+    #[error("Relation `{object_name}` cannot have triggers.")]
+    TriggerRelationWrongKind {
+        /// Stored, unqualified name of the target relation.
+        object_name: String,
+    },
+    /// A foreign key targets a relation that cannot be referenced.
+    #[error("Referenced relation `{object_name}` is not a table.")]
+    ReferencedRelationWrongKind {
+        /// Stored, unqualified name of the referenced relation.
+        object_name: String,
+    },
     /// Adding a table would create semantic lookup ambiguity.
     #[error(
         "Cannot add table `{table}` because existing table `{conflicting_table}` already uses that name under the {case} identifier comparison."
@@ -1047,6 +1059,8 @@ pub enum LookupError {
         conflicting_table: String,
         /// Comparison under which the two names are one.
         case: IdentifierCase,
+        /// Whether both tables have the same stored identity.
+        same_stored_identity: bool,
     },
     /// A database object handed to a metadata accessor is not present in the
     /// database being queried, for instance because it was renamed away, was
@@ -1820,6 +1834,8 @@ pub enum Error {
         table_name: String,
         /// Human-readable reason describing why the primary key is invalid.
         reason: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error(
         "Referenced table `{referenced_table}` not found for foreign key in table `{host_table}`."

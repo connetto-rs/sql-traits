@@ -141,6 +141,7 @@ fn resolve_candidates<'a>(
             Err(LookupError::AmbiguousTableLookup {
                 object_name: target.to_string(),
                 candidates: rendered,
+                site: sql_traits::errors::AmbiguousLookupSite::Relation,
             })
         }
     }
