@@ -96,14 +96,6 @@ impl<P: EmptyKinds> TableLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn is_strict(&self) -> bool {
-        self.unreach()
-    }
-
-    fn is_without_rowid(&self) -> bool {
-        self.unreach()
-    }
-
     fn storage_parameters(&self) -> impl Iterator<Item = (Cow<'_, str>, Cow<'_, str>)> {
         self.unreach::<core::iter::Empty<(Cow<'_, str>, Cow<'_, str>)>>()
     }

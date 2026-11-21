@@ -458,7 +458,7 @@ pub trait TableLike:
     /// A `STRICT` table refuses a value that its column's declared type cannot
     /// hold, and every key column but the rowid alias is `NOT NULL`. The
     /// option holds however it is spelled, ordered or repeated. A table of any
-    /// other dialect never declares it.
+    /// other dialect never declares it, so the default answers `false`.
     /// <https://www.sqlite.org/stricttables.html>
     ///
     /// # Example
@@ -478,7 +478,9 @@ pub trait TableLike:
     /// # Ok(())
     /// # }
     /// ```
-    fn is_strict(&self) -> bool;
+    fn is_strict(&self) -> bool {
+        false
+    }
 
     /// Returns whether this table declares SQLite's `WITHOUT ROWID` option,
     /// which `pragma_table_list` reports in its `wr` column.
@@ -486,7 +488,7 @@ pub trait TableLike:
     /// A `WITHOUT ROWID` table stores its rows by its primary key, which it
     /// must declare and whose columns are `NOT NULL`. The option holds however
     /// it is spelled, ordered or repeated. A table of any other dialect never
-    /// declares it.
+    /// declares it, so the default answers `false`.
     /// <https://www.sqlite.org/withoutrowid.html>
     ///
     /// # Example
@@ -506,7 +508,9 @@ pub trait TableLike:
     /// # Ok(())
     /// # }
     /// ```
-    fn is_without_rowid(&self) -> bool;
+    fn is_without_rowid(&self) -> bool {
+        false
+    }
 
     /// Iterates over this table's storage parameters (`pg_class.reloptions`)
     /// as name and value, after every `ALTER TABLE ... SET (...)` and
