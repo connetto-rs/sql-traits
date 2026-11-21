@@ -13,6 +13,7 @@ mod aggregate_window_from_calls;
 mod altered_policies;
 mod array_column_types;
 mod array_vector_interval_types;
+mod attach_adopts_primary_key;
 mod binary_send;
 mod call_kind_rules;
 mod call_resolution;
