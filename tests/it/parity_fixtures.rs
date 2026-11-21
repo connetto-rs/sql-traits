@@ -14,11 +14,15 @@ use std::{
 };
 
 use serde_json::json;
-use sql_traits::parity::{
-    Answer, Case, CaseKnown, ColumnCommand, Direction, DiscrepancyKind, Engine, EngineAnswer,
-    EngineKnown, Fixture, KnownRow, Recorded, RecordedAnswer, Shape, Write, direction, fixtures,
-    text_of,
+use sql_traits::{
+    parity::{
+        Answer, Case, CaseKnown, ColumnCommand, Direction, DiscrepancyKind, Engine, EngineAnswer,
+        EngineKnown, Fixture, KnownRow, Recorded, RecordedAnswer, Shape, Write, direction,
+        fixtures, text_of,
+    },
+    prelude::{SetPacking, SettingContent, SettingValue},
 };
+use sqlparser::ast::DataType;
 
 /// Every embedded case, read and validated.
 fn all() -> Vec<Fixture> {
@@ -444,11 +448,150 @@ fn invalid_case_configuration() {
             ),
             "must carry the row key",
         ),
+        (
+            format!("[[settings]]\nname = \"app.user_id\"\nvalue = {{ caller = \"1\" }}\n{valid}"),
+            "\"1\" is not a PostgreSQL type",
+        ),
+        (
+            format!(
+                "[[settings]]\nname = \"app.user_id\"\nvalue = {{ owner = \"uuid\" }}\n{valid}"
+            ),
+            "unknown variant",
+        ),
+        (
+            format!(
+                "[[settings]]\nname = \"app.user_id\"\nvalue = {{ caller = \"uuid\" }}\nstale = \
+                 true\n{valid}"
+            ),
+            "unknown field",
+        ),
+        (
+            format!(
+                "[[settings]]\nname = \"app.user_id\"\nvalue = {{ caller = \"uuid\" }}\n{valid}"
+            ),
+            "every session setting",
+        ),
+        (
+            format!(
+                "[[settings]]\nname = \"app.user_id\"\nvalue = {{ caller = \"uuid\" }}\n\
+                 [[settings]]\nname = \"app.subjects\"\nvalue = {{ set = {{ element = \"text\", \
+                 packing = {{ delimited = \"\" }} }} }}\n{valid}"
+            ),
+            "splits a set on an empty separator",
+        ),
+        (
+            format!(
+                "[[settings]]\nname = \"app.user_id\"\nvalue = {{ caller = \"uuid\" }}\n\
+                 [[settings]]\nname = \"app.subjects\"\nvalue = {{ principal = {{ kind = \"\", \
+                 identity = \"uuid\" }} }}\n{valid}"
+            ),
+            "principal of no type",
+        ),
     ] {
         let error =
             Case::parse("fixture", "", "", config).expect_err("the configuration is invalid");
         assert!(error.to_string().contains(expected), "{error}");
     }
+}
+
+const DECLARED_SETTINGS: &str = r#"
+[[settings]]
+name = "app.user_id"
+value = { caller = "uuid" }
+
+[[settings]]
+name = "app.installation"
+value = { principal = { kind = "installation", identity = "bigint" } }
+
+[[settings]]
+name = "app.tenant"
+value = { scalar = "integer" }
+
+[[settings]]
+name = "app.subjects"
+value = { set = { element = "uuid", packing = "json_array" } }
+
+[[settings]]
+name = "app.teams"
+value = { set = { element = "text", packing = { delimited = ";" } } }
+
+[[tables]]
+name = "docs"
+key = ["id"]
+columns = ["id"]
+
+[[callers]]
+name = "a"
+role = "app_reader"
+settings = { "app.user_id" = "00000000-0000-0000-0000-00000000000a", "app.installation" = "7", "app.tenant" = "1", "app.subjects" = "[]", "app.teams" = "red;blue" }
+"#;
+
+/// A case's deployment declares each session setting as `callers.toml` types
+/// and packs it, the declarations survive the round trip rls-parity records
+/// cases through, and a case declaring none keeps a text caller and
+/// comma-packed text subjects.
+#[test]
+fn declared_settings() {
+    let case = Case::parse("fixture", "", "", DECLARED_SETTINGS).expect("the case reads");
+    let deployment = case.config.deployment().expect("the deployment is valid");
+    let value = SettingContent::Value;
+    assert_eq!(
+        deployment
+            .settings()
+            .iter()
+            .map(|setting| (setting.name(), setting.content()))
+            .collect::<Vec<_>>(),
+        [
+            ("app.user_id", &value(SettingValue::Caller(DataType::Uuid))),
+            (
+                "app.installation",
+                &value(SettingValue::Principal {
+                    kind: "installation".into(),
+                    identity: DataType::BigInt(None),
+                }),
+            ),
+            ("app.tenant", &value(SettingValue::Scalar(DataType::Integer(None)))),
+            (
+                "app.subjects",
+                &value(SettingValue::Set {
+                    element: DataType::Uuid,
+                    packing: SetPacking::JsonArray
+                }),
+            ),
+            (
+                "app.teams",
+                &value(SettingValue::Set {
+                    element: DataType::Text,
+                    packing: SetPacking::Delimited(";".into()),
+                }),
+            ),
+        ]
+    );
+
+    let recorded = toml::to_string(&case.config).expect("the case serializes");
+    let reread = Case::parse("fixture", "", "", &recorded).expect("the recorded case reads");
+    assert_eq!(reread.config, case.config);
+
+    let legacy = small_fixture().case.config;
+    assert!(!toml::to_string(&legacy).expect("the case serializes").contains("settings ="));
+    let legacy = legacy.deployment().expect("the deployment is valid");
+    assert_eq!(
+        legacy
+            .settings()
+            .iter()
+            .map(|setting| (setting.name(), setting.content()))
+            .collect::<Vec<_>>(),
+        [
+            ("app.user_id", &value(SettingValue::Caller(DataType::Text))),
+            (
+                "app.subjects",
+                &value(SettingValue::Set {
+                    element: DataType::Text,
+                    packing: SetPacking::Delimited(",".into()),
+                }),
+            ),
+        ]
+    );
 }
 
 /// SQL identifiers escape embedded quotes in the projection and table.

@@ -1,3 +1,11 @@
+[[settings]]
+name = "app.user_id"
+value = { caller = "uuid" }
+
+[[settings]]
+name = "app.subjects"
+value = { set = { element = "text", packing = { delimited = "," } } }
+
 [[tables]]
 name = "udocs"
 key = ["id"]

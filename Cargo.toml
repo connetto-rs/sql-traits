@@ -38,16 +38,14 @@ git = [
     "dep:git2",
     "dep:tempfile",
 ]
-# Derives `Serialize` and `Deserialize` for the names and collation facts a
-# consumer persists: `TargetName`, `ColumnCollation`, `NamedColumnCollation`
-# and `MySqlCollationPadding`. Kept `no_std`-compatible through `serde/alloc`.
+# `Serialize` and `Deserialize` for persisted names, collation facts and session setting values, `no_std` through `serde/alloc`.
 serde = ["dep:serde"]
 # Implements sqlparser-canonicalize's `SemanticContext` through
 # `SemanticProofs`, so canonical text spells the casts and constants
 # PostgreSQL derives for an expression. Kept `no_std`-compatible.
 canonicalize = ["dep:sqlparser-canonicalize"]
 # rls-parity's recorded cases and the judgement of one engine against them, as the `parity` module.
-parity-fixtures = ["std", "dep:serde", "dep:serde_json", "dep:toml"]
+parity-fixtures = ["std", "serde", "dep:serde_json", "dep:toml"]
 
 [dependencies]
 sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
@@ -110,6 +108,7 @@ pedantic = { level = "deny", priority = -1 }
 arbitrary = "1.4"
 proptest = "1.7"
 serde_json = "1.0"
+toml = "1"
 
 # Every integration test is a module of this one binary, see tests/it/main.rs.
 [[test]]
