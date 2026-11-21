@@ -33,6 +33,7 @@ mod column_type_change_dependents;
 mod column_written_constraints;
 mod comment_on_documentation;
 mod constraint_renames;
+mod constraint_using_index;
 mod constraint_validation;
 mod creation_identifier_case;
 mod data_statement_analysis;

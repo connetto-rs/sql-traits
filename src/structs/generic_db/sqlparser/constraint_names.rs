@@ -921,27 +921,7 @@ pub(super) fn key_index_table(
     old: &Ident,
     new: &Ident,
 ) -> Result<Option<StoredTable>, Error> {
-    let case = builder.identifier_case();
-    let reached = builder
-        .relation_reached(name)
-        .filter(|(kind, _)| matches!(kind, ObjectKind::UniqueIndex))
-        .and_then(|(_, schema)| {
-            builder
-                .tables()
-                .iter()
-                .find(|(table, metadata, _)| {
-                    schema_qualifiers_match(
-                        builder.namespaces(),
-                        table_schema_qualifier(table),
-                        Some(schema),
-                        case,
-                    ) && locate(table, metadata.generated_constraint_names(), old, case)
-                        .and_then(|position| slot_at(table, position))
-                        .is_some_and(|(slot, _)| backed_by_index(slot))
-                })
-                .map(|(table, _, _)| (StoredTable::of(table), schema))
-        });
-    let Some((stored, schema)) = reached else {
+    let Some((stored, schema)) = key_index_owner(builder, name, old) else {
         return Ok(None);
     };
     match super::relation_name_holder(builder, new, Some(schema)) {
@@ -954,6 +934,35 @@ pub(super) fn key_index_table(
         }
         None => Ok(Some(stored)),
     }
+}
+
+/// The table and reached schema whose constraint owns the index named by
+/// `name`.
+pub(super) fn key_index_owner<'name>(
+    builder: &'name ParserDBBuilder,
+    name: &'name ObjectName,
+    index_name: &Ident,
+) -> Option<(StoredTable, (&'name str, bool))> {
+    let case = builder.identifier_case();
+    builder
+        .relation_reached(name)
+        .filter(|(kind, _)| matches!(kind, ObjectKind::UniqueIndex))
+        .and_then(|(_, schema)| {
+            builder
+                .tables()
+                .iter()
+                .find(|(table, metadata, _)| {
+                    schema_qualifiers_match(
+                        builder.namespaces(),
+                        table_schema_qualifier(table),
+                        Some(schema),
+                        case,
+                    ) && locate(table, metadata.generated_constraint_names(), index_name, case)
+                        .and_then(|position| slot_at(table, position))
+                        .is_some_and(|(slot, _)| backed_by_index(slot))
+                })
+                .map(|(table, _, _)| (StoredTable::of(table), schema))
+        })
 }
 
 /// Applies `ALTER INDEX ... RENAME TO new` to the key of `stored` answering to
