@@ -48,12 +48,17 @@ pub(super) fn inherit(
         return Err(Error::InheritsFromPartitionedTable { table_name, parent_name: parent_text });
     }
     if parent_node.partition_of.is_some() {
-        return Err(Error::InheritsFromPartition { table_name, parent_name: parent_text });
+        return Err(Error::InheritsFromPartition {
+            table_name,
+            parent_name: parent_text,
+            altering: true,
+        });
     }
     if parent_node.is_temporary() && !child_node.is_temporary() {
         return Err(Error::PermanentRelationInheritsTemporary {
             table_name,
             parent_name: parent_text,
+            partition: None,
         });
     }
     let parent = StoredTable::of(parent_node);

@@ -7,6 +7,7 @@ use sqlparser::dialect::{Dialect, PostgreSqlDialect};
 
 mod keys_triggers_grants;
 mod lookup_columns;
+mod persistence_partitions;
 mod roles_functions_schemas;
 mod types_settings;
 mod views_constraints_functions;

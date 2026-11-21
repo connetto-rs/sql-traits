@@ -32,7 +32,7 @@ fn a_partition_key_names_a_column_of_its_table() {
         assert!(
             matches!(
                 &error,
-                Error::PartitionKeyColumnNotFound { table_name, column_name }
+                Error::PartitionKeyColumnNotFound { table_name, column_name, .. }
                     if table_name == "k" && column_name == column
             ),
             "{sql}: {error:?}"
@@ -117,7 +117,7 @@ fn a_unique_constraint_on_a_partitioned_table_covers_its_key() {
         assert!(
             matches!(
                 refusal(sql),
-                Error::UniqueConstraintOverExpressionPartitionKey { table_name } if table_name == "k"
+                Error::UniqueConstraintOverExpressionPartitionKey { table_name, .. } if table_name == "k"
             ),
             "{sql}"
         );

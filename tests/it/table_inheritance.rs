@@ -518,7 +518,7 @@ fn no_table_inherits_from_a_partition() {
         assert!(
             matches!(
                 &error,
-                Error::InheritsFromPartition { table_name, parent_name }
+                Error::InheritsFromPartition { table_name, parent_name, .. }
                     if table_name == "c" && parent_name == "p"
             ),
             "{statement}: {error:?}"
