@@ -1,6 +1,17 @@
-//! Standalone indexes inherited by partitions.
+//! Standalone indexes inherited by partitions, and the indexes
+//! `ALTER INDEX ... ATTACH PARTITION` makes partitions of another.
+//!
+//! A partitioned index is valid once every direct partition of its table,
+//! a foreign one included, holds a valid index attached to it. Validating
+//! one may validate the index it is attached to in turn.
 
-use alloc::{borrow::Cow, string::ToString, sync::Arc, vec, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 
 use sqlparser::ast::{
     CreateIndex, CreateTable, Expr, Ident, IndexType, NullsDistinctOption, ObjectName,
@@ -9,16 +20,19 @@ use sqlparser::ast::{
 
 use super::{
     IndexSlot, ParserDB, ParserDBBuilder, StoredTable, attach_partition,
-    constraint_names::{self, Slot},
+    constraint_names::{self, Position, Slot},
     inheritance::{self, ParentKind},
     object_name_last_identifier,
     partition_index_families::OPERATOR_FAMILIES,
     referenced_keys,
 };
 use crate::{
-    errors::Error,
+    errors::{AttachIndexRefusal, Error},
     traits::TableLike,
-    utils::identifier_resolution::{stored_ident_name, stored_identifier},
+    utils::{
+        identifier_resolution::{stored_ident_name, stored_identifier},
+        last_str,
+    },
 };
 
 /// Whether two identifiers name the same stored object.
@@ -515,4 +529,411 @@ pub(super) fn drop_index(
         }
         Ok(builder)
     })
+}
+
+/// An index a partitioned index tree may hold, either a standalone index at
+/// its position in the builder or the index behind the primary key or unique
+/// constraint at its position in the table node.
+#[derive(Clone, Copy)]
+enum Member {
+    /// The standalone index at the position.
+    Standalone(usize),
+    /// The index of the key at the position.
+    Key(Position),
+}
+
+/// An index of a table, with the name it answers to.
+struct NamedIndex {
+    /// The table the index is on.
+    table: StoredTable,
+    /// The name of the index.
+    name: Ident,
+    /// Where the index is held.
+    member: Member,
+}
+
+/// The index on `table` answering to `name`.
+fn member_on(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+    name: &Ident,
+) -> Result<Option<Member>, Error> {
+    let case = builder.identifier_case();
+    if let Some(position) = builder.indices().iter().position(|(index, _)| {
+        table.matches(index.table(), case)
+            && index
+                .attribute()
+                .name
+                .as_ref()
+                .and_then(object_name_last_identifier)
+                .is_some_and(|held| same_name(builder, held, name))
+    }) {
+        return Ok(Some(Member::Standalone(position)));
+    }
+    let node = ParserDB::stored_node(builder, table)?;
+    Ok(constraint_names::answers(builder, node)
+        .into_iter()
+        .find(|(slot, key)| {
+            slot.is_unique_key()
+                && key.as_ref().is_some_and(|key| {
+                    case.identifiers_match(key, true, &name.value, name.quote_style.is_some())
+                })
+        })
+        .map(|(slot, _)| Member::Key(slot.position())))
+}
+
+/// The index `name` reaches, [`None`] for an index on a materialized view.
+fn resolve(builder: &ParserDBBuilder, name: &ObjectName) -> Result<Option<NamedIndex>, Error> {
+    let not_found = || Error::AlterIndexNotFound { index_name: last_str(name).to_string() };
+    if let Some(ident) = object_name_last_identifier(name)
+        && let Some((table, _)) = constraint_names::key_index_owner(builder, name, ident)
+        && let Some(member) = member_on(builder, &table, ident)?
+    {
+        let name = Ident::with_quote('"', stored_ident_name(ident).as_ref());
+        return Ok(Some(NamedIndex { table, name, member }));
+    }
+    match builder.index_position(name)? {
+        None => Err(not_found()),
+        Some(IndexSlot::MaterializedView(_)) => Ok(None),
+        Some(IndexSlot::Table(position)) => {
+            let index = &builder.indices()[position].0;
+            let held = index
+                .attribute()
+                .name
+                .as_ref()
+                .and_then(object_name_last_identifier)
+                .ok_or_else(not_found)?;
+            Ok(Some(NamedIndex {
+                table: StoredTable::of(index.table()),
+                name: held.clone(),
+                member: Member::Standalone(position),
+            }))
+        }
+    }
+}
+
+/// The definition of `index`, a key's as the index PostgreSQL builds for it.
+fn definition<'builder>(
+    builder: &'builder ParserDBBuilder,
+    index: &NamedIndex,
+) -> Result<Option<Cow<'builder, CreateIndex>>, Error> {
+    match index.member {
+        Member::Standalone(position) => {
+            Ok(Some(Cow::Borrowed(builder.indices()[position].0.attribute())))
+        }
+        Member::Key(position) => {
+            let node = ParserDB::stored_node(builder, &index.table)?;
+            Ok(constraint_names::slots(node)
+                .into_iter()
+                .find(|slot| slot.position() == position)
+                .and_then(|slot| constraint_index(node, slot, &index.name.value))
+                .map(Cow::Owned))
+        }
+    }
+}
+
+/// Whether the index `member` is valid, which the index of a key always is.
+fn is_valid(builder: &ParserDBBuilder, member: Member) -> bool {
+    match member {
+        Member::Standalone(position) => builder.indices()[position].1.is_valid(),
+        Member::Key(_) => true,
+    }
+}
+
+/// Every index of a partition `table` records, with the index it is attached
+/// to.
+fn attachments<'builder>(
+    builder: &'builder ParserDBBuilder,
+    table: &'builder StoredTable,
+) -> impl Iterator<Item = &'builder (Ident, Ident)> {
+    builder
+        .tables()
+        .iter()
+        .filter(|(node, _, _)| table.matches(node, builder.identifier_case()))
+        .flat_map(|(_, metadata, _)| metadata.partition_indexes())
+}
+
+/// The table a partition's keys are received from.
+fn partition_parent<'builder>(
+    builder: &'builder ParserDBBuilder,
+    node: &CreateTable,
+) -> Option<&'builder CreateTable> {
+    node.partition_of
+        .as_ref()
+        .and_then(|name| builder.resolve_bound_table_name(name).ok().flatten())
+}
+
+/// Whether the key in `slot` of the partition `table` is one it received,
+/// which a key in the constraint list is only when the table records it.
+fn received_key(builder: &ParserDBBuilder, table: &StoredTable, slot: Slot<'_>) -> bool {
+    match slot {
+        Slot::Column { .. } => true,
+        Slot::Table(_, constraint) => {
+            inheritance::records_inherited_constraint(builder, table, constraint)
+        }
+    }
+}
+
+/// Every index of a partition `table` attached to an index of its parent,
+/// with that index, the keys it received included.
+fn links(builder: &ParserDBBuilder, table: &StoredTable) -> Result<Vec<(Ident, Ident)>, Error> {
+    let mut links: Vec<(Ident, Ident)> = attachments(builder, table).cloned().collect();
+    let node = ParserDB::stored_node(builder, table)?;
+    let Some(parent) = partition_parent(builder, node) else {
+        return Ok(links);
+    };
+    let case = builder.identifier_case();
+    let parent_keys: Vec<(Cow<'_, TableConstraint>, Cow<'_, str>)> =
+        constraint_names::answers(builder, parent)
+            .into_iter()
+            .filter(|(slot, _)| slot.is_unique_key())
+            .filter_map(|(slot, name)| Some((constraint_form(slot)?, name?)))
+            .collect();
+    for (slot, name) in constraint_names::answers(builder, node) {
+        let (Some(name), Some(form)) = (name, constraint_form(slot)) else {
+            continue;
+        };
+        if !slot.is_unique_key()
+            || links.iter().any(|(held, _)| {
+                case.identifiers_match(&name, true, &held.value, held.quote_style.is_some())
+            })
+            || !received_key(builder, table, slot)
+        {
+            continue;
+        }
+        if let Some((_, parent_name)) = parent_keys
+            .iter()
+            .find(|(passed, _)| attach_partition::same_key(builder, &form, passed))
+        {
+            links.push((
+                Ident::with_quote('"', name.as_ref()),
+                Ident::with_quote('"', parent_name.as_ref()),
+            ));
+        }
+    }
+    Ok(links)
+}
+
+/// Whether `held`, a key of the partition `child`, was attached to a key of
+/// `parent`, its partitioned table, by `ALTER INDEX ... ATTACH PARTITION`.
+pub(super) fn attached_to_key(
+    builder: &ParserDBBuilder,
+    child: &CreateTable,
+    parent: &CreateTable,
+    held: &TableConstraint,
+) -> bool {
+    let table = StoredTable::of(child);
+    if attachments(builder, &table).next().is_none() {
+        return false;
+    }
+    let case = builder.identifier_case();
+    let named = |node, wanted: &dyn Fn(Slot<'_>) -> bool| -> Vec<String> {
+        constraint_names::answers(builder, node)
+            .into_iter()
+            .filter(|(slot, _)| slot.is_unique_key() && wanted(*slot))
+            .filter_map(|(_, name)| name.map(Cow::into_owned))
+            .collect()
+    };
+    let held_names = named(child, &|slot| constraint_form(slot).is_some_and(|form| *form == *held));
+    let parent_names = named(parent, &|_| true);
+    let answers_to = |names: &[String], ident: &Ident| {
+        names.iter().any(|name| {
+            case.identifiers_match(name, true, &ident.value, ident.quote_style.is_some())
+        })
+    };
+    attachments(builder, &table).any(|(name, parent_name)| {
+        answers_to(&held_names, name) && answers_to(&parent_names, parent_name)
+    })
+}
+
+/// The key of the partition `table` received from or attached to `passed`,
+/// the parent's key named `passed_name`, with its position and name.
+pub(super) fn linked_key(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+    passed: &TableConstraint,
+    passed_name: &str,
+) -> Result<Option<(Position, TableConstraint, String)>, Error> {
+    let node = ParserDB::stored_node(builder, table)?;
+    let case = builder.identifier_case();
+    Ok(constraint_names::answers(builder, node).into_iter().find_map(|(slot, name)| {
+        let form = constraint_form(slot).filter(|_| slot.is_unique_key())?;
+        let name = name?;
+        let attached = attachments(builder, table).any(|(held, parent)| {
+            case.identifiers_match(&name, true, &held.value, held.quote_style.is_some())
+                && case.identifiers_match(
+                    passed_name,
+                    true,
+                    &parent.value,
+                    parent.quote_style.is_some(),
+                )
+        });
+        (attached
+            || (received_key(builder, table, slot)
+                && attach_partition::same_key(builder, &form, passed)))
+        .then(|| (slot.position(), form.into_owned(), name.into_owned()))
+    }))
+}
+
+/// Whether every direct partition of `table` holds a valid index attached to
+/// its index `name`, which a foreign partition never does.
+fn partitions_attached(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+    name: &Ident,
+) -> Result<bool, Error> {
+    for (kind, child) in inheritance::direct_children(builder, table) {
+        if kind != ParentKind::PartitionOf {
+            continue;
+        }
+        if builder.is_foreign_table(ParserDB::stored_node(builder, &child)?) {
+            return Ok(false);
+        }
+        let Some((held, _)) = links(builder, &child)?
+            .into_iter()
+            .find(|(_, parent)| same_name(builder, parent, name))
+        else {
+            return Ok(false);
+        };
+        let Some(member) = member_on(builder, &child, &held)? else {
+            return Ok(false);
+        };
+        if !is_valid(builder, member) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Validates the invalid index `name` of `table` once each partition holds a
+/// valid index attached to it, then the index it is attached to the same
+/// way, up the tree.
+fn revalidate(
+    builder: &mut ParserDBBuilder,
+    mut table: StoredTable,
+    mut name: Ident,
+) -> Result<(), Error> {
+    loop {
+        let Some(member) = member_on(builder, &table, &name)? else {
+            return Ok(());
+        };
+        if is_valid(builder, member) || !partitions_attached(builder, &table, &name)? {
+            return Ok(());
+        }
+        if let Member::Standalone(position) = member {
+            builder.indices_mut()[position].1.set_validity(true);
+        }
+        let Some(parent_name) = links(builder, &table)?
+            .into_iter()
+            .find(|(held, _)| same_name(builder, held, &name))
+            .map(|(_, parent)| parent)
+        else {
+            return Ok(());
+        };
+        let Some(parent_table) =
+            partition_parent(builder, ParserDB::stored_node(builder, &table)?).map(StoredTable::of)
+        else {
+            return Ok(());
+        };
+        table = parent_table;
+        name = parent_name;
+    }
+}
+
+/// Applies `ALTER INDEX parent ATTACH PARTITION child`, making the index
+/// `child` of a partition the partition of the index `parent` of its
+/// partitioned table, which it validates once every partition holds one.
+///
+/// # Errors
+///
+/// Returns [`Error::AlterIndexNotFound`] for a name reaching no index,
+/// [`Error::RelationKindMismatch`] for one reaching another relation,
+/// [`Error::AttachIndexNotSupported`] when `parent` is not on a partitioned
+/// table, and [`Error::AttachIndexRefused`] when PostgreSQL refuses to attach
+/// `child` to it.
+pub(super) fn attach(
+    mut builder: ParserDBBuilder,
+    parent_name: &ObjectName,
+    child_name: &ObjectName,
+) -> Result<ParserDBBuilder, Error> {
+    let not_supported =
+        || Error::AttachIndexNotSupported { index_name: last_str(parent_name).to_string() };
+    let parent = resolve(&builder, parent_name)?.ok_or_else(not_supported)?;
+    let parent_node = ParserDB::stored_node(&builder, &parent.table)?;
+    if parent_node.partition_by.is_none() {
+        return Err(not_supported());
+    }
+    let parent_table_name = parent_node.table_name().to_string();
+    let child = resolve(&builder, child_name)?;
+    let refused = |index_name: String, reason: AttachIndexRefusal| {
+        Error::AttachIndexRefused {
+            index_name,
+            parent_index_name: parent.name.value.clone(),
+            reason,
+        }
+    };
+    let Some(child) = child else {
+        return Err(refused(
+            last_str(child_name).to_string(),
+            AttachIndexRefusal::NotOnPartition { table_name: parent_table_name },
+        ));
+    };
+    let links = links(&builder, &child.table)?;
+    let attached_to = links
+        .iter()
+        .find(|(held, _)| same_name(&builder, held, &child.name))
+        .map(|(_, attached_to)| same_name(&builder, attached_to, &parent.name));
+    if attached_to == Some(true) {
+        revalidate(&mut builder, parent.table, parent.name)?;
+        return Ok(builder);
+    }
+    if links.iter().any(|(_, attached_to)| same_name(&builder, attached_to, &parent.name)) {
+        let partition_name =
+            ParserDB::stored_node(&builder, &child.table)?.table_name().to_string();
+        return Err(refused(
+            child.name.value,
+            AttachIndexRefusal::PartitionHasIndex { partition_name },
+        ));
+    }
+    if attached_to.is_some() {
+        return Err(refused(child.name.value, AttachIndexRefusal::AttachedElsewhere));
+    }
+    let child_node = ParserDB::stored_node(&builder, &child.table)?;
+    let case = builder.identifier_case();
+    if !inheritance::direct_children(&builder, &parent.table)
+        .iter()
+        .any(|(kind, table)| *kind == ParentKind::PartitionOf && table.matches(child_node, case))
+    {
+        return Err(refused(
+            child.name.value,
+            AttachIndexRefusal::NotOnPartition { table_name: parent_table_name },
+        ));
+    }
+    let parent_node = ParserDB::stored_node(&builder, &parent.table)?;
+    let matching = definition(&builder, &parent)?.zip(definition(&builder, &child)?).is_some_and(
+        |(parent_definition, child_definition)| {
+            equivalent(&builder, parent_node, &parent_definition, child_node, &child_definition)
+        },
+    );
+    if !matching {
+        return Err(refused(child.name.value, AttachIndexRefusal::DefinitionsDiffer));
+    }
+    if matches!(parent.member, Member::Key(_)) && matches!(child.member, Member::Standalone(_)) {
+        return Err(refused(
+            child.name.value,
+            AttachIndexRefusal::ConstraintMissing { table_name: parent_table_name },
+        ));
+    }
+    if let (Member::Key(_), Member::Key(position)) = (parent.member, child.member)
+        && let Some(form) = constraint_names::slots(child_node)
+            .into_iter()
+            .find(|slot| slot.position() == position)
+            .and_then(constraint_form)
+            .map(Cow::into_owned)
+    {
+        inheritance::mark_inherited_constraint(&mut builder, &child.table, &form);
+    }
+    record(&mut builder, &child.table, child.name, parent.name.clone());
+    revalidate(&mut builder, parent.table, parent.name)?;
+    Ok(builder)
 }

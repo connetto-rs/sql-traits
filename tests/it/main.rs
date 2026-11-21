@@ -149,6 +149,7 @@ mod partition_alterations;
 mod partition_attachment;
 mod partition_bounds;
 mod partition_detachment;
+mod partition_index_attachment;
 mod partition_keys;
 mod partition_triggers;
 mod partitioned_index_copies;

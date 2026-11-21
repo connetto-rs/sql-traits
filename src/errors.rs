@@ -451,6 +451,54 @@ impl core::fmt::Display for ReplicaIdentityRefusal {
     }
 }
 
+/// Why `ALTER INDEX ... ATTACH PARTITION` refuses to attach an index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AttachIndexRefusal {
+    /// The index is not on a direct partition of the named table, the table
+    /// of the parent index.
+    NotOnPartition {
+        /// Name of the parent index's table.
+        table_name: String,
+    },
+    /// The index is already a partition of another index.
+    AttachedElsewhere,
+    /// The named partition already holds an index attached to the parent.
+    PartitionHasIndex {
+        /// Name of the partition.
+        partition_name: String,
+    },
+    /// The two indexes differ in their keys, method, uniqueness, included
+    /// columns or predicate.
+    DefinitionsDiffer,
+    /// The parent index backs a constraint of the named table, and the
+    /// attached index backs none.
+    ConstraintMissing {
+        /// Name of the parent index's table.
+        table_name: String,
+    },
+}
+
+impl core::fmt::Display for AttachIndexRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotOnPartition { table_name } => {
+                write!(f, "it is not an index on any partition of table \"{table_name}\"")
+            }
+            Self::AttachedElsewhere => f.write_str("it is already attached to another index"),
+            Self::PartitionHasIndex { partition_name } => {
+                write!(f, "another index is already attached for partition \"{partition_name}\"")
+            }
+            Self::DefinitionsDiffer => f.write_str("the index definitions do not match"),
+            Self::ConstraintMissing { table_name } => {
+                write!(
+                    f,
+                    "the parent index belongs to a constraint in table \"{table_name}\" and no constraint exists for it"
+                )
+            }
+        }
+    }
+}
+
 /// Why a table's persistence may not change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FixedPersistence {
@@ -3639,6 +3687,24 @@ pub enum Error {
         index_name: String,
         /// Name of the immediate parent index.
         parent_index_name: String,
+    },
+    /// PostgreSQL attaches an index only to an index of a partitioned table.
+    #[error("ALTER action ATTACH PARTITION cannot be performed on relation \"{index_name}\"")]
+    AttachIndexNotSupported {
+        /// Name of the index the statement alters.
+        index_name: String,
+    },
+    /// PostgreSQL refuses to make an index a partition of another index.
+    #[error(
+        "cannot attach index \"{index_name}\" as a partition of index \"{parent_index_name}\" because {reason}"
+    )]
+    AttachIndexRefused {
+        /// Name of the index being attached.
+        index_name: String,
+        /// Name of the index it would become a partition of.
+        parent_index_name: String,
+        /// What stands in the way.
+        reason: AttachIndexRefusal,
     },
     /// PostgreSQL refuses dropping an index with dependent constraints without
     /// `CASCADE`.

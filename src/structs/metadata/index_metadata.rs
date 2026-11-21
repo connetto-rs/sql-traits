@@ -45,6 +45,11 @@ impl<I: IndexLike> IndexMetadata<I> {
         self.valid
     }
 
+    /// Marks the index valid or invalid.
+    pub(crate) fn set_validity(&mut self, valid: bool) {
+        self.valid = valid;
+    }
+
     /// Stores the identity the index was given when it was created.
     #[must_use]
     pub(crate) fn with_key_identity(mut self, identity: Option<KeyIdentity>) -> Self {

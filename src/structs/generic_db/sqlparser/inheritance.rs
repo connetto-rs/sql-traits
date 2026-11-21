@@ -474,7 +474,7 @@ pub(super) fn receives_column_constraint(
     let case = builder.identifier_case();
     if matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_)) {
         return super::attach_partition::table_form(written_on, option)
-            .is_some_and(|held| receives_partition_key(builder, child, &held));
+            .is_some_and(|held| receives_partition_key(builder, child, &held, true));
     }
     parents_with_kind(child).any(|(kind, name)| {
         option_passes_down(kind, &option.option)
@@ -794,16 +794,20 @@ pub(super) fn partition_keys(
 }
 
 /// Whether the partition's parent supplies this key in either constraint
-/// location.
+/// location, `recorded` saying whether the partition records receiving it,
+/// or the key was attached to a key of the parent.
 fn receives_partition_key(
     builder: &ParserDBBuilder,
     child: &CreateTable,
     held: &TableConstraint,
+    recorded: bool,
 ) -> bool {
     child.partition_of.as_ref().is_some_and(|name| {
         builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
-            partition_keys(parent)
-                .any(|(_, passed)| super::attach_partition::same_key(builder, held, &passed))
+            (recorded
+                && partition_keys(parent)
+                    .any(|(_, passed)| super::attach_partition::same_key(builder, held, &passed)))
+                || super::partition_indexes::attached_to_key(builder, child, parent, held)
         })
     })
 }
@@ -836,9 +840,9 @@ pub(super) fn receives_constraint(
     held: &TableConstraint,
 ) -> bool {
     if matches!(held, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_)) {
-        // A key the partition added itself stays its own beside an alike one.
-        return records_inherited_constraint(builder, &StoredTable::of(child), held)
-            && receives_partition_key(builder, child, held);
+        // A key the partition added itself stays its own until it is attached.
+        let recorded = records_inherited_constraint(builder, &StoredTable::of(child), held);
+        return receives_partition_key(builder, child, held, recorded);
     }
     parents_with_kind(child).any(|(kind, name)| {
         builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
