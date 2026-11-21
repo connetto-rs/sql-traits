@@ -1,7 +1,10 @@
 //! Index refusals follow dialect validation phases.
 
-use sql_traits::{errors::Error, prelude::*};
-use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sql_traits::{
+    errors::{Error, LookupError},
+    prelude::*,
+};
+use sqlparser::dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect};
 
 const TABLE: &str =
     "CREATE TABLE probe(z text, payload json, number int); CREATE INDEX occupied ON probe(z);";
@@ -111,6 +114,25 @@ fn materialized_view_keys_follow_expression_transform() {
         "CREATE INDEX idx ON probe(absent_column) WHERE absent_predicate > 0",
     );
     assert!(error.contains("UnknownColumn") && error.contains("absent_predicate"), "{error}");
+}
+
+#[test]
+fn materialized_view_index_columns_outside_postgres() {
+    let setup = "CREATE MATERIALIZED VIEW probe AS SELECT 1 AS z;";
+    for statement in [
+        "CREATE INDEX idx ON probe(absent_column)",
+        "CREATE INDEX idx ON probe(z) INCLUDE(absent_column)",
+    ] {
+        let error = ParserDB::parse::<GenericDialect>(&format!("{setup}{statement};")).err();
+        assert!(
+            matches!(
+                &error,
+                Some(Error::IdentifierLookupError(LookupError::ColumnNotFound { column_name, .. }))
+                    if column_name == "absent_column"
+            ),
+            "{statement}: {error:?}"
+        );
+    }
 }
 
 #[test]
