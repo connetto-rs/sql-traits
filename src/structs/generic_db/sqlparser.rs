@@ -43,8 +43,8 @@ use crate::{
     structs::{
         ColumnIdentity, ColumnMetadata, ConstraintDeferral, DeclaredVirtualTable, DefaultPrivilege,
         DefaultPrivilegeKind, ForeignTableSource, FunctionKind, GenericDB, IdentifierCase,
-        MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership, Schema,
-        SchemaProfile, Sequence, StoredReplicaIdentity, TableAttribute, TableMetadata,
+        KeyIdentity, MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership,
+        Schema, SchemaProfile, Sequence, StoredReplicaIdentity, TableAttribute, TableMetadata,
         TriggerEnablement, UserDefinedType, View, VirtualTableSource,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
@@ -120,6 +120,7 @@ mod postgres_catalog;
 mod procedures;
 use procedures::RoutineKeyword;
 mod range_constructors;
+mod referenced_keys;
 mod replica_identity;
 mod revocations;
 mod role_memberships;
@@ -437,9 +438,9 @@ struct PreservedColumnMetadata {
     identity: Option<ColumnIdentity>,
 }
 
-/// An index a table rebuild detaches, with its expression and the operator
-/// selections it held.
-type DetachedIndex = (CreateIndex, Expr, operator_carry::Selections);
+/// An index a table rebuild detaches, with its expression, the operator
+/// selections it held and the identity it was created with.
+type DetachedIndex = (CreateIndex, Expr, operator_carry::Selections, Option<KeyIdentity>);
 
 fn qualify_created_collation_name(
     builder: &ParserDBBuilder,
@@ -1115,6 +1116,26 @@ fn column_metadata_for_collations(
     Ok(metadata)
 }
 
+/// Where in `node` a column added at `position` lands, the end when it names
+/// no place or a column the node lacks.
+fn column_insert_position(
+    node: &CreateTable,
+    position: Option<&MySQLColumnPosition>,
+    case: IdentifierCase,
+) -> usize {
+    match position {
+        Some(MySQLColumnPosition::First) => 0,
+        Some(MySQLColumnPosition::After(after)) => {
+            let after = NamedColumn::of(after, case);
+            node.columns
+                .iter()
+                .position(|declared| after.matches(&declared.name))
+                .map_or(node.columns.len(), |index| index + 1)
+        }
+        None => node.columns.len(),
+    }
+}
+
 /// The refusal of a column a parent adds where the child already declares one
 /// of its name, which PostgreSQL merges only when type and collation agree.
 fn existing_child_column_conflict(
@@ -1669,6 +1690,7 @@ impl ParserDBBuilder {
                     index.attribute().clone(),
                     metadata.expression().clone(),
                     selections,
+                    metadata.key_identity(),
                 ));
                 return false;
             }
@@ -2141,6 +2163,22 @@ impl ParserDBBuilder {
             }
         }
         Ok(())
+    }
+
+    /// Binds the foreign key `constraint` is, on `host`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`Self::bind_foreign_key`] raises.
+    fn bind_constraint_foreign_key(
+        &self,
+        host: &StoredTable,
+        constraint: &mut TableConstraint,
+    ) -> Result<(), crate::errors::Error> {
+        match constraint {
+            TableConstraint::ForeignKey(foreign_key) => self.bind_foreign_key(host, foreign_key),
+            _ => Ok(()),
+        }
     }
 
     /// The name PostgreSQL gives an index `create_index` leaves unnamed, or
@@ -6788,7 +6826,7 @@ impl ParserDB {
         let replacement = Arc::new(replacement);
 
         let renamed = !stored.matches(&replacement, builder.identifier_case());
-        for (mut index, expression, selections) in detached_indices {
+        for (mut index, expression, selections, key_identity) in detached_indices {
             if renamed {
                 index.table_name = replacement.name.clone();
             }
@@ -6799,7 +6837,9 @@ impl ParserDB {
             metadata.add_index(index.clone());
             let mut calls = builder.calls_carried(index.attribute(), &mut carried);
             carried.operators.take_index(index.attribute(), selections, &mut calls);
-            builder = builder.add_index(index, IndexMetadata::new(expression).with_calls(calls));
+            let metadata =
+                IndexMetadata::new(expression).with_calls(calls).with_key_identity(key_identity);
+            builder = builder.add_index(index, metadata);
         }
 
         builder = Self::ingest_table_node_with_collations(
@@ -6867,6 +6907,18 @@ impl ParserDB {
             removed,
         ));
         metadata.set_replica_identity(previous_metadata.take_replica_identity());
+        metadata.set_key_creations(constraint_names::follow(
+            previous_metadata.key_creations(),
+            previous_node,
+            replacement,
+            removed,
+        ));
+        metadata.set_primary_key_references(constraint_names::follow(
+            previous_metadata.primary_key_references(),
+            previous_node,
+            replacement,
+            removed,
+        ));
         metadata
     }
 
@@ -7586,6 +7638,7 @@ impl ParserDB {
         Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
+        referenced_keys::settle_key_creations(&mut builder, &create_table, &mut table_metadata);
 
         Ok(builder.add_table_with_identity(create_table, table_metadata, identity)?)
     }
@@ -7913,23 +7966,22 @@ impl ParserDB {
         {
             return Ok(builder);
         }
-        let names = generated_constraint_names(&builder, &stored);
-        if let Some(name) = table_constraint_name(&constraint)
-            && constraint_names::locate(node, names, name, case).is_some()
-        {
-            return Err(crate::errors::Error::ConstraintAlreadyExists {
-                table_name: stored.name.clone(),
-                constraint_name: name.value.clone(),
-            });
-        }
-        if let TableConstraint::ForeignKey(foreign_key) = &mut constraint {
-            builder.bind_foreign_key(&stored, foreign_key)?;
-        }
+        Self::refuse_held_constraint_name(&builder, &stored, &constraint)?;
+        let bound_to_primary_key = referenced_keys::bind_noting_primary_key(
+            &mut constraint,
+            referenced_keys::constraint_foreign_keys,
+            |constraint| builder.bind_constraint_foreign_key(&stored, constraint),
+        )?;
 
         let mut builder = Self::alter_table_constraints(builder, &stored, |_, constraints| {
             constraints.push(constraint.clone());
             Ok(())
         })?;
+        referenced_keys::record_primary_key_references(
+            &mut builder,
+            &stored,
+            &bound_to_primary_key,
+        );
         if !validated {
             constraint_validity::record(&mut builder, &stored, &constraint, false);
         }
@@ -8019,6 +8071,29 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// Refuses a constraint whose name one of `stored`'s constraints holds.
+    fn refuse_held_constraint_name(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        constraint: &TableConstraint,
+    ) -> Result<(), crate::errors::Error> {
+        if let Some(name) = table_constraint_name(constraint)
+            && constraint_names::locate(
+                Self::stored_node(builder, stored)?,
+                generated_constraint_names(builder, stored),
+                name,
+                builder.identifier_case(),
+            )
+            .is_some()
+        {
+            return Err(crate::errors::Error::ConstraintAlreadyExists {
+                table_name: stored.name.clone(),
+                constraint_name: name.value.clone(),
+            });
+        }
+        Ok(())
+    }
+
     /// Refuses a primary key or unique constraint that `ALTER TABLE ... ADD`
     /// gives a table when its key names one column twice, looking through the
     /// whole key before any of its columns is looked up, which is the order
@@ -8066,49 +8141,77 @@ impl ParserDB {
         scope: AlterTableScope,
         name: &Ident,
         if_exists: bool,
+        cascade: bool,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
 
         let node = Self::stored_node(&builder, &stored)?;
-        match constraint_names::locate(
+        let located = constraint_names::locate(
             node,
             generated_constraint_names(&builder, &stored),
             name,
             builder.identifier_case(),
-        ) {
-            Some(constraint_names::Position::Table(position)) => {
-                let dropped = node.constraints[position].clone();
-                if let TableConstraint::NotNull(not_null) = &dropped {
-                    return Self::drop_not_null_constraint(builder, &stored, scope, name, not_null);
+        );
+        let Some(position) = located else {
+            if if_exists {
+                return Ok(builder);
+            }
+            return Err(crate::errors::Error::DropConstraintNotFound {
+                table_name: node.name.to_string(),
+                constraint_name: name.value.clone(),
+            });
+        };
+        // A foreign key the drop takes along first may sit before the key in
+        // the same node, so the key is found again by what it holds.
+        let held = referenced_keys::HeldConstraint::at(node, position);
+        let remove = |builder: ParserDBBuilder| {
+            let node = Self::stored_node(&builder, &stored)?;
+            let Some(position) = held.and_then(|held| held.position_in(node)) else {
+                return Err(crate::errors::Error::DropConstraintNotFound {
+                    table_name: node.name.to_string(),
+                    constraint_name: name.value.clone(),
+                });
+            };
+            match position {
+                constraint_names::Position::Table(position) => {
+                    let dropped = node.constraints[position].clone();
+                    if let TableConstraint::NotNull(not_null) = &dropped {
+                        return Self::drop_not_null_constraint(
+                            builder, &stored, scope, name, not_null,
+                        );
+                    }
+                    Self::drop_table_constraint(builder, &stored, scope, name, position, dropped)
                 }
-                return Self::drop_table_constraint(
-                    builder, &stored, scope, name, position, dropped,
-                );
+                constraint_names::Position::Column(column, option) => {
+                    let written_on = node.columns[column].name.clone();
+                    let held = node.columns[column].options[option].clone();
+                    Self::drop_column_constraint(
+                        builder,
+                        &stored,
+                        scope,
+                        name,
+                        (column, option),
+                        (&written_on, &held),
+                    )
+                }
             }
-            Some(constraint_names::Position::Column(column, option)) => {
-                let written_on = node.columns[column].name.clone();
-                let held = node.columns[column].options[option].clone();
-                return Self::drop_column_constraint(
-                    builder,
-                    &stored,
-                    scope,
-                    name,
-                    (column, option),
-                    (&written_on, &held),
-                );
-            }
-            None => {}
+        };
+        let is_key = constraint_names::slots(node)
+            .into_iter()
+            .any(|slot| slot.position() == position && slot.is_unique_key());
+        if !is_key {
+            return remove(builder);
         }
-
-        if if_exists {
-            return Ok(builder);
-        }
-        Err(crate::errors::Error::DropConstraintNotFound {
-            table_name: node.name.to_string(),
-            constraint_name: name.value.clone(),
-        })
+        let removed = referenced_keys::removed_keys(&builder, &stored, position, scope.only);
+        let key_name = stored_ident_name(name);
+        let on_dependents = if cascade {
+            referenced_keys::OnDependents::Cascade
+        } else {
+            referenced_keys::OnDependents::Refuse { key_name: &key_name, table_name: &stored.name }
+        };
+        Self::drop_keys(builder, &removed, on_dependents, remove)
     }
 
     /// Drops a constraint held in the table's own constraint list.
@@ -8138,6 +8241,14 @@ impl ParserDB {
             });
         }
 
+        let mut builder = builder;
+        if scope.only {
+            // The copies below stand on their own afterwards, so each keeps
+            // what it read from the original.
+            for (_, child) in inheritance::direct_children(&builder, stored) {
+                referenced_keys::keep_received_primary_key_references(&mut builder, &child);
+            }
+        }
         let removed = constraint_names::Position::Table(position);
         let mut builder =
             Self::replace_table_node_removing(builder, stored, removed, |_, node| {
@@ -8427,6 +8538,12 @@ impl ParserDB {
             replica_identity::refuse_losing_requirement(&builder, &stored.name, node, written_on)?;
         }
 
+        let mut builder = builder;
+        if scope.only {
+            for (_, child) in inheritance::direct_children(&builder, stored) {
+                referenced_keys::keep_received_primary_key_references(&mut builder, &child);
+            }
+        }
         let removed = constraint_names::Position::Column(column, position);
         let mut builder =
             Self::replace_table_node_removing(builder, stored, removed, |_, node| {
@@ -9255,7 +9372,11 @@ impl ParserDB {
         let (builder, column_sequences) =
             sequences::create_column_sequences(builder, &stored, column_sequences, creator)?;
         sequences::bind_column_defaults(&builder, &stored.name, core::iter::once(&mut column_def))?;
-        builder.bind_column_foreign_keys(&stored, &mut column_def)?;
+        let bound_to_primary_key = referenced_keys::bind_noting_primary_key(
+            &mut column_def,
+            referenced_keys::column_foreign_keys,
+            |column_def| builder.bind_column_foreign_keys(&stored, column_def),
+        )?;
 
         // Read before the parent changes.
         let inheritors = inheritance::descendants(&builder, &stored);
@@ -9282,21 +9403,16 @@ impl ParserDB {
             Some(context.catalog),
             |_| {},
             |_, node| {
-                let at = match position {
-                    Some(MySQLColumnPosition::First) => 0,
-                    Some(MySQLColumnPosition::After(after)) => {
-                        let after = NamedColumn::of(after, case);
-                        node.columns
-                            .iter()
-                            .position(|declared| after.matches(&declared.name))
-                            .map_or(node.columns.len(), |index| index + 1)
-                    }
-                    None => node.columns.len(),
-                };
+                let at = column_insert_position(node, position, case);
                 node.columns.insert(at, column_def);
                 Ok(())
             },
         )?;
+        referenced_keys::record_primary_key_references(
+            &mut builder,
+            &stored,
+            &bound_to_primary_key,
+        );
 
         for child in &inheritors {
             // A child already declaring the name keeps its own, the way
@@ -9847,6 +9963,15 @@ impl ParserDB {
                 Self::apply_alter_column(declared, operation.clone());
             },
         )?;
+        if matches!(operation, AlterColumnOperation::SetDataType { .. })
+            && let Some(stored) = Self::alter_table_target(&builder, table_name, scope)?
+        {
+            let mut changed = inheritance::descendants(&builder, &stored);
+            changed.push(stored);
+            for table in &changed {
+                referenced_keys::forget_primary_key_references(&mut builder, table, column_name);
+            }
+        }
         if let Some((stored, created)) = identity_sequence {
             sequences::own_column_sequences(&mut builder, &stored, created);
         }
@@ -10628,6 +10753,7 @@ impl ParserDB {
                     object_type: sqlparser::ast::ObjectType::Index,
                     if_exists,
                     names,
+                    cascade,
                     ..
                 } => {
                     for name in names {
@@ -10649,7 +10775,38 @@ impl ParserDB {
                             });
                         };
 
-                        builder.remove_index_at(position);
+                        let IndexSlot::Table(at) = position else {
+                            builder.remove_index_at(position);
+                            continue;
+                        };
+                        let Some(identity) = builder.indices()[at].1.key_identity() else {
+                            builder.remove_index_at(position);
+                            continue;
+                        };
+                        let Some(table_name) = builder
+                            .resolve_bound_table_name(
+                                &builder.indices()[at].0.attribute().table_name,
+                            )?
+                            .map(|node| StoredTable::of(node).name)
+                        else {
+                            builder.remove_index_at(position);
+                            continue;
+                        };
+                        let index_name = object_name_last_identifier(&name)
+                            .map(|ident| stored_ident_name(ident).into_owned())
+                            .unwrap_or_default();
+                        let on_dependents = if cascade {
+                            referenced_keys::OnDependents::Cascade
+                        } else {
+                            referenced_keys::OnDependents::Refuse {
+                                key_name: &index_name,
+                                table_name: &table_name,
+                            }
+                        };
+                        builder =
+                            Self::drop_keys(builder, &[identity], on_dependents, |builder| {
+                                Ok(Self::remove_key_index(builder, identity))
+                            })?;
                     }
                 }
                 Statement::AlterIndex {
@@ -11114,6 +11271,7 @@ impl ParserDB {
                     }) {
                         entry.1.add_index(index.clone());
                     }
+                    let metadata = metadata.with_key_identity(Some(builder.draw_key_identity()));
                     builder = builder.add_index(index, metadata);
                 }
                 Statement::AlterView(alter_view) => {
@@ -11269,13 +11427,18 @@ impl ParserDB {
                                     &name,
                                 )?;
                             }
-                            AlterTableOperation::DropConstraint { if_exists, name, .. } => {
+                            AlterTableOperation::DropConstraint {
+                                if_exists,
+                                name,
+                                drop_behavior,
+                            } => {
                                 builder = Self::alter_table_drop_constraint(
                                     builder,
                                     &alter_table.name,
                                     scope,
                                     &name,
                                     if_exists,
+                                    drop_behavior == Some(DropBehavior::Cascade),
                                 )?;
                             }
                             AlterTableOperation::AddColumn {
@@ -11923,7 +12086,11 @@ impl ParserDB {
                     };
                     refuse_no_inherit_constraints_on_partitioned(&create_table)?;
                     record_implied_not_null(&mut create_table, *builder.dialect(), case);
-                    bind_foreign_key_targets(&builder, &mut create_table)?;
+                    let bound_to_primary_key = referenced_keys::bind_noting_primary_key(
+                        &mut create_table,
+                        referenced_keys::table_foreign_keys,
+                        |create_table| bind_foreign_key_targets(&builder, create_table),
+                    )?;
                     let name = create_table.name.clone();
                     let mut metadata = TableMetadata::default();
                     metadata.set_owner(creator.owner());
@@ -11970,6 +12137,11 @@ impl ParserDB {
                         &inherited.column_metadata,
                         TableOrigin::Declaration(documentation, creations),
                     )?;
+                    referenced_keys::record_primary_key_references(
+                        &mut builder,
+                        &stored,
+                        &bound_to_primary_key,
+                    );
                     if let Some(root) = &partition_root {
                         triggers::clone_onto_partition(&mut builder, root, &stored)?;
                     }

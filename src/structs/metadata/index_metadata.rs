@@ -6,7 +6,7 @@ use sqlparser::ast::{Expr, Visit};
 
 use super::{ExpressionCalls, expression_calls::call_site};
 use crate::{
-    structs::WrittenCall,
+    structs::{KeyIdentity, WrittenCall},
     traits::{DatabaseLike, IndexLike},
 };
 
@@ -17,6 +17,9 @@ pub struct IndexMetadata<I: IndexLike> {
     expression: Expr,
     /// The calls of the index's expressions and predicate.
     calls: ExpressionCalls<<I::DB as DatabaseLike>::Function>,
+    /// The identity the index was given when it was created on a table,
+    /// which orders it among the table's keys.
+    key_identity: Option<KeyIdentity>,
 }
 
 impl<I: IndexLike> IndexMetadata<I> {
@@ -24,7 +27,20 @@ impl<I: IndexLike> IndexMetadata<I> {
     #[must_use]
     #[inline]
     pub fn new(expression: Expr) -> Self {
-        Self { expression, calls: ExpressionCalls::default() }
+        Self { expression, calls: ExpressionCalls::default(), key_identity: None }
+    }
+
+    /// Stores the identity the index was given when it was created.
+    #[must_use]
+    pub(crate) fn with_key_identity(mut self, identity: Option<KeyIdentity>) -> Self {
+        self.key_identity = identity;
+        self
+    }
+
+    /// Returns the identity the index was given when it was created on a
+    /// table.
+    pub(crate) fn key_identity(&self) -> Option<KeyIdentity> {
+        self.key_identity
     }
 
     /// Stores the calls of the index's expressions and predicate.

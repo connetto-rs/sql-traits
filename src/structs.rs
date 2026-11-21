@@ -96,8 +96,8 @@ pub use helper_set::{
     WalkDirection,
 };
 pub use identifier_case::IdentifierCase;
-pub(crate) use identity::IdentityCounter;
 pub use identity::{ColumnIdentity, RelationIdentity};
+pub(crate) use identity::{IdentityCounter, KeyIdentity};
 pub use index_key::IndexKey;
 pub use maintenance_refusal::{BodyExcerpt, MaintenanceRefusal};
 pub use materialized_view_index::MaterializedViewIndex;

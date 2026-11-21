@@ -10,8 +10,8 @@ use alloc::{
 use crate::{
     errors::LookupError,
     structs::{
-        ColumnIdentity, GenericDB, IdentifierCase, IdentityCounter, Meta, RelationIdentity,
-        RoleSetting, SchemaProfile,
+        ColumnIdentity, GenericDB, IdentifierCase, IdentityCounter, KeyIdentity, Meta,
+        RelationIdentity, RoleSetting, SchemaProfile,
         generic_db::{
             Identified, RelationSlot, Stored,
             builtin_functions::{BuiltinTable, Builtins},
@@ -385,6 +385,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     /// Hands out a column identity no object of this ingestion has held.
     pub(crate) fn draw_column_identity(&mut self) -> ColumnIdentity {
         self.identities.column()
+    }
+
+    /// Hands out a key identity after every one this ingestion has handed
+    /// out.
+    pub(crate) fn draw_key_identity(&mut self) -> KeyIdentity {
+        self.identities.key()
     }
 
     /// Returns the schemas an unqualified name resolves against, in order,

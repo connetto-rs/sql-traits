@@ -12,7 +12,7 @@ use sqlparser::ast::{AlterTableOperation, DetachPartitionMode, ForValues, Object
 use super::{
     AlterTableScope, ParserDB, ParserDBBuilder, StoredTable,
     inheritance::{self, ParentKind},
-    triggers,
+    referenced_keys, triggers,
 };
 use crate::{
     errors::{Error, ObjectKind},
@@ -32,7 +32,7 @@ use crate::{
 /// transaction block and [`Error::DetachConcurrentlyWithDefault`] while the
 /// root has a default partition.
 pub(super) fn detach_partition(
-    builder: ParserDBBuilder,
+    mut builder: ParserDBBuilder,
     root_name: &ObjectName,
     scope: AlterTableScope,
     partition_name: &ObjectName,
@@ -74,6 +74,7 @@ pub(super) fn detach_partition(
         Some(DetachPartitionMode::Concurrently) | None => {}
     }
 
+    referenced_keys::keep_received_primary_key_references(&mut builder, &partition);
     let mut builder = ParserDB::replace_table_node(builder, &partition, |_, node| {
         node.partition_of = None;
         node.for_values = None;

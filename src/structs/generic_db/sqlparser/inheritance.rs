@@ -56,7 +56,7 @@ pub(super) enum ParentKind {
 ///
 /// `INHERITS` names any number of parents and `PARTITION OF` names exactly
 /// one.
-fn parents_with_kind(
+pub(super) fn parents_with_kind(
     create_table: &CreateTable,
 ) -> impl Iterator<Item = (ParentKind, &ObjectName)> {
     create_table

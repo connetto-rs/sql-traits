@@ -7,10 +7,11 @@ use alloc::sync::Arc;
 use sqlparser::ast::{ColumnOption, Ident, ObjectName};
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable,
+    AlterTableScope, IndexSlot, ParserDB, ParserDBBuilder, StoredTable,
     constraint_names::Position,
     function_dependents::{Held, Holder, call_count},
     postgres_catalog::PostgresCatalog,
+    referenced_keys::{self, HeldConstraint, OnDependents},
     type_arrays::TypeArrays,
     user_defined_types::{self, Doomed, TypeDrop},
     views,
@@ -96,7 +97,7 @@ impl ParserDB {
             Held::Check(table, position) => {
                 builder = Self::drop_cascaded_constraint(builder, &table, position, &name)?;
             }
-            Held::Exclusion(table, position) | Held::UniqueKey(table, position) => {
+            Held::Exclusion(table, position) => {
                 builder = Self::drop_cascaded_constraint(
                     builder,
                     &table,
@@ -104,7 +105,10 @@ impl ParserDB {
                     &name,
                 )?;
             }
-            Held::Index(position) => builder.remove_index_at(position),
+            Held::UniqueKey(table, position) => {
+                builder = Self::take_unique_key(builder, &table, position, &name)?;
+            }
+            Held::Index(position) => builder = Self::take_index(builder, position)?,
             Held::PartitionedTable(table) => {
                 (builder, taken) = Self::drop_tables(
                     builder,
@@ -150,6 +154,45 @@ impl ParserDB {
         Ok((builder, taken))
     }
 
+    /// Takes the unique key at `position` of `table`'s constraint list along,
+    /// with every foreign key depending on it.
+    fn take_unique_key(
+        builder: ParserDBBuilder,
+        table: &StoredTable,
+        position: usize,
+        name: &str,
+    ) -> Result<ParserDBBuilder, Error> {
+        let position = Position::Table(position);
+        let removed = referenced_keys::removed_keys(&builder, table, position, false);
+        let held = HeldConstraint::at(Self::stored_node(&builder, table)?, position);
+        Self::drop_keys(builder, &removed, OnDependents::Cascade, |builder| {
+            let node = Self::stored_node(&builder, table)?;
+            match held.and_then(|held| held.position_in(node)) {
+                Some(position) => Self::drop_cascaded_constraint(builder, table, position, name),
+                None => Ok(builder),
+            }
+        })
+    }
+
+    /// Takes the index at `position` along, with every foreign key depending
+    /// on it.
+    fn take_index(
+        mut builder: ParserDBBuilder,
+        position: IndexSlot,
+    ) -> Result<ParserDBBuilder, Error> {
+        let identity = match position {
+            IndexSlot::Table(at) => builder.indices()[at].1.key_identity(),
+            IndexSlot::MaterializedView(_) => None,
+        };
+        let Some(identity) = identity else {
+            builder.remove_index_at(position);
+            return Ok(builder);
+        };
+        Self::drop_keys(builder, &[identity], OnDependents::Cascade, |builder| {
+            Ok(Self::remove_key_index(builder, identity))
+        })
+    }
+
     /// The name a cascade reaches `table` by, qualified so that the session's
     /// path cannot lead it to another table.
     fn cascade_table_name(
@@ -161,7 +204,7 @@ impl ParserDB {
 
     /// Drops the constraint at `position` of `table`, its copies below it
     /// with it, a refusal naming it `name`.
-    fn drop_cascaded_constraint(
+    pub(super) fn drop_cascaded_constraint(
         builder: ParserDBBuilder,
         table: &StoredTable,
         position: Position,
