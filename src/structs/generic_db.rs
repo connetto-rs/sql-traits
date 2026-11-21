@@ -18,8 +18,9 @@ pub use sqlparser::{
     PostgresCatalogType, SqlparserProfile, UnresolvedAccessReference,
 };
 pub(crate) use sqlparser::{
-    ConstraintObject, InstalledForeignKey, OperatorRow, ResolvedForeignKey, is_candidate_key,
-    key_excludes_null, table_not_null,
+    ConstraintObject, InstalledForeignKey, OperatorRow, ResolvedForeignKey, SqliteAutoindex,
+    constraint_index_record, created_index_record, is_candidate_key, key_excludes_null,
+    table_not_null,
 };
 
 use crate::{

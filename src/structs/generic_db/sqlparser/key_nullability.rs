@@ -8,7 +8,10 @@
 //! <https://www.sqlite.org/lang_createtable.html#the_primary_key>
 
 use sqlparser::{
-    ast::{ColumnDef, ColumnOption, CreateTable, DataType, Expr, ObjectNamePart, TableConstraint},
+    ast::{
+        ColumnDef, ColumnOption, CreateTable, DataType, Expr, ObjectNamePart, OrderBySort,
+        TableConstraint,
+    },
     keywords::Keyword,
     tokenizer::Token,
 };
@@ -75,7 +78,10 @@ pub(super) fn is_integer_primary_key(
     let keyed_on_column =
         column.options.iter().any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)));
     if keyed_on_column {
-        return !column.options.iter().any(|option| orders_descending(&option.option));
+        return !column
+            .options
+            .iter()
+            .any(|option| written_direction(&option.option) == Some(OrderBySort::Desc));
     }
     table.constraints.iter().any(|constraint| {
         let TableConstraint::PrimaryKey(key) = constraint else {
@@ -88,13 +94,17 @@ pub(super) fn is_integer_primary_key(
     })
 }
 
-/// Whether the option is the `DESC` SQLite lets a column's `PRIMARY KEY`
-/// carry.
-fn orders_descending(option: &ColumnOption) -> bool {
+/// The direction SQLite lets a column's `PRIMARY KEY` carry, which sqlparser
+/// reads as an option of its own, or `None` for any other option.
+pub(super) fn written_direction(option: &ColumnOption) -> Option<OrderBySort> {
     let ColumnOption::DialectSpecific(tokens) = option else {
-        return false;
+        return None;
     };
-    matches!(tokens.as_slice(), [Token::Word(word)] if word.keyword == Keyword::DESC)
+    match tokens.as_slice() {
+        [Token::Word(word)] if word.keyword == Keyword::ASC => Some(OrderBySort::Asc),
+        [Token::Word(word)] if word.keyword == Keyword::DESC => Some(OrderBySort::Desc),
+        _ => None,
+    }
 }
 
 /// Whether the declared type is spelled `INTEGER` with nothing after it,

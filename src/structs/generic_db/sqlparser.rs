@@ -140,6 +140,7 @@ mod sequences;
 mod signature_types;
 mod sqlite_autoindex;
 mod sqlite_databases;
+mod sqlite_index_record;
 mod stored_expressions;
 mod table_as;
 mod table_owner;
@@ -160,6 +161,8 @@ use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
 use parsed_source::{ParsedSource, StatementSource};
 use postgres_catalog::CatalogName;
+pub(crate) use sqlite_autoindex::SqliteAutoindex;
+pub(crate) use sqlite_index_record::{constraint_index_record, created_index_record};
 mod postgres_cast;
 mod postgres_operator;
 pub use postgres_cast::PostgresCatalogCast;
@@ -7099,6 +7102,11 @@ impl ParserDB {
                     );
                 }
                 ColumnOption::PrimaryKey(primary_key) => {
+                    // SQLite writes the direction of a column's key right
+                    // after it, as an option sqlparser keeps apart.
+                    let sort = options
+                        .get(position + 1)
+                        .and_then(|next| key_nullability::written_direction(&next.option));
                     let primary_key_unique_constraint = UniqueConstraint {
                         name: option.name.clone(),
                         index_name: None,
@@ -7107,7 +7115,7 @@ impl ParserDB {
                         columns: vec![IndexColumn {
                             column: OrderByExpr {
                                 expr: Expr::Identifier(column.attribute().name.clone()),
-                                options: OrderByOptions::default(),
+                                options: OrderByOptions { sort, nulls_first: None },
                                 with_fill: None,
                             },
                             operator_class: None,
@@ -7775,7 +7783,7 @@ impl ParserDB {
         }
         builder = Self::process_foreign_keys(&create_table, &mut table_metadata, builder)?;
         Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
-        sqlite_autoindex::record_autoindex_names(&builder, &create_table, &mut table_metadata);
+        sqlite_autoindex::record_autoindexes(&builder, &create_table, &mut table_metadata);
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
         referenced_keys::settle_key_creations(&mut builder, &create_table, &mut table_metadata);

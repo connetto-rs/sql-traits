@@ -8,7 +8,7 @@ use sqlparser::ast::{Expr, IndexType};
 
 use crate::{
     errors::LookupError,
-    structs::{IndexKey, TargetName, WrittenCall},
+    structs::{IndexKey, SqliteIndexColumn, TargetName, WrittenCall},
     traits::{DatabaseLike, Metadata, Relation, TableLike},
     utils::columns_in_expression::columns_in_expression,
 };
@@ -655,6 +655,119 @@ pub trait TableIndexLike: IndexLike {
         Self: 'db,
     {
         Ok(core::iter::empty())
+    }
+
+    /// Returns the entries of the record SQLite stores for each row of the
+    /// index, in the order and with the answers `pragma_index_xinfo` gives,
+    /// or `None` when SQLite builds no index for it.
+    ///
+    /// The written keys come first. A key naming a column, inside any
+    /// parentheses and `COLLATE`, holds that column, and any other key holds
+    /// its expression. A key compares under the outermost `COLLATE` written
+    /// on it, else under the column's declared collation when it holds a
+    /// column, else under `BINARY`. Auxiliary entries follow, the rowid of a
+    /// rowid table, or the primary key entries of a `WITHOUT ROWID` table
+    /// that no key already holds under the same collation. `CREATE INDEX`
+    /// appends those in the primary key's direction, and the index of a key
+    /// constraint appends them ascending. The primary key of a
+    /// `WITHOUT ROWID` table keeps one entry for a column it lists twice
+    /// under one collation, and carries every other column the table stores,
+    /// under `BINARY`.
+    ///
+    /// SQLite builds one index for the key constraints of a table that list
+    /// the same columns under the same collations, whatever their
+    /// directions, and every constraint of such a group answers the entries
+    /// of that one index. Its keys take the directions of the constraint
+    /// SQLite built it for, the first one declared, except that a
+    /// `WITHOUT ROWID` table builds the index of an `INTEGER PRIMARY KEY`
+    /// after every other.
+    ///
+    /// `None` for an index of any other dialect and for the primary key that
+    /// aliases the rowid. Defaults to `None`, so an implementation over a
+    /// SQLite source must override it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE w (a TEXT COLLATE NOCASE, b INT, PRIMARY KEY (a DESC, b)) WITHOUT ROWID;
+    ///      CREATE INDEX lowered ON w (lower(a) COLLATE RTRIM);",
+    /// )?;
+    /// let index = db.indexes().next().unwrap();
+    /// let entries: Vec<_> = index
+    ///     .sqlite_index_columns(&db)?
+    ///     .unwrap()
+    ///     .map(|entry| {
+    ///         let held = match entry.indexed() {
+    ///             SqliteIndexed::Column(column) => column.column_name().to_owned(),
+    ///             SqliteIndexed::Expression(expression) => expression.to_string(),
+    ///             SqliteIndexed::Rowid => "rowid".to_owned(),
+    ///         };
+    ///         (held, entry.is_descending(), entry.collation(), entry.is_key())
+    ///     })
+    ///     .collect();
+    /// assert_eq!(
+    ///     entries,
+    ///     [
+    ///         ("lower(a) COLLATE RTRIM".to_owned(), false, "RTRIM", true),
+    ///         ("a".to_owned(), true, "NOCASE", false),
+    ///         ("b".to_owned(), false, "BINARY", false),
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Constraints listing the same columns under collations equal without
+    /// regard to case share one index, which keeps the first one's
+    /// direction. The rowid alias has none.
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT COLLATE nocase,
+    ///          UNIQUE (a DESC), UNIQUE (a COLLATE NOCASE), UNIQUE (a COLLATE RTRIM));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let keys: Vec<_> = table
+    ///     .unique_indices(&db)?
+    ///     .map(|key| {
+    ///         let first = key.sqlite_index_columns(&db)?.and_then(|mut entries| entries.next());
+    ///         Ok(first.map(|entry| (entry.is_descending(), entry.collation())))
+    ///     })
+    ///     .collect::<Result<_, sql_traits::errors::LookupError>>()?;
+    /// assert_eq!(
+    ///     keys,
+    ///     [None, Some((true, "nocase")), Some((true, "nocase")), Some((false, "RTRIM"))]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn sqlite_index_columns<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<
+        Option<impl Iterator<Item = SqliteIndexColumn<'db, <Self::DB as DatabaseLike>::Column>>>,
+        LookupError,
+    >
+    where
+        Self: 'db,
+    {
+        Ok(None::<core::iter::Empty<_>>)
     }
 }
 

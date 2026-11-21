@@ -9,7 +9,8 @@ use crate::{
     impls::PrivilegeKind,
     structs::{
         ForeignTableSource, KeyIdentity, RevokedPrivilege, StoredReplicaIdentity, TableAttribute,
-        VirtualTableSource, generic_db::ResolvedForeignKey,
+        VirtualTableSource,
+        generic_db::{ResolvedForeignKey, SqliteAutoindex},
     },
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
@@ -48,10 +49,10 @@ pub struct TableMetadata<T: TableLike> {
     indices: Vec<Arc<<T::DB as DatabaseLike>::Index>>,
     /// The unique indices of the table.
     unique_indices: Vec<Arc<<T::DB as DatabaseLike>::UniqueIndex>>,
-    /// The name of the index SQLite builds behind each unique index of the
-    /// table, in the same order, [`None`] for the rowid alias, which has
-    /// none. Empty under every other dialect.
-    sqlite_autoindex_names: Vec<Option<String>>,
+    /// The index SQLite builds behind each unique index of the table, in the
+    /// same order, [`None`] for the rowid alias, which has none. Empty under
+    /// every other dialect.
+    sqlite_autoindexes: Vec<Option<SqliteAutoindex>>,
     /// The foreign keys of the table.
     foreign_keys: Vec<Arc<<T::DB as DatabaseLike>::ForeignKey>>,
     /// Resolved PostgreSQL foreign keys awaiting constraint naming.
@@ -153,7 +154,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             check_constraints: Vec::new(),
             indices: Vec::new(),
             unique_indices: Vec::new(),
-            sqlite_autoindex_names: Vec::new(),
+            sqlite_autoindexes: Vec::new(),
             foreign_keys: Vec::new(),
             pending_foreign_keys: Vec::new(),
             primary_key: Vec::new(),
@@ -570,26 +571,42 @@ impl<T: TableLike> TableMetadata<T> {
         self.unique_indices.iter()
     }
 
-    /// Returns the name of the index SQLite builds behind `index`, a unique
-    /// index of the table, found by identity, or for a value not taken from
-    /// the table by equality. [`None`] for the rowid alias, which has none,
-    /// and under every other dialect.
-    pub(crate) fn sqlite_autoindex_name(
+    /// Returns the index SQLite builds behind `index`, a unique index of the
+    /// table, found by identity, or for a value not taken from the table by
+    /// equality. [`None`] for the rowid alias, which has none, and under
+    /// every other dialect.
+    pub(crate) fn sqlite_autoindex(
         &self,
         index: &<T::DB as DatabaseLike>::UniqueIndex,
-    ) -> Option<&str> {
+    ) -> Option<&SqliteAutoindex> {
         let position = self
             .unique_indices
             .iter()
             .position(|held| core::ptr::eq(held.as_ref(), index))
             .or_else(|| self.unique_indices.iter().position(|held| held.as_ref() == index))?;
-        self.sqlite_autoindex_names.get(position)?.as_deref()
+        self.sqlite_autoindexes.get(position)?.as_ref()
     }
 
-    /// Sets the name of the index SQLite builds behind each unique index of
-    /// the table, in the order the table holds them.
-    pub(crate) fn set_sqlite_autoindex_names(&mut self, names: Vec<Option<String>>) {
-        self.sqlite_autoindex_names = names;
+    /// Returns the index SQLite builds behind the primary key of the table,
+    /// [`None`] for the rowid alias, for a table with no primary key, and
+    /// under every other dialect.
+    pub(crate) fn sqlite_primary_key_autoindex(&self) -> Option<&SqliteAutoindex> {
+        self.sqlite_autoindexes.iter().flatten().find(|autoindex| autoindex.is_primary_key())
+    }
+
+    /// Returns the unique index SQLite built `autoindex` for, whose
+    /// directions it keeps.
+    pub(crate) fn sqlite_autoindex_first(
+        &self,
+        autoindex: &SqliteAutoindex,
+    ) -> Option<&<T::DB as DatabaseLike>::UniqueIndex> {
+        self.unique_indices.get(autoindex.first()).map(AsRef::as_ref)
+    }
+
+    /// Sets the index SQLite builds behind each unique index of the table,
+    /// in the order the table holds them.
+    pub(crate) fn set_sqlite_autoindexes(&mut self, autoindexes: Vec<Option<SqliteAutoindex>>) {
+        self.sqlite_autoindexes = autoindexes;
     }
 
     /// Returns an iterator over the foreign keys of the table.

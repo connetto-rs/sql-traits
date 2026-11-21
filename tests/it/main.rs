@@ -204,6 +204,7 @@ mod sql_text_calls;
 mod sqlite_autoindex_names;
 mod sqlite_databases;
 mod sqlite_foreign_key_targets;
+mod sqlite_index_columns;
 mod sqlite_primary_key_nullability;
 mod sqlite_table_options;
 mod stored_column_references;
