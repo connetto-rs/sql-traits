@@ -108,6 +108,7 @@ mod inherited_definition_matching;
 mod inherited_privileges;
 mod key_conflict_clauses;
 mod key_ordinal_cost;
+mod key_type_btree_opclass;
 mod keyword_grantees;
 mod leading_comment_documentation;
 mod length_check_spellings;
