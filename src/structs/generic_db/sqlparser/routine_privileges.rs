@@ -34,6 +34,13 @@ pub(super) enum Routines {
 }
 
 impl Routines {
+    /// The keyword naming the routines.
+    const fn keyword(&self) -> RoutineKeyword {
+        match self {
+            Self::Signatures(keyword, _) | Self::Schemas(keyword, _) => *keyword,
+        }
+    }
+
     /// Takes the objects out when they name routines, and leaves relation
     /// objects in place.
     pub(super) fn take(objects: &mut Option<GrantObjects>) -> Option<Self> {
@@ -76,7 +83,7 @@ pub(super) fn grant(
     arrays: &TypeArrays,
 ) -> Result<Vec<FunctionDesc>, Error> {
     let reached = Reached::of(builder, &routines, access_resolution, arrays)?;
-    validate(builder, &grant.grantees, &grant.privileges, access_resolution)?;
+    validate(builder, &grant.grantees, &grant.privileges, access_resolution, routines.keyword())?;
 
     for &position in &reached.functions {
         builder.functions_mut()[position]
@@ -109,7 +116,7 @@ pub(super) fn revoke(
     arrays: &TypeArrays,
 ) -> Result<(), Error> {
     let reached = Reached::of(builder, routines, access_resolution, arrays)?;
-    validate(builder, &revoke.grantees, &revoke.privileges, access_resolution)?;
+    validate(builder, &revoke.grantees, &revoke.privileges, access_resolution, routines.keyword())?;
 
     let names_owner = |grantee: &Grantee, owner: &str| {
         grantee_role_ident(grantee).is_some_and(|ident| stored_role_name(ident) == owner)
@@ -132,6 +139,7 @@ fn validate(
     grantees: &[Grantee],
     privileges: &Privileges,
     access_resolution: AccessResolution,
+    routine: RoutineKeyword,
 ) -> Result<(), Error> {
     if access_resolution == AccessResolution::ClosedWorld {
         validate_access_targets_against_builder(builder, grantees, None)?;
@@ -141,7 +149,19 @@ fn validate(
         return Ok(());
     };
     match actions.iter().find(|action| !matches!(action, Action::Execute { obj_type: None })) {
-        Some(action) => Err(Error::InvalidFunctionPrivilege { privilege: action.to_string() }),
+        Some(action) => {
+            Err(Error::InvalidFunctionPrivilege {
+                privilege: action.to_string(),
+                routine,
+                columns: matches!(
+                    action,
+                    Action::Select { columns: Some(_) }
+                        | Action::Insert { columns: Some(_) }
+                        | Action::Update { columns: Some(_) }
+                        | Action::References { columns: Some(_) }
+                ),
+            })
+        }
         None => Ok(()),
     }
 }
@@ -180,13 +200,14 @@ impl Reached {
                     let matching = ParserDB::functions_named(builder, signature, arrays, *keyword)?;
                     match matching.as_slice() {
                         [] => {
-                            reached.miss(index, signature, access_resolution, builder)?;
+                            reached.miss(index, signature, access_resolution, builder, *keyword)?;
                         }
                         [_, _, ..] if signature.args.is_none() => {
                             return Err(Error::AmbiguousFunctionForGrant {
                                 function_name: builder
                                     .dialect()
                                     .stored_object_name(&signature.name),
+                                routine: *keyword,
                             });
                         }
                         _ => reached.functions.extend(matching),
@@ -224,6 +245,7 @@ impl Reached {
         signature: &FunctionDesc,
         access_resolution: AccessResolution,
         builder: &ParserDBBuilder,
+        keyword: RoutineKeyword,
     ) -> Result<(), Error> {
         if access_resolution == AccessResolution::ClosedWorld {
             if let Some(schema_name) =
@@ -233,6 +255,12 @@ impl Reached {
             }
             return Err(Error::FunctionNotFoundForGrant {
                 function_name: builder.dialect().stored_object_name(&signature.name),
+                signature: super::procedures::diagnostic_signature(
+                    *builder.dialect(),
+                    signature,
+                    |data_type| super::domains::format_type_for_builder(builder, data_type),
+                ),
+                procedure: keyword == RoutineKeyword::Procedure,
             });
         }
         self.unresolved.push(index);

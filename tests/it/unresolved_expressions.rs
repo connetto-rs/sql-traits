@@ -69,7 +69,7 @@ fn a_created_expression_is_refused() {
         "CREATE DOMAIN dm AS text CHECK (VALUE > 0);",
         "CREATE TABLE d (a text) PARTITION BY RANGE ((a > 0));",
     ] {
-        assert_operator_refused(created, ">", &["text", "int4"], Unresolved::DoesNotExist);
+        assert_operator_refused(created, ">", &["text", "integer"], Unresolved::DoesNotExist);
     }
 }
 
@@ -81,7 +81,7 @@ fn a_type_change_refuses_an_operator_the_new_type_lacks() {
         "CREATE TABLE d (a INT4, CONSTRAINT ck CHECK (a > 0));
          ALTER TABLE d ALTER COLUMN a TYPE text USING a::text;",
         ">",
-        &["text", "int4"],
+        &["text", "integer"],
         Unresolved::DoesNotExist,
     );
     assert_operator_refused(
@@ -90,7 +90,7 @@ fn a_type_change_refuses_an_operator_the_new_type_lacks() {
              ALTER TABLE d ALTER COLUMN a TYPE text USING a::text;"
         ),
         "<<<",
-        &["text", "int8"],
+        &["text", "bigint"],
         Unresolved::DoesNotExist,
     );
 }
@@ -131,11 +131,11 @@ fn a_refusal_names_what_was_weighed() {
     let message = |sql: &str| parse(sql).expect_err(sql).to_string();
     assert_eq!(
         message("CREATE TABLE d (a text CHECK (a > 0));"),
-        "Operator `>` over (text, int4) does not exist."
+        "Operator `>` over (text, integer) does not exist."
     );
     assert_eq!(
         message(&format!("{FUNCTIONS} {MIXED} CREATE TABLE d (a INT2, CHECK (a <<< 1::int2));")),
-        "Operator `<<<` over (int2, int2) is not unique."
+        "Operator `<<<` over (smallint, smallint) is not unique."
     );
     assert_eq!(
         message(
@@ -189,7 +189,7 @@ fn an_ambiguous_operator_is_refused_only_when_written() {
     assert_operator_refused(
         &format!("{FUNCTIONS} {MIXED} CREATE TABLE d (a INT2, CHECK (a <<< 1::int2));"),
         "<<<",
-        &["int2", "int2"],
+        &["smallint", "smallint"],
         Unresolved::NotUnique,
     );
     parse(&format!(
@@ -263,8 +263,8 @@ const CROSSED: &str =
 #[test]
 fn an_unresolved_from_call_is_refused() {
     let refused = [
-        ("CREATE VIEW v AS SELECT x FROM nosuchfn(1) AS x;", "nosuchfn", &["int4"][..]),
-        ("CREATE VIEW v AS SELECT x FROM t, LATERAL nosuchfn(t.a) AS x;", "nosuchfn", &["int4"]),
+        ("CREATE VIEW v AS SELECT x FROM nosuchfn(1) AS x;", "nosuchfn", &["integer"][..]),
+        ("CREATE VIEW v AS SELECT x FROM t, LATERAL nosuchfn(t.a) AS x;", "nosuchfn", &["integer"]),
         (
             "CREATE VIEW v AS SELECT x FROM generate_series('a'::text, 'b'::text) AS x;",
             "generate_series",
@@ -274,7 +274,7 @@ fn an_unresolved_from_call_is_refused() {
             "ALTER TABLE t ENABLE ROW LEVEL SECURITY;
              CREATE POLICY p ON t USING (a IN (SELECT x FROM nosuchfn(1) AS x));",
             "nosuchfn",
-            &["int4"],
+            &["integer"],
         ),
     ];
     for (sql, function, arguments) in refused {
@@ -288,7 +288,7 @@ fn an_unresolved_from_call_is_refused() {
     assert_call_refused(
         &format!("{CROSSED} CREATE VIEW v AS SELECT x FROM srf(1, 1) AS x;"),
         "srf",
-        &["int4", "int4"],
+        &["integer", "integer"],
         Unresolved::NotUnique,
     );
 }
@@ -297,7 +297,7 @@ fn an_unresolved_from_call_is_refused() {
 #[test]
 fn an_unresolved_aggregate_or_window_call_is_refused() {
     let refused = [
-        ("CREATE VIEW v AS SELECT nosuchagg(a) FROM t;", "nosuchagg", &["int4"][..]),
+        ("CREATE VIEW v AS SELECT nosuchagg(a) FROM t;", "nosuchagg", &["integer"][..]),
         ("CREATE VIEW v AS SELECT sum(b) FROM t;", "sum", &["text"]),
         ("CREATE VIEW v AS SELECT nosuchwin() OVER () FROM t;", "nosuchwin", &[]),
         ("CREATE VIEW v AS SELECT ntile('x'::text) OVER () FROM t;", "ntile", &["text"]),
@@ -313,7 +313,7 @@ fn an_unresolved_aggregate_or_window_call_is_refused() {
     assert_call_refused(
         &format!("{CROSSED} CREATE VIEW v AS SELECT g(1, 1) OVER () FROM t;"),
         "g",
-        &["int4", "int4"],
+        &["integer", "integer"],
         Unresolved::NotUnique,
     );
 }
@@ -431,7 +431,7 @@ fn a_lookup_reaching_only_held_schemas_is_refused() {
         (
             "CREATE SCHEMA ext; CREATE VIEW v AS SELECT x FROM ext.rows(1) AS x;".to_string(),
             "ext.rows",
-            &["int4"],
+            &["integer"],
         ),
         (
             "CREATE TABLE d (a text CHECK (pg_catalog.valid(a)));".to_string(),

@@ -995,7 +995,7 @@ fn a_relation_a_view_reads_cannot_be_dropped_from_under_it() {
     )
     .expect_err("v2 reads v1");
     assert!(
-        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name }
+        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name, .. }
             if *object_kind == ObjectKind::View
                 && object_name == "v1"
                 && *dependent_kind == ObjectKind::View

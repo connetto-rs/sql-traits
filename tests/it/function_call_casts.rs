@@ -146,7 +146,7 @@ fn a_name_that_is_no_type_runs_its_function() {
     assert!(
         matches!(
             &result,
-            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                 if function_name == "serial"
                     && *dependent_kind == ObjectKind::ColumnDefault
                     && dependent_name == "d.a"
@@ -196,7 +196,7 @@ fn a_cast_holds_no_function() {
     assert!(
         matches!(
             &result,
-            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                 if function_name == "uuid"
                     && *dependent_kind == ObjectKind::CheckConstraint
                     && dependent_name == "d.ck"

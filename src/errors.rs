@@ -1433,6 +1433,20 @@ pub enum RowSecurityError {
     },
 }
 
+/// Why a sequence option cannot be read as an integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceIntegerRefusal {
+    /// The numeric literal exceeds the range of `bigint`.
+    OutOfRange,
+    /// The numeric literal is not an integer.
+    InvalidInput,
+    /// The option contains a token the grammar refuses.
+    UnexpectedToken {
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
+    },
+}
+
 /// Why PostgreSQL refuses the parameters of a sequence.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum SequenceParameterError {
@@ -1450,6 +1464,8 @@ pub enum SequenceParameterError {
         option: &'static str,
         /// The value, as written.
         value: String,
+        /// Whether the literal is malformed, out of range or a different token.
+        refusal: SequenceIntegerRefusal,
     },
     /// `INCREMENT` is zero.
     #[error("INCREMENT must not be zero")]
@@ -1814,6 +1830,32 @@ pub enum HelperSetError {
         setting: String,
         /// Why its call does not read as its body.
         reason: AccessorRefusal,
+    },
+}
+
+/// The kind of routine a statement names, by its keyword.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineKeyword {
+    /// `FUNCTION`, any routine but a procedure.
+    Function,
+    /// `PROCEDURE`, a procedure alone.
+    Procedure,
+    /// `ROUTINE`, any routine.
+    Routine,
+}
+
+/// The object whose removal drops one of its functions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionOwner {
+    /// An extension owning the function.
+    Extension {
+        /// The stored extension name.
+        extension_name: String,
+    },
+    /// A type owning one of its constructors.
+    Type {
+        /// The diagnostic spelling of the type.
+        type_description: String,
     },
 }
 
@@ -2185,15 +2227,15 @@ pub enum Error {
     /// different type, which PostgreSQL refuses.
     InheritedColumnTypeConflict {
         /// Stored name of the column declared twice.
-        column_name: String,
+        column_name: Box<str>,
         /// Stored name of the table redeclaring the column.
-        child_table: String,
+        child_table: Box<str>,
         /// Type the child declares.
-        child_type: String,
+        child_type: Box<str>,
         /// Stored name of the parent the column comes from.
-        parent_table: String,
+        parent_table: Box<str>,
         /// Type the parent declares.
-        parent_type: String,
+        parent_type: Box<str>,
     },
     #[error(
         "Column `{column_name}` of table `{child_table}` has collation `{child_collation}`, conflicting with collation `{parent_collation}` inherited from `{parent_table}`."
@@ -2409,6 +2451,8 @@ pub enum Error {
         function_name: String,
         /// The rule the call breaks.
         rule: Misapplied,
+        /// Diagnostic types of the arguments when a procedure is called.
+        procedure_argument_types: Vec<String>,
     },
     #[error("Invalid value `{option_value}` for collation option `{option_name}`.")]
     /// Error indicating that a `CREATE COLLATION` option is malformed.
@@ -2417,6 +2461,11 @@ pub enum Error {
         option_name: Box<str>,
         /// Value the statement supplied.
         option_value: Box<str>,
+        /// Whether the option name has a namespace qualifier.
+        qualified: bool,
+        /// Whether a false value requests a nondeterministic collation from a
+        /// provider that cannot supply one.
+        nondeterministic_provider: bool,
     },
     #[error("Collation option `{option_name}` appears more than once.")]
     /// Error indicating that a `CREATE COLLATION` option is repeated.
@@ -2455,6 +2504,9 @@ pub enum Error {
     DropTableInheritedFrom {
         /// Name of the table the statement drops, as stored.
         parent_table: String,
+        /// The stored schema name when the dropped table is outside the
+        /// search path.
+        schema_name: Option<String>,
         /// Name of a table inheriting from it, as stored.
         child_table: String,
     },
@@ -2840,11 +2892,16 @@ pub enum Error {
     /// sequence leaves with the column.
     SequenceRequiredByColumn {
         /// Name of the sequence, as stored.
-        sequence_name: String,
+        sequence_name: Box<str>,
+        /// The stored schema name when the sequence is outside the search
+        /// path.
+        sequence_schema: Option<Box<str>>,
         /// Name of the table, as stored.
-        table_name: String,
+        table_name: Box<str>,
+        /// The stored schema name when the table is outside the search path.
+        table_schema: Option<Box<str>>,
         /// Name of the identity column, as stored.
-        column_name: String,
+        column_name: Box<str>,
     },
     #[error(
         "Sequence `{sequence_name}` cannot be dropped: the default of column `{column_name}` of table `{table_name}` draws from it."
@@ -2859,6 +2916,9 @@ pub enum Error {
     SequenceUsedByDefault {
         /// Name of the sequence, as stored.
         sequence_name: String,
+        /// The stored schema name when the sequence is outside the search
+        /// path.
+        sequence_schema: Option<String>,
         /// Name of the table, as stored.
         table_name: String,
         /// Name of the column, as stored.
@@ -2873,6 +2933,8 @@ pub enum Error {
         sequence_name: String,
         /// Why the parameters are refused.
         reason: SequenceParameterError,
+        /// Whether the sequence belongs to an identity column.
+        identity: bool,
     },
     #[error(
         "Relation `{relation_name}` not found for the default of column `{column_name}` of table `{table_name}`."
@@ -2903,6 +2965,8 @@ pub enum Error {
         table_name: String,
         /// Name of the column, as stored.
         column_name: String,
+        /// Stored parts of a syntactically valid name, or an empty list.
+        name_parts: Vec<String>,
     },
     #[error("Invalid index `{index_name}`: {reason}")]
     /// Error indicating that an index definition is invalid.
@@ -2911,6 +2975,8 @@ pub enum Error {
         index_name: String,
         /// Reason why the index is invalid.
         reason: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error("access method \"{access_method}\" does not support unique indexes")]
     /// PostgreSQL refuses unique indexes whose access method lacks uniqueness
@@ -3040,12 +3106,30 @@ pub enum Error {
         /// The stored, possibly qualified name of the undefined table.
         table_name: String,
     },
+    /// A grant or revoke targets an index.
+    #[error("`{index_name}` is an index.")]
+    GrantOnIndex {
+        /// The stored index name.
+        index_name: String,
+    },
+    /// A grant or revoke targets a composite type.
+    #[error("`{type_name}` is a composite type.")]
+    GrantOnCompositeType {
+        /// The stored type name.
+        type_name: String,
+    },
     #[error("Function `{function_name}` not found for a grant or revoke.")]
     /// Error indicating that a grant or a revoke names a function or procedure
     /// that does not exist.
+    ///
+    /// The diagnostic signature distinguishes overloads.
     FunctionNotFoundForGrant {
         /// The stored, possibly qualified name of the undefined function.
         function_name: String,
+        /// The diagnostic signature when an argument list was written.
+        signature: Option<String>,
+        /// Whether the statement names a procedure.
+        procedure: bool,
     },
     #[error(
         "Function name `{function_name}` is not unique: a grant or revoke naming no argument list cannot say which one it covers."
@@ -3055,6 +3139,8 @@ pub enum Error {
     AmbiguousFunctionForGrant {
         /// The stored, possibly qualified name covering multiple routines.
         function_name: String,
+        /// The routine keyword used by the statement.
+        routine: RoutineKeyword,
     },
     #[error("Privilege `{privilege}` cannot be granted on a function.")]
     /// Error indicating that a grant or a revoke on a function names a
@@ -3062,6 +3148,10 @@ pub enum Error {
     InvalidFunctionPrivilege {
         /// The privilege as the statement spelled it.
         privilege: String,
+        /// The routine keyword used by the statement.
+        routine: RoutineKeyword,
+        /// Whether the privilege names columns.
+        columns: bool,
     },
     #[error("Function `{function_name}` not found for DROP FUNCTION statement.")]
     /// Error indicating that a DROP FUNCTION statement references a function
@@ -3069,6 +3159,8 @@ pub enum Error {
     DropFunctionNotFound {
         /// The stored, possibly qualified name of the missing function.
         function_name: String,
+        /// The diagnostic signature when an argument list was written.
+        signature: Option<String>,
     },
     #[error("Procedure `{procedure_name}` not found for DROP PROCEDURE statement.")]
     /// Error indicating that a `DROP PROCEDURE` statement without `IF EXISTS`
@@ -3076,6 +3168,8 @@ pub enum Error {
     DropProcedureNotFound {
         /// The stored, possibly qualified name of the missing procedure.
         procedure_name: String,
+        /// The diagnostic signature when an argument list was written.
+        signature: Option<String>,
     },
     #[error("`{function_name}` is not a function.")]
     /// Error indicating that a statement naming a function, `DROP FUNCTION`,
@@ -3088,6 +3182,8 @@ pub enum Error {
     NotAFunction {
         /// The stored, possibly qualified function name.
         function_name: String,
+        /// The diagnostic signature of the routine.
+        signature: String,
     },
     #[error("`{procedure_name}` is not a procedure.")]
     /// Error indicating that a statement naming a procedure, `DROP
@@ -3100,6 +3196,8 @@ pub enum Error {
     NotAProcedure {
         /// The stored, possibly qualified procedure name.
         procedure_name: String,
+        /// The diagnostic signature of the routine.
+        signature: String,
     },
     #[error(
         "Procedure `{procedure_name}` has a body of bare statements, which PostgreSQL does not read."
@@ -3110,6 +3208,8 @@ pub enum Error {
     ProcedureBodyUnsupported {
         /// The stored procedure name.
         procedure_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error(
         "Function `{function_name}` cannot be dropped because {dependent_kind} `{dependent_name}` uses it."
@@ -3123,6 +3223,12 @@ pub enum Error {
     FunctionReferenced {
         /// The stored function name.
         function_name: String,
+        /// The diagnostic signature of the routine.
+        signature: String,
+        /// Whether the routine is a procedure.
+        procedure: bool,
+        /// The owning object whose removal drops the function.
+        dropping_object: Option<FunctionOwner>,
         /// [`ObjectKind::Column`] for a generated column,
         /// [`ObjectKind::ColumnDefault`], [`ObjectKind::CheckConstraint`],
         /// [`ObjectKind::Index`], [`ObjectKind::View`],
@@ -3144,6 +3250,8 @@ pub enum Error {
         function_name: String,
         /// The stored extension name.
         extension_name: String,
+        /// The diagnostic signature of the function.
+        signature: String,
     },
     #[error("Cannot drop function `{function_name}`: type `{type_name}` requires it.")]
     /// Error indicating that a DROP FUNCTION statement names a constructor
@@ -3155,6 +3263,10 @@ pub enum Error {
         function_name: String,
         /// The stored name of the requiring type.
         type_name: String,
+        /// The diagnostic signature of the function.
+        signature: String,
+        /// The diagnostic spelling of the requiring type.
+        type_description: String,
     },
     #[error("Table `{table_name}` not found for DROP TABLE statement.")]
     /// Error indicating that a DROP TABLE statement references a table
@@ -3169,6 +3281,8 @@ pub enum Error {
     TableReferenced {
         /// The stored table name.
         table_name: String,
+        /// The stored schema name when the table is outside the search path.
+        schema_name: Option<String>,
     },
     #[error(
         "Cannot drop column `{column_name}` of table `{table_name}`: still referenced from outside the table."
@@ -3183,6 +3297,8 @@ pub enum Error {
         table_name: String,
         /// The stored column name.
         column_name: String,
+        /// The stored schema name when the table is outside the search path.
+        schema_name: Option<String>,
     },
     #[error(
         "Cannot drop `{key_name}` of table `{table_name}`: a foreign key of table `{referencing_table}` depends on it."
@@ -3231,6 +3347,8 @@ pub enum Error {
         table_name: String,
         /// The stored column name.
         column_name: String,
+        /// Whether the name repeats within a relation declaration.
+        declaration: bool,
     },
     #[error(
         "Unsupported `ALTER TABLE` operation on `{table_name}`: `{operation}` changes something this model represents but does not yet apply."
@@ -4422,6 +4540,9 @@ pub enum Error {
         table_name: String,
         /// Stored name of the foreign table below it.
         partition_name: String,
+        /// Whether a foreign partition is being created beneath an existing
+        /// unique index.
+        creating_partition: bool,
     },
     #[error(
         "Cannot change name of view column `{existing_column}` to `{new_column}` of view `{view_name}`."
@@ -4457,6 +4578,8 @@ pub enum Error {
     MaterializedViewCannotBeReplaced {
         /// Stored name the statement wrote.
         view_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error("`CREATE VIEW` does not take `IF NOT EXISTS`, so view `{view_name}` cannot use it.")]
     /// Error indicating that the input writes `CREATE VIEW ... IF NOT EXISTS`,
@@ -4466,6 +4589,8 @@ pub enum Error {
     ViewIfNotExistsUnsupported {
         /// Stored name the statement wrote.
         view_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error("View `{view_name}` specifies more column names than columns.")]
     /// Error indicating that a view's explicit column list is longer than what
@@ -4529,6 +4654,8 @@ pub enum Error {
         object_kind: ObjectKind,
         /// Stored name of the relation the statement drops.
         object_name: String,
+        /// The stored schema name when PostgreSQL qualifies the relation.
+        schema_name: Option<String>,
         /// Kind of the dependent object.
         dependent_kind: ObjectKind,
         /// Stored name of the dependent object.
@@ -4616,6 +4743,10 @@ pub enum Error {
         table_name: String,
         /// Stored name of the partitioned table carrying the trigger it copies.
         parent_table_name: String,
+        /// The stored partition schema when PostgreSQL qualifies its name.
+        table_schema: Option<String>,
+        /// The stored parent schema when PostgreSQL qualifies its name.
+        parent_table_schema: Option<String>,
     },
     #[error(
         "Trigger `{trigger_name}` on table `{table_name}` is the partition's copy of a trigger \
@@ -4692,6 +4823,16 @@ pub enum Error {
     FunctionAlreadyExists {
         /// Stored name of the function whose signature is repeated.
         function_name: String,
+    },
+    #[error("Function `{function_name}` already exists in schema `{schema_name}`.")]
+    /// A routine move collides with an existing signature.
+    FunctionAlreadyExistsInSchema {
+        /// The stored function name.
+        function_name: String,
+        /// The input types as PostgreSQL prints them.
+        argument_types: Vec<String>,
+        /// The stored destination schema name.
+        schema_name: String,
     },
     #[error(
         "Permission denied for function `{function_name}`: role `{role_name}` creating it may not execute it."
@@ -4772,6 +4913,16 @@ pub enum Error {
         /// statement.
         command_tag: Option<String>,
     },
+    #[error("`{statement}` is not supported in the body of function `{function_name}`.")]
+    /// A function body uses a clause shape outside PostgreSQL's grammar.
+    FunctionBodySyntaxUnsupported {
+        /// The statement the body holds.
+        statement: String,
+        /// The stored function name.
+        function_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
+    },
     #[error(
         "Column `{column_name}` of `{relation_name}` cannot be renamed while function `{function_name}` writes to the relation in a statement that cannot follow the rename."
     )]
@@ -4803,6 +4954,8 @@ pub enum Error {
         /// Stored name of the function whose final statement produces no
         /// result.
         function_name: String,
+        /// The result type as PostgreSQL prints it.
+        return_type: String,
     },
     #[error("Column `{column_name}` is ambiguous in the body of function `{function_name}`.")]
     /// Error indicating that a body statement references a column bare while

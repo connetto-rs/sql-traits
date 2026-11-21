@@ -570,7 +570,7 @@ fn a_table_names_each_column_and_each_parent_once() {
         assert!(
             matches!(
                 &error,
-                Error::ColumnAlreadyExists { table_name, column_name }
+                Error::ColumnAlreadyExists { table_name, column_name, declaration: true }
                     if table_name == "p" && column_name == column
             ),
             "{statement}: {error:?}"
@@ -634,7 +634,7 @@ fn redeclaring_an_inherited_column_with_another_type_is_refused() {
              CREATE TABLE c (x TEXT) INHERITS (p);"
         ),
         Err(Error::InheritedColumnTypeConflict { ref column_name, ref child_table, .. })
-            if column_name == "x" && child_table == "c"
+            if &**column_name == "x" && &**child_table == "c"
     ));
 
     // A narrower or wider integer is a different type, and so is a different
@@ -698,7 +698,7 @@ fn dropping_a_parent_needs_cascade_and_takes_the_children_with_it() {
              CREATE TABLE c (y INT) INHERITS (p);
              DROP TABLE p;"
         ),
-        Err(Error::DropTableInheritedFrom { ref parent_table, ref child_table })
+        Err(Error::DropTableInheritedFrom { ref parent_table, ref child_table, .. })
             if parent_table == "p" && child_table == "c"
     ));
 

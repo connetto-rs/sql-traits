@@ -29,7 +29,7 @@ const OWNER: &str = "OWNER TO absent_owner";
 const STORAGE: &str = "SET(fillfactor=999)";
 
 const ERROR_COLUMN_ALREADY_EXISTS: &str =
-    "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }";
+    "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\", declaration: false }";
 const ERROR_ABSENT_DROP: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_drop\", site: Relation })";
 const ERROR_ABSENT_CONSTRAINT: &str =
     "DropConstraintNotFound { table_name: \"probe\", constraint_name: \"absent_constraint\" }";
@@ -38,7 +38,7 @@ const ERROR_ABSENT_NOTNULL: &str = "IdentifierLookupError(ColumnNotFound { table
 const ERROR_ABSENT_TYPE: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_type\", site: Relation })";
 const ERROR_ABSENT_EXPRESSION: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_expression\", site: Relation })";
 const ERROR_ABSENT_COLLATION: &str = "CollationNotFound { collation_name: \"absent_collation\" }";
-const ERROR_INVALID_SEQUENCE_PARAMETERS: &str = "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }";
+const ERROR_INVALID_SEQUENCE_PARAMETERS: &str = "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" }, identity: true }";
 const ERROR_ABSENT_EXPRESSION_COLUMN: &str = "UnknownColumn { reference: Column { column_name: \"absent_expression_column\", relation_name: None } }";
 const ERROR_ABSENT_KEY: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_key\", site: Key })";
 const ERROR_ABSENT_REFERENCE: &str = "ReferencedTableNotFoundForForeignKey { referenced_table: \"absent_reference\", host_table: \"probe\" }";
@@ -743,7 +743,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P162",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD CONSTRAINT bad UNIQUE(absent_column), ADD COLUMN z int;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P164",
@@ -753,12 +753,12 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P171",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD CONSTRAINT bad UNIQUE(absent_column), ADD COLUMN g text GENERATED ALWAYS AS IDENTITY;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P172",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD COLUMN e int REFERENCES absent_parent(id), ADD COLUMN z int;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P174",
@@ -788,12 +788,12 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P181",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD COLUMN e int REFERENCES absent_parent(id), ADD COLUMN g text GENERATED ALWAYS AS IDENTITY;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P182",
         "CREATE TABLE probe(z int PRIMARY KEY,q int);\nALTER TABLE probe ADD PRIMARY KEY(q), ADD COLUMN z int;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P184",
@@ -808,12 +808,12 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P191",
         "CREATE TABLE probe(z int PRIMARY KEY,q int);\nALTER TABLE probe ADD PRIMARY KEY(q), ADD COLUMN g text GENERATED ALWAYS AS IDENTITY;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P192",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ALTER COLUMN absent_column SET NOT NULL, ADD COLUMN z int;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P194",
@@ -823,12 +823,12 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P201",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ALTER COLUMN absent_column SET NOT NULL, ADD COLUMN g text GENERATED ALWAYS AS IDENTITY;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P212",
         "CREATE TABLE probe(z int);\nALTER TABLE probe INHERIT absent_parent, ADD COLUMN z int;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P214",
@@ -853,7 +853,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P221",
         "CREATE TABLE probe(z int);\nALTER TABLE probe INHERIT absent_parent, ADD COLUMN g text GENERATED ALWAYS AS IDENTITY;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P378",
@@ -923,37 +923,37 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P133",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN z int, ADD COLUMN b text COLLATE absent_collation;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P134",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN z int, ADD CONSTRAINT bad UNIQUE(absent_column);",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P135",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN z int, ADD COLUMN e int REFERENCES absent_parent(id);",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P136",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN z int, ADD PRIMARY KEY(q);",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P137",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN z int, ALTER COLUMN absent_column SET NOT NULL;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P139",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN z int, INHERIT absent_parent;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P141",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN z int, ADD COLUMN g text GENERATED ALWAYS AS IDENTITY;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P152",
@@ -1053,37 +1053,37 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P232",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY, ADD COLUMN z int;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P234",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY, ADD COLUMN b text COLLATE absent_collation;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P235",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY, ADD CONSTRAINT bad UNIQUE(absent_column);",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P236",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY, ADD COLUMN e int REFERENCES absent_parent(id);",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P237",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY, ADD PRIMARY KEY(q);",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P238",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY, ALTER COLUMN absent_column SET NOT NULL;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P240",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY, INHERIT absent_parent;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
     (
         "P377",
@@ -1133,7 +1133,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P395",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN z int,ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED;",
-        "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }",
+        ERROR_COLUMN_ALREADY_EXISTS,
     ),
     (
         "P396",
@@ -1178,7 +1178,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P409",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN g text GENERATED ALWAYS AS IDENTITY,ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED;",
-        "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }",
+        ERROR_INVALID_SEQUENCE_PARAMETERS,
     ),
 ];
 

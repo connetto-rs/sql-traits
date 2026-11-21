@@ -81,6 +81,13 @@ pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> 
             let too_wide =
                 || Error::FunctionBodyInsertTooWide { function_name: function_name.clone() };
             for statement in &mut block.statements {
+                if matches!(statement, Statement::StartTransaction { begin: true, .. }) {
+                    return Err(Error::FunctionBodySyntaxUnsupported {
+                        statement: statement.to_string(),
+                        function_name: function_name.clone(),
+                        written_token: "BEGIN".to_string(),
+                    });
+                }
                 if !matches!(
                     statement,
                     Statement::Query(_)
@@ -115,7 +122,43 @@ pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> 
                 && (block.statements.is_empty()
                     || block.statements.last().is_some_and(final_statement_produces_no_result))
             {
-                return Err(Error::FunctionBodyResultMissing { function_name });
+                let return_type = match function.return_type.as_ref() {
+                    Some(FunctionReturnType::DataType(DataType::Table(columns))) => {
+                        match columns.as_deref() {
+                            Some([column]) => {
+                                super::domains::format_type_for_builder(
+                                    builder,
+                                    &crate::utils::postgres_types::PgType::of(&column.data_type),
+                                )
+                            }
+                            _ => "record".to_string(),
+                        }
+                    }
+                    Some(
+                        FunctionReturnType::DataType(data_type)
+                        | FunctionReturnType::SetOf(data_type),
+                    ) => {
+                        super::domains::format_type_for_builder(
+                            builder,
+                            &crate::utils::postgres_types::PgType::of(data_type),
+                        )
+                    }
+                    None => {
+                        let mut outputs = function.args.iter().flatten().filter(|argument| {
+                            matches!(argument.mode, Some(ArgMode::Out | ArgMode::InOut))
+                        });
+                        match (outputs.next(), outputs.next()) {
+                            (Some(argument), None) => {
+                                super::domains::format_type_for_builder(
+                                    builder,
+                                    &crate::utils::postgres_types::PgType::of(&argument.data_type),
+                                )
+                            }
+                            _ => "record".to_string(),
+                        }
+                    }
+                };
+                return Err(Error::FunctionBodyResultMissing { function_name, return_type });
             }
             Ok(())
         }

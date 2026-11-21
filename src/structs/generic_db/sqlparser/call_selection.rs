@@ -19,7 +19,13 @@
 //! the operators selected then, to read what the deparse pins, and once more
 //! honouring those pins.
 
-use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{
@@ -574,11 +580,22 @@ impl Nodes<'_, '_, '_> {
         if let Some(choice) = choice {
             self.selections.calls.insert(address(name), choice);
         }
-        let Some((called, refusal)) = application.and_then(CallApplication::into_refusal) else {
+        let Some((called, refusal, arguments)) =
+            application.and_then(CallApplication::into_refusal)
+        else {
             return;
         };
         let refused = match refusal {
-            CallRefusal::Unresolved((reason, argument_types)) => {
+            CallRefusal::Unresolved((reason, mut argument_types)) => {
+                for argument in &mut argument_types {
+                    if let Some(data_type) = crate::utils::postgres_types::PgType::parse(argument) {
+                        *argument = crate::utils::postgres_format_type::format_type_in(
+                            self.database,
+                            &data_type,
+                        )
+                        .into_boxed_str();
+                    }
+                }
                 Error::UnresolvedCall {
                     function_name: stored_name(&called),
                     argument_types,
@@ -586,7 +603,32 @@ impl Nodes<'_, '_, '_> {
                 }
             }
             CallRefusal::Misapplied(rule) => {
-                Error::MisappliedCall { function_name: stored_name(&called), rule }
+                let procedure_argument_types = if rule == crate::errors::Misapplied::ProcedureCalled
+                {
+                    arguments
+                        .into_iter()
+                        .map(|argument| {
+                            match self.context.type_of(argument) {
+                                Ok(crate::structs::OperandType::Known { type_name, .. }) => {
+                                    crate::utils::postgres_format_type::format_type_in(
+                                        self.database,
+                                        &crate::utils::postgres_types::PgType::from_target(
+                                            &type_name,
+                                        ),
+                                    )
+                                }
+                                _ => "unknown".to_string(),
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Error::MisappliedCall {
+                    function_name: stored_name(&called),
+                    rule,
+                    procedure_argument_types,
+                }
             }
         };
         self.selections.refused_calls.insert(address(name), refused);
@@ -604,7 +646,16 @@ impl Nodes<'_, '_, '_> {
                 if matches!(row, OperatorRow::Added(_)) {
                     selected.push((position, row));
                 }
-            } else if let Some((name, (reason, operand_types))) = application.into_refusal() {
+            } else if let Some((name, (reason, mut operand_types))) = application.into_refusal() {
+                for operand in &mut operand_types {
+                    if let Some(data_type) = crate::utils::postgres_types::PgType::parse(operand) {
+                        *operand = crate::utils::postgres_format_type::format_type_in(
+                            self.database,
+                            &data_type,
+                        )
+                        .into_boxed_str();
+                    }
+                }
                 self.selections.refused_operators.entry(address(expression)).or_insert_with(|| {
                     Error::UnresolvedOperator {
                         operator_name: stored_name(&name).into_boxed_str(),

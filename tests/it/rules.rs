@@ -498,7 +498,7 @@ fn dropping_a_column_a_rule_reads_needs_cascade() {
     assert!(
         matches!(
             &error,
-            Error::ColumnReferenced { table_name, column_name }
+            Error::ColumnReferenced { table_name, column_name, .. }
                 if table_name == "orders" && column_name == "total"
         ),
         "got {error:?}"

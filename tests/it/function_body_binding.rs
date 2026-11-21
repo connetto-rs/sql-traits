@@ -39,7 +39,7 @@ fn text(db: &ParserDB, name: &str) -> String {
 fn refuses_missing_result(sql: &str) {
     let refused = parse(sql).expect_err("the final statement produces no result");
     assert!(
-        matches!(&refused, Error::FunctionBodyResultMissing { function_name } if function_name == "f"),
+        matches!(&refused, Error::FunctionBodyResultMissing { function_name, .. } if function_name == "f"),
         "got {refused:?}"
     );
 }
@@ -282,7 +282,7 @@ fn a_relation_a_block_body_writes_cannot_be_dropped_from_under_it() {
     )
     .expect_err("f writes t");
     assert!(
-        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name }
+        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name, .. }
             if *object_kind == ObjectKind::Table
                 && object_name == "t"
                 && *dependent_kind == ObjectKind::Function
@@ -570,7 +570,7 @@ fn a_relation_a_function_reads_cannot_be_dropped_from_under_it() {
     )
     .expect_err("r reads t");
     assert!(
-        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name }
+        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name, .. }
             if *object_kind == ObjectKind::Table
                 && object_name == "t"
                 && *dependent_kind == ObjectKind::Function
@@ -1034,7 +1034,7 @@ fn a_block_body_merge_follows_renames_of_its_clauses() {
     )
     .expect_err("the wildcard update is not a clause shape the body holds");
     assert!(
-        matches!(&refused, Error::FunctionBodyStatementUnsupported { function_name, .. }
+        matches!(&refused, Error::FunctionBodySyntaxUnsupported { function_name, .. }
             if function_name == "f"),
         "got {refused:?}"
     );
@@ -1736,7 +1736,7 @@ fn a_set_or_table_declaration_declares_a_result_a_returning_list_produces() {
     )
     .expect_err("the SETOF declaration produces no result from the final statement");
     assert!(
-        matches!(&refused, Error::FunctionBodyResultMissing { function_name }
+        matches!(&refused, Error::FunctionBodyResultMissing { function_name, .. }
             if function_name == "f"),
         "got {refused:?}"
     );
@@ -1748,7 +1748,7 @@ fn a_set_or_table_declaration_declares_a_result_a_returning_list_produces() {
     )
     .expect_err("the TABLE declaration produces no result from the final statement");
     assert!(
-        matches!(&refused, Error::FunctionBodyResultMissing { function_name }
+        matches!(&refused, Error::FunctionBodyResultMissing { function_name, .. }
             if function_name == "f"),
         "got {refused:?}"
     );
@@ -1818,7 +1818,7 @@ fn a_block_body_refuses_a_join_on_its_write_target() {
         );
         let refused = parse(&sql).expect_err("a join on the write target is a syntax error");
         assert!(
-            matches!(&refused, Error::FunctionBodyStatementUnsupported { function_name, .. }
+            matches!(&refused, Error::FunctionBodySyntaxUnsupported { function_name, .. }
                 if function_name == "f"),
             "got {refused:?}"
         );
@@ -1843,7 +1843,7 @@ fn a_block_body_refuses_a_wildcard_merge_update_set() {
         );
         let refused = parse(&sql).expect_err("a wildcard merge update is a syntax error");
         assert!(
-            matches!(&refused, Error::FunctionBodyStatementUnsupported { function_name, .. }
+            matches!(&refused, Error::FunctionBodySyntaxUnsupported { function_name, .. }
                 if function_name == "f"),
             "got {refused:?}"
         );
@@ -2255,7 +2255,13 @@ fn a_block_body_stores_a_temporary_relation_bare() {
     )
     .expect_err("f writes f19u");
     assert!(
-        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name } if *object_kind == ObjectKind::Table
+        matches!(&refused, Error::RelationHasDependents {
+            object_kind,
+            object_name,
+            dependent_kind,
+            dependent_name,
+            ..
+        } if *object_kind == ObjectKind::Table
             && object_name == "f19u"
             && *dependent_kind == ObjectKind::Function
             && dependent_name == "f"),
@@ -2835,7 +2841,7 @@ fn a_block_body_refuses_a_merge_output_and_a_dml_return() {
          END;",
     )
     .expect_err("the merge writes an OUTPUT clause");
-    assert!(matches!(&refused, Error::FunctionBodyStatementUnsupported { .. }), "got {refused:?}");
+    assert!(matches!(&refused, Error::FunctionBodySyntaxUnsupported { .. }), "got {refused:?}");
 }
 
 /// A function without a `RETURNS` clause declares no result, so its final

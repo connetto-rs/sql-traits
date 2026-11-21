@@ -167,7 +167,7 @@ fn a_view_holds_the_overload_its_from_call_runs() {
     assert!(
         matches!(
             &result,
-            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                 if function_name == "f"
                     && *dependent_kind == ObjectKind::View
                     && dependent_name == "v"

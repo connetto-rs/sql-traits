@@ -70,7 +70,7 @@ fn adding_a_column_that_exists_is_refused_unless_tolerated() {
     )
     .expect_err("a is already declared");
     assert!(
-        matches!(&error, Error::ColumnAlreadyExists { table_name, column_name }
+        matches!(&error, Error::ColumnAlreadyExists { table_name, column_name, declaration: false }
             if table_name == "t" && column_name == "a"),
         "got {error:?}"
     );
