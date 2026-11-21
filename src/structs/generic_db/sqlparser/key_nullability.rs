@@ -51,13 +51,25 @@ pub(crate) fn key_excludes_null(
 /// Whether `column` is the alias SQLite gives the rowid of `table`, with the
 /// key naming its columns under `case`.
 ///
-/// The alias is the sole column of a rowid table's primary key when its
-/// declared type is exactly `INTEGER` in any case. A key written on the
-/// column as `PRIMARY KEY DESC` makes no alias, while the same order written
-/// in a table-level key does.
+/// The alias is the integer primary key of a rowid table.
 /// <https://www.sqlite.org/lang_createtable.html#rowid>
 fn is_rowid_alias(table: &CreateTable, column: &ColumnDef, case: IdentifierCase) -> bool {
-    if table.is_without_rowid() || !declares_integer(&column.data_type) {
+    !table.is_without_rowid() && is_integer_primary_key(table, column, case)
+}
+
+/// Whether `column` is the sole column of the primary key of `table` with a
+/// declared type of exactly `INTEGER` in any case, and keyed in an order that
+/// would make it the rowid alias, with the key naming its columns under
+/// `case`.
+///
+/// A key written on the column as `PRIMARY KEY DESC` makes no alias, while
+/// the same order written in a table-level key does.
+pub(super) fn is_integer_primary_key(
+    table: &CreateTable,
+    column: &ColumnDef,
+    case: IdentifierCase,
+) -> bool {
+    if !declares_integer(&column.data_type) {
         return false;
     }
     let keyed_on_column =

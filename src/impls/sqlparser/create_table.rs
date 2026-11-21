@@ -34,7 +34,7 @@ impl Metadata for CreateTable {
 /// A [`CreateTable`] node and a [`ParserDB`] are independent values, so a node
 /// the database does not hold (renamed away, dropped, or parsed from different
 /// input) has no metadata to report.
-fn table_metadata<'db>(
+pub(super) fn table_metadata<'db>(
     table: &CreateTable,
     database: &'db ParserDB,
 ) -> Result<&'db TableMetadata<CreateTable>, LookupError> {
