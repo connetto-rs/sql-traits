@@ -14,7 +14,7 @@
 //! A serial column arrives as its integer type, drawing from the original's
 //! sequence only under `INCLUDING DEFAULTS`.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::vec::Vec;
 
 use sqlparser::ast::{
     ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, CreateTableLikeDefaults,
@@ -89,9 +89,14 @@ pub(super) fn apply_like(
     };
 
     let Some(copied) = builder.resolve_table_object_name(source_name)? else {
+        let object_kind = builder.relation_reached(source_name).map(|(kind, _)| kind);
         return Err(Error::CopiedTableNotFound {
-            copied_table: source_name.to_string(),
-            table_name: create_table.name.to_string(),
+            copied_table: if object_kind.is_some() {
+                builder.dialect().stored_object_name_last(source_name)
+            } else {
+                builder.dialect().stored_object_name(source_name)
+            },
+            table_name: builder.dialect().stored_object_name_last(&create_table.name),
         });
     };
 

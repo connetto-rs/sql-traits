@@ -19,6 +19,7 @@ use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, S
 
 use crate::{
     errors::{Error, ObjectKind},
+    impls::SqlparserDialect,
     utils::{
         identifier_resolution::is_temporary_schema,
         object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of},
@@ -75,7 +76,7 @@ impl ViewDeclaration {
     ///     let Some(Statement::CreateView(node)) = statements.pop() else {
     ///         panic!("expected a view declaration")
     ///     };
-    ///     View::from_node(&node)
+    ///     View::from_node(&node, SqlparserDialect::PostgreSql).ok()
     /// };
     /// let ordinary = declaration("CREATE VIEW v AS SELECT 1 AS result").unwrap();
     /// let temporary = declaration("CREATE TEMP VIEW v AS SELECT 1 AS result").unwrap();
@@ -227,11 +228,11 @@ impl View {
     /// name, and [`Error::UnrecognizedViewOption`],
     /// [`Error::InvalidViewOptionValue`] or [`Error::RepeatedViewOption`] for
     /// an option list PostgreSQL refuses.
-    pub fn from_node(node: &CreateView) -> Result<Self, Error> {
+    pub fn from_node(node: &CreateView, dialect: SqlparserDialect) -> Result<Self, Error> {
         let declaration = ViewDeclaration::from_node(node)
             .ok_or(Error::UnnamedObject { object_kind: ObjectKind::View })?;
         let mut view = Self { declaration, security_barrier: false, security_invoker: false };
-        view.set_options(&node.name, with_options(node))?;
+        view.set_options(&node.name, with_options(node), dialect)?;
         Ok(view)
     }
 
@@ -268,8 +269,9 @@ impl View {
         &mut self,
         view_name: &ObjectName,
         options: &[SqlOption],
+        dialect: SqlparserDialect,
     ) -> Result<(), Error> {
-        self.apply(options::plain_view_options(view_name, options)?);
+        self.apply(options::plain_view_options(view_name, options, dialect)?);
         Ok(())
     }
 
@@ -313,10 +315,10 @@ impl MaterializedView {
     /// Returns [`Error::UnnamedObject`] for a declaration carrying no usable
     /// name, and [`Error::UnrecognizedViewOption`] for an option only a plain
     /// view takes.
-    pub fn from_node(node: &CreateView) -> Result<Self, Error> {
+    pub fn from_node(node: &CreateView, dialect: SqlparserDialect) -> Result<Self, Error> {
         let declaration = ViewDeclaration::from_node(node)
             .ok_or(Error::UnnamedObject { object_kind: ObjectKind::MaterializedView })?;
-        options::refuse_plain_view_options(&node.name, with_options(node))?;
+        options::refuse_plain_view_options(&node.name, with_options(node), dialect)?;
         Ok(Self { declaration })
     }
 

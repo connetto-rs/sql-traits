@@ -6,17 +6,18 @@ use sqlparser::ast::{ColumnOption, CreateTable, DataType, Ident, Spanned, TableC
 
 use super::{
     CreatedCollationMetadata, NotNullRequirement, ParserDB, ParserDBBuilder, PostgresCatalog,
-    PreservedColumnMetadata, RelationNamePhase, TableDeclaration, TypeArrays, case_idents_match,
-    column_collation_name, column_metadata_for_collations, domains, index_access_methods,
-    index_opclasses, inheritance, partition_keys, refuse_no_inherit_constraints_on_partitioned,
-    sequences, stored_expressions, validate_relation_names,
+    PreservedColumnMetadata, RelationNamePhase, StoredTable, TableDeclaration, TypeArrays,
+    case_idents_match, column_collation_name, column_metadata_for_collations, domains,
+    index_access_methods, index_opclasses, inheritance, partition_keys,
+    refuse_no_inherit_constraints_on_partitioned, sequences, stored_expressions,
+    validate_relation_names,
 };
 use crate::{
     errors::{Error, LookupError, ObjectKind},
     structs::IdentifierCase,
     traits::TableLike,
     utils::{
-        columns_in_expression::validate_columns_in_expression, last_str,
+        columns_in_expression::validate_columns_in_expression,
         object_name::target_name_of_object_name,
     },
 };
@@ -57,8 +58,8 @@ pub(super) fn columns(
                 ParserDB::validate_foreign_key_deferral(builder, &table.name, foreign_key)?;
             }
         }
-        NotNullRequirement::new(column, &[], builder.identifier_case())
-            .validate(last_str(&table.name))?;
+        NotNullRequirement::new(column, &[], builder.identifier_case(), *builder.dialect())
+            .validate(&table.name, *builder.dialect())?;
         if let Some(column_metadata) = column_metadata {
             metadata.push(PreservedColumnMetadata {
                 column_name: column.name.value.clone(),
@@ -88,7 +89,7 @@ pub(super) fn keys(builder: &ParserDBBuilder, table: &CreateTable) -> Result<boo
         for option in &column.options {
             match &option.option {
                 ColumnOption::PrimaryKey(primary) => {
-                    primary_key(table, &mut has_primary_key)?;
+                    primary_key(builder, table, &mut has_primary_key)?;
                     for name in &primary.include {
                         key_column(builder, table, name)?;
                     }
@@ -109,9 +110,17 @@ pub(super) fn keys(builder: &ParserDBBuilder, table: &CreateTable) -> Result<boo
 }
 
 /// Refuses a second primary key before resolving its columns.
-fn primary_key(table: &CreateTable, held: &mut bool) -> Result<(), Error> {
+fn primary_key(
+    builder: &ParserDBBuilder,
+    table: &CreateTable,
+    held: &mut bool,
+) -> Result<(), Error> {
     if *held {
-        return Err(Error::MultiplePrimaryKeys { table_name: table.table_name().to_string() });
+        return Err(Error::MultiplePrimaryKeys {
+            table_name: builder
+                .dialect()
+                .stored_spelling(table.table_name(), table.table_name_is_quoted()),
+        });
     }
     *held = true;
     Ok(())
@@ -128,7 +137,7 @@ fn key(
         constraint,
         TableConstraint::PrimaryKey(_) | TableConstraint::PrimaryKeyUsingIndex(_)
     ) {
-        primary_key(table, has_primary_key)?;
+        primary_key(builder, table, has_primary_key)?;
     }
     ParserDB::validate_key_columns(constraint, table, builder, true)
 }
@@ -139,7 +148,7 @@ pub(super) fn expressions(
     table: &mut CreateTable,
     written_defaults: &[Ident],
 ) -> Result<(), Error> {
-    let table_name = table.name.to_string();
+    let table_name = StoredTable::of(table);
     for column_index in 0..table.columns.len() {
         for option_index in 0..table.columns[column_index].options.len() {
             let option = &table.columns[column_index].options[option_index].option;
@@ -151,6 +160,7 @@ pub(super) fn expressions(
                     &target_name_of_object_name(&table.name),
                     table.columns.iter().map(|column| &column.name),
                     builder.identifier_case(),
+                    *builder.dialect(),
                 )?;
             }
             let column = &mut table.columns[column_index];
@@ -159,7 +169,7 @@ pub(super) fn expressions(
                 .any(|name| case_idents_match(name, &column.name, builder.identifier_case()))
                 && let ColumnOption::Default(expression) = &mut column.options[option_index].option
             {
-                sequences::bind_default(builder, &table_name, &column.name.value, expression)?;
+                sequences::bind_default(builder, &table_name, &column.name, expression)?;
             }
         }
     }
@@ -182,14 +192,14 @@ pub(super) fn key_column(
         return Ok(());
     }
     for parent_name in inheritance::parent_names(table) {
-        let parent = inheritance::resolve_unbound_parent(builder, parent_name, table.table_name())?;
+        let parent = inheritance::resolve_unbound_parent(builder, parent_name, &table.name)?;
         if declares(parent) {
             return Ok(());
         }
     }
     Err(LookupError::ColumnNotFound {
-        table_name: table.name.to_string(),
-        column_name: name.value.clone(),
+        table_name: builder.dialect().stored_object_name_last(&table.name),
+        column_name: builder.dialect().stored_name(name),
     }
     .into())
 }
@@ -201,10 +211,14 @@ pub(super) fn finish(
     declaration: &TableDeclaration,
 ) -> Result<(), Error> {
     for requirement in &declaration.not_null {
-        requirement.validate(table.table_name())?;
+        requirement.validate(&table.name, *builder.dialect())?;
     }
-    refuse_no_inherit_constraints_on_partitioned(table)?;
-    partition_keys::validate_partitioned_table(table, builder.identifier_case())?;
+    refuse_no_inherit_constraints_on_partitioned(*builder.dialect(), table)?;
+    partition_keys::validate_partitioned_table(
+        table,
+        builder.identifier_case(),
+        *builder.dialect(),
+    )?;
     if declaration.primary_key_declared
         && let Some(parent_name) = &table.partition_of
         && let Some(parent) = builder.resolve_bound_table_name(parent_name)?
@@ -223,6 +237,7 @@ pub(super) fn finish(
 pub(super) fn not_null_requirements(
     table: &CreateTable,
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Vec<NotNullRequirement<'static>> {
     table
         .columns
@@ -233,6 +248,8 @@ pub(super) fn not_null_requirements(
                 if case_idents_match(&not_null.column, &column.name, case))
             })
         })
-        .map(|column| NotNullRequirement::new(column, &table.constraints, case).into_owned())
+        .map(|column| {
+            NotNullRequirement::new(column, &table.constraints, case, dialect).into_owned()
+        })
         .collect()
 }

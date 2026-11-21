@@ -11,7 +11,7 @@
 //! text removes it as `IS NULL` does. The other objects `COMMENT ON` names
 //! keep no documentation in the model.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 
 use sqlparser::ast::{CommentObject, ObjectName, ObjectNamePart};
 
@@ -71,7 +71,7 @@ fn comment_on_table(
         return Ok(builder);
     };
     if kind != expected {
-        return Err(kind_mismatch(&name, expected, kind));
+        return Err(kind_mismatch(&builder, &name, expected, kind));
     }
     let table = builder.resolve_table_object_name(&name)?.map(core::ptr::from_ref);
     for (stored, metadata, _) in builder.tables_mut() {
@@ -96,7 +96,11 @@ fn comment_on_column(
         Some(ObjectNamePart::Identifier(column)) if !relation.0.is_empty() => column,
         part => {
             return Err(Error::UnqualifiedCommentColumn {
-                column_name: part.map(|part| part.to_string()).unwrap_or_default(),
+                column_name: part
+                    .as_ref()
+                    .and_then(ObjectNamePart::as_ident)
+                    .map(|ident| builder.dialect().stored_name(ident))
+                    .unwrap_or_default(),
             });
         }
     };
@@ -113,12 +117,12 @@ fn comment_on_column(
         ObjectKind::Type => {
             object_name_last_identifier(&relation).map_or(Ok(()), |composite| {
                 user_defined_types::require_composite_attribute(
-                    &builder, composite, schema, &column,
+                    &builder, composite, schema, &column, &relation,
                 )
             })?;
             return Ok(builder);
         }
-        other => return Err(kind_mismatch(&relation, ObjectKind::Table, other)),
+        other => return Err(kind_mismatch(&builder, &relation, ObjectKind::Table, other)),
     }
 
     let table = builder.resolve_table_object_name(&relation)?;
@@ -138,8 +142,8 @@ fn comment_on_column(
         })
         .ok_or_else(|| {
             LookupError::ColumnNotFound {
-                table_name: relation.to_string(),
-                column_name: column.value,
+                table_name: builder.dialect().stored_object_name(&relation),
+                column_name: builder.dialect().stored_name(&column),
             }
         })?;
     builder.columns_mut()[position].1.set_documentation(documentation);
@@ -161,14 +165,22 @@ fn reached<'name>(
         Some(reached) => Ok(Some(reached)),
         None if if_exists => Ok(None),
         None => {
-            Err(Error::RelationNotFound { object_kind: expected, object_name: name.to_string() })
+            Err(Error::RelationNotFound {
+                object_kind: expected,
+                object_name: builder.dialect().stored_object_name(name),
+            })
         }
     }
 }
 
-fn kind_mismatch(name: &ObjectName, expected: ObjectKind, actual: ObjectKind) -> Error {
+fn kind_mismatch(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+    expected: ObjectKind,
+    actual: ObjectKind,
+) -> Error {
     Error::RelationKindMismatch {
-        object_name: name.to_string(),
+        object_name: builder.dialect().stored_object_name_last(name),
         expected_kind: expected,
         actual_kind: actual,
     }

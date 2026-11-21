@@ -20,10 +20,7 @@ use super::{
 };
 use crate::{
     errors::Error,
-    utils::{
-        last_str,
-        object_name::{object_name_last_part, qualifier_of},
-    },
+    utils::object_name::{object_name_last_part, qualifier_of},
 };
 
 /// The routines a grant or a revoke names, taken out of its object list,
@@ -182,10 +179,14 @@ impl Reached {
                 for (index, signature) in signatures.iter().enumerate() {
                     let matching = ParserDB::functions_named(builder, signature, arrays, *keyword)?;
                     match matching.as_slice() {
-                        [] => reached.miss(index, signature, access_resolution)?,
+                        [] => {
+                            reached.miss(index, signature, access_resolution, builder)?;
+                        }
                         [_, _, ..] if signature.args.is_none() => {
                             return Err(Error::AmbiguousFunctionForGrant {
-                                function_name: last_str(&signature.name).to_string(),
+                                function_name: builder
+                                    .dialect()
+                                    .stored_object_name(&signature.name),
                             });
                         }
                         _ => reached.functions.extend(matching),
@@ -222,9 +223,12 @@ impl Reached {
         index: usize,
         signature: &FunctionDesc,
         access_resolution: AccessResolution,
+        builder: &ParserDBBuilder,
     ) -> Result<(), Error> {
         if access_resolution == AccessResolution::ClosedWorld {
-            return Err(Error::FunctionNotFoundForGrant { function_name: signature.to_string() });
+            return Err(Error::FunctionNotFoundForGrant {
+                function_name: builder.dialect().stored_object_name(&signature.name),
+            });
         }
         self.unresolved.push(index);
         Ok(())

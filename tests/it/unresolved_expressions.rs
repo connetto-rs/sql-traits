@@ -459,10 +459,10 @@ fn a_lookup_reaching_only_held_schemas_is_refused() {
     ] {
         assert_call_refused(&sql, function, arguments, Unresolved::DoesNotExist);
     }
-    for sql in [
-        "CREATE SCHEMA ext; CREATE TABLE d (a text CHECK (a OPERATOR(ext.%) 'x'));",
-        "SET search_path = \"$user\", public; CREATE TABLE d (a text CHECK (a % 'x'));",
+    for (sql, operator) in [
+        ("CREATE SCHEMA ext; CREATE TABLE d (a text CHECK (a OPERATOR(ext.%) 'x'));", "ext.%"),
+        ("SET search_path = \"$user\", public; CREATE TABLE d (a text CHECK (a % 'x'));", "%"),
     ] {
-        assert_operator_refused(sql, "%", &["text", "unknown"], Unresolved::DoesNotExist);
+        assert_operator_refused(sql, operator, &["text", "unknown"], Unresolved::DoesNotExist);
     }
 }

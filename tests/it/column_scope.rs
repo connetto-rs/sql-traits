@@ -1365,7 +1365,7 @@ fn qualified_wildcard_over_a_derived_relation_passes_through() {
 #[test]
 fn ambiguity_candidates_name_the_relation() {
     let db = schema_db();
-    let Err(LookupError::AmbiguousTableLookup { object_name, candidates }) =
+    let Err(LookupError::AmbiguousTableLookup { object_name, candidates, .. }) =
         resolve_projection("SELECT x FROM (SELECT id AS x, payload AS x FROM a)", &db)
     else {
         panic!("expected an ambiguity for the anonymous subquery")

@@ -2791,7 +2791,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(Error::AlterFunctionNotFound { function_name }) if function_name == "missing_func"
+            Err(Error::AlterFunctionNotFound { function_name, .. }) if function_name == "missing_func"
         ));
     }
 

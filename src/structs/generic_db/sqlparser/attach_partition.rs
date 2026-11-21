@@ -76,7 +76,7 @@ pub(super) fn attach_partition(
     let unsupported = |object_kind, relation_name: &ObjectName| {
         Error::AlterActionUnsupportedOnRelation {
             object_kind,
-            relation_name: relation_name.to_string(),
+            relation_name: builder.dialect().stored_object_name_last(relation_name),
             operation: AlterTableOperation::AttachPartitionOf {
                 partition: partition_name.clone(),
                 for_values: for_values.clone(),
@@ -100,13 +100,18 @@ pub(super) fn attach_partition(
         }
         return Err(Error::RelationNotFound {
             object_kind: ObjectKind::Table,
-            object_name: partition_name.to_string(),
+            object_name: builder.dialect().stored_object_name(partition_name),
         });
     };
     let partition = StoredTable::of(partition_node);
 
     refuse_unattachable(&builder, (&root, root_node), (&partition, partition_node))?;
-    partition_bounds::validate_bound(&builder, root_node, &partition.name, for_values)?;
+    partition_bounds::validate_bound(
+        &builder,
+        root_node,
+        &builder.dialect().stored_object_name_last(&partition_node.name),
+        for_values,
+    )?;
     let merged_checks = existing_child::merge_into_existing(
         &builder,
         (&root, root_node),
@@ -114,8 +119,8 @@ pub(super) fn attach_partition(
     )
     .map_err(|mismatch| {
         Error::PartitionNotAttachable {
-            table_name: root.name.clone(),
-            partition_name: partition.name.clone(),
+            table_name: builder.dialect().stored_object_name_last(&root_node.name),
+            partition_name: builder.dialect().stored_object_name_last(&partition_node.name),
             reason: UnattachablePartition::Shape(mismatch),
         }
     })?;
@@ -170,8 +175,8 @@ fn refuse_foreign_under_unique_index(
     }
     if builder.is_foreign_table(partition_node) {
         return Err(Error::PartitionNotAttachable {
-            table_name: root.name.clone(),
-            partition_name: partition.name.clone(),
+            table_name: builder.dialect().stored_object_name_last(&root_node.name),
+            partition_name: builder.dialect().stored_object_name_last(&partition_node.name),
             reason: UnattachablePartition::ForeignTableUnderUniqueIndex,
         });
     }
@@ -198,8 +203,8 @@ pub(super) fn refuse_foreign_partition_under_unique_index(
     let root = StoredTable::of(root_node);
     if holds_unique_index_above(builder, &root, root_node)? {
         return Err(Error::UniqueIndexOverForeignPartition {
-            table_name: root.name,
-            partition_name: partition.table_name().to_string(),
+            table_name: builder.dialect().stored_object_name_last(&root_node.name),
+            partition_name: builder.dialect().stored_object_name_last(&partition.name),
         });
     }
     Ok(())
@@ -251,8 +256,8 @@ fn refuse_unattachable(
 ) -> Result<(), Error> {
     let refuse = |reason| {
         Err(Error::PartitionNotAttachable {
-            table_name: root.name.clone(),
-            partition_name: partition.name.clone(),
+            table_name: builder.dialect().stored_object_name_last(&root_node.name),
+            partition_name: builder.dialect().stored_object_name_last(&partition_node.name),
             reason,
         })
     };
@@ -275,14 +280,14 @@ fn refuse_unattachable(
 
     if partition_node.is_temporary() && !root_node.is_temporary() {
         return Err(Error::TemporaryPartitionOfPermanent {
-            table_name: partition.name.clone(),
-            parent_name: root.name.clone(),
+            table_name: builder.dialect().stored_object_name_last(&partition_node.name),
+            parent_name: builder.dialect().stored_object_name_last(&root_node.name),
         });
     }
     if !partition_node.is_temporary() && root_node.is_temporary() {
         return Err(Error::PermanentRelationInheritsTemporary {
-            table_name: partition.name.clone(),
-            parent_name: root.name.clone(),
+            table_name: builder.dialect().stored_object_name_last(&partition_node.name),
+            parent_name: builder.dialect().stored_object_name_last(&root_node.name),
         });
     }
 
@@ -294,14 +299,14 @@ fn refuse_unattachable(
             .any(|held| super::case_idents_match(&held.name, &column.name, case))
         {
             return refuse(UnattachablePartition::ExtraColumn {
-                column_name: column.name.value.clone(),
+                column_name: builder.dialect().stored_name(&column.name),
             });
         }
     }
     for column in &partition_node.columns {
         if column.options.iter().any(|option| is_identity(&option.option)) {
             return refuse(UnattachablePartition::IdentityColumn {
-                column_name: column.name.value.clone(),
+                column_name: builder.dialect().stored_name(&column.name),
             });
         }
     }
@@ -489,7 +494,9 @@ fn receive(
         if matches!(arriving.constraint, TableConstraint::PrimaryKey(_))
             && held.iter().any(|own| matches!(own.constraint, TableConstraint::PrimaryKey(_)))
         {
-            return Err(Error::MultiplePrimaryKeys { table_name: table.name.clone() });
+            return Err(Error::MultiplePrimaryKeys {
+                table_name: builder.dialect().stored_spelling(&table.name, table.name_quoted),
+            });
         }
 
         if let Some((column, option)) = &arriving.written_on {

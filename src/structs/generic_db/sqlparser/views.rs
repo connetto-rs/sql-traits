@@ -53,7 +53,7 @@ use super::{
 };
 use crate::{
     errors::{Error, LookupError, ObjectKind},
-    impls::dql::query_output_names,
+    impls::{SqlparserDialect, dql::query_output_names},
     structs::{
         IdentifierCase, MaterializedView, View, ViewDeclaration, metadata::ViewMetadata,
         view::options::refuse_plain_view_options,
@@ -61,7 +61,6 @@ use crate::{
     traits::ViewLike,
     utils::{
         identifier_resolution::identifiers_match,
-        last_str,
         object_name::{
             Namespaces, RelationKey, qualifier_of, stored_view_key, target_key,
             target_name_from_object_name,
@@ -104,7 +103,7 @@ pub(super) fn create_view(
     if node.materialized
         && let sqlparser::ast::CreateTableOptions::With(options) = &node.options
     {
-        refuse_plain_view_options(&node.name, options)?;
+        refuse_plain_view_options(&node.name, options, *builder.dialect())?;
         if *builder.dialect() == super::SqlparserDialect::PostgreSql {
             super::storage_parameters::heap(&node.name, options)?;
         }
@@ -112,14 +111,18 @@ pub(super) fn create_view(
 
     if node.materialized && node.or_replace {
         return Err(Error::MaterializedViewCannotBeReplaced {
-            view_name: rendered_name(&node.name),
+            view_name: builder.dialect().stored_object_name_last(&node.name),
         });
     }
     if node.materialized && node.temporary {
-        return Err(Error::TemporaryMaterializedView { view_name: rendered_name(&node.name) });
+        return Err(Error::TemporaryMaterializedView {
+            view_name: builder.dialect().stored_object_name_last(&node.name),
+        });
     }
     if !node.materialized && node.if_not_exists {
-        return Err(Error::ViewIfNotExistsUnsupported { view_name: rendered_name(&node.name) });
+        return Err(Error::ViewIfNotExistsUnsupported {
+            view_name: builder.dialect().stored_object_name_last(&node.name),
+        });
     }
 
     // A view reading a temporary relation is temporary whatever it wrote.
@@ -133,7 +136,7 @@ pub(super) fn create_view(
         && let Some(relation_name) = temporary_read
     {
         return Err(Error::MaterializedViewReadsTemporaryRelation {
-            view_name: rendered_name(&node.name),
+            view_name: builder.dialect().stored_object_name_last(&node.name),
             relation_name,
         });
     }
@@ -153,12 +156,12 @@ pub(super) fn create_view(
         let (existing, mut metadata, identity) = builder.views_mut().remove(position);
         let exposed = exposed_by(&builder, &node)?;
         check_replacement_columns(&builder, existing.as_ref(), &exposed)?;
-        refuse_repeated_columns(&exposed.0, &name_ident.value, builder.identifier_case())?;
+        refuse_repeated_columns(&exposed.0, name_ident, &builder)?;
         metadata.set_calls(builder.calls_in(&node.query));
         // The replacement keeps the stored name of the view it replaces,
         // whichever spelling of its schema the statement wrote.
         bind_reference(&mut node.name, stored_view_qualifier(existing.as_ref()));
-        let mut view = View::from_node(&node)?;
+        let mut view = View::from_node(&node, *builder.dialect())?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
@@ -167,7 +170,7 @@ pub(super) fn create_view(
     // name, and a taken name of a materialized view before a repeated column.
     if !node.materialized {
         let (names, _) = exposed_by(&builder, &node)?;
-        refuse_repeated_columns(&names, &name_ident.value, builder.identifier_case())?;
+        refuse_repeated_columns(&names, name_ident, &builder)?;
     }
 
     // A view takes a shell of its name over, filling the type name.
@@ -186,12 +189,12 @@ pub(super) fn create_view(
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: kind,
             conflicting_kind,
-            object_name: name_ident.value.clone(),
+            object_name: builder.dialect().stored_name(name_ident),
         });
     }
     if node.materialized {
         let (names, _) = exposed_by(&builder, &node)?;
-        refuse_repeated_columns(&names, &name_ident.value, builder.identifier_case())?;
+        refuse_repeated_columns(&names, name_ident, &builder)?;
     }
 
     if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &node.name) {
@@ -201,11 +204,11 @@ pub(super) fn create_view(
     metadata.set_owner(creator.owner());
     metadata.set_calls(builder.calls_in(&node.query));
     let builder = if node.materialized {
-        let mut view = MaterializedView::from_node(&node)?;
+        let mut view = MaterializedView::from_node(&node, *builder.dialect())?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         builder.add_materialized_view(Arc::new(view), metadata)
     } else {
-        let mut view = View::from_node(&node)?;
+        let mut view = View::from_node(&node, *builder.dialect())?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         builder.add_view(Arc::new(view), metadata)
     };
@@ -237,15 +240,19 @@ fn check_replacement_columns(
     let (before, _) = output_names(builder, existing.declaration())?;
     if *after_enumerable && after.len() < before.len() {
         return Err(Error::ViewColumnsDroppedByReplace {
-            view_name: existing.view_name().to_string(),
+            view_name: builder
+                .dialect()
+                .stored_spelling(existing.view_name(), existing.view_name_is_quoted()),
         });
     }
     for ((existing_name, existing_quoted), (new_name, new_quoted)) in before.iter().zip(after) {
         if !identifiers_match(existing_name, *existing_quoted, new_name, *new_quoted) {
             return Err(Error::ViewColumnRenamedByReplace {
-                view_name: existing.view_name().to_string(),
-                existing_column: existing_name.clone(),
-                new_column: new_name.clone(),
+                view_name: builder
+                    .dialect()
+                    .stored_spelling(existing.view_name(), existing.view_name_is_quoted()),
+                existing_column: builder.dialect().stored_spelling(existing_name, *existing_quoted),
+                new_column: builder.dialect().stored_spelling(new_name, *new_quoted),
             });
         }
     }
@@ -261,15 +268,15 @@ fn check_replacement_columns(
 /// Returns [`Error::ColumnAlreadyExists`] naming the later of the two.
 fn refuse_repeated_columns(
     names: &[(String, bool)],
-    view_name: &str,
-    case: IdentifierCase,
+    view_name: &Ident,
+    builder: &ParserDBBuilder,
 ) -> Result<(), Error> {
     let names = names.iter().map(|(name, quoted)| (name.as_str(), *quoted));
-    match first_repeated_column(names, case) {
-        Some(column_name) => {
+    match first_repeated_column(names, builder.identifier_case()) {
+        Some((column_name, quoted)) => {
             Err(Error::ColumnAlreadyExists {
-                table_name: view_name.to_string(),
-                column_name: column_name.to_string(),
+                table_name: builder.dialect().stored_name(view_name),
+                column_name: builder.dialect().stored_spelling(column_name, quoted),
             })
         }
         None => Ok(()),
@@ -390,12 +397,12 @@ pub(super) fn drop_views(
                 {
                     return Err(Error::RelationHasDependents {
                         object_kind: expected_kind,
-                        object_name: rendered_name(name),
+                        object_name: key.name.clone(),
                         dependent_kind: dependent.kind,
                         dependent_name: dependent.name,
                     });
                 }
-                refuse_dependent_views(&builder, &key, expected_kind, &rendered_name(name))?;
+                refuse_dependent_views(&builder, &key, expected_kind, &key)?;
             }
             // Re-read the position: a cascade may have removed views ahead of
             // this one in the same collection.
@@ -432,7 +439,7 @@ pub(super) fn drop_views(
         match builder.relation_reached(name).map(|(kind, _)| kind) {
             Some(actual_kind) => {
                 return Err(Error::RelationKindMismatch {
-                    object_name: rendered_name(name),
+                    object_name: builder.dialect().stored_object_name_last(name),
                     expected_kind,
                     actual_kind,
                 });
@@ -440,7 +447,7 @@ pub(super) fn drop_views(
             None if !if_exists => {
                 return Err(Error::RelationNotFound {
                     object_kind: expected_kind,
-                    object_name: rendered_name(name),
+                    object_name: builder.dialect().stored_object_name_last(name),
                 });
             }
             None => {}
@@ -487,18 +494,13 @@ pub(super) fn refuse_dropping_other_kind(
             _,
         )) if actual_kind != expected_kind => {
             Err(Error::RelationKindMismatch {
-                object_name: rendered_name(name),
+                object_name: builder.dialect().stored_object_name_last(name),
                 expected_kind,
                 actual_kind,
             })
         }
         _ => Ok(()),
     }
-}
-
-/// A view name as the statement wrote it, for an error message.
-fn rendered_name(name: &ObjectName) -> String {
-    name.to_string()
 }
 
 /// Applies an `ALTER TABLE` whose target is a view.
@@ -560,7 +562,7 @@ pub(super) fn alter_view(
         other => {
             Err(Error::AlterActionUnsupportedOnRelation {
                 object_kind: kind,
-                relation_name: rendered_name(name),
+                relation_name: builder.dialect().stored_object_name_last(name),
                 operation: other.to_string(),
             })
         }
@@ -611,7 +613,7 @@ pub(super) fn apply_alter_view(
                     }
                     _ => {
                         Err(Error::RelationKindMismatch {
-                            object_name: rendered_name(name),
+                            object_name: builder.dialect().stored_object_name_last(name),
                             expected_kind: kind,
                             actual_kind,
                         })
@@ -620,7 +622,10 @@ pub(super) fn apply_alter_view(
             }
             None if *if_exists => Ok(builder),
             None => {
-                Err(Error::RelationNotFound { object_kind: kind, object_name: rendered_name(name) })
+                Err(Error::RelationNotFound {
+                    object_kind: kind,
+                    object_name: builder.dialect().stored_object_name(name),
+                })
             }
         };
     }
@@ -641,7 +646,7 @@ pub(super) fn apply_alter_view(
         AlterViewOperation::AlterColumn { .. } if *materialized => {
             Err(Error::AlterActionUnsupportedOnRelation {
                 object_kind: kind,
-                relation_name: rendered_name(name),
+                relation_name: builder.dialect().stored_object_name_last(name),
                 operation: operation.to_string(),
             })
         }
@@ -650,7 +655,7 @@ pub(super) fn apply_alter_view(
         }
         AlterViewOperation::SetSchema { .. } | AlterViewOperation::As { .. } => {
             Err(Error::UnsupportedAlterTableOperation {
-                table_name: rendered_name(name),
+                table_name: builder.dialect().stored_object_name(name),
                 operation: operation.to_string(),
             })
         }
@@ -690,13 +695,13 @@ fn rename_column_of_other_kind(
         ObjectKind::Sequence => {
             Err(Error::AlterActionUnsupportedOnRelation {
                 object_kind: actual_kind,
-                relation_name: rendered_name(name),
+                relation_name: builder.dialect().stored_object_name_last(name),
                 operation: operation.to_string(),
             })
         }
         _ => {
             Err(Error::UnsupportedAlterTableOperation {
-                table_name: rendered_name(name),
+                table_name: builder.dialect().stored_object_name(name),
                 operation: operation.to_string(),
             })
         }
@@ -759,8 +764,10 @@ fn require_exposed(
     });
     if enumerable && !exposed {
         return Err(LookupError::ColumnNotFound {
-            table_name: declaration.name().to_string(),
-            column_name: column_name.value.clone(),
+            table_name: builder
+                .dialect()
+                .stored_spelling(declaration.name(), declaration.name_is_quoted()),
+            column_name: builder.dialect().stored_name(column_name),
         }
         .into());
     }
@@ -811,7 +818,7 @@ fn set_view_options(
     options: &[SqlOption],
 ) -> Result<ParserDBBuilder, Error> {
     if kind == ObjectKind::MaterializedView {
-        refuse_plain_view_options(name, options)?;
+        refuse_plain_view_options(name, options, *builder.dialect())?;
         if *builder.dialect() == super::SqlparserDialect::PostgreSql {
             super::storage_parameters::heap(name, options)?;
         }
@@ -819,7 +826,8 @@ fn set_view_options(
     if kind == ObjectKind::View
         && let Some(position) = plain_view_position(&builder, name)
     {
-        Arc::make_mut(&mut builder.views_mut()[position].0).set_options(name, options)?;
+        let dialect = *builder.dialect();
+        Arc::make_mut(&mut builder.views_mut()[position].0).set_options(name, options, dialect)?;
     }
     Ok(builder)
 }
@@ -905,7 +913,7 @@ fn rename_view(
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: kind,
             conflicting_kind,
-            object_name: new_ident.value.clone(),
+            object_name: builder.dialect().stored_name(new_ident),
         });
     }
 
@@ -1159,7 +1167,6 @@ fn rename_view_column(
     // Only a plain view carries rules and triggers.
     let host =
         (kind == ObjectKind::View).then(|| ViewHost::of_view(builder.views()[position].0.as_ref()));
-    let view_name = declaration.name().to_string();
 
     let (names, enumerable) = output_names(&builder, declaration)?;
     let same = |(name, quoted): &(String, bool), ident: &Ident| {
@@ -1168,20 +1175,22 @@ fn rename_view_column(
     let Some(ordinal) = names.iter().position(|name| same(name, old_name)) else {
         if !enumerable {
             return Err(Error::UnsupportedAlterTableOperation {
-                table_name: view_name,
+                table_name: builder.dialect().stored_object_name(name),
                 operation: format!("RENAME COLUMN {old_name} TO {new_name}"),
             });
         }
         return Err(LookupError::ColumnNotFound {
-            table_name: view_name,
-            column_name: old_name.value.clone(),
+            table_name: builder
+                .dialect()
+                .stored_spelling(declaration.name(), declaration.name_is_quoted()),
+            column_name: builder.dialect().stored_name(old_name),
         }
         .into());
     };
     if !same(&names[ordinal], new_name) && names.iter().any(|name| same(name, new_name)) {
         return Err(Error::ColumnAlreadyExists {
-            table_name: view_name,
-            column_name: new_name.value.clone(),
+            table_name: builder.dialect().stored_object_name_last(name),
+            column_name: builder.dialect().stored_name(new_name),
         });
     }
     let columns: Vec<Ident> = names
@@ -1190,6 +1199,8 @@ fn rename_view_column(
             if *quoted { Ident::with_quote('"', name.as_str()) } else { Ident::new(name.as_str()) }
         })
         .collect();
+    let relation_name =
+        builder.dialect().stored_spelling(declaration.name(), declaration.name_is_quoted());
     let readers = view_rewrites::readers(&builder, &[&key]);
 
     let declaration = if kind == ObjectKind::MaterializedView {
@@ -1203,13 +1214,7 @@ fn rename_view_column(
         view_rewrites::follow_renames(
             &mut builder,
             readers,
-            &[Rename::Column {
-                key,
-                relation_name: view_name,
-                ordinal,
-                to: new_name.clone(),
-                columns,
-            }],
+            &[Rename::Column { key, relation_name, ordinal, to: new_name.clone(), columns }],
         )?;
     }
     if let Some(host) = &host {
@@ -1491,7 +1496,7 @@ impl VisitorMut for DefinitionBinder<'_> {
             && let Some(bound) = self.builder.bound_relation(name)
         {
             if bound.temporary && self.temporary_read.is_none() {
-                self.temporary_read = Some(name.to_string());
+                self.temporary_read = Some(self.builder.dialect().stored_object_name_last(name));
             }
             bind_reference(name, bound.qualifier);
         }
@@ -1645,27 +1650,33 @@ fn insert_target(statement: &Statement) -> Option<&ObjectName> {
 /// One object a dependency walk reaches.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Dependent {
-    /// A view's catalog-case key and stored name, or a materialized view's.
+    /// A view or a materialized view, under the catalog-case key its readers
+    /// name it by, with the name its engine stores.
     Reader(ObjectKind, RelationKey, String),
     /// A function whose bound body or signature reads a relation, which is
     /// one overload alone.
     Function(Arc<CreateFunction>),
-    /// A rule, which nothing reads, by its name on the relation stored under
-    /// the key.
+    /// A rule, which nothing reads, by its stored name on the relation stored
+    /// under the key.
     Rule(RelationKey, String),
 }
 
 impl Dependent {
-    /// The view or materialized view `view` as a reader, keyed under `case`.
+    /// The view or materialized view `view` as a reader, keyed under `case`
+    /// and named as `dialect`'s engine stores it.
     pub(super) fn view<V: ViewLike>(
         namespaces: Namespaces,
+        dialect: SqlparserDialect,
         kind: ObjectKind,
         view: &V,
         case: IdentifierCase,
     ) -> Self {
-        Self::Reader(kind, stored_view_key(namespaces, view, case), view.view_name().to_string())
+        Self::Reader(
+            kind,
+            stored_view_key(namespaces, view, case),
+            dialect.stored_spelling(view.view_name(), view.view_name_is_quoted()),
+        )
     }
-
     /// The kind of object reached.
     pub(super) const fn kind(&self) -> ObjectKind {
         match self {
@@ -1675,11 +1686,20 @@ impl Dependent {
         }
     }
 
-    /// The name the object is stored under.
-    pub(super) fn name(&self) -> &str {
+    /// The key a view or a materialized view is stored under, which other
+    /// objects read it by.
+    pub(super) const fn reader_key(&self) -> Option<&RelationKey> {
         match self {
-            Self::Reader(_, _, name) | Self::Rule(_, name) => name,
-            Self::Function(function) => last_str(&function.name),
+            Self::Reader(_, key, _) => Some(key),
+            Self::Function(_) | Self::Rule(..) => None,
+        }
+    }
+
+    /// The name the object is stored under in `dialect`'s engine.
+    pub(super) fn stored_name(&self, dialect: SqlparserDialect) -> String {
+        match self {
+            Self::Reader(_, _, name) | Self::Rule(_, name) => name.clone(),
+            Self::Function(function) => dialect.stored_object_name_last(&function.name),
         }
     }
 }
@@ -1703,15 +1723,7 @@ pub(super) fn readers_and_dependents(
     builder: &ParserDBBuilder,
     readers: Vec<Dependent>,
 ) -> Vec<Dependent> {
-    let frontier = readers
-        .iter()
-        .filter_map(|reader| {
-            match reader {
-                Dependent::Reader(_, key, _) => Some(key.clone()),
-                Dependent::Function(_) | Dependent::Rule(..) => None,
-            }
-        })
-        .collect();
+    let frontier = readers.iter().filter_map(Dependent::reader_key).cloned().collect();
     readers_closure(builder, frontier, readers, None)
 }
 
@@ -1730,34 +1742,32 @@ fn readers_closure(
         .views()
         .iter()
         .map(|(view, _, _)| {
+            let reader = Dependent::view(
+                builder.namespaces(),
+                *builder.dialect(),
+                ObjectKind::View,
+                view.as_ref(),
+                builder.identifier_case(),
+            );
+            let key = reader.reader_key().cloned();
             (
-                Dependent::view(
-                    builder.namespaces(),
-                    ObjectKind::View,
-                    view.as_ref(),
-                    builder.identifier_case(),
-                ),
-                Some(stored_view_key(
-                    builder.namespaces(),
-                    view.as_ref(),
-                    builder.identifier_case(),
-                )),
+                reader,
+                key,
                 relations_read_by(builder.namespaces(), view.as_ref(), builder.identifier_case()),
             )
         })
         .chain(builder.materialized_views().iter().map(|(view, _, _)| {
+            let reader = Dependent::view(
+                builder.namespaces(),
+                *builder.dialect(),
+                ObjectKind::MaterializedView,
+                view.as_ref(),
+                builder.identifier_case(),
+            );
+            let key = reader.reader_key().cloned();
             (
-                Dependent::view(
-                    builder.namespaces(),
-                    ObjectKind::MaterializedView,
-                    view.as_ref(),
-                    builder.identifier_case(),
-                ),
-                Some(stored_view_key(
-                    builder.namespaces(),
-                    view.as_ref(),
-                    builder.identifier_case(),
-                )),
+                reader,
+                key,
                 relations_read_by(builder.namespaces(), view.as_ref(), builder.identifier_case()),
             )
         }))
@@ -1783,7 +1793,12 @@ fn readers_closure(
         }))
         .chain(builder.rules().iter().map(|(rule, _)| {
             (
-                rules::dependent(builder.namespaces(), rule, builder.identifier_case()),
+                rules::dependent(
+                    builder.namespaces(),
+                    *builder.dialect(),
+                    rule,
+                    builder.identifier_case(),
+                ),
                 Some(rules::relation_key(builder.namespaces(), rule, builder.identifier_case())),
                 rules::rules_reading(builder, rule),
             )
@@ -1798,9 +1813,7 @@ fn readers_closure(
             if !found.contains(dependent) {
                 // Nothing reads a function or a rule as a relation, so the
                 // walk goes no further from one.
-                if matches!(dependent, Dependent::Reader(..))
-                    && let Some(key) = own_relation
-                {
+                if let Some(key) = dependent.reader_key() {
                     frontier.push(key.clone());
                 }
                 found.push(dependent.clone());
@@ -1821,14 +1834,14 @@ pub(super) fn refuse_dependent_views(
     builder: &ParserDBBuilder,
     key: &RelationKey,
     object_kind: ObjectKind,
-    object_name: &str,
+    object_key: &RelationKey,
 ) -> Result<(), Error> {
     if let Some(dependent) = dependent_views(builder, key).first() {
         return Err(Error::RelationHasDependents {
             object_kind,
-            object_name: object_name.to_string(),
+            object_name: object_key.name.clone(),
             dependent_kind: dependent.kind(),
-            dependent_name: dependent.name().to_string(),
+            dependent_name: dependent.stored_name(*builder.dialect()),
         });
     }
     Ok(())
@@ -1863,9 +1876,9 @@ pub(super) fn remove_readers(
 ) -> TypeDrop {
     let case = builder.identifier_case();
     let is_doomed = |kind: ObjectKind, own_key: RelationKey| {
-        doomed.iter().any(|dependent| {
-            matches!(dependent, Dependent::Reader(held_kind, key, _) if *held_kind == kind && *key == own_key)
-        })
+        doomed
+            .iter()
+            .any(|dependent| dependent.kind() == kind && dependent.reader_key() == Some(&own_key))
     };
     let hosts: Vec<ViewHost> = builder
         .views()
@@ -1911,7 +1924,7 @@ pub(super) fn remove_readers(
             }
         })
         .collect();
-    let namespaces = builder.namespaces();
+    let (namespaces, dialect) = (builder.namespaces(), *builder.dialect());
     builder.views_mut().retain(|(view, _, _)| {
         !is_doomed(ObjectKind::View, stored_view_key(namespaces, view.as_ref(), case))
     });
@@ -1927,7 +1940,7 @@ pub(super) fn remove_readers(
         .retain(|(function, _)| !functions.iter().any(|doomed| Arc::ptr_eq(doomed, function)));
     builder
         .rules_mut()
-        .retain(|(rule, _)| !doomed.contains(&rules::dependent(namespaces, rule, case)));
+        .retain(|(rule, _)| !doomed.contains(&rules::dependent(namespaces, dialect, rule, case)));
     for host in &hosts {
         host.drop_dependents(builder);
     }

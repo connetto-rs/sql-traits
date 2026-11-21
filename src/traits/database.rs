@@ -564,8 +564,24 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
                 let referenced_table_number =
                     tables.binary_search(&referenced_table).map_err(|_| {
                         Error::ReferencedTableNotFoundForForeignKey {
-                            referenced_table: referenced_table.table_name().to_string(),
-                            host_table: table.table_name().to_string(),
+                            referenced_table: if self
+                                .dialect()
+                                .sqlparser_dialect()
+                                .is::<sqlparser::dialect::PostgreSqlDialect>()
+                            {
+                                referenced_table.stored_table_name().into_owned()
+                            } else {
+                                referenced_table.table_name().to_string()
+                            },
+                            host_table: if self
+                                .dialect()
+                                .sqlparser_dialect()
+                                .is::<sqlparser::dialect::PostgreSqlDialect>()
+                            {
+                                table.stored_table_name().into_owned()
+                            } else {
+                                table.table_name().to_string()
+                            },
                         }
                     })?;
                 edges.push((referenced_table_number, table_number));
@@ -875,6 +891,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
         resolve_target_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.tables(),
             &target,
@@ -899,6 +916,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::View>, LookupError> {
         resolve_view_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.views(),
             &target,
@@ -923,6 +941,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
         resolve_view_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.materialized_views(),
             &target,
@@ -1037,6 +1056,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         let path = || search_path.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
         let claimed = |key: &RelationKey| relation_name_is_claimed(self, key, case);
         if let Some(table) = resolve_target_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.tables(),
             &target,
@@ -1047,6 +1067,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             return Ok(Some(Relation::Table(table)));
         }
         if let Some(table) = resolve_target_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.foreign_tables(),
             &target,
@@ -1057,6 +1078,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             return Ok(Some(Relation::ForeignTable(table)));
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.views(),
             &target,
@@ -1067,6 +1089,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             return Ok(Some(Relation::View(view)));
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.materialized_views(),
             &target,
@@ -1077,6 +1100,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             return Ok(Some(Relation::MaterializedView(view)));
         }
         resolve_sequence_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.sequences(),
             &target,
@@ -1184,6 +1208,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Sequence>, LookupError> {
         resolve_sequence_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.sequences(),
             &target,
@@ -1207,6 +1232,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
         resolve_target_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.foreign_tables(),
             &target,
@@ -1270,7 +1296,13 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
-        resolve_target_in_iter(Namespaces::of_database(self), self.tables(), &target, case)
+        resolve_target_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            Namespaces::of_database(self),
+            self.tables(),
+            &target,
+            case,
+        )
     }
 
     /// Returns the foreign table a name in parts denotes, applying the same
@@ -1304,7 +1336,13 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
-        resolve_target_in_iter(Namespaces::of_database(self), self.foreign_tables(), &target, case)
+        resolve_target_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            Namespaces::of_database(self),
+            self.foreign_tables(),
+            &target,
+            case,
+        )
     }
 
     /// Returns the plain view a name in parts denotes, applying the same rules
@@ -1343,7 +1381,13 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::View>, LookupError> {
-        resolve_view_in_iter(Namespaces::of_database(self), self.views(), &target, case)
+        resolve_view_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            Namespaces::of_database(self),
+            self.views(),
+            &target,
+            case,
+        )
     }
 
     /// Returns the materialized view a name in parts denotes, applying the
@@ -1379,6 +1423,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         case: IdentifierCase,
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
         resolve_view_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             Namespaces::of_database(self),
             self.materialized_views(),
             &target,
@@ -1416,7 +1461,13 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Sequence>, LookupError> {
-        resolve_sequence_in_iter(Namespaces::of_database(self), self.sequences(), &target, case)
+        resolve_sequence_in_iter(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            Namespaces::of_database(self),
+            self.sequences(),
+            &target,
+            case,
+        )
     }
 
     /// Returns the function a name in parts denotes, applying the same rules
@@ -1460,7 +1511,13 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
         target: TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&Self::Function>, LookupError> {
-        resolve_function_in_iter(Namespaces::of_database(self), self.functions(), &target, case)
+        resolve_function_in_iter(
+            Namespaces::of_database(self),
+            self.functions(),
+            &target,
+            case,
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+        )
     }
 
     /// Returns the table ID for the given table object according to its
@@ -1713,7 +1770,11 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             .functions()
             .filter(|function| function_has_stored_identity(*function, schema, name))
             .collect();
-        resolve_one_function(name, &candidates)
+        resolve_one_function(
+            &TargetName::new(name, true),
+            &candidates,
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+        )
     }
 
     /// Resolves a name a statement wrote into the function it denotes,
@@ -1775,6 +1836,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             &target,
             function_search_path(|| self.search_path()),
             case,
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
         )
     }
 

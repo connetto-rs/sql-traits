@@ -215,6 +215,7 @@ fn only_cannot_validate_a_check_the_tables_below_also_hold() {
         Err(Error::OnlyRefusedWithChildren {
             ref table_name,
             change: InheritedChange::ValidateConstraint,
+            ..
         }) if table_name == "parent"
     ));
 

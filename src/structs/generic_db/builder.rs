@@ -22,8 +22,8 @@ use crate::{
         SchemaLike, TableLike, TriggerLike, UserDefinedTypeLike, ViewLike,
     },
     utils::object_name::{
-        Namespaces, RelationKey, render_table_candidate, stored_function_key, stored_sequence_key,
-        stored_table_key, stored_view_key, table_matches_key, view_matches_key,
+        Namespaces, RelationKey, stored_function_key, stored_sequence_key, stored_table_key,
+        stored_view_key, table_matches_key, view_matches_key,
     },
 };
 
@@ -770,9 +770,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             if tables_share_identity(existing, table, case)
                 || creates_implicit_default_ambiguity(namespaces, existing, table, case)
             {
+                let dialect = crate::impls::SqlparserDialect::for_error_names(self.dialect());
                 return Err(LookupError::TableLookupConflict {
-                    table: render_table_candidate(table),
-                    conflicting_table: render_table_candidate(existing),
+                    table: dialect
+                        .stored_spelling(table.table_name(), table.table_name_is_quoted()),
+                    conflicting_table: dialect
+                        .stored_spelling(existing.table_name(), existing.table_name_is_quoted()),
                     case,
                 });
             }

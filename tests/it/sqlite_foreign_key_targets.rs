@@ -140,7 +140,11 @@ fn a_view_holding_the_name_is_not_a_target() {
         "CREATE TABLE child (pid REFERENCES parent (id)); CREATE VIEW parent AS SELECT 1 AS id;",
     ] {
         let database = parse(sql).expect("SQLite stores a key whose name a view holds");
-        assert_eq!(target_of(&database, "child"), Err(table_not_found("parent")), "{sql}");
+        assert_eq!(
+            target_of(&database, "child"),
+            Err(LookupError::TableNotFound { object_name: "parent".to_owned() }),
+            "{sql}"
+        );
     }
 }
 

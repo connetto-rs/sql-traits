@@ -82,11 +82,10 @@ fn usable_index(
         schema_qualifiers_match(namespaces, table_schema_qualifier(other), schema, case)
     };
     let owner = StoredTable::of(table);
+    let table_name =
+        builder.dialect().stored_spelling(table.table_name(), table.table_name_is_quoted());
     let other_table = |index_name: String| {
-        Error::ReplicaIdentityIndexOfOtherTable {
-            table_name: table.table_name().to_string(),
-            index_name,
-        }
+        Error::ReplicaIdentityIndexOfOtherTable { table_name: table_name.clone(), index_name }
     };
 
     let created = builder.indices().iter().map(|(created, _)| created.as_ref()).find(|created| {
@@ -126,11 +125,7 @@ fn usable_index(
     match checked {
         Some((held, Ok(()))) => Ok(held),
         Some((held, Err(reason))) => {
-            Err(Error::ReplicaIdentityIndexRefused {
-                table_name: table.table_name().to_string(),
-                index_name: held,
-                reason,
-            })
+            Err(Error::ReplicaIdentityIndexRefused { table_name, index_name: held, reason })
         }
         None => {
             match relation_name_holder(builder, index, schema, None) {
@@ -143,12 +138,7 @@ fn usable_index(
                         actual_kind,
                     })
                 }
-                None => {
-                    Err(Error::ReplicaIdentityIndexNotFound {
-                        table_name: table.table_name().to_string(),
-                        index_name: wanted,
-                    })
-                }
+                None => Err(Error::ReplicaIdentityIndexNotFound { table_name, index_name: wanted }),
             }
         }
     }
@@ -318,14 +308,14 @@ fn key_slot_columns(slot: Slot<'_>) -> Vec<Ident> {
 /// Returns [`Error::RequiredValueNotDroppable`] for such a column.
 pub(super) fn refuse_losing_requirement(
     builder: &ParserDBBuilder,
-    table_name: &str,
+    stored: &StoredTable,
     node: &CreateTable,
     column: &Ident,
 ) -> Result<(), Error> {
     if covers_column(builder, node, column) {
         return Err(Error::RequiredValueNotDroppable {
-            table_name: table_name.to_string(),
-            column_name: column.value.clone(),
+            table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+            column_name: builder.dialect().stored_name(column),
             reason: RequiredValue::InReplicaIdentity,
         });
     }
@@ -348,7 +338,7 @@ pub(super) fn refuse_lost_requirement(
     if requires_value(node, column, builder.identifier_case()) {
         return Ok(());
     }
-    refuse_losing_requirement(builder, &stored.name, node, column)
+    refuse_losing_requirement(builder, stored, node, column)
 }
 
 /// Points the setting of `metadata` at `new` where it named the index `old`,

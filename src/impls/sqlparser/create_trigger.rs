@@ -1,8 +1,6 @@
 //! Implementation of the `TriggerLike` trait for sqlparser's `CreateTrigger`
 //! type.
 
-use alloc::string::ToString;
-
 use sqlparser::ast::{ArgMode, CreateTrigger};
 
 use crate::{
@@ -58,7 +56,9 @@ impl TriggerLike for CreateTrigger {
                 relation @ (Relation::Table(_) | Relation::ForeignTable(_) | Relation::View(_)),
             ) => Ok(relation),
             Some(Relation::MaterializedView(_) | Relation::Sequence(_)) | None => {
-                Err(LookupError::RelationNotFound { object_name: self.table_name.to_string() })
+                Err(LookupError::RelationNotFound {
+                    object_name: database.dialect().stored_object_name(&self.table_name),
+                })
             }
         }
     }
