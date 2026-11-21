@@ -3030,3 +3030,10 @@ fn an_engine_without_operator_or_cast_catalogs_answers_none() {
     assert_eq!(database.new_function_executable_by_public(None, "public"), None);
     assert!(database.default_privileges().is_none());
 }
+
+#[test]
+fn a_catalog_without_sqlite_options_declares_neither() {
+    let docs = table(Some("app"), "docs");
+    assert!(!docs.is_strict());
+    assert!(!docs.is_without_rowid());
+}

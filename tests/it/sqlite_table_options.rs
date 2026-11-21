@@ -6,7 +6,10 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::prelude::*;
-use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sqlparser::{
+    ast::CreateTable,
+    dialect::{PostgreSqlDialect, SQLiteDialect},
+};
 
 /// The statements of one SQLite connection, with the shadow tables as SQLite
 /// stores them.
@@ -88,4 +91,21 @@ fn a_postgresql_table_declares_no_sqlite_option() {
         .expect("the table exists");
     assert!(!table.is_strict());
     assert!(!table.is_without_rowid());
+}
+
+#[test]
+fn a_reference_to_a_table_reports_its_sqlite_options() {
+    let database = ParserDB::parse::<SQLiteDialect>(
+        "CREATE TABLE keyed(k TEXT PRIMARY KEY) WITHOUT ROWID, STRICT;
+         CREATE TABLE plain(k TEXT PRIMARY KEY);",
+    )
+    .expect("SQLite accepts the tables");
+    for (name, declared) in [("keyed", true), ("plain", false)] {
+        let table = database
+            .table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("unambiguous lookup")
+            .expect("the table exists");
+        assert_eq!(<&CreateTable as TableLike>::is_strict(&table), declared, "{name}");
+        assert_eq!(<&CreateTable as TableLike>::is_without_rowid(&table), declared, "{name}");
+    }
 }
