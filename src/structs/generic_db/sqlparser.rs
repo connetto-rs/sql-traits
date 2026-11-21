@@ -97,6 +97,7 @@ mod function_moves;
 mod generated_names;
 mod grantors;
 mod inheritance;
+mod key_nullability;
 mod leading_comments;
 mod like;
 mod materialized_view_indexes;
@@ -138,6 +139,7 @@ mod virtual_tables;
 use default_privileges::{
     Creator, DefaultPrivileges, SessionChange, SessionRoles, tracks_session_roles,
 };
+pub(crate) use key_nullability::key_excludes_null;
 use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
 use parsed_source::{ParsedSource, StatementSource};
@@ -5162,13 +5164,19 @@ pub(crate) fn requires_value(node: &CreateTable, column: &Ident, case: Identifie
 /// PostgreSQL keeps it as a constraint of its own rather than as a shadow of
 /// the key, which has two consequences this mirrors: a child copying its
 /// parent's columns receives it without the key coming too, and dropping the
-/// key afterwards leaves the column still requiring a value.
+/// key afterwards leaves the column still requiring a value. A key writes it
+/// only where the catalog of `dialect` records it, which SQLite does only in a
+/// `STRICT` or `WITHOUT ROWID` table.
 ///
 /// Called wherever a table node is about to be stored, so every path that
 /// builds or rewrites one upholds the invariant without knowing about it. A
 /// key names its columns under `case`.
-fn record_implied_not_null(create_table: &mut CreateTable, case: IdentifierCase) {
-    let required = required_columns(create_table, case);
+fn record_implied_not_null(
+    create_table: &mut CreateTable,
+    dialect: SqlparserDialect,
+    case: IdentifierCase,
+) {
+    let required = required_columns(create_table, dialect, case);
     for column in &mut create_table.columns {
         if required.iter().any(|required| case_idents_match(required, &column.name, case)) {
             state_not_null(column);
@@ -5176,9 +5184,14 @@ fn record_implied_not_null(create_table: &mut CreateTable, case: IdentifierCase)
     }
 }
 
-/// The columns the node requires a value of, stated or implied by a key or an
-/// identity, with a key naming its columns under `case`.
-fn required_columns(create_table: &CreateTable, case: IdentifierCase) -> Vec<Ident> {
+/// The columns the node requires a value of, stated or implied by an identity
+/// or by a key the catalog of `dialect` records `NOT NULL` for, with a key
+/// naming its columns under `case`.
+fn required_columns(
+    create_table: &CreateTable,
+    dialect: SqlparserDialect,
+    case: IdentifierCase,
+) -> Vec<Ident> {
     let keyed: Vec<Ident> = create_table
         .constraints
         .iter()
@@ -5195,10 +5208,15 @@ fn required_columns(create_table: &CreateTable, case: IdentifierCase) -> Vec<Ide
         .columns
         .iter()
         .filter(|column| {
-            keyed.iter().any(|keyed| case_idents_match(keyed, &column.name, case))
+            let in_key = keyed.iter().any(|keyed| case_idents_match(keyed, &column.name, case))
+                || column
+                    .options
+                    .iter()
+                    .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)));
+            (in_key && key_nullability::key_states_not_null(create_table, column, dialect, case))
                 || crate::impls::serial_sequence_type(&column.data_type).is_some()
                 || column.options.iter().any(|option| {
-                    matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::NotNull)
+                    matches!(option.option, ColumnOption::NotNull)
                         || crate::utils::is_identity(&option.option)
                 })
         })
@@ -6596,7 +6614,7 @@ impl ParserDB {
             builder.tables_mut().remove(position);
         let mut replacement = (*previous_node).clone();
         edit(&previous_node, &mut replacement)?;
-        record_implied_not_null(&mut replacement, builder.identifier_case());
+        record_implied_not_null(&mut replacement, *builder.dialect(), builder.identifier_case());
         // A table keeping its schema stays where it was declared even while a
         // schema rename has taken the old name, so only a move is checked.
         if !schema_qualifiers_match(
@@ -11625,7 +11643,7 @@ impl ParserDB {
                         None => None,
                     };
                     refuse_no_inherit_constraints_on_partitioned(&create_table)?;
-                    record_implied_not_null(&mut create_table, case);
+                    record_implied_not_null(&mut create_table, *builder.dialect(), case);
                     bind_foreign_key_targets(&builder, &mut create_table)?;
                     let name = create_table.name.clone();
                     let mut metadata = TableMetadata::default();

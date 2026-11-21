@@ -209,24 +209,31 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     /// Returns an error when the table the column belongs to is not held by
     /// `database`.
     ///
-    /// A stored node carries the `NOT NULL` a key or an identity implies, so
-    /// the option alone answers for anything this crate built. The key, the
-    /// identity and a table-level `NOT NULL` naming the column are still
-    /// consulted, so a node assembled by hand rather than parsed answers
-    /// alike.
+    /// A stored node carries the `NOT NULL` an identity implies, and the one
+    /// a key implies wherever the dialect's catalog records it, so the option
+    /// alone answers for most columns this crate built. The key, the identity
+    /// and a table-level `NOT NULL` naming the column are still consulted, so
+    /// a node assembled by hand rather than parsed answers alike, and so does
+    /// a SQLite rowid alias, which never holds `NULL` although its catalog
+    /// records no `NOT NULL`.
     #[inline]
     fn is_nullable(&self, database: &Self::DB) -> Result<bool, LookupError> {
         let declared = self.attribute().options.iter().any(|option| {
             matches!(option.option, sqlparser::ast::ColumnOption::NotNull)
                 || is_identity(&option.option)
         });
-        let table_holds = crate::structs::generic_db::table_not_null(
-            self.table(),
-            &self.attribute().name,
-            database.identifier_case(),
-        )
-        .is_some();
-        Ok(!declared && !table_holds && !self.is_primary_key(database)?)
+        let case = database.identifier_case();
+        let table_holds =
+            crate::structs::generic_db::table_not_null(self.table(), &self.attribute().name, case)
+                .is_some();
+        let key_holds = self.is_primary_key(database)?
+            && crate::structs::generic_db::key_excludes_null(
+                self.table(),
+                self.attribute(),
+                *database.dialect(),
+                case,
+            );
+        Ok(!declared && !table_holds && !key_holds)
     }
 
     #[inline]
