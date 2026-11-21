@@ -83,6 +83,7 @@ mod column_copy;
 mod column_references;
 mod comment_on;
 mod constraint_names;
+mod constraint_using_index;
 mod constraint_validity;
 mod default_privileges;
 mod detach_partition;
@@ -7761,7 +7762,7 @@ impl ParserDB {
     /// copy made by the walk shares, since the rows below were not read
     /// either.
     fn alter_table_add_constraint(
-        builder: ParserDBBuilder,
+        mut builder: ParserDBBuilder,
         table_name: &ObjectName,
         scope: AlterTableScope,
         mut constraint: TableConstraint,
@@ -7773,23 +7774,20 @@ impl ParserDB {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
+        constraint_using_index::adopt(&mut builder, &stored, &mut constraint)?;
         Self::refuse_repeated_added_key_column(&builder, &stored, &constraint)?;
         stored_expressions::refuse_in_constraint(&builder, &constraint)?;
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
         let case = builder.identifier_case();
+        let node = Self::stored_node(&builder, &stored)?;
         if let TableConstraint::NotNull(not_null) = &constraint
-            && requires_value(Self::stored_node(&builder, &stored)?, &not_null.column, case)
+            && requires_value(node, &not_null.column, case)
         {
             return Ok(builder);
         }
+        let names = generated_constraint_names(&builder, &stored);
         if let Some(name) = table_constraint_name(&constraint)
-            && constraint_names::locate(
-                Self::stored_node(&builder, &stored)?,
-                generated_constraint_names(&builder, &stored),
-                name,
-                builder.identifier_case(),
-            )
-            .is_some()
+            && constraint_names::locate(node, names, name, case).is_some()
         {
             return Err(crate::errors::Error::ConstraintAlreadyExists {
                 table_name: stored.name.clone(),
@@ -10469,6 +10467,15 @@ impl ParserDB {
                     ..
                 } => {
                     for name in names {
+                        if let Some(index_name) = object_name_last_identifier(&name)
+                            && let Some((stored, _)) =
+                                constraint_names::key_index_owner(&builder, &name, index_name)
+                        {
+                            return Err(crate::errors::Error::IndexRequiredByConstraint {
+                                index_name: index_name.value.clone(),
+                                table_name: stored.name,
+                            });
+                        }
                         let Some(position) = builder.index_position(&name)? else {
                             if if_exists {
                                 continue;

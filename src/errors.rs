@@ -3351,6 +3351,87 @@ pub enum Error {
         /// Name of the policy applying to it.
         policy_name: String,
     },
+    #[error("\"{index_name}\" is not a unique index")]
+    /// Error indicating that an adopted index is not unique.
+    ///
+    /// PostgreSQL refuses `ADD CONSTRAINT USING INDEX` with a non-unique index.
+    AdoptedIndexNotUnique {
+        /// Name of the index.
+        index_name: String,
+    },
+    #[error("\"{index_name}\" is a partial index")]
+    /// Error indicating that an adopted index is partial.
+    ///
+    /// PostgreSQL refuses `ADD CONSTRAINT USING INDEX` with a partial index.
+    AdoptedIndexPartial {
+        /// Name of the index.
+        index_name: String,
+    },
+    #[error("index \"{index_name}\" contains expressions")]
+    /// Error indicating that an adopted index contains expressions.
+    ///
+    /// PostgreSQL refuses `ADD CONSTRAINT USING INDEX` with expression keys.
+    AdoptedIndexExpressions {
+        /// Name of the index.
+        index_name: String,
+    },
+    #[error("index \"{index_name}\" does not exist")]
+    /// Error indicating that an adopted index does not exist.
+    ///
+    /// PostgreSQL refuses adoption when the target table's schema lacks the
+    /// index.
+    AdoptedIndexNotFound {
+        /// Name of the index.
+        index_name: String,
+    },
+    #[error("index \"{index_name}\" does not belong to table \"{table_name}\"")]
+    /// Error indicating that an adopted index belongs to another table.
+    ///
+    /// PostgreSQL refuses adoption of another table's index.
+    AdoptedIndexWrongTable {
+        /// Name of the index.
+        index_name: String,
+        /// Name of the target table.
+        table_name: String,
+    },
+    #[error("index \"{index_name}\" is already associated with a constraint")]
+    /// Error indicating that an adopted index already belongs to a constraint.
+    ///
+    /// PostgreSQL refuses adoption of a constraint-owned index.
+    AdoptedIndexAlreadyConstrained {
+        /// Name of the index.
+        index_name: String,
+    },
+    #[error("ALTER TABLE / ADD CONSTRAINT USING INDEX is not supported on partitioned tables")]
+    /// Error indicating that a partitioned table attempts to adopt an index.
+    ///
+    /// PostgreSQL refuses `ADD CONSTRAINT USING INDEX` on partitioned tables.
+    AdoptedIndexOnPartitionedTable,
+    #[error(
+        "index \"{index_name}\" column number {column_number} does not have default sorting behavior"
+    )]
+    /// Error indicating that an adopted index has non-default sorting.
+    ///
+    /// PostgreSQL refuses adoption unless every key column has default sorting.
+    AdoptedIndexSorting {
+        /// Name of the index.
+        index_name: String,
+        /// One-based position of the index column.
+        column_number: usize,
+    },
+    #[error(
+        "cannot drop index {index_name} because constraint {index_name} on table {table_name} requires it"
+    )]
+    /// Error indicating that a constraint requires the index being dropped.
+    ///
+    /// PostgreSQL refuses `DROP INDEX` for a constraint-owned index even with
+    /// `CASCADE`.
+    IndexRequiredByConstraint {
+        /// Name shared by the index and constraint.
+        index_name: String,
+        /// Name of the table holding the constraint.
+        table_name: String,
+    },
     #[error("Index `{index_name}` not found for DROP INDEX statement.")]
     /// Error indicating that a DROP INDEX statement references an index
     /// that does not exist.
