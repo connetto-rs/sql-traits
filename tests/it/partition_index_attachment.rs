@@ -1,7 +1,9 @@
 //! `ALTER INDEX parent ATTACH PARTITION child` makes an index of a partition
 //! a partition of an index of its partitioned table. A partitioned index is
 //! valid once every direct partition, a foreign one included, holds a valid
-//! index attached to it. Expectations were measured on PostgreSQL 18.7.
+//! index attached to it, and a primary key or unique constraint added `ONLY`
+//! to a partitioned table that has partitions starts invalid the same way.
+//! Expectations were measured on PostgreSQL 18.7.
 #![allow(clippy::expect_used)]
 
 use sql_traits::{
@@ -254,6 +256,56 @@ const KEYED: &str = "CREATE TABLE a (id INT NOT NULL) PARTITION BY RANGE (id);
 CREATE TABLE a0 PARTITION OF a FOR VALUES FROM (0) TO (10);
 ";
 
+#[test]
+fn a_key_added_only_above_partitions_starts_invalid() -> Result<(), Error> {
+    for (constraint, name) in [("PRIMARY KEY", "a_pkey"), ("UNIQUE", "a_uq")] {
+        let sql = format!("{KEYED}ALTER TABLE ONLY a ADD CONSTRAINT {name} {constraint} (id);");
+        assert_eq!(validity(&parse(&sql)?), owned(&[(name, false)]), "{constraint}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_key_added_only_stays_valid_without_partitions_or_partitioning() -> Result<(), Error> {
+    let unpartitioned = "CREATE TABLE w (id INT NOT NULL) PARTITION BY RANGE (id);
+ALTER TABLE ONLY w ADD CONSTRAINT w_pkey PRIMARY KEY (id);
+CREATE TABLE w0 PARTITION OF w FOR VALUES FROM (0) TO (10);";
+    assert_eq!(validity(&parse(unpartitioned)?), owned(&[("w0_pkey", true), ("w_pkey", true)]));
+    let inherited = "CREATE TABLE x (id INT NOT NULL);
+CREATE TABLE x1 () INHERITS (x);
+ALTER TABLE ONLY x ADD CONSTRAINT x_pkey PRIMARY KEY (id);";
+    assert_eq!(validity(&parse(inherited)?), owned(&[("x_pkey", true)]));
+    Ok(())
+}
+
+#[test]
+fn a_foreign_key_needs_the_key_valid() -> Result<(), Error> {
+    let only = format!("{KEYED}ALTER TABLE ONLY a ADD CONSTRAINT a_pkey PRIMARY KEY (id);\n");
+    for reference in
+        ["CREATE TABLE ar (id INT REFERENCES a);", "CREATE TABLE ar (id INT REFERENCES a (id));"]
+    {
+        assert!(
+            matches!(
+                parse(&format!("{only}{reference}")),
+                Err(Error::ReferencedColumnsNotUniqueForForeignKey { .. })
+            ),
+            "{reference}"
+        );
+    }
+    let unique = format!(
+        "{KEYED}ALTER TABLE ONLY a ADD CONSTRAINT a_uq UNIQUE (id);
+CREATE TABLE ar (id INT REFERENCES a (id));"
+    );
+    assert!(matches!(parse(&unique), Err(Error::ReferencedColumnsNotUniqueForForeignKey { .. })));
+    let attached = format!(
+        "{only}ALTER TABLE ONLY a0 ADD CONSTRAINT a0_pkey PRIMARY KEY (id);
+ALTER INDEX a_pkey ATTACH PARTITION a0_pkey;
+CREATE TABLE ar (id INT REFERENCES a);"
+    );
+    assert_eq!(validity(&parse(&attached)?), owned(&[("a0_pkey", true), ("a_pkey", true)]));
+    Ok(())
+}
+
 /// A key's index attaches under a plain unique index, and a primary key and a
 /// unique constraint attach under each other.
 #[test]
@@ -338,6 +390,19 @@ const UNATTACHED_KEYS: &str = "CREATE TABLE k (id INT NOT NULL) PARTITION BY RAN
 CREATE TABLE k0 PARTITION OF k FOR VALUES FROM (0) TO (10);
 ALTER TABLE ONLY k ADD CONSTRAINT k_parent PRIMARY KEY (id);
 ";
+
+/// A partition's key alike to its parent's stays the partition's own until
+/// it is attached.
+#[test]
+fn an_unattached_alike_key_stays_the_partitions_own() -> Result<(), Error> {
+    let alike =
+        format!("{UNATTACHED_KEYS}ALTER TABLE ONLY k0 ADD CONSTRAINT k_child PRIMARY KEY (id);\n");
+    let dropped_below = format!("{alike}ALTER TABLE k0 DROP CONSTRAINT k_child;");
+    assert_eq!(validity(&parse(&dropped_below)?), owned(&[("k_parent", false)]));
+    let dropped_above = format!("{alike}ALTER TABLE k DROP CONSTRAINT k_parent;");
+    assert_eq!(validity(&parse(&dropped_above)?), owned(&[("k_child", true)]));
+    Ok(())
+}
 
 /// A key attached to a key of the other kind is inherited, so its partition
 /// cannot drop it and the parent's drop takes it along.

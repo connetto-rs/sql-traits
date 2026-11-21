@@ -107,6 +107,13 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         }))
     }
 
+    fn is_valid(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        let table = self.table();
+        let held: Vec<_> = table.unique_indices(database)?.collect();
+        Ok(super::create_table::position_among(&held, self)
+            .is_none_or(|position| database.constraint_index_is_valid(table, position)))
+    }
+
     fn backing_index_name<'db>(
         &'db self,
         database: &'db Self::DB,

@@ -28,7 +28,8 @@ pub(crate) struct RecordedConstraintName {
     pub(crate) names_index: bool,
 }
 
-/// The identity a key the table holds was given when it arrived.
+/// The identity a key the table holds was given when it arrived, and whether
+/// its index is valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyCreation {
     /// Which constraint of the table node it is, keyed the way
@@ -36,6 +37,10 @@ pub(crate) struct KeyCreation {
     pub(crate) slot: String,
     /// The identity, ordered as the keys were created.
     pub(crate) identity: KeyIdentity,
+    /// Whether the key's index is valid, which the index of a key added
+    /// `ONLY` to a partitioned table holding a partition is not until an
+    /// index is attached for every partition.
+    pub(crate) valid: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +496,16 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub(crate) fn set_key_creations(&mut self, creations: Vec<KeyCreation>) {
         self.key_creations = creations;
+    }
+
+    /// Marks the index of the key at `slot` valid or invalid.
+    #[inline]
+    pub(crate) fn set_key_validity(&mut self, slot: &str, valid: bool) {
+        for creation in &mut self.key_creations {
+            if creation.slot == slot {
+                creation.valid = valid;
+            }
+        }
     }
 
     /// Returns the slot of each foreign key the table declared naming no

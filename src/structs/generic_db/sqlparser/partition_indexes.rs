@@ -632,11 +632,14 @@ fn definition<'builder>(
     }
 }
 
-/// Whether the index `member` is valid, which the index of a key always is.
-fn is_valid(builder: &ParserDBBuilder, member: Member) -> bool {
+/// Whether the index `member` of `table` is valid.
+fn is_valid(builder: &ParserDBBuilder, table: &StoredTable, member: Member) -> Result<bool, Error> {
     match member {
-        Member::Standalone(position) => builder.indices()[position].1.is_valid(),
-        Member::Key(_) => true,
+        Member::Standalone(position) => Ok(builder.indices()[position].1.is_valid()),
+        Member::Key(position) => {
+            let node = ParserDB::stored_node(builder, table)?;
+            Ok(!referenced_keys::invalid_keys(builder, node).contains(&position))
+        }
     }
 }
 
@@ -798,7 +801,7 @@ fn partitions_attached(
         let Some(member) = member_on(builder, &child, &held)? else {
             return Ok(false);
         };
-        if !is_valid(builder, member) {
+        if !is_valid(builder, &child, member)? {
             return Ok(false);
         }
     }
@@ -817,11 +820,14 @@ fn revalidate(
         let Some(member) = member_on(builder, &table, &name)? else {
             return Ok(());
         };
-        if is_valid(builder, member) || !partitions_attached(builder, &table, &name)? {
+        if is_valid(builder, &table, member)? || !partitions_attached(builder, &table, &name)? {
             return Ok(());
         }
-        if let Member::Standalone(position) = member {
-            builder.indices_mut()[position].1.set_validity(true);
+        match member {
+            Member::Standalone(position) => builder.indices_mut()[position].1.set_validity(true),
+            Member::Key(position) => {
+                referenced_keys::set_key_validity(builder, &table, position, true)?;
+            }
         }
         let Some(parent_name) = links(builder, &table)?
             .into_iter()
@@ -838,6 +844,32 @@ fn revalidate(
         table = parent_table;
         name = parent_name;
     }
+}
+
+/// Marks invalid the index of `constraint`, a primary key or unique
+/// constraint just added `ONLY` to `table`, when the table has a partition,
+/// since no index of a partition is attached to it yet.
+///
+/// # Errors
+///
+/// Returns the error naming a table the builder does not hold.
+pub(super) fn invalidate_key_above_partitions(
+    builder: &mut ParserDBBuilder,
+    table: &StoredTable,
+    constraint: &TableConstraint,
+) -> Result<(), Error> {
+    if !matches!(constraint, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_))
+        || !inheritance::direct_children(builder, table)
+            .iter()
+            .any(|(kind, _)| *kind == ParentKind::PartitionOf)
+    {
+        return Ok(());
+    }
+    let Some(added) = ParserDB::stored_node(builder, table)?.constraints.len().checked_sub(1)
+    else {
+        return Ok(());
+    };
+    referenced_keys::set_key_validity(builder, table, Position::Table(added), false)
 }
 
 /// Applies `ALTER INDEX parent ATTACH PARTITION child`, making the index
