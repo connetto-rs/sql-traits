@@ -27,9 +27,10 @@ use crate::{structs::IdentifierCase, traits::TableLike};
 /// One entry of a key as SQLite compares it: the column, and the collation
 /// it is compared under.
 struct KeyEntry<'node> {
-    /// The position of the column among those of the table, or the written
-    /// expression when it names none.
-    column: Result<usize, &'node Expr>,
+    /// The position of the column among those of the table.
+    column: Option<usize>,
+    /// The written expression, for an entry naming no column of the table.
+    expression: Option<&'node Expr>,
     /// The collation written on the entry, else the one declared on the
     /// column, else `BINARY`.
     collation: &'node str,
@@ -37,8 +38,19 @@ struct KeyEntry<'node> {
 
 impl PartialEq for KeyEntry<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.column == other.column && self.collation.eq_ignore_ascii_case(other.collation)
+        self.column == other.column
+            && self.expression == other.expression
+            && self.collation.eq_ignore_ascii_case(other.collation)
     }
+}
+
+/// A primary key or unique constraint of a table, as SQLite indexes it.
+struct Key<'node> {
+    /// Whether the constraint is the primary key.
+    primary: bool,
+    /// The entries of its key, a constraint on a column keying that column
+    /// alone.
+    entries: Vec<KeyEntry<'node>>,
 }
 
 /// The name of the index SQLite builds behind each primary key and unique
@@ -51,19 +63,18 @@ pub(super) fn autoindex_names(node: &CreateTable, case: IdentifierCase) -> Vec<O
     let mut built: Vec<Vec<KeyEntry<'_>>> = Vec::new();
     let mut ordinals: Vec<Option<usize>> = Vec::new();
     let mut delayed = None;
-    for slot in slots(node).into_iter().filter(|slot| slot.is_unique_key()) {
-        let key = key_entries(node, slot, case);
-        if integer_primary_key(node, slot, case) {
+    for key in slots(node).into_iter().filter_map(|slot| key_of(node, slot, case)) {
+        if key.primary && keys_integer_column(node, &key.entries, case) {
             if without_rowid {
-                delayed = Some((ordinals.len(), key));
+                delayed = Some((ordinals.len(), key.entries));
             }
             ordinals.push(None);
             continue;
         }
-        ordinals.push(Some(ordinal_of(&mut built, key)));
+        ordinals.push(Some(ordinal_of(&mut built, key.entries)));
     }
-    if let Some((position, key)) = delayed {
-        ordinals[position] = Some(ordinal_of(&mut built, key));
+    if let Some((position, entries)) = delayed {
+        ordinals[position] = Some(ordinal_of(&mut built, entries));
     }
     let table = object_name_last_identifier(&node.name).map_or("", |name| name.value.as_str());
     ordinals
@@ -82,55 +93,61 @@ fn ordinal_of<'node>(built: &mut Vec<Vec<KeyEntry<'node>>>, key: Vec<KeyEntry<'n
     built.len()
 }
 
-/// Whether `slot` holds the primary key of `node` on the one integer column
-/// that would make it the rowid alias, with keys naming columns under `case`.
-fn integer_primary_key(node: &CreateTable, slot: Slot<'_>, case: IdentifierCase) -> bool {
-    match slot {
-        Slot::Column { def, held, .. } => {
-            matches!(held.option, ColumnOption::PrimaryKey(_))
-                && is_integer_primary_key(node, def, case)
-        }
-        Slot::Table(_, TableConstraint::PrimaryKey(key)) => {
-            let [only] = key.columns.as_slice() else {
-                return false;
-            };
-            let Expr::Identifier(name) = &only.column.expr else {
-                return false;
-            };
-            node.columns.iter().any(|column| {
-                case_idents_match(&column.name, name, case)
-                    && is_integer_primary_key(node, column, case)
-            })
-        }
-        Slot::Table(..) => false,
-    }
+/// Whether `entries` key the one integer column of `node` that would make a
+/// primary key the rowid alias, with keys naming columns under `case`.
+fn keys_integer_column(node: &CreateTable, entries: &[KeyEntry<'_>], case: IdentifierCase) -> bool {
+    matches!(
+        entries,
+        [KeyEntry { column: Some(position), .. }]
+            if is_integer_primary_key(node, &node.columns[*position], case)
+    )
 }
 
-/// The entries of the key `slot` holds, a constraint on a column keying that
-/// column alone, with keys naming columns under `case`.
-fn key_entries<'node>(
+/// The primary key or unique constraint `slot` of `node` holds, with keys
+/// naming columns under `case`, or [`None`] for any other constraint.
+fn key_of<'node>(
     node: &'node CreateTable,
     slot: Slot<'node>,
     case: IdentifierCase,
-) -> Vec<KeyEntry<'node>> {
-    match slot {
-        Slot::Column { column, def, .. } => {
-            Vec::from([KeyEntry { column: Ok(column), collation: declared_collation(def) }])
-        }
-        Slot::Table(_, constraint) => {
-            let columns: &[IndexColumn] = match constraint {
-                TableConstraint::PrimaryKey(key) => &key.columns,
-                TableConstraint::Unique(key) => &key.columns,
-                _ => &[],
+) -> Option<Key<'node>> {
+    let (primary, entries) = match slot {
+        Slot::Column { column, def, held, .. } => {
+            let primary = match held.option {
+                ColumnOption::PrimaryKey(_) => true,
+                ColumnOption::Unique(_) => false,
+                _ => return None,
             };
-            columns.iter().map(|entry| key_entry(node, &entry.column.expr, case)).collect()
+            let entry = KeyEntry {
+                column: Some(column),
+                expression: None,
+                collation: declared_collation(def),
+            };
+            (primary, Vec::from([entry]))
         }
-    }
+        Slot::Table(_, TableConstraint::PrimaryKey(key)) => {
+            (true, table_entries(node, &key.columns, case))
+        }
+        Slot::Table(_, TableConstraint::Unique(key)) => {
+            (false, table_entries(node, &key.columns, case))
+        }
+        Slot::Table(..) => return None,
+    };
+    Some(Key { primary, entries })
+}
+
+/// The entries `columns`, written in a constraint of `node`, key, naming
+/// columns under `case`.
+fn table_entries<'node>(
+    node: &'node CreateTable,
+    columns: &'node [IndexColumn],
+    case: IdentifierCase,
+) -> Vec<KeyEntry<'node>> {
+    columns.iter().map(|entry| table_entry(node, &entry.column.expr, case)).collect()
 }
 
 /// The key entry `expression` writes in a constraint of `node`, naming its
 /// column under `case`.
-fn key_entry<'node>(
+fn table_entry<'node>(
     node: &'node CreateTable,
     expression: &'node Expr,
     case: IdentifierCase,
@@ -139,23 +156,14 @@ fn key_entry<'node>(
         Expr::Collate { expr, collation } => (&**expr, Some(collation_name(collation))),
         _ => (expression, None),
     };
-    let declared = match expression {
-        Expr::Identifier(name) => {
-            node.columns
-                .iter()
-                .enumerate()
-                .find(|(_, column)| case_idents_match(&column.name, name, case))
-        }
-        _ => None,
-    };
-    match declared {
-        Some((position, column)) => {
-            KeyEntry {
-                column: Ok(position),
-                collation: written.unwrap_or_else(|| declared_collation(column)),
-            }
-        }
-        None => KeyEntry { column: Err(expression), collation: written.unwrap_or("BINARY") },
+    let column = node.columns.iter().position(|column| {
+        matches!(expression, Expr::Identifier(name) if case_idents_match(&column.name, name, case))
+    });
+    let declared = column.map_or("BINARY", |position| declared_collation(&node.columns[position]));
+    KeyEntry {
+        column,
+        expression: column.is_none().then_some(expression),
+        collation: written.unwrap_or(declared),
     }
 }
 

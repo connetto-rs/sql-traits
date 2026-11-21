@@ -121,6 +121,39 @@ fn only_an_integer_key_ascending_on_its_column_is_the_alias() {
 }
 
 #[test]
+fn constraints_building_no_index_take_no_ordinal() {
+    assert_eq!(
+        sqlite_names(
+            "CREATE TABLE chk(x TEXT NOT NULL UNIQUE CHECK (x <> ''), y INTEGER PRIMARY KEY, z TEXT REFERENCES chk(x), CHECK (z <> ''), UNIQUE(z));",
+            "chk",
+        ),
+        expected("chk", &[Some(1), None, Some(2)]),
+    );
+}
+
+#[test]
+fn a_handle_cloned_out_of_the_database_answers_like_the_one_it_copies() {
+    let database = database::<SQLiteDialect>(
+        "CREATE TABLE b(x TEXT UNIQUE, y INTEGER PRIMARY KEY, z TEXT UNIQUE);",
+    );
+    let cloned: Vec<_> = table(&database, None, "b")
+        .unique_indices(&database)
+        .expect("the table is held")
+        .cloned()
+        .collect();
+    let names: Vec<_> = cloned
+        .iter()
+        .map(|index| {
+            index
+                .backing_index_name(&database)
+                .expect("an equal index is held")
+                .map(std::borrow::Cow::into_owned)
+        })
+        .collect();
+    assert_eq!(names, expected("b", &[Some(1), None, Some(2)]));
+}
+
+#[test]
 fn written_constraint_names_leave_the_index_name_alone() {
     let database = database::<SQLiteDialect>(
         "CREATE TABLE named(x TEXT CONSTRAINT uq UNIQUE, y TEXT, CONSTRAINT pk PRIMARY KEY(y));",
