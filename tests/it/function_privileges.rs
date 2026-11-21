@@ -172,7 +172,7 @@ fn a_function_target_folds_like_any_other_name() {
          REVOKE EXECUTE ON FUNCTION "F"() FROM PUBLIC;"#,
     );
     assert!(
-        matches!(&quoted, Err(Error::FunctionNotFoundForGrant { function_name }) if function_name == "F"),
+        matches!(&quoted, Err(Error::FunctionNotFoundForGrant { function_name, .. }) if function_name == "F"),
         "got {quoted:?}"
     );
 }
@@ -194,7 +194,7 @@ fn a_bare_name_reaches_the_only_function_of_that_name() {
          REVOKE EXECUTE ON FUNCTION f FROM PUBLIC;",
     );
     assert!(
-        matches!(&overloaded, Err(Error::AmbiguousFunctionForGrant { function_name }) if function_name == "f"),
+        matches!(&overloaded, Err(Error::AmbiguousFunctionForGrant { function_name, .. }) if function_name == "f"),
         "got {overloaded:?}"
     );
 
@@ -204,7 +204,7 @@ fn a_bare_name_reaches_the_only_function_of_that_name() {
          REVOKE EXECUTE ON FUNCTION f() FROM PUBLIC;",
     );
     assert!(
-        matches!(&empty, Err(Error::FunctionNotFoundForGrant { function_name }) if function_name == "f"),
+        matches!(&empty, Err(Error::FunctionNotFoundForGrant { function_name, .. }) if function_name == "f"),
         "got {empty:?}"
     );
 }
@@ -347,7 +347,7 @@ fn the_closed_world_refuses_a_function_the_schema_does_not_declare() {
     ] {
         let result = parse(sql);
         assert!(
-            matches!(&result, Err(Error::FunctionNotFoundForGrant { function_name }) if function_name == "nope"),
+            matches!(&result, Err(Error::FunctionNotFoundForGrant { function_name, .. }) if function_name == "nope"),
             "{sql}: got {result:?}"
         );
     }
@@ -394,7 +394,7 @@ fn the_open_world_reports_a_grant_on_a_function_the_schema_does_not_declare() {
         );
         assert!(matches!(
             db.validate_access_targets(),
-            Err(Error::FunctionNotFoundForGrant { function_name }) if function_name == "auth.uid"
+            Err(Error::FunctionNotFoundForGrant { function_name, .. }) if function_name == "auth.uid"
         ));
     }
 
@@ -546,7 +546,7 @@ fn a_privilege_functions_do_not_have_is_refused() {
          GRANT SELECT ON FUNCTION f() TO bob;",
     );
     assert!(
-        matches!(&result, Err(Error::InvalidFunctionPrivilege { privilege }) if privilege == "SELECT"),
+        matches!(&result, Err(Error::InvalidFunctionPrivilege { privilege, .. }) if privilege == "SELECT"),
         "got {result:?}"
     );
 
@@ -559,7 +559,7 @@ fn a_privilege_functions_do_not_have_is_refused() {
     ] {
         let result = parse(sql);
         assert!(
-            matches!(&result, Err(Error::InvalidFunctionPrivilege { privilege }) if privilege == "SELECT"),
+            matches!(&result, Err(Error::InvalidFunctionPrivilege { privilege, .. }) if privilege == "SELECT"),
             "{sql}: got {result:?}"
         );
     }

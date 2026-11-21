@@ -257,8 +257,8 @@ fn an_identity_sequence_cannot_be_dropped_on_its_own() {
         assert!(
             matches!(
                 parse(&format!("CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY); {drop}")),
-                Err(Error::SequenceRequiredByColumn { ref sequence_name, ref table_name, ref column_name })
-                    if sequence_name == "t_id_seq" && table_name == "t" && column_name == "id"
+                Err(Error::SequenceRequiredByColumn { ref sequence_name, ref table_name, ref column_name, .. })
+                    if &**sequence_name == "t_id_seq" && &**table_name == "t" && &**column_name == "id"
             ),
             "{drop}"
         );

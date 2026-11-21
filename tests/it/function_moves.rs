@@ -183,7 +183,7 @@ fn a_move_postgresql_refuses_is_refused() {
     ] {
         let result = refused(statement);
         assert!(
-            matches!(&result, Err(Error::FunctionAlreadyExists { function_name }) if function_name == "a"),
+            matches!(&result, Err(Error::FunctionAlreadyExistsInSchema { function_name, .. }) if function_name == "a"),
             "{statement} got {result:?}"
         );
     }

@@ -89,6 +89,7 @@ pub(super) fn create(
                 |name| builder.dialect().stored_object_name_last(name),
             ),
             reason: "index has no columns".into(),
+            written_token: ")".into(),
         });
     };
 

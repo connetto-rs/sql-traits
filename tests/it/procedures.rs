@@ -114,7 +114,7 @@ fn procedures_are_held_under_postgres_and_generic_only() {
 fn a_statement_list_body_is_refused() {
     let result = parse("CREATE PROCEDURE p() AS BEGIN SELECT 1; END;");
     assert!(
-        matches!(&result, Err(Error::ProcedureBodyUnsupported { procedure_name }) if procedure_name == "p"),
+        matches!(&result, Err(Error::ProcedureBodyUnsupported { procedure_name, .. }) if procedure_name == "p"),
         "{result:?}"
     );
 }
@@ -183,26 +183,26 @@ fn drops_reach_routines_of_their_own_kind() {
 
     let result = parse(&format!("{BOTH} DROP FUNCTION p(int);"));
     assert!(
-        matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p"),
+        matches!(&result, Err(Error::NotAFunction { function_name, .. }) if function_name == "p"),
         "{result:?}"
     );
     let result = parse(&format!("{BOTH} DROP FUNCTION IF EXISTS p(int);"));
     assert!(matches!(&result, Err(Error::NotAFunction { .. })), "{result:?}");
     let result = parse(&format!("{BOTH} DROP PROCEDURE f(int);"));
     assert!(
-        matches!(&result, Err(Error::NotAProcedure { procedure_name }) if procedure_name == "f"),
+        matches!(&result, Err(Error::NotAProcedure { procedure_name, .. }) if procedure_name == "f"),
         "{result:?}"
     );
 
     // A bare name looks among the routines of the statement's kind only.
     let result = parse(&format!("{BOTH} DROP FUNCTION p;"));
     assert!(
-        matches!(&result, Err(Error::DropFunctionNotFound { function_name }) if function_name == "p"),
+        matches!(&result, Err(Error::DropFunctionNotFound { function_name, .. }) if function_name == "p"),
         "{result:?}"
     );
     let result = parse(&format!("{BOTH} DROP PROCEDURE f;"));
     assert!(
-        matches!(&result, Err(Error::DropProcedureNotFound { procedure_name }) if procedure_name == "f"),
+        matches!(&result, Err(Error::DropProcedureNotFound { procedure_name, .. }) if procedure_name == "f"),
         "{result:?}"
     );
     let db = parse(&format!("{BOTH} DROP PROCEDURE IF EXISTS f; DROP PROCEDURE IF EXISTS q();"))
@@ -249,7 +249,7 @@ fn an_unmarked_list_may_name_every_argument() {
     // `PROCEDURE` matches every argument among procedures alone.
     let result = parse(&format!("{ROUTINES} DROP PROCEDURE f(int, int);"));
     assert!(
-        matches!(&result, Err(Error::DropProcedureNotFound { procedure_name }) if procedure_name == "f"),
+        matches!(&result, Err(Error::DropProcedureNotFound { procedure_name, .. }) if procedure_name == "f"),
         "{result:?}"
     );
     let result = parse(&format!(
@@ -316,7 +316,7 @@ fn a_procedure_hides_a_later_function_on_the_path() {
 
     let result = parse(&format!("{HIDING} DROP FUNCTION tf;"));
     assert!(
-        matches!(&result, Err(Error::DropFunctionNotFound { function_name }) if function_name == "tf"),
+        matches!(&result, Err(Error::DropFunctionNotFound { function_name, .. }) if function_name == "tf"),
         "{result:?}"
     );
     let result = parse(&format!(
@@ -340,7 +340,7 @@ fn alter_function_refuses_a_procedure() {
             "CREATE ROLE bob; CREATE PROCEDURE p(a int) LANGUAGE sql AS 'SELECT 1'; {alter}"
         ));
         assert!(
-            matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p"),
+            matches!(&result, Err(Error::NotAFunction { function_name, .. }) if function_name == "p"),
             "{alter}: {result:?}"
         );
     }
@@ -380,17 +380,17 @@ fn grants_reach_routines_of_their_kind() {
 
     let result = parse(&format!("{BOTH} GRANT EXECUTE ON FUNCTION p(int) TO bob;"));
     assert!(
-        matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p"),
+        matches!(&result, Err(Error::NotAFunction { function_name, .. }) if function_name == "p"),
         "{result:?}"
     );
     let result = parse(&format!("{BOTH} GRANT EXECUTE ON PROCEDURE f(int) TO bob;"));
     assert!(
-        matches!(&result, Err(Error::NotAProcedure { procedure_name }) if procedure_name == "f"),
+        matches!(&result, Err(Error::NotAProcedure { procedure_name, .. }) if procedure_name == "f"),
         "{result:?}"
     );
     let result = parse(&format!("{BOTH} GRANT EXECUTE ON FUNCTION p TO bob;"));
     assert!(
-        matches!(&result, Err(Error::FunctionNotFoundForGrant { function_name }) if function_name == "p"),
+        matches!(&result, Err(Error::FunctionNotFoundForGrant { function_name, .. }) if function_name == "p"),
         "{result:?}"
     );
 }
@@ -424,7 +424,7 @@ fn an_expression_calling_a_procedure_is_refused() {
         assert!(
             matches!(
                 &result,
-                Err(Error::MisappliedCall { function_name, rule: Misapplied::ProcedureCalled })
+                Err(Error::MisappliedCall { function_name, rule: Misapplied::ProcedureCalled, .. })
                     if function_name == "q"
             ),
             "{stored}: {result:?}"

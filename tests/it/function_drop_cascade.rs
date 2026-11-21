@@ -257,6 +257,7 @@ fn every_cascade_removing_a_function_takes_its_dependents() {
                 function_name,
                 dependent_kind: ObjectKind::ColumnDefault,
                 dependent_name,
+                ..
             }) if function_name == "g" && dependent_name == "t.b"
         ),
         "got {result:?}"

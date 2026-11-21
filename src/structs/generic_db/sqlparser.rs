@@ -604,7 +604,7 @@ fn create_collation_options_deterministic(
     let mut deterministic = Some(true);
     for option in options {
         let SqlOption::KeyValue { key, value } = option else {
-            return Err(invalid_collation_option("option", option.to_string()));
+            return Err(invalid_collation_option("option", option.to_string(), false));
         };
         // PostgreSQL's grammar takes a collation option as a single word, so
         // a namespaced key such as `x.provider` names no option.
@@ -612,6 +612,7 @@ fn create_collation_options_deterministic(
             return Err(invalid_collation_option(
                 &SqlparserDialect::PostgreSql.stored_object_name(key),
                 value.to_string(),
+                true,
             ));
         };
         if seen.iter().any(|seen| idents_match(seen, key)) {
@@ -623,7 +624,16 @@ fn create_collation_options_deterministic(
         if collation_option_key_matches(key, "provider") {
             validate_collation_provider(key, value)?;
         } else if collation_option_key_matches(key, "deterministic") {
-            deterministic = Some(collation_option_bool(key, value)?);
+            deterministic = Some(collation_option_bool(key, value).map_err(|mut error| {
+                if let crate::errors::Error::InvalidCollationOption { nondeterministic_provider, .. } = &mut error {
+                    let false_value = collation_literal(value).is_some_and(|literal| literal == "0" || literal.eq_ignore_ascii_case("false"));
+                    let provider_is_icu = options.iter().any(|option| matches!(option,
+                        SqlOption::KeyValue { key, value } if matches!(key.0.as_slice(), [ObjectNamePart::Identifier(key)] if collation_option_key_matches(key, "provider"))
+                            && collation_literal(value).is_some_and(|provider| provider.eq_ignore_ascii_case("icu"))));
+                    *nondeterministic_provider = false_value && !provider_is_icu;
+                }
+                error
+            })?);
         } else if !collation_option_key_matches(key, "locale")
             && !collation_option_key_matches(key, "lc_collate")
             && !collation_option_key_matches(key, "lc_ctype")
@@ -633,6 +643,7 @@ fn create_collation_options_deterministic(
             return Err(invalid_collation_option(
                 &SqlparserDialect::PostgreSql.stored_name(key),
                 value.to_string(),
+                false,
             ));
         }
     }
@@ -655,6 +666,7 @@ fn collation_option_bool(key: &Ident, value: &Expr) -> Result<bool, crate::error
                 Err(invalid_collation_option(
                     &SqlparserDialect::PostgreSql.stored_name(key),
                     value.to_string(),
+                    false,
                 ))
             }
         }
@@ -662,8 +674,28 @@ fn collation_option_bool(key: &Ident, value: &Expr) -> Result<bool, crate::error
             Err(invalid_collation_option(
                 &SqlparserDialect::PostgreSql.stored_name(key),
                 value.to_string(),
+                false,
             ))
         }
+    }
+}
+
+/// Borrows the scalar spelling accepted by PostgreSQL's collation options.
+fn collation_literal(value: &Expr) -> Option<&str> {
+    match value {
+        Expr::Identifier(ident) => Some(&ident.value),
+        Expr::Value(ValueWithSpan {
+            value:
+                Value::SingleQuotedString(value)
+                | Value::EscapedStringLiteral(value)
+                | Value::UnicodeStringLiteral(value)
+                | Value::Number(value, _),
+            ..
+        }) => Some(value),
+        Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(value), .. }) => {
+            Some(&value.value)
+        }
+        _ => None,
     }
 }
 
@@ -686,6 +718,7 @@ fn validate_collation_provider(key: &Ident, value: &Expr) -> Result<(), crate::e
             return Err(invalid_collation_option(
                 &SqlparserDialect::PostgreSql.stored_name(key),
                 value.to_string(),
+                false,
             ));
         }
     };
@@ -697,17 +730,24 @@ fn validate_collation_provider(key: &Ident, value: &Expr) -> Result<(), crate::e
         } else {
             provider.to_string()
         };
-        Err(invalid_collation_option(&SqlparserDialect::PostgreSql.stored_name(key), provider))
+        Err(invalid_collation_option(
+            &SqlparserDialect::PostgreSql.stored_name(key),
+            provider,
+            false,
+        ))
     }
 }
 
 fn invalid_collation_option(
     option_name: &str,
     option_value: impl Into<Box<str>>,
+    qualified: bool,
 ) -> crate::errors::Error {
     crate::errors::Error::InvalidCollationOption {
         option_name: option_name.into(),
         option_value: option_value.into(),
+        qualified,
+        nondeterministic_provider: false,
     }
 }
 
@@ -1116,7 +1156,9 @@ fn validate_postgres_column_collation_type(
     validate_postgres_collatable_type(&column.data_type, catalog, search_path).map_err(|error| {
         error.into_column_error(
             &SqlparserDialect::PostgreSql.stored_name(&column.name),
-            &column.data_type.to_string(),
+            &crate::utils::postgres_format_type::format_type(
+                &crate::utils::postgres_types::PgType::of(&column.data_type),
+            ),
         )
     })
 }
@@ -1257,11 +1299,14 @@ fn existing_child_column_conflict(
     let own_type = &child_column.attribute().data_type;
     if inheritance::types_conflict(builder, &inherited_def.data_type, own_type) {
         return Some(crate::errors::Error::InheritedColumnTypeConflict {
-            column_name: builder.dialect().stored_spelling(&added.name, added.quoted),
-            child_table: builder.dialect().stored_spelling(&child.name, child.name_quoted),
-            child_type: own_type.to_string(),
-            parent_table: builder.dialect().stored_spelling(&parent.name, parent.name_quoted),
-            parent_type: inherited_def.data_type.to_string(),
+            column_name: builder.dialect().stored_spelling(&added.name, added.quoted).into(),
+            child_table: builder.dialect().stored_spelling(&child.name, child.name_quoted).into(),
+            child_type: own_type.to_string().into(),
+            parent_table: builder
+                .dialect()
+                .stored_spelling(&parent.name, parent.name_quoted)
+                .into(),
+            parent_type: inherited_def.data_type.to_string().into(),
         });
     }
     if child_metadata.postgres_collation_matches(inherited_metadata) != Some(false) {
@@ -1397,7 +1442,32 @@ impl ParserDBBuilder {
     ) -> Result<(), crate::errors::Error> {
         for function in dropping {
             if let Some(dependent) = self.function_dependent(function, dropping) {
-                return Err(function_dependents::referenced(self, function, dependent));
+                let metadata = self
+                    .functions()
+                    .iter()
+                    .find(|(held, _)| Arc::ptr_eq(held, function))
+                    .map(|(_, metadata)| metadata);
+                let dropping_object =
+                    metadata.and_then(|metadata| metadata.range_constructor()).map(|constructor| {
+                        crate::errors::FunctionOwner::Type {
+                            type_description: domains::format_type_for_builder(
+                                self,
+                                &crate::utils::postgres_types::PgType::of(
+                                    &sqlparser::ast::DataType::Custom(
+                                        constructor.range.clone(),
+                                        Vec::new(),
+                                    ),
+                                ),
+                            ),
+                        }
+                    });
+                return Err(function_dependents::referenced(
+                    self,
+                    function,
+                    false,
+                    dropping_object,
+                    dependent,
+                ));
             }
         }
         self.functions_mut()
@@ -4239,6 +4309,29 @@ fn validate_table_schema(
     )
 }
 
+/// The schema PostgreSQL must print to identify a table outside the search
+/// path.
+fn diagnostic_table_schema(
+    builder: &ParserDBBuilder,
+    table: &CreateTable,
+) -> Result<Option<String>, crate::errors::Error> {
+    let Some((schema, quoted)) = qualifier_of(&table.name).named() else {
+        return Ok(None);
+    };
+    let Some(last) = table.name.0.last() else {
+        return Ok(None);
+    };
+    let unqualified = ObjectName(vec![last.clone()]);
+    if builder
+        .resolve_table_object_name(&unqualified)?
+        .is_some_and(|found| core::ptr::eq(found, table))
+    {
+        Ok(None)
+    } else {
+        Ok(Some(builder.dialect().stored_spelling(schema, quoted)))
+    }
+}
+
 /// Moves the functions the engine provides that `statement` names as objects
 /// into the builder's own store, where the statement replaces, alters, grants
 /// on or drops them as it would a declared function.
@@ -5058,6 +5151,7 @@ fn validate_distinct_columns(
             Err(crate::errors::Error::ColumnAlreadyExists {
                 table_name: dialect.stored_object_name_last(&create_table.name),
                 column_name: dialect.stored_spelling(column_name, quoted),
+                declaration: true,
             })
         }
         None => Ok(()),
@@ -5641,6 +5735,19 @@ fn validate_access_targets_against_builder(
             {
                 if let Some(schema_name) = missing_schema::missing_schema_name(builder, table_obj) {
                     return Err(crate::errors::Error::SchemaNotFound { schema_name });
+                }
+                match builder.relation_reached(table_obj) {
+                    Some((ObjectKind::Index | ObjectKind::UniqueIndex, _)) => {
+                        return Err(crate::errors::Error::GrantOnIndex {
+                            index_name: builder.dialect().stored_object_name_last(table_obj),
+                        });
+                    }
+                    Some((ObjectKind::Type, _)) => {
+                        return Err(crate::errors::Error::GrantOnCompositeType {
+                            type_name: builder.dialect().stored_object_name_last(table_obj),
+                        });
+                    }
+                    _ => {}
                 }
                 return Err(crate::errors::Error::TableNotFoundForGrant {
                     table_name: builder.dialect().stored_object_name(table_obj),
@@ -6902,6 +7009,14 @@ impl ParserDB {
             Some(UnresolvedAccessReference::GrantFunction(function)) => {
                 Err(crate::errors::Error::FunctionNotFoundForGrant {
                     function_name: self.dialect.stored_object_name(&function.name),
+                    signature: procedures::diagnostic_signature(
+                        self.dialect,
+                        function,
+                        |data_type| {
+                            crate::utils::postgres_format_type::format_type_in(self, data_type)
+                        },
+                    ),
+                    procedure: false,
                 })
             }
             Some(UnresolvedAccessReference::PolicyRole { policy, role }) => {
@@ -7079,6 +7194,7 @@ impl ParserDB {
                     |name| builder.dialect().stored_object_name_last(name),
                 ),
                 reason: "index has no columns".to_string(),
+                written_token: ")".to_string(),
             });
         };
         let metadata = IndexMetadata::new(expression)
@@ -8161,7 +8277,45 @@ impl ParserDB {
                 "unique constraint entries must be plain columns, found expression `{}`",
                 entry.column.expr
             ),
+            written_token: Self::unique_constraint_expression_token(&entry.column.expr),
         })
+    }
+
+    /// The first token a column-name list cannot consume from an expression.
+    fn unique_constraint_expression_token(expression: &Expr) -> String {
+        match expression {
+            Expr::CompoundIdentifier(_) => ".".to_string(),
+            Expr::Function(function) => {
+                if function.name.0.len() > 1 { "." } else { "(" }.to_string()
+            }
+            Expr::BinaryOp { left, op, .. } if matches!(left.as_ref(), Expr::Identifier(_)) => {
+                op.to_string()
+            }
+            Expr::BinaryOp { left, .. } => Self::unique_constraint_expression_token(left),
+            Expr::Nested(_) => "(".to_string(),
+            Expr::Cast { expr, kind: sqlparser::ast::CastKind::DoubleColon, .. } => {
+                if matches!(expr.as_ref(), Expr::Identifier(_)) {
+                    "::".to_string()
+                } else {
+                    Self::unique_constraint_expression_token(expr)
+                }
+            }
+            _ => {
+                let written = expression.to_string();
+                sqlparser::tokenizer::Tokenizer::new(
+                    &sqlparser::dialect::PostgreSqlDialect {},
+                    &written,
+                )
+                .tokenize()
+                .ok()
+                .and_then(|tokens| {
+                    tokens
+                        .into_iter()
+                        .find(|token| !matches!(token, sqlparser::tokenizer::Token::Whitespace(_)))
+                })
+                .map_or(written, |token| token.to_string())
+            }
+        }
     }
 
     /// Resolves key and included columns, optionally through parents, and
@@ -8550,6 +8704,7 @@ impl ParserDB {
                     partition_name: builder
                         .dialect()
                         .stored_spelling(&partition.name, partition.name_quoted),
+                    creating_partition: false,
                 })
             }
             None => Ok(()),
@@ -9741,8 +9896,29 @@ impl ParserDB {
                 case,
             )
         }) {
-            return Err(crate::errors::Error::FunctionAlreadyExists {
+            let parts = builder.dialect().stored_object_name_parts(&moved);
+            let schema_name = parts
+                .iter()
+                .rev()
+                .nth(1)
+                .cloned()
+                .unwrap_or_else(|| builder.namespaces().default_schema().to_string());
+            let argument_types = function
+                .args
+                .iter()
+                .flatten()
+                .filter(|argument| argument.mode != Some(ArgMode::Out))
+                .map(|argument| {
+                    domains::format_type_for_builder(
+                        &builder,
+                        &crate::utils::postgres_types::PgType::of(&argument.data_type),
+                    )
+                })
+                .collect();
+            return Err(crate::errors::Error::FunctionAlreadyExistsInSchema {
                 function_name: builder.dialect().stored_object_name_last(&moved),
+                argument_types,
+                schema_name,
             });
         }
         let relocations = function_moves::Moves::new(vec![(function, moved)], *builder.dialect());
@@ -10025,6 +10201,10 @@ impl ParserDB {
                     parent_table: builder
                         .dialect()
                         .stored_spelling(&dropped.name, dropped.name_quoted),
+                    schema_name: diagnostic_table_schema(
+                        &builder,
+                        Self::stored_node(&builder, &dropped)?,
+                    )?,
                     child_table: builder.dialect().stored_spelling(&child.name, child.name_quoted),
                 });
             }
@@ -10055,6 +10235,7 @@ impl ParserDB {
                         return Err(crate::errors::Error::RelationHasDependents {
                             object_kind: expected_kind,
                             object_name: key.name.clone(),
+                            schema_name: views::relation_schema_for_error(&builder, &key),
                             dependent_kind: dependent.kind,
                             dependent_name: dependent.name,
                         });
@@ -10075,6 +10256,7 @@ impl ParserDB {
                 let owner = Self::stored_node(&builder, &doomed[dropped_index])?;
                 return Err(crate::errors::Error::TableReferenced {
                     table_name: builder.dialect().stored_object_name_last(&owner.name),
+                    schema_name: diagnostic_table_schema(&builder, owner)?,
                 });
             }
 
@@ -10912,6 +11094,7 @@ impl ParserDB {
             return Err(crate::errors::Error::ColumnAlreadyExists {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 column_name: builder.dialect().stored_name(&column_def.name),
+                declaration: false,
             });
         }
         let change = InheritedChange::AddColumn;
@@ -11162,9 +11345,11 @@ impl ParserDB {
                     || inheritor_triggers
                     || builder.column_has_outside_dependents(&stored, &declaring, &column))
             {
+                let table = Self::stored_node(&builder, &stored)?;
                 return Err(crate::errors::Error::ColumnReferenced {
                     table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                     column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
+                    schema_name: diagnostic_table_schema(&builder, table)?,
                 });
             }
             if !readers.is_empty() {
@@ -11275,6 +11460,7 @@ impl ParserDB {
             return Err(crate::errors::Error::ColumnAlreadyExists {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 column_name: builder.dialect().stored_name(new_column_name),
+                declaration: false,
             });
         }
 
@@ -12254,12 +12440,26 @@ impl ParserDB {
                                     procedure_name: builder
                                         .dialect()
                                         .stored_object_name(&func_desc.name),
+                                    signature: procedures::diagnostic_signature(
+                                        *builder.dialect(),
+                                        func_desc,
+                                        |data_type| {
+                                            domains::format_type_for_builder(&builder, data_type)
+                                        },
+                                    ),
                                 }
                             } else {
                                 crate::errors::Error::DropFunctionNotFound {
                                     function_name: builder
                                         .dialect()
                                         .stored_object_name(&func_desc.name),
+                                    signature: procedures::diagnostic_signature(
+                                        *builder.dialect(),
+                                        func_desc,
+                                        |data_type| {
+                                            domains::format_type_for_builder(&builder, data_type)
+                                        },
+                                    ),
                                 }
                             });
                         };
@@ -12287,6 +12487,7 @@ impl ParserDB {
                                     .dialect()
                                     .stored_object_name_last(&function.name),
                                 extension_name: builder.dialect().stored_name(extension),
+                                signature: procedures::diagnostic_definition(&builder, function),
                             });
                         }
                         if let Some(type_name) =
@@ -12299,6 +12500,16 @@ impl ParserDB {
                                     .dialect()
                                     .stored_object_name_last(&function.name),
                                 type_name: builder.dialect().stored_object_name_last(type_name),
+                                type_description: domains::format_type_for_builder(
+                                    &builder,
+                                    &crate::utils::postgres_types::PgType::of(
+                                        &sqlparser::ast::DataType::Custom(
+                                            type_name.clone(),
+                                            Vec::new(),
+                                        ),
+                                    ),
+                                ),
+                                signature: procedures::diagnostic_definition(&builder, function),
                             });
                         }
                         let refused = |(dependent_kind, dependent_name)| {
@@ -12306,6 +12517,9 @@ impl ParserDB {
                                 function_name: builder
                                     .dialect()
                                     .stored_object_name_last(&function.name),
+                                signature: procedures::diagnostic_definition(&builder, function),
+                                procedure: metadata.kind() == FunctionKind::Procedure,
+                                dropping_object: None,
                                 dependent_kind,
                                 dependent_name,
                             }

@@ -112,6 +112,7 @@ pub(super) fn create_view(
     if node.materialized && node.or_replace {
         return Err(Error::MaterializedViewCannotBeReplaced {
             view_name: builder.dialect().stored_object_name_last(&node.name),
+            written_token: "MATERIALIZED".to_string(),
         });
     }
     if node.materialized && node.temporary {
@@ -122,6 +123,7 @@ pub(super) fn create_view(
     if !node.materialized && node.if_not_exists {
         return Err(Error::ViewIfNotExistsUnsupported {
             view_name: builder.dialect().stored_object_name_last(&node.name),
+            written_token: "NOT".to_string(),
         });
     }
 
@@ -278,6 +280,7 @@ fn refuse_repeated_columns(
             Err(Error::ColumnAlreadyExists {
                 table_name: builder.dialect().stored_name(view_name),
                 column_name: builder.dialect().stored_spelling(column_name, quoted),
+                declaration: true,
             })
         }
         None => Ok(()),
@@ -399,6 +402,7 @@ pub(super) fn drop_views(
                     return Err(Error::RelationHasDependents {
                         object_kind: expected_kind,
                         object_name: key.name.clone(),
+                        schema_name: relation_schema_for_error(&builder, &key),
                         dependent_kind: dependent.kind,
                         dependent_name: dependent.name,
                     });
@@ -1314,6 +1318,7 @@ fn rename_view_column(
         return Err(Error::ColumnAlreadyExists {
             table_name: builder.dialect().stored_object_name_last(name),
             column_name: builder.dialect().stored_name(new_name),
+            declaration: false,
         });
     }
     let columns: Vec<Ident> = names
@@ -1963,11 +1968,24 @@ pub(super) fn refuse_dependent_views(
         return Err(Error::RelationHasDependents {
             object_kind,
             object_name: object_key.name.clone(),
+            schema_name: relation_schema_for_error(builder, object_key),
             dependent_kind: dependent.kind(),
             dependent_name: dependent.stored_name(*builder.dialect()),
         });
     }
     Ok(())
+}
+
+/// The schema PostgreSQL needs to distinguish `key` from the relation path.
+pub(super) fn relation_schema_for_error(
+    builder: &ParserDBBuilder,
+    key: &RelationKey,
+) -> Option<String> {
+    let name = ObjectName::from(Ident::with_quote('"', &key.name));
+    let visible = builder
+        .relation_reached(&name)
+        .is_some_and(|(_, (schema, quoted))| identifiers_match(schema, quoted, &key.schema, true));
+    (!visible).then(|| key.schema.clone())
 }
 
 /// Removes the views and functions a `CASCADE` takes along with the relation

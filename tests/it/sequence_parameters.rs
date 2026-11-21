@@ -42,7 +42,9 @@ fn row(database: &ParserDB, name: &str) -> String {
 /// Why the schema is refused, for a refusal of a sequence's parameters.
 fn refusal(sql: &str) -> (String, SequenceParameterError) {
     match parse(sql) {
-        Err(Error::InvalidSequenceParameters { sequence_name, reason }) => (sequence_name, reason),
+        Err(Error::InvalidSequenceParameters { sequence_name, reason, .. }) => {
+            (sequence_name, reason)
+        }
         other => panic!("expected refused sequence parameters, got {other:?}"),
     }
 }
@@ -149,19 +151,37 @@ fn parameters_postgresql_refuses_are_refused() {
     );
     assert_eq!(
         refused("CREATE SEQUENCE s INCREMENT 1.5;"),
-        NotABigint { option: "INCREMENT", value: "1.5".to_string() }
+        NotABigint {
+            option: "INCREMENT",
+            value: "1.5".to_string(),
+            refusal: sql_traits::errors::SequenceIntegerRefusal::InvalidInput
+        }
     );
     assert_eq!(
         refused("CREATE SEQUENCE s INCREMENT 9223372036854775808;"),
-        NotABigint { option: "INCREMENT", value: "9223372036854775808".to_string() }
+        NotABigint {
+            option: "INCREMENT",
+            value: "9223372036854775808".to_string(),
+            refusal: sql_traits::errors::SequenceIntegerRefusal::OutOfRange
+        }
     );
     assert_eq!(
         refused("CREATE SEQUENCE s START 1e3;"),
-        NotABigint { option: "START", value: "1e3".to_string() }
+        NotABigint {
+            option: "START",
+            value: "1e3".to_string(),
+            refusal: sql_traits::errors::SequenceIntegerRefusal::InvalidInput
+        }
     );
     assert_eq!(
         refused("CREATE SEQUENCE s START $1;"),
-        NotABigint { option: "START", value: "$1".to_string() }
+        NotABigint {
+            option: "START",
+            value: "$1".to_string(),
+            refusal: sql_traits::errors::SequenceIntegerRefusal::UnexpectedToken {
+                written_token: "$1".to_string()
+            }
+        }
     );
     for misnamed in ["\"INT8\"", "public.int8"] {
         assert_eq!(
@@ -184,13 +204,24 @@ fn a_built_statement_with_a_malformed_number_is_refused() {
             panic!("the template is a CREATE SEQUENCE");
         };
         let written = start.to_string();
+        let expected_refusal = if matches!(&start, Expr::UnaryOp { .. }) {
+            sql_traits::errors::SequenceIntegerRefusal::UnexpectedToken {
+                written_token: "-".to_string(),
+            }
+        } else {
+            sql_traits::errors::SequenceIntegerRefusal::InvalidInput
+        };
         sequence_options[0] = SequenceOptions::StartWith(start, true);
         match ParserDB::from_statements(statements, "test".to_string()) {
-            Err(Error::InvalidSequenceParameters { sequence_name, reason }) => {
+            Err(Error::InvalidSequenceParameters { sequence_name, reason, .. }) => {
                 assert_eq!(sequence_name, "s");
                 assert_eq!(
                     reason,
-                    SequenceParameterError::NotABigint { option: "START", value: written }
+                    SequenceParameterError::NotABigint {
+                        option: "START",
+                        value: written,
+                        refusal: expected_refusal
+                    }
                 );
             }
             other => panic!("expected refused sequence parameters, got {other:?}"),

@@ -116,7 +116,7 @@ fn a_copy_is_neither_dropped_nor_replaced_on_its_own() {
 
     assert!(matches!(
         parse(&format!("{schema} DROP TRIGGER rowtrg ON p1a;")),
-        Err(Error::ClonedTriggerDropped { trigger_name, table_name, parent_table_name })
+        Err(Error::ClonedTriggerDropped { trigger_name, table_name, parent_table_name, .. })
             if trigger_name == "rowtrg" && table_name == "p1a" && parent_table_name == "p1"
     ));
     assert!(matches!(

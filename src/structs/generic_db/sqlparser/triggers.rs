@@ -16,7 +16,7 @@
 //! PostgreSQL also `BEFORE` or `AFTER` it once per statement. It goes with
 //! the view, follows its renames and outlives its replacement.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{
     CreateTable, CreateTrigger, DropTrigger, Ident, ObjectName, TriggerEvent, TriggerObject,
@@ -323,13 +323,32 @@ pub(super) fn drop_trigger(
     let name = trigger.name.clone();
     if metadata.is_clone() {
         let node = ParserDB::stored_node(&builder, &table)?;
+        let key = crate::utils::object_name::stored_table_key(
+            builder.namespaces(),
+            node,
+            builder.identifier_case(),
+        );
         let parent = node.partition_of.as_ref();
+        let parent_key = parent.map(|parent| {
+            let schema = crate::utils::object_name::qualifier_of(parent).named().map_or_else(
+                || builder.namespaces().default_schema().to_string(),
+                |(schema, quoted)| builder.dialect().stored_spelling(schema, quoted),
+            );
+            crate::utils::object_name::RelationKey {
+                schema,
+                name: builder.dialect().stored_object_name_last(parent),
+            }
+        });
         return Err(Error::ClonedTriggerDropped {
             trigger_name: builder.dialect().stored_object_name_last(&name),
             table_name: builder.dialect().stored_spelling(&table.name, table.name_quoted),
             parent_table_name: parent
                 .map(|parent| builder.dialect().stored_object_name_last(parent))
                 .unwrap_or_default(),
+            table_schema: views::relation_schema_for_error(&builder, &key),
+            parent_table_schema: parent_key
+                .as_ref()
+                .and_then(|key| views::relation_schema_for_error(&builder, key)),
         });
     }
     drop_with_clones(&mut builder, &name, &table);

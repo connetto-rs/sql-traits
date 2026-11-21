@@ -26,7 +26,7 @@ const TRIGGER_FUNCTION: &str =
 fn a_column_declared_twice_is_refused() {
     let refused = parse("CREATE TABLE docs (id INT, id INT);");
     assert!(
-        matches!(&refused, Err(Error::ColumnAlreadyExists { table_name, column_name })
+        matches!(&refused, Err(Error::ColumnAlreadyExists { table_name, column_name, declaration: true })
             if table_name == "docs" && column_name == "id"),
         "got {refused:?}"
     );
@@ -112,7 +112,7 @@ fn a_view_exposing_a_column_twice_is_refused() {
     ] {
         let refused = parse(sql);
         assert!(
-            matches!(&refused, Err(Error::ColumnAlreadyExists { table_name, column_name })
+            matches!(&refused, Err(Error::ColumnAlreadyExists { table_name, column_name, declaration: true })
                 if table_name == view && column_name == column),
             "{sql} got {refused:?}"
         );
@@ -873,7 +873,7 @@ fn dropping_a_function_takes_only_the_signature_it_names() {
          DROP FUNCTION f(TEXT);",
     );
     assert!(
-        matches!(&missing, Err(Error::DropFunctionNotFound { function_name }) if function_name == "f"),
+        matches!(&missing, Err(Error::DropFunctionNotFound { function_name, .. }) if function_name == "f"),
         "got {missing:?}"
     );
 }
@@ -924,7 +924,7 @@ fn dropping_a_function_without_an_argument_list_stays_in_its_schema() {
          DROP FUNCTION f;",
     );
     assert!(
-        matches!(&missing, Err(Error::DropFunctionNotFound { function_name }) if function_name == "f"),
+        matches!(&missing, Err(Error::DropFunctionNotFound { function_name, .. }) if function_name == "f"),
         "got {missing:?}"
     );
 }

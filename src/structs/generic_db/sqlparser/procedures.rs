@@ -6,18 +6,89 @@
 //! [`FunctionKind::Procedure`], so the two kinds share one store and one
 //! signature space, as they share `pg_proc`.
 
-use alloc::vec::Vec;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use sqlparser::ast::{
-    CreateFunction, CreateFunctionBody, CreateProcedureBody, FunctionDesc, Ident, ObjectName,
-    OperateFunctionArg, ProcedureParam,
+    ArgMode, CreateFunction, CreateFunctionBody, CreateProcedureBody, FunctionDesc, Ident,
+    ObjectName, OperateFunctionArg, ProcedureParam,
 };
 
 use crate::{
     errors::Error,
     impls::SqlparserDialect,
     structs::{FunctionKind, ParserDBBuilder},
+    utils::{postgres_types::PgType, quote_identifier::quote_identifier},
 };
+
+/// The signature PostgreSQL prints for an unresolved routine reference.
+pub(super) fn diagnostic_signature(
+    dialect: SqlparserDialect,
+    function: &FunctionDesc,
+    format_type: impl Fn(&PgType) -> String,
+) -> Option<String> {
+    function.args.as_ref().map(|arguments| {
+        let mut signature = dialect.stored_object_name(&function.name);
+        append_arguments(&mut signature, arguments, ", ", &format_type);
+        signature
+    })
+}
+
+/// The signature PostgreSQL prints for a stored routine.
+pub(super) fn diagnostic_definition(
+    builder: &ParserDBBuilder,
+    function: &CreateFunction,
+) -> String {
+    let visible = function.name.0.last().is_some_and(|last| {
+        let unqualified = ObjectName(vec![last.clone()]);
+        let arguments = super::function_argument_types(function.args.as_deref());
+        super::routines_on_path(
+            builder,
+            &unqualified,
+            Some(&arguments),
+            super::function_argument_types,
+        )
+        .first()
+        .is_some_and(|position| core::ptr::eq(builder.functions()[*position].0.as_ref(), function))
+    });
+    let mut signature = String::new();
+    let parts = builder.dialect().stored_object_name_parts(&function.name);
+    let first = if visible { parts.len().saturating_sub(1) } else { 0 };
+    for part in &parts[first..] {
+        if !signature.is_empty() {
+            signature.push('.');
+        }
+        signature.push_str(&quote_identifier(part));
+    }
+    append_arguments(
+        &mut signature,
+        function.args.as_deref().unwrap_or_default(),
+        ",",
+        &|data_type| super::domains::format_type_for_builder(builder, data_type),
+    );
+    signature
+}
+
+/// Appends the input argument types of a routine.
+fn append_arguments(
+    signature: &mut String,
+    arguments: &[OperateFunctionArg],
+    separator: &str,
+    format_type: &impl Fn(&PgType) -> String,
+) {
+    signature.push('(');
+    let mut first = true;
+    for argument in arguments.iter().filter(|argument| argument.mode != Some(ArgMode::Out)) {
+        if !first {
+            signature.push_str(separator);
+        }
+        first = false;
+        signature.push_str(&format_type(&PgType::of(&argument.data_type)));
+    }
+    signature.push(')');
+}
 
 /// Whether `dialect` holds procedures, which the dialects following
 /// PostgreSQL's `pg_proc` do. Another engine's procedures share no signature
@@ -45,9 +116,12 @@ pub(super) fn procedure_function(
             CreateFunctionBody::AsBeforeOptions { body, link_symbol }
         }
         CreateProcedureBody::BeginAtomic(block) => CreateFunctionBody::BeginAtomic(block),
-        CreateProcedureBody::As(_) => {
+        CreateProcedureBody::As(statements) => {
+            let written_token =
+                statements.to_string().split_whitespace().next().unwrap_or_default().to_string();
             return Err(Error::ProcedureBodyUnsupported {
                 procedure_name: dialect.stored_object_name_last(&name),
+                written_token,
             });
         }
     };
@@ -91,16 +165,7 @@ pub(super) fn procedure_function(
     })
 }
 
-/// The kind of routine a statement names, by its keyword.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum RoutineKeyword {
-    /// `FUNCTION`, any routine but a procedure.
-    Function,
-    /// `PROCEDURE`, a procedure alone.
-    Procedure,
-    /// `ROUTINE`, any routine.
-    Routine,
-}
+pub(super) use crate::errors::RoutineKeyword;
 
 impl RoutineKeyword {
     /// Whether the keyword reaches a routine of `kind`.
@@ -133,11 +198,19 @@ impl RoutineKeyword {
             Self::Procedure => {
                 Err(Error::NotAProcedure {
                     procedure_name: builder.dialect().stored_object_name(&signature.name),
+                    signature: diagnostic_signature(*builder.dialect(), signature, |data_type| {
+                        super::domains::format_type_for_builder(builder, data_type)
+                    })
+                    .unwrap_or_else(|| builder.dialect().stored_object_name(&signature.name)),
                 })
             }
             Self::Function | Self::Routine => {
                 Err(Error::NotAFunction {
                     function_name: builder.dialect().stored_object_name(&signature.name),
+                    signature: diagnostic_signature(*builder.dialect(), signature, |data_type| {
+                        super::domains::format_type_for_builder(builder, data_type)
+                    })
+                    .unwrap_or_else(|| builder.dialect().stored_object_name(&signature.name)),
                 })
             }
         }
