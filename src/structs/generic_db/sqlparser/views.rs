@@ -110,6 +110,7 @@ pub(super) fn create_view(
     if node.materialized && node.temporary {
         return Err(Error::TemporaryMaterializedView {
             view_name: builder.dialect().stored_object_name_last(&node.name),
+            written_token: "MATERIALIZED".to_string(),
         });
     }
     if !node.materialized && node.if_not_exists {

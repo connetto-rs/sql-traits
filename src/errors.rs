@@ -722,12 +722,17 @@ pub enum InvalidBound {
         expected: usize,
         /// The number of values written.
         found: usize,
+        /// Whether this is the upper bound.
+        upper: bool,
     },
     /// A range bound lists `NULL`.
     NullInRange,
     /// A value follows `MINVALUE` or `MAXVALUE` in a range bound, which takes
     /// only more of the same infinity there.
-    ValueAfterInfinity,
+    ValueAfterInfinity {
+        /// Whether the preceding infinity is `MAXVALUE`.
+        maximum: bool,
+    },
     /// A bound value reads a column.
     ColumnReference,
     /// The partition is the default of a hash-partitioned table.
@@ -756,6 +761,27 @@ pub enum InvalidBound {
         /// The key column's type.
         type_name: String,
     },
+    /// A numeric partition bound exceeds its column's range.
+    ValueOutOfRange {
+        /// The literal's value.
+        value: String,
+        /// PostgreSQL's name for the target type.
+        type_name: String,
+        /// Whether the input is a string literal.
+        quoted: bool,
+    },
+    /// A date or timestamp bound has an out-of-range field.
+    DateTimeOutOfRange {
+        /// The literal's value.
+        value: String,
+    },
+    /// A partition bound has no implicit cast to its column's type.
+    ValueCannotCast {
+        /// PostgreSQL's name for the target type.
+        type_name: String,
+        /// The stored column name.
+        column_name: String,
+    },
 }
 
 impl core::fmt::Display for InvalidBound {
@@ -769,11 +795,11 @@ impl core::fmt::Display for InvalidBound {
                 };
                 write!(f, "it is not a {name} bound")
             }
-            Self::ValueCount { expected, found } => {
+            Self::ValueCount { expected, found, .. } => {
                 write!(f, "it lists {found} values for {expected} key columns")
             }
             Self::NullInRange => f.write_str("a range bound cannot list NULL"),
-            Self::ValueAfterInfinity => {
+            Self::ValueAfterInfinity { .. } => {
                 f.write_str("every value after MINVALUE or MAXVALUE must be the same")
             }
             Self::ColumnReference => f.write_str("a bound cannot read a column"),
@@ -791,6 +817,15 @@ impl core::fmt::Display for InvalidBound {
             Self::EmptyRange => f.write_str("its range is empty"),
             Self::ValueNotOfKeyType { value, type_name } => {
                 write!(f, "`{value}` is not a value of type `{type_name}`")
+            }
+            Self::ValueOutOfRange { value, type_name, .. } => {
+                write!(f, "`{value}` is out of range for type `{type_name}`")
+            }
+            Self::DateTimeOutOfRange { value } => {
+                write!(f, "`{value}` has an out-of-range date/time field")
+            }
+            Self::ValueCannotCast { type_name, column_name } => {
+                write!(f, "the bound cannot be cast to `{type_name}` for column `{column_name}`")
             }
         }
     }
@@ -3484,6 +3519,8 @@ pub enum Error {
     TemporaryMaterializedView {
         /// The stored view name.
         view_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error("Materialized view `{view_name}` cannot read temporary relation `{relation_name}`.")]
     /// Error indicating that a materialized view's definition reads a
@@ -3506,6 +3543,8 @@ pub enum Error {
         referenced_table: String,
         /// Whether the declaring table is the temporary one.
         host_is_temporary: bool,
+        /// Whether the declaring table is unlogged.
+        host_is_unlogged: bool,
     },
     #[error(
         "Foreign key of permanent table `{host_table}` cannot reference unlogged table `{referenced_table}`: constraints on permanent tables may reference only permanent tables."
@@ -3521,6 +3560,9 @@ pub enum Error {
         host_table: String,
         /// The stored referenced table name.
         referenced_table: String,
+        /// The requested persistence for an alteration, or `None` for a foreign
+        /// key declaration.
+        set_unlogged: Option<bool>,
     },
     #[error("Table `{table_name}` cannot be both temporary and unlogged.")]
     /// Error indicating that an unlogged table is declared temporary or placed
@@ -3532,6 +3574,10 @@ pub enum Error {
     UnloggedTemporaryTable {
         /// The stored table name.
         table_name: String,
+        /// Whether `TEMP` was written explicitly beside `UNLOGGED`.
+        explicit_temporary: bool,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error("Partitioned table `{table_name}` cannot be unlogged.")]
     /// Error indicating that `CREATE UNLOGGED TABLE` declares a partitioned
@@ -3549,6 +3595,8 @@ pub enum Error {
         table_name: String,
         /// What fixes the table's persistence.
         reason: FixedPersistence,
+        /// Whether the statement requests `SET UNLOGGED`.
+        unlogged: bool,
     },
     #[error("Cannot change persistence of table `{table_name}` twice in one statement.")]
     /// Error indicating that one `ALTER TABLE` changes a table's persistence
@@ -3577,6 +3625,9 @@ pub enum Error {
         table_name: String,
         /// The stored parent relation name.
         parent_name: String,
+        /// `Some` for a partition, with `true` for attachment and `false` for
+        /// creation.
+        partition: Option<bool>,
     },
     #[error(
         "Temporary table `{table_name}` cannot be a partition of permanent relation `{parent_name}`."
@@ -3589,6 +3640,8 @@ pub enum Error {
         table_name: String,
         /// The stored parent relation name.
         parent_name: String,
+        /// Whether the partition is being attached.
+        attach: bool,
     },
     #[error(
         "Table `{table_name}` cannot be a partition of `{parent_name}`, which is not partitioned."
@@ -3731,6 +3784,8 @@ pub enum Error {
     PartitionCommandNotAlone {
         /// The stored table name.
         table_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     /// PostgreSQL requires a relation rename to be its statement's only action.
     #[error("A rename on relation `{relation_name}` must be the only action of its statement.")]
@@ -3746,6 +3801,8 @@ pub enum Error {
         table_name: String,
         /// The stored parent relation name.
         parent_name: String,
+        /// Whether an existing table is being altered.
+        altering: bool,
     },
     #[error(
         "Column `{column_name}` named in the partition key of table `{table_name}` does not exist."
@@ -3757,6 +3814,8 @@ pub enum Error {
         table_name: String,
         /// The stored column name.
         column_name: String,
+        /// Whether the name is read inside an expression.
+        expression: bool,
     },
     #[error(
         "Generated column `{column_name}` cannot be part of the partition key of table `{table_name}`."
@@ -3795,6 +3854,8 @@ pub enum Error {
     UniqueConstraintOverExpressionPartitionKey {
         /// The stored table name.
         table_name: String,
+        /// The kind of constraint requiring uniqueness.
+        constraint: KeyConstraint,
     },
     #[error(
         "Partition `{partition_name}` of table `{table_name}` cannot take its bound because {reason}."
@@ -5359,12 +5420,12 @@ mod tests {
                 "it is not a hash bound",
             ),
             (
-                InvalidBound::ValueCount { expected: 1, found: 2 },
+                InvalidBound::ValueCount { expected: 1, found: 2, upper: false },
                 "it lists 2 values for 1 key columns",
             ),
             (InvalidBound::NullInRange, "a range bound cannot list NULL"),
             (
-                InvalidBound::ValueAfterInfinity,
+                InvalidBound::ValueAfterInfinity { maximum: false },
                 "every value after MINVALUE or MAXVALUE must be the same",
             ),
             (InvalidBound::ColumnReference, "a bound cannot read a column"),

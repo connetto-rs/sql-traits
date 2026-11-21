@@ -6,11 +6,12 @@ use alloc::string::String;
 pub use sqlstate::SqlState;
 use sqlstate::pg;
 
-use super::{Error, LookupError};
+use super::{AttachIndexRefusal, Error, LookupError};
 use crate::utils::quote_identifier::quote_identifier;
 
 mod keys_triggers_grants;
 mod lookup_columns;
+mod persistence_partitions;
 mod roles_functions_schemas;
 mod types_settings;
 mod views_constraints_functions;
@@ -57,6 +58,17 @@ fn relation_name(name: &str, schema: Option<&str>) -> String {
     match schema {
         Some(schema) => format!("{}.{name}", quote_identifier(schema)),
         None => name,
+    }
+}
+
+/// The keywords that declare a constraint of `kind`, as PostgreSQL's
+/// messages print them.
+const fn constraint_keyword(kind: super::KeyConstraint) -> &'static str {
+    match kind {
+        super::KeyConstraint::PrimaryKey => "PRIMARY KEY",
+        super::KeyConstraint::Unique => "UNIQUE",
+        super::KeyConstraint::Exclusion => "EXCLUDE",
+        super::KeyConstraint::ForeignKey => "FOREIGN KEY",
     }
 }
 
@@ -502,42 +514,6 @@ impl Error {
             | Self::OperatorRequiredBySystem { .. }
             | Self::OperatorReferenced { .. }
             | Self::OperatorAttributeAlreadySet { .. }
-            | Self::TemporaryRelationInPermanentSchema { .. }
-            | Self::TemporaryMaterializedView { .. }
-            | Self::PartitionCommandNotAlone { .. }
-            | Self::MaterializedViewReadsTemporaryRelation { .. }
-            | Self::ForeignKeyCrossesTemporaryStorage { .. }
-            | Self::ForeignKeyReferencesUnloggedTable { .. }
-            | Self::UnloggedTemporaryTable { .. }
-            | Self::UnloggedPartitionedTable { .. }
-            | Self::PersistenceNotChangeable { .. }
-            | Self::PersistenceChangedTwice { .. }
-            | Self::StorageParametersOnPartitionedTable { .. }
-            | Self::PermanentRelationInheritsTemporary { .. }
-            | Self::TemporaryPartitionOfPermanent { .. }
-            | Self::ParentNotPartitioned { .. }
-            | Self::PartitionedTableInherits { .. }
-            | Self::ParentRepeated { .. }
-            | Self::DefaultOnInheritedGeneratedColumn { .. }
-            | Self::InheritsFromPartitionedTable { .. }
-            | Self::InheritanceChildMismatch { .. }
-            | Self::InheritanceChangeOnPartition { .. }
-            | Self::InheritanceChangeOnPartitioned { .. }
-            | Self::CircularInheritance { .. }
-            | Self::NotAParentOf { .. }
-            | Self::NotAPartitionOf { .. }
-            | Self::DetachConcurrentlyInTransaction { .. }
-            | Self::DetachConcurrentlyWithDefault { .. }
-            | Self::NoDetachPending { .. }
-            | Self::InheritsFromPartition { .. }
-            | Self::PartitionKeyColumnNotFound { .. }
-            | Self::GeneratedColumnInPartitionKey { .. }
-            | Self::ListPartitionKeyHasManyColumns { .. }
-            | Self::UniqueConstraintMissesPartitionKey { .. }
-            | Self::UniqueConstraintOverExpressionPartitionKey { .. }
-            | Self::PartitionBoundInvalid { .. }
-            | Self::PartitionBoundOverlaps { .. }
-            | Self::PartitionNotAttachable { .. }
             | Self::AlterActionUnsupportedOnRelation { action: None, .. }
             | Self::GenerationExpressionNotDroppable { .. }
             | Self::DatabaseOutsideSqlite { .. }
@@ -555,11 +531,55 @@ impl Error {
             | Self::AdoptedIndexAlreadyConstrained { .. }
             | Self::AdoptedIndexOnPartitionedTable
             | Self::AdoptedIndexSorting { .. }
-            | Self::IndexRequiredByConstraint { .. }
-            | Self::IndexRequiredByParent { .. }
-            | Self::IndexHasDependentConstraints { .. }
-            | Self::AttachIndexNotSupported { .. }
-            | Self::AttachIndexRefused { .. } => None,
+            | Self::IndexRequiredByConstraint { .. } => None,
+            Self::IndexRequiredByParent { index_name, parent_index_name } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop index {} because index {} requires it",
+                        quote_identifier(index_name),
+                        quote_identifier(parent_index_name)
+                    ),
+                ))
+            }
+            Self::IndexHasDependentConstraints { index_name } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop index {} because other objects depend on it",
+                        quote_identifier(index_name)
+                    ),
+                ))
+            }
+            Self::AttachIndexNotSupported { index_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "ALTER action ATTACH PARTITION cannot be performed on relation {}",
+                        quoted(index_name)
+                    ),
+                ))
+            }
+            Self::AttachIndexRefused { index_name, parent_index_name, reason } => {
+                Some(PostgresError::new(
+                    match reason {
+                        AttachIndexRefusal::NotOnPartition { .. }
+                        | AttachIndexRefusal::AttachedElsewhere
+                        | AttachIndexRefusal::PartitionHasIndex { .. } => {
+                            pg::OBJECT_NOT_IN_PREREQUISITE_STATE
+                        }
+                        AttachIndexRefusal::DefinitionsDiffer
+                        | AttachIndexRefusal::ConstraintMissing { .. } => {
+                            pg::INVALID_OBJECT_DEFINITION
+                        }
+                    },
+                    format!(
+                        "cannot attach index {} as a partition of index {}",
+                        quoted(index_name),
+                        quoted(parent_index_name)
+                    ),
+                ))
+            }
             Self::ForeignKeyCannotBeImplemented { constraint_name, .. } => {
                 Some(PostgresError::new(
                     pg::DATATYPE_MISMATCH,
@@ -581,6 +601,290 @@ impl Error {
             Self::GitError(..) => None,
             #[cfg(feature = "std")]
             Self::IoError(..) => None,
+            Self::TemporaryRelationInPermanentSchema { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    "cannot create temporary relation in non-temporary schema",
+                ))
+            }
+            Self::TemporaryMaterializedView { written_token, .. }
+            | Self::PartitionCommandNotAlone { written_token, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!("syntax error at or near {}", quoted(written_token)),
+                ))
+            }
+            Self::MaterializedViewReadsTemporaryRelation { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "materialized views must not use temporary tables or views",
+                ))
+            }
+            Self::ForeignKeyCrossesTemporaryStorage {
+                host_is_temporary, host_is_unlogged, ..
+            } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    if *host_is_temporary {
+                        "constraints on temporary tables may reference only temporary tables"
+                    } else if *host_is_unlogged {
+                        "constraints on unlogged tables may reference only permanent or unlogged tables"
+                    } else {
+                        "constraints on permanent tables may reference only permanent tables"
+                    },
+                ))
+            }
+            Self::ForeignKeyReferencesUnloggedTable {
+                host_table,
+                referenced_table,
+                set_unlogged,
+            } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    match set_unlogged {
+                        None => {
+                            "constraints on permanent tables may reference only permanent tables"
+                                .into()
+                        }
+                        Some(true) => {
+                            format!(
+                                "could not change table {} to unlogged because it references logged table {}",
+                                quoted(referenced_table),
+                                quoted(host_table)
+                            )
+                        }
+                        Some(false) => {
+                            format!(
+                                "could not change table {} to logged because it references unlogged table {}",
+                                quoted(host_table),
+                                quoted(referenced_table)
+                            )
+                        }
+                    },
+                ))
+            }
+            Self::UnloggedTemporaryTable { explicit_temporary, written_token, .. } => {
+                Some(if *explicit_temporary {
+                    PostgresError::new(
+                        pg::SYNTAX_ERROR,
+                        format!("syntax error at or near {}", quoted(written_token)),
+                    )
+                } else {
+                    PostgresError::new(
+                        pg::INVALID_TABLE_DEFINITION,
+                        "only temporary relations may be created in temporary schemas",
+                    )
+                })
+            }
+            Self::UnloggedPartitionedTable { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "partitioned tables cannot be unlogged",
+                ))
+            }
+            Self::PersistenceNotChangeable { table_name, reason, unlogged } => {
+                Some(persistence_partitions::persistence(table_name, *reason, *unlogged))
+            }
+            Self::PersistenceChangedTwice { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "cannot change persistence setting twice",
+                ))
+            }
+            Self::StorageParametersOnPartitionedTable { .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    "cannot specify storage parameters for a partitioned table",
+                ))
+            }
+            Self::PermanentRelationInheritsTemporary { parent_name, partition, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    match partition {
+                        None => {
+                            format!(
+                                "cannot inherit from temporary relation {}",
+                                quoted(parent_name)
+                            )
+                        }
+                        Some(attach) => {
+                            format!(
+                                "cannot {} a permanent relation as partition of temporary relation {}",
+                                if *attach { "attach" } else { "create" },
+                                quoted(parent_name)
+                            )
+                        }
+                    },
+                ))
+            }
+            Self::TemporaryPartitionOfPermanent { parent_name, attach, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "cannot {} a temporary relation as partition of permanent relation {}",
+                        if *attach { "attach" } else { "create" },
+                        quoted(parent_name)
+                    ),
+                ))
+            }
+            Self::ParentNotPartitioned { parent_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    format!("{} is not partitioned", quoted(parent_name)),
+                ))
+            }
+            Self::PartitionedTableInherits { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    "cannot create partitioned table as inheritance child",
+                ))
+            }
+            Self::ParentRepeated { parent_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_TABLE,
+                    format!(
+                        "relation {} would be inherited from more than once",
+                        quoted(parent_name)
+                    ),
+                ))
+            }
+            Self::DefaultOnInheritedGeneratedColumn { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_COLUMN_DEFINITION,
+                    format!(
+                        "column {} inherits from generated column but specifies default",
+                        quoted(column_name)
+                    ),
+                ))
+            }
+            Self::InheritsFromPartitionedTable { parent_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("cannot inherit from partitioned table {}", quoted(parent_name)),
+                ))
+            }
+            Self::InheritanceChildMismatch { table_name, reason, .. } => {
+                Some(persistence_partitions::shape(table_name, reason))
+            }
+            Self::InheritanceChangeOnPartition { .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    "cannot change inheritance of a partition",
+                ))
+            }
+            Self::InheritanceChangeOnPartitioned { .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    "cannot change inheritance of partitioned table",
+                ))
+            }
+            Self::CircularInheritance { .. } => {
+                Some(PostgresError::new(pg::DUPLICATE_TABLE, "circular inheritance not allowed"))
+            }
+            Self::NotAParentOf { table_name, parent_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!(
+                        "relation {} is not a parent of relation {}",
+                        quoted(parent_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::NotAPartitionOf { table_name, partition_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!(
+                        "relation {} is not a partition of relation {}",
+                        quoted(partition_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::DetachConcurrentlyInTransaction { .. } => {
+                Some(PostgresError::new(
+                    pg::ACTIVE_SQL_TRANSACTION,
+                    "ALTER TABLE ... DETACH CONCURRENTLY cannot run inside a transaction block",
+                ))
+            }
+            Self::DetachConcurrentlyWithDefault { .. } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cannot detach partitions concurrently when a default partition exists",
+                ))
+            }
+            Self::NoDetachPending { partition_name, .. } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("cannot complete detaching partition {}", quoted(partition_name)),
+                ))
+            }
+            Self::InheritsFromPartition { parent_name, altering, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    if *altering {
+                        "cannot inherit from a partition".into()
+                    } else {
+                        format!("cannot inherit from partition {}", quoted(parent_name))
+                    },
+                ))
+            }
+            Self::PartitionKeyColumnNotFound { column_name, expression, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_COLUMN,
+                    if *expression {
+                        format!("column {} does not exist", quoted(column_name))
+                    } else {
+                        format!(
+                            "column {} named in partition key does not exist",
+                            quoted(column_name)
+                        )
+                    },
+                ))
+            }
+            Self::GeneratedColumnInPartitionKey { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    "cannot use generated column in partition key",
+                ))
+            }
+            Self::ListPartitionKeyHasManyColumns { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    "cannot use \"list\" partition strategy with more than one column",
+                ))
+            }
+            Self::UniqueConstraintMissesPartitionKey { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "unique constraint on partitioned table must include all partitioning columns",
+                ))
+            }
+            Self::UniqueConstraintOverExpressionPartitionKey { constraint, .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "unsupported {} constraint with partition key definition",
+                        constraint_keyword(*constraint)
+                    ),
+                ))
+            }
+            Self::PartitionBoundInvalid { partition_name, reason, .. } => {
+                Some(persistence_partitions::bound(partition_name, reason))
+            }
+            Self::PartitionBoundOverlaps { partition_name, other_partition, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    format!(
+                        "partition {} would overlap partition {}",
+                        quoted(partition_name),
+                        quoted(other_partition)
+                    ),
+                ))
+            }
+            Self::PartitionNotAttachable { table_name, partition_name, reason } => {
+                Some(persistence_partitions::attachment(table_name, partition_name, reason))
+            }
             Self::NoSchemaSelectedForCollation { .. } => {
                 Some(PostgresError::new(
                     pg::INVALID_SCHEMA_NAME,
