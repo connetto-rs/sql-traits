@@ -777,6 +777,15 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
                     conflicting_table: dialect
                         .stored_spelling(existing.table_name(), existing.table_name_is_quoted()),
                     case,
+                    same_stored_identity: stored_table_key(
+                        namespaces,
+                        table,
+                        IdentifierCase::AsWritten,
+                    ) == stored_table_key(
+                        namespaces,
+                        existing,
+                        IdentifierCase::AsWritten,
+                    ),
                 });
             }
         }

@@ -128,7 +128,13 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         match rule {
             SiteRule::Scope(cursor) => self.resolve_binding(cursor, reference),
             SiteRule::OrderBy(query) => self.resolve_order_by(query, reference),
-            SiteRule::OutputFirst(cursor) => self.resolve_output_first(cursor, reference),
+            SiteRule::OutputFirst(cursor) => {
+                self.resolve_output_first(
+                    cursor,
+                    reference,
+                    crate::errors::AmbiguousLookupSite::DistinctOn,
+                )
+            }
             SiteRule::InputFirst(cursor) => self.resolve_input_first(cursor, reference),
         }
     }

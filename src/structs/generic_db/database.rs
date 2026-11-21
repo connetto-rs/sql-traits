@@ -988,6 +988,7 @@ impl<P: SchemaProfile> GenericDB<P> {
                 object_name: crate::impls::SqlparserDialect::for_error_names(self.dialect())
                     .stored_target_name(target),
                 candidates: rendered,
+                site: crate::errors::AmbiguousLookupSite::Relation,
             });
         }
         Ok(candidates.pop())

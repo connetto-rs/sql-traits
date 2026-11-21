@@ -14,8 +14,6 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "git")]
 use git2::Repository;
-#[cfg(feature = "std")]
-use sqlparser::parser::ParserError;
 use sqlparser::{
     ast::{
         Action, AlterColumnOperation, AlterFunction, AlterFunctionAction, AlterFunctionOperation,
@@ -35,6 +33,7 @@ use sqlparser::{
         VisitMut, Visitor, VisitorMut, helpers::stmt_create_table::CreateTableBuilder,
     },
     dialect::Dialect,
+    parser::ParserError,
 };
 
 use crate::{
@@ -5516,6 +5515,24 @@ fn repeated_index_column(create_table: &CreateTable, name: &Ident) -> crate::err
     }
 }
 
+/// The token that cannot continue a primary-key column name.
+fn invalid_primary_key_token(expression: &Expr) -> Result<String, ParserError> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let written = expression.to_string();
+    let tokens = Tokenizer::new(&sqlparser::dialect::PostgreSqlDialect {}, &written)
+        .tokenize()
+        .map_err(|error| ParserError::TokenizerError(error.to_string()))?;
+    let mut tokens = tokens.into_iter().filter(|token| !matches!(token, Token::Whitespace(_)));
+    let first = tokens.next().ok_or(ParserError::ParserError(written))?;
+    let token = if matches!(&first, Token::Word(word) if !matches!(word.keyword, sqlparser::keywords::Keyword::TRUE | sqlparser::keywords::Keyword::FALSE | sqlparser::keywords::Keyword::NULL | sqlparser::keywords::Keyword::CASE | sqlparser::keywords::Keyword::CAST | sqlparser::keywords::Keyword::ARRAY))
+    {
+        tokens.next().unwrap_or(first)
+    } else {
+        first
+    };
+    Ok(token.to_string())
+}
+
 /// Reads a primary-key entry consisting of one column identifier.
 fn primary_key_column<'expression>(
     expression: &'expression Expr,
@@ -5527,6 +5544,7 @@ fn primary_key_column<'expression>(
         _ => {
             Err(crate::errors::Error::InvalidPrimaryKey {
                 table_name: dialect.stored_object_name_last(&table.name),
+                written_token: invalid_primary_key_token(expression)?,
                 reason: format!(
                     "primary key entries must be plain columns, found expression `{expression}`"
                 ),

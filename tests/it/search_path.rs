@@ -282,10 +282,7 @@ fn an_entry_postgresql_rejects_is_refused() {
         let result =
             ParserDB::parse::<PostgreSqlDialect>(&format!("SET search_path = app, {value};"));
         assert!(
-            matches!(
-                result,
-                Err(Error::IdentifierLookupError(LookupError::InvalidObjectName { .. }))
-            ),
+            matches!(result, Err(Error::IdentifierLookupError(LookupError::InvalidSetting { .. }))),
             "{value}: {result:?}"
         );
     }

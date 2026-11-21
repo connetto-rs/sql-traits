@@ -53,7 +53,12 @@ impl TriggerLike for CreateTrigger {
             Some(
                 relation @ (Relation::Table(_) | Relation::ForeignTable(_) | Relation::View(_)),
             ) => Ok(relation),
-            Some(Relation::MaterializedView(_) | Relation::Sequence(_)) | None => {
+            Some(Relation::MaterializedView(_) | Relation::Sequence(_)) => {
+                Err(LookupError::TriggerRelationWrongKind {
+                    object_name: database.dialect().stored_object_name_last(&self.table_name),
+                })
+            }
+            None => {
                 Err(LookupError::RelationNotFound {
                     object_name: database.dialect().stored_object_name(&self.table_name),
                 })
