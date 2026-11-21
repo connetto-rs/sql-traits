@@ -2033,11 +2033,11 @@ mod tests {
         let db =
             parse_with::<SQLiteDialect>("CREATE TABLE t (a TEXT COLLATE NOCASE COLLATE RTRIM);");
         let column = column_named(&db, "a");
-        let ColumnCollation::Named(collation) = column.collation(&db).expect("collation metadata")
-        else {
-            panic!("expected a named collation");
-        };
-        assert_eq!(collation.name().name(), "RTRIM");
+        let collation = column.collation(&db).expect("collation metadata");
+        assert!(
+            matches!(&collation, ColumnCollation::Named(named) if named.name().name() == "RTRIM"),
+            "{collation:?}"
+        );
     }
 
     #[test]
