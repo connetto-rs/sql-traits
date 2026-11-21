@@ -81,8 +81,9 @@ pub(crate) fn float4_option(value: &Expr) -> Option<f32> {
 
 /// The value C's `strtod` reads from the start of `text`, which sqlparser
 /// tokenized as a number. That is the hexadecimal digits behind `0x`, or else
-/// the longest decimal mantissa with an optional exponent, and zero when no
-/// digit starts it.
+/// the longest decimal mantissa with an optional exponent. The tokenizer keeps
+/// an exponent marker only when a digit follows it and its sign, so every
+/// marker the prefix reaches starts an exponent.
 fn strtod_prefix(text: &str) -> f64 {
     if let Some(hexadecimal) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         return hexadecimal
@@ -99,11 +100,7 @@ fn strtod_prefix(text: &str) -> f64 {
         end = digits_from(end + 1);
     }
     if matches!(bytes.get(end), Some(b'e' | b'E')) {
-        let exponent_start = end + 1 + usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-')));
-        let exponent_end = digits_from(exponent_start);
-        if exponent_end > exponent_start {
-            end = exponent_end;
-        }
+        end = digits_from(end + 1 + usize::from(matches!(bytes.get(end + 1), Some(b'+' | b'-'))));
     }
     text[..end].parse().unwrap_or(0.0)
 }
