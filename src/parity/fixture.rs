@@ -419,7 +419,7 @@ static EMBEDDED: &[Embedded] = &embedded![
     "grant_without_update" known,
     "insert_only_grant" known,
     "jsonb_numeric_owner",
-    "membership_under_rls" known,
+    "membership_under_rls",
     "partitioned" known,
     "policy_for_role_without_privilege",
     "restrictive_to_role",
