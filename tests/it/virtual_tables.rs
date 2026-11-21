@@ -48,6 +48,31 @@ fn sqlite(sql: &str) -> Result<ParserDB, Error> {
     ParseOptions::default().with_identifier_case(IdentifierCase::Folded).parse::<SQLiteDialect>(sql)
 }
 
+#[test]
+fn generic_virtual_table_duplicates_are_lookup_conflicts() {
+    for sql in [
+        "CREATE VIRTUAL TABLE docs USING fts5(body);
+         CREATE VIRTUAL TABLE docs USING fts5(body);",
+        "CREATE VIRTUAL TABLE docs USING fts5(body);
+         CREATE TABLE docs (body TEXT);",
+        "CREATE TABLE docs (body TEXT);
+         CREATE VIRTUAL TABLE docs USING fts5(body);",
+        "CREATE VIRTUAL TABLE docs USING fts5(body);
+         CREATE VIRTUAL TABLE docs USING fts5(body, unknown_option = 1);",
+    ] {
+        let refused = ParserDB::parse::<sqlparser::dialect::GenericDialect>(sql);
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::IdentifierLookupError(
+                    sql_traits::errors::LookupError::TableLookupConflict { .. }
+                ))
+            ),
+            "got {refused:?}"
+        );
+    }
+}
+
 fn table<'db>(db: &'db ParserDB, name: &str) -> &'db <ParserDB as DatabaseLike>::Table {
     db.table_by_target(TargetName::new(name, false), IdentifierCase::Folded)
         .expect("unambiguous lookup")
