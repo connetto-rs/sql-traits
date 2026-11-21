@@ -91,6 +91,7 @@ mod fuzz_crashes;
 mod generated_column_key_actions;
 mod generated_constraint_names;
 mod generated_index_names;
+mod generated_key_name_collisions;
 mod golden_fingerprints;
 mod granted_columns;
 mod grantors;

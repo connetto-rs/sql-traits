@@ -4880,6 +4880,16 @@ fn index_name_holder(
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
+    standalone_index_name_holder(builder, name, schema)
+        .or_else(|| constraint_index_name_holder(builder, name, schema))
+}
+
+/// Finds a named index created independently of a table constraint.
+fn standalone_index_name_holder(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: SchemaQualifier<'_>,
+) -> Option<ObjectKind> {
     let namespaces = builder.namespaces();
     let case = builder.identifier_case();
     if builder
@@ -4898,6 +4908,17 @@ fn index_name_holder(
     {
         return Some(ObjectKind::Index);
     }
+    None
+}
+
+/// Finds the index of a named primary key or unique constraint.
+fn constraint_index_name_holder(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: SchemaQualifier<'_>,
+) -> Option<ObjectKind> {
+    let namespaces = builder.namespaces();
+    let case = builder.identifier_case();
     builder
         .unique_indices()
         .iter()
@@ -4988,6 +5009,20 @@ fn relation_name_holder(
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
+    non_constraint_relation_name_holder(builder, name, schema)
+        .or_else(|| constraint_index_name_holder(builder, name, schema))
+        .or_else(|| {
+            constraint_names::index_name_held(builder, name, schema)
+                .then_some(ObjectKind::UniqueIndex)
+        })
+}
+
+/// Finds a schema relation whose name is independent of a table constraint.
+fn non_constraint_relation_name_holder(
+    builder: &ParserDBBuilder,
+    name: &Ident,
+    schema: SchemaQualifier<'_>,
+) -> Option<ObjectKind> {
     let case = builder.identifier_case();
     let table = builder.tables().iter().find(|(table, _, _)| {
         case.identifiers_match(
@@ -5011,11 +5046,7 @@ fn relation_name_holder(
     }
     view_name_holder(builder, name, schema)
         .or_else(|| sequence_name_holder(builder, name, schema))
-        .or_else(|| index_name_holder(builder, name, schema))
-        .or_else(|| {
-            constraint_names::index_name_held(builder, name, schema)
-                .then_some(ObjectKind::UniqueIndex)
-        })
+        .or_else(|| standalone_index_name_holder(builder, name, schema))
         // Of the user-defined types only a composite takes a relation name.
         .or_else(|| user_defined_types::composite_name_holder(builder, name, schema))
 }
@@ -5206,23 +5237,17 @@ fn validate_access_targets_against_builder(
     Ok(())
 }
 
-/// Returns whether a table constraint was declared under `name`.
-///
-/// PostgreSQL spells the name as a constraint name while MySQL spells some of
-/// them as an index name, and sqlparser keeps the two in separate fields. A
-/// constraint declared without a name has no name to be found by.
-/// The names PostgreSQL gave the constraints of the stored table that the
-/// statement left unnamed.
-fn generated_constraint_names<'builder>(
+/// The names reserved by the stored table's installed constraints.
+fn recorded_constraint_names<'builder>(
     builder: &'builder ParserDBBuilder,
     stored: &StoredTable,
-) -> &'builder [crate::structs::metadata::GeneratedConstraintName] {
+) -> &'builder [crate::structs::metadata::RecordedConstraintName] {
     let case = builder.identifier_case();
     builder
         .tables()
         .iter()
         .find(|(table, _, _)| stored.matches(table, case))
-        .map_or(&[], |(_, metadata, _)| metadata.generated_constraint_names())
+        .map_or(&[], |(_, metadata, _)| metadata.recorded_constraint_names())
 }
 
 /// The name the statement wrote for a table constraint.
@@ -5930,7 +5955,7 @@ impl ParserDB {
         position: usize,
     ) -> Option<Cow<'db, str>> {
         let recorded =
-            self.table_metadata(table).map_or(&[][..], TableMetadata::generated_constraint_names);
+            self.table_metadata(table).map_or(&[][..], TableMetadata::recorded_constraint_names);
         constraint_names::names(table, recorded, self.identifier_case())
             .into_iter()
             .filter(|(slot, _)| {
@@ -5951,7 +5976,7 @@ impl ParserDB {
         column: &Ident,
     ) -> Option<Cow<'db, str>> {
         let recorded =
-            self.table_metadata(table).map_or(&[][..], TableMetadata::generated_constraint_names);
+            self.table_metadata(table).map_or(&[][..], TableMetadata::recorded_constraint_names);
         constraint_names::names(table, recorded, self.identifier_case())
             .into_iter()
             .find(|(slot, _)| {
@@ -6797,7 +6822,7 @@ impl ParserDB {
         replica_identity::follow_rebuild(
             &mut metadata,
             &previous_node,
-            previous_metadata.generated_constraint_names(),
+            previous_metadata.recorded_constraint_names(),
             &replacement,
             builder.identifier_case(),
         );
@@ -6808,7 +6833,7 @@ impl ParserDB {
 
         let check_names = constraint_names::check_names(
             &previous_node,
-            previous_metadata.generated_constraint_names(),
+            previous_metadata.recorded_constraint_names(),
         );
         let (detached_indices, mut carried) = builder.take_table_derived_objects(
             &stored.name,
@@ -6904,8 +6929,8 @@ impl ParserDB {
             &previous_node.constraints,
             &replacement.constraints,
         ));
-        metadata.set_generated_constraint_names(constraint_names::follow(
-            previous_metadata.generated_constraint_names(),
+        metadata.set_recorded_constraint_names(constraint_names::follow(
+            previous_metadata.recorded_constraint_names(),
             previous_node,
             replacement,
             removed,
@@ -6937,7 +6962,7 @@ impl ParserDB {
     ) {
         let names = constraint_names::exclusion_names(
             previous,
-            previous_metadata.generated_constraint_names(),
+            previous_metadata.recorded_constraint_names(),
         );
         for ((exclusion, name), calls) in constraint_names::exclusions(previous)
             .zip(names)
@@ -6964,7 +6989,7 @@ impl ParserDB {
             })
             .collect();
         let check_names =
-            constraint_names::check_names(replacement, metadata.generated_constraint_names());
+            constraint_names::check_names(replacement, metadata.recorded_constraint_names());
         carried.operators.rebuild(columns, check_names);
     }
 
@@ -7659,7 +7684,7 @@ impl ParserDB {
     ) {
         let names = constraint_names::exclusion_names(
             create_table,
-            table_metadata.generated_constraint_names(),
+            table_metadata.recorded_constraint_names(),
         );
         let exclusion_calls = constraint_names::exclusions(create_table)
             .zip(names)
@@ -7817,7 +7842,7 @@ impl ParserDB {
         column: &Ident,
     ) -> String {
         let case = builder.identifier_case();
-        constraint_names::names(node, generated_constraint_names(builder, stored), case)
+        constraint_names::names(node, recorded_constraint_names(builder, stored), case)
             .into_iter()
             .find(|(slot, _)| {
                 slot.not_null_of().is_some_and(|held| case_idents_match(held, column, case))
@@ -8086,7 +8111,7 @@ impl ParserDB {
         if let Some(name) = table_constraint_name(constraint)
             && constraint_names::locate(
                 Self::stored_node(builder, stored)?,
-                generated_constraint_names(builder, stored),
+                recorded_constraint_names(builder, stored),
                 name,
                 builder.identifier_case(),
             )
@@ -8155,7 +8180,7 @@ impl ParserDB {
         let node = Self::stored_node(&builder, &stored)?;
         let key = constraint_names::locate(
             node,
-            generated_constraint_names(&builder, &stored),
+            recorded_constraint_names(&builder, &stored),
             name,
             builder.identifier_case(),
         )
@@ -8195,7 +8220,7 @@ impl ParserDB {
         let node = Self::stored_node(&builder, stored)?;
         match constraint_names::locate(
             node,
-            generated_constraint_names(&builder, stored),
+            recorded_constraint_names(&builder, stored),
             name,
             builder.identifier_case(),
         ) {
@@ -10510,10 +10535,16 @@ impl ParserDB {
         // SQLite reads the names of a permanent object in its own database
         // alone, so the path narrows for the statement and widens after it.
         let mut whole_search_path: Option<Vec<(String, bool)>> = None;
+        let mut naming_order = constraint_names::CreationOrder::CreateTable;
         for statement in statements {
             // What the previous statement created is named before this one can
             // refer to it.
-            constraint_names::name_pending(&mut builder);
+            constraint_names::name_pending(&mut builder, naming_order)?;
+            naming_order = if matches!(statement, Statement::AlterTable(_)) {
+                constraint_names::CreationOrder::AlterTable
+            } else {
+                constraint_names::CreationOrder::CreateTable
+            };
             if tracks_session_roles(dialect)
                 && let Some(change) =
                     SessionChange::of(&statement, dialect.hex_strings_may_be_integers())?
@@ -11913,7 +11944,10 @@ impl ParserDB {
                     }
                     // PostgreSQL sets the replica identity in its last pass.
                     if !replica_identities.is_empty() {
-                        constraint_names::name_pending(&mut builder);
+                        constraint_names::name_pending(
+                            &mut builder,
+                            constraint_names::CreationOrder::AlterTable,
+                        )?;
                     }
                     for identity in &replica_identities {
                         builder = replica_identity::set(
@@ -13219,7 +13253,7 @@ impl ParserDB {
         if let Some(search_path) = whole_search_path {
             builder = builder.with_search_path(search_path);
         }
-        constraint_names::name_pending(&mut builder);
+        constraint_names::name_pending(&mut builder, naming_order)?;
         Ok(transactions::Catalog {
             builder,
             postgres: active_postgres_catalog,

@@ -696,6 +696,7 @@ fn generated_key_name(
 ) -> Ident {
     let name = generated_names::index_name_on_table(builder, child, columns, label, |candidate| {
         taken.iter().any(|held| super::idents_match(held, candidate))
+            || super::constraint_names::constraint_name_held(builder, child, &candidate.value)
     });
     taken.push(name.clone());
     name
