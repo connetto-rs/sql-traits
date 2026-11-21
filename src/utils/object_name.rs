@@ -1104,15 +1104,39 @@ pub(crate) fn resolve_target_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
 where
     I: Iterator<Item = (&'path str, bool)>,
 {
+    resolve_table_handle_on_search_path(
+        namespaces,
+        tables,
+        target,
+        search_path,
+        case,
+        claimed,
+        |table| table,
+    )
+}
+
+/// Resolves a table while preserving the caller's storage handle.
+fn resolve_table_handle_on_search_path<'a, 'path, Table: TableLike, Handle, Path>(
+    namespaces: Namespaces,
+    tables: impl Iterator<Item = &'a Handle>,
+    target: &TargetName<'_>,
+    search_path: impl Fn() -> Path,
+    case: IdentifierCase,
+    claimed: impl Fn(&RelationKey) -> bool,
+    table_of: impl Fn(&Handle) -> &Table,
+) -> Result<Option<&'a Handle>, LookupError>
+where
+    Path: Iterator<Item = (&'path str, bool)>,
+{
     resolve_relation_on_search_path(
         namespaces,
         tables,
         target,
         search_path,
         case,
-        stored_table_key,
+        |namespaces, handle, case| stored_table_key(namespaces, table_of(handle), case),
         claimed,
-        render_table_candidate,
+        |handle| render_table_candidate(table_of(handle)),
     )
 }
 
@@ -1321,15 +1345,14 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
-    resolve_relation_on_search_path(
+    resolve_table_handle_on_search_path(
         namespaces,
         tables,
         &target_name_of_idents(schema_ident, table_ident),
         search_path,
         case,
-        |namespaces, table, case| stored_table_key(namespaces, table.as_ref(), case),
         claimed,
-        |table| render_table_candidate(table.as_ref()),
+        alloc::sync::Arc::as_ref,
     )
 }
 
