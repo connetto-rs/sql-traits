@@ -26,8 +26,8 @@ use sqlparser::{
     ast::{
         Action, ArgMode, ConstraintReferenceMatchKind, CreatePolicyCommand, CreatePolicyType,
         CreateRuleAction, CreateRuleEvent, Expr, FunctionBehavior, FunctionCalledOnNull,
-        FunctionDefinitionSetParam, FunctionSecurity, Grantee, Owner, Query, ReferentialAction,
-        Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
+        FunctionDefinitionSetParam, FunctionSecurity, GeneratedExpressionMode, Grantee, Owner,
+        Query, ReferentialAction, Statement, TriggerEvent, TriggerObjectKind, TriggerPeriod,
     },
     dialect::{Dialect, GenericDialect},
     parser::Parser,
@@ -807,6 +807,10 @@ impl ColumnLike for MemoryColumn {
     }
 
     fn generation_expression(&self) -> Option<&Expr> {
+        None
+    }
+
+    fn generation_storage(&self, _database: &Self::DB) -> Option<GeneratedExpressionMode> {
         None
     }
 

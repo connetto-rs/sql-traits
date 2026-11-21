@@ -3,7 +3,9 @@
 
 use alloc::{borrow::Cow, string::ToString};
 
-use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable, DataType, Expr, ObjectNamePart};
+use sqlparser::ast::{
+    ColumnDef, ColumnOption, CreateTable, DataType, Expr, GeneratedExpressionMode, ObjectNamePart,
+};
 
 use crate::{
     errors::{LookupError, ObjectKind},
@@ -253,6 +255,26 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
                 ColumnOption::Generated { generation_expr, .. } => generation_expr.as_ref(),
                 _ => None,
             }
+        })
+    }
+
+    fn generation_storage(&self, database: &Self::DB) -> Option<GeneratedExpressionMode> {
+        self.attribute().options.iter().find_map(|option| {
+            let ColumnOption::Generated { generation_expr: Some(_), generation_expr_mode, .. } =
+                &option.option
+            else {
+                return None;
+            };
+            generation_expr_mode.or_else(|| {
+                matches!(
+                    database.dialect(),
+                    SqlparserDialect::SQLite
+                        | SqlparserDialect::MySql
+                        | SqlparserDialect::PostgreSql
+                        | SqlparserDialect::Generic
+                )
+                .then_some(GeneratedExpressionMode::Virtual)
+            })
         })
     }
 
@@ -1807,6 +1829,156 @@ mod tests {
             );
             assert!(<&_ as ColumnLike>::is_serial(&seq, &db));
             assert!(Arc::new(seq.clone()).is_serial(&db));
+        }
+    }
+
+    mod generation_storage {
+        use sqlparser::{
+            ast::GeneratedExpressionMode::{self, Stored, Virtual},
+            dialect::{
+                Dialect, DuckDbDialect, GenericDialect, MySqlDialect, PostgreSqlDialect,
+                SQLiteDialect,
+            },
+        };
+
+        use super::{Arc, ColumnLike, column_named, parse_with};
+
+        fn storages<D: Dialect + Default + 'static, const N: usize>(
+            sql: &str,
+            names: [&str; N],
+        ) -> [Option<GeneratedExpressionMode>; N] {
+            let db = parse_with::<D>(sql);
+            names.map(|name| column_named(&db, name).generation_storage(&db))
+        }
+
+        /// Matches `pragma_table_xinfo`, `hidden = 2` virtual and `hidden = 3`
+        /// stored.
+        #[test]
+        fn sqlite_reads_written_and_omitted_modes_in_every_table_shape() {
+            let names = [
+                "base",
+                "short_default",
+                "long_default",
+                "short_virtual",
+                "long_virtual",
+                "short_stored",
+                "long_stored",
+            ];
+            for suffix in ["", " WITHOUT ROWID", " STRICT", " STRICT, WITHOUT ROWID"] {
+                assert_eq!(
+                    storages::<SQLiteDialect, 7>(
+                        &format!(
+                            "CREATE TABLE t (
+                                 base INTEGER PRIMARY KEY,
+                                 short_default INT AS (base + 1),
+                                 long_default INT GENERATED ALWAYS AS (base + 1),
+                                 short_virtual INT AS (base + 1) VIRTUAL,
+                                 long_virtual INT GENERATED ALWAYS AS (base + 1) VIRTUAL,
+                                 short_stored INT AS (base + 1) STORED,
+                                 long_stored INT GENERATED ALWAYS AS (base + 1) STORED
+                             ){suffix};"
+                        ),
+                        names,
+                    ),
+                    [
+                        None,
+                        Some(Virtual),
+                        Some(Virtual),
+                        Some(Virtual),
+                        Some(Virtual),
+                        Some(Stored),
+                        Some(Stored)
+                    ],
+                    "suffix {suffix:?}"
+                );
+            }
+        }
+
+        /// A schema cannot tell the empty table SQLite needs for a stored
+        /// addition.
+        #[test]
+        fn sqlite_reads_columns_added_by_alter_table() {
+            assert_eq!(
+                storages::<SQLiteDialect, 6>(
+                    "CREATE TABLE t (base INT);
+                     ALTER TABLE t ADD COLUMN short_default INT AS (base + 1);
+                     ALTER TABLE t ADD COLUMN long_default INT GENERATED ALWAYS AS (base + 1);
+                     ALTER TABLE t ADD COLUMN short_virtual INT AS (base + 1) VIRTUAL;
+                     ALTER TABLE t ADD COLUMN long_virtual INT GENERATED ALWAYS AS (base + 1) VIRTUAL;
+                     ALTER TABLE t ADD COLUMN short_stored INT AS (base + 1) STORED;
+                     ALTER TABLE t ADD COLUMN long_stored INT GENERATED ALWAYS AS (base + 1) STORED;",
+                    [
+                        "short_default",
+                        "long_default",
+                        "short_virtual",
+                        "long_virtual",
+                        "short_stored",
+                        "long_stored"
+                    ],
+                ),
+                [
+                    Some(Virtual),
+                    Some(Virtual),
+                    Some(Virtual),
+                    Some(Virtual),
+                    Some(Stored),
+                    Some(Stored)
+                ]
+            );
+        }
+
+        #[test]
+        fn mysql_and_generic_default_to_virtual() {
+            let sql = "CREATE TABLE t (
+                           base INT,
+                           omitted INT AS (base + 1),
+                           stored INT GENERATED ALWAYS AS (base + 1) STORED
+                       );";
+            let names = ["base", "omitted", "stored"];
+            let expected = [None, Some(Virtual), Some(Stored)];
+            assert_eq!(storages::<MySqlDialect, 3>(sql, names), expected);
+            assert_eq!(storages::<GenericDialect, 3>(sql, names), expected);
+        }
+
+        #[test]
+        fn postgres_reads_stored_and_nothing_for_identity_or_serial() {
+            assert_eq!(
+                storages::<PostgreSqlDialect, 4>(
+                    "CREATE TABLE t (
+                         sequenced serial,
+                         identity INT GENERATED ALWAYS AS IDENTITY,
+                         computed INT GENERATED ALWAYS AS (1) STORED,
+                         plain INT
+                     );",
+                    ["sequenced", "identity", "computed", "plain"],
+                ),
+                [None, None, Some(Stored), None]
+            );
+        }
+
+        #[test]
+        fn undefined_dialect_answers_only_a_written_mode() {
+            let db = parse_with::<DuckDbDialect>(
+                "CREATE TABLE t (
+                     base INT,
+                     omitted INT GENERATED ALWAYS AS (base + 1),
+                     written INT GENERATED ALWAYS AS (base + 1) VIRTUAL
+                 );",
+            );
+            let omitted = column_named(&db, "omitted");
+            assert!(omitted.generation_expression().is_some());
+            assert_eq!(omitted.generation_storage(&db), None);
+            assert_eq!(column_named(&db, "written").generation_storage(&db), Some(Virtual));
+        }
+
+        #[test]
+        fn reader_forwards_through_reference_and_arc() {
+            let db = parse_with::<SQLiteDialect>(
+                "CREATE TABLE t (base INT, cached INT AS (base + 1) STORED);",
+            );
+            let cached = column_named(&db, "cached");
+            assert_eq!(<&_ as ColumnLike>::generation_storage(&cached, &db), Some(Stored));
+            assert_eq!(Arc::new(cached.clone()).generation_storage(&db), Some(Stored));
         }
     }
 
