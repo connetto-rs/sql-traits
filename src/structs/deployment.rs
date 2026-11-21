@@ -593,9 +593,14 @@ impl JsonField {
 /// A type is a promise that the text is that type's canonical rendering, so
 /// casting it to the type renames nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case", deny_unknown_fields)
+)]
 pub enum SettingValue {
     /// The caller's identity.
-    Caller(DataType),
+    Caller(#[cfg_attr(feature = "serde", serde(with = "spelled_type"))] DataType),
     /// The identity of a principal of type `kind` the request acts as or
     /// for beside the caller, such as the app installation acting for the
     /// caller.
@@ -603,13 +608,15 @@ pub enum SettingValue {
         /// The type of the principal, such as `installation`.
         kind: String,
         /// The type of the identity.
+        #[cfg_attr(feature = "serde", serde(with = "spelled_type"))]
         identity: DataType,
     },
     /// One value the request carries.
-    Scalar(DataType),
+    Scalar(#[cfg_attr(feature = "serde", serde(with = "spelled_type"))] DataType),
     /// A set of values the request carries.
     Set {
         /// The type of every element.
+        #[cfg_attr(feature = "serde", serde(with = "spelled_type"))]
         element: DataType,
         /// How the elements are packed into the text.
         packing: SetPacking,
@@ -658,11 +665,44 @@ impl SettingValue {
 
 /// How a set's elements are packed into one setting's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum SetPacking {
     /// Joined by a non-empty delimiter, read with `string_to_array`.
     Delimited(String),
     /// A JSON array, read with `jsonb_array_elements_text`.
     JsonArray,
+}
+
+/// A [`DataType`] as the SQL spelling PostgreSQL reads.
+#[cfg(feature = "serde")]
+mod spelled_type {
+    use alloc::string::String;
+
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+    use sqlparser::ast::DataType;
+
+    use crate::utils::postgres_types::parse_data_type;
+
+    /// Writes `data_type` as its SQL spelling.
+    pub(super) fn serialize<S: Serializer>(
+        data_type: &DataType,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(data_type)
+    }
+
+    /// Reads a type from its SQL spelling.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<DataType, D::Error> {
+        let spelling = String::deserialize(deserializer)?;
+        parse_data_type(&spelling)
+            .ok_or_else(|| D::Error::custom(format_args!("{spelling:?} is not a PostgreSQL type")))
+    }
 }
 
 /// Whether a request always sets a [`SessionSetting`].

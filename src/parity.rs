@@ -43,7 +43,7 @@ mod fixture;
 
 pub use answer::{Answer, Direction, Engine, direction};
 pub use case::{
-    Caller, Case, CaseError, ColumnCommand, Config, MissingKeyColumn, Shape, Table, Write,
+    Caller, Case, CaseError, ColumnCommand, Config, MissingKeyColumn, Setting, Shape, Table, Write,
     identifier, text_of,
 };
 pub use fixture::{

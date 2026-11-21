@@ -5,6 +5,7 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 
@@ -28,6 +29,16 @@ pub struct Caller {
     pub role: String,
     /// The value of every session setting the deployment declares.
     pub settings: BTreeMap<String, String>,
+}
+
+/// A session setting a case's deployment declares.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setting {
+    /// The setting's name, as policies read it with `current_setting`.
+    pub name: String,
+    /// What the setting holds.
+    pub value: SettingValue,
 }
 
 /// A statement shape a case measures, each asked of `OpenFGA` as its own
@@ -101,6 +112,10 @@ pub struct Table {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// The session settings the deployment declares, a text caller
+    /// `app.user_id` and comma-packed text subjects `app.subjects` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Vec<Setting>>,
     /// The measured tables.
     pub tables: Vec<Table>,
     /// The callers, the first one's role being the login role.
@@ -294,29 +309,40 @@ impl Config {
         roles
     }
 
-    /// The deployment the translators read, declaring connetto's caller and
-    /// packed subject inputs, logging in as the first caller's role and acting
-    /// as every role a caller names.
+    /// The deployment the translators read, declaring [`Self::settings`],
+    /// logging in as the first caller's role and acting as every role a
+    /// caller names.
     ///
     /// # Errors
     ///
-    /// Returns a [`DeploymentError`] when no caller is declared.
+    /// Returns a [`DeploymentError`] when no caller is declared or
+    /// [`Deployment::new`] or [`SessionSetting::value`] refuses a declared
+    /// setting.
     pub fn deployment(&self) -> Result<Deployment, DeploymentError> {
         let login = self.callers.first().ok_or(DeploymentError::NoActingRole)?;
-        Deployment::new(
-            login.role.as_str(),
-            self.acting_roles(),
-            [
-                SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))?,
-                SessionSetting::value(
-                    "app.subjects",
-                    SettingValue::Set {
-                        element: DataType::Text,
-                        packing: SetPacking::Delimited(",".into()),
-                    },
-                )?,
-            ],
-        )
+        let settings = match &self.settings {
+            Some(settings) => {
+                settings
+                    .iter()
+                    .map(|setting| {
+                        SessionSetting::value(setting.name.as_str(), setting.value.clone())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            None => {
+                vec![
+                    SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))?,
+                    SessionSetting::value(
+                        "app.subjects",
+                        SettingValue::Set {
+                            element: DataType::Text,
+                            packing: SetPacking::Delimited(",".into()),
+                        },
+                    )?,
+                ]
+            }
+        };
+        Deployment::new(login.role.as_str(), self.acting_roles(), settings)
     }
 }
 

@@ -1,47 +1,13 @@
-[sqlite]
-refusal = "4, the declared text caller setting is cast to `UUID` by the policy"
-
 [[sqlite.row]]
-caller = "a"
-row = "udocs:1"
-statement = 'SELECT "id" FROM "udocs"'
-direction = "refused"
-finding = "4, the declared text caller setting is cast to `UUID` by the policy"
-
-[[sqlite.row]]
-caller = "a"
-row = "udocs:2"
-statement = 'SELECT "id" FROM "udocs"'
-direction = "refused"
-finding = "4, the declared text caller setting is cast to `UUID` by the policy"
-
-[[sqlite.row]]
-caller = "b"
-row = "udocs:1"
-statement = 'SELECT "id" FROM "udocs"'
-direction = "refused"
-finding = "4, the declared text caller setting is cast to `UUID` by the policy"
-
-[[sqlite.row]]
-caller = "b"
-row = "udocs:2"
-statement = 'SELECT "id" FROM "udocs"'
-direction = "refused"
-finding = "4, the declared text caller setting is cast to `UUID` by the policy"
-
-[openfga]
-refusal = "4, the `UUID` caller cast falls below the translation confidence threshold"
-
-[[openfga.row]]
 caller = "a"
 row = "udocs:1"
 statement = 'SELECT "id" FROM "udocs"'
 direction = "narrower"
-finding = "4, the `UUID` caller cast falls below the translation confidence threshold"
+finding = "4, the `UUID` caller setting reaches SQLite as text while the column stores `UUID` as a blob"
 
-[[openfga.row]]
+[[sqlite.row]]
 caller = "b"
 row = "udocs:2"
 statement = 'SELECT "id" FROM "udocs"'
 direction = "narrower"
-finding = "4, the `UUID` caller cast falls below the translation confidence threshold"
+finding = "4, the `UUID` caller setting reaches SQLite as text while the column stores `UUID` as a blob"
