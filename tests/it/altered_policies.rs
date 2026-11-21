@@ -171,13 +171,20 @@ fn the_lookup_folds_the_names_the_two_statements_spell() {
     let folded = altered("ALTER POLICY DOCS_SEL ON DOCS USING (false);");
     assert_eq!(using(&folded, "docs_sel").as_deref(), Some("false"));
 
-    for tail in [
-        "ALTER POLICY \"DOCS_SEL\" ON docs USING (false);",
-        "ALTER POLICY docs_sel ON \"DOCS\" USING (false);",
+    for (tail, missing_table) in [
+        ("ALTER POLICY \"DOCS_SEL\" ON docs USING (false);", false),
+        ("ALTER POLICY docs_sel ON \"DOCS\" USING (false);", true),
     ] {
         let error = parse(&format!("{GUARDED}{tail}"))
             .expect_err("a quoted name is exact, and neither spells docs_sel on docs");
-        assert!(matches!(&error, Error::AlterPolicyNotFound { .. }), "got {error:?} for {tail}");
+        assert!(
+            matches!(
+                (&error, missing_table),
+                (Error::AlterPolicyNotFound { .. }, false)
+                    | (Error::AlterPolicyTableNotFound { .. }, true)
+            ),
+            "got {error:?} for {tail}",
+        );
     }
 }
 
@@ -192,7 +199,7 @@ fn a_statement_naming_a_table_the_policy_is_not_on_is_refused() {
     .expect_err("b carries no policy called p");
 
     assert!(
-        matches!(&error, Error::AlterPolicyNotFound { policy_name } if policy_name == "p"),
+        matches!(&error, Error::AlterPolicyNotFound { policy_name, .. } if policy_name == "p"),
         "got {error:?}"
     );
 }
@@ -344,7 +351,7 @@ fn a_table_name_no_lookup_can_denote_matches_no_policy() {
     .expect_err("a three-part name denotes no table");
 
     assert!(
-        matches!(&error, Error::AlterPolicyNotFound { policy_name } if policy_name == "docs_sel"),
+        matches!(&error, Error::IdentifierLookupError(sql_traits::errors::LookupError::InvalidObjectName { object_name, .. }) if object_name == "catalog.public.docs"),
         "got {error:?}"
     );
 }

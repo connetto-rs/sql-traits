@@ -37,6 +37,8 @@ pub(super) enum OnDependents<'statement> {
         key_name: &'statement str,
         /// The name of the table holding it.
         table_name: &'statement str,
+        /// Whether a `DROP INDEX` drops the key.
+        dropping_index: bool,
     },
     /// Take each of them along, which is what `CASCADE` does.
     Cascade,
@@ -595,7 +597,7 @@ impl ParserDB {
             .into_iter()
             .filter(|dependence| removed.contains(&dependence.key))
             .collect();
-        if let OnDependents::Refuse { key_name, table_name } = on_dependents {
+        if let OnDependents::Refuse { key_name, table_name, dropping_index } = on_dependents {
             if let Some(dependence) = dependents.first() {
                 return Err(Error::KeyReferenced {
                     key_name: key_name.into(),
@@ -603,6 +605,7 @@ impl ParserDB {
                     referencing_table: builder
                         .dialect()
                         .stored_spelling(&dependence.host.name, dependence.host.name_quoted),
+                    dropping_index,
                 });
             }
             return drop(builder);

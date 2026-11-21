@@ -100,6 +100,7 @@ pub(super) fn apply_like(
             } else {
                 builder.dialect().stored_object_name(source_name)
             },
+            object_kind,
             table_name: builder.dialect().stored_object_name_last(&create_table.name),
         });
     };
