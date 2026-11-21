@@ -352,3 +352,26 @@ fn additional_equality_families() {
         assert_outcome(sql, true, 1);
     }
 }
+
+/// Each inherited column key retains the name of its matching parent key.
+#[test]
+fn inherited_column_key_names() {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE referenced (id integer PRIMARY KEY);
+CREATE TABLE parent (first_key integer REFERENCES referenced, second_key integer REFERENCES referenced) PARTITION BY RANGE (first_key);
+CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (10);",
+    ).unwrap();
+    for table_name in ["parent", "child"] {
+        let table = database
+            .table_by_target(TargetName::new(table_name, false), IdentifierCase::AsWritten)
+            .unwrap()
+            .unwrap();
+        let mut names: Vec<_> = table
+            .foreign_keys(&database)
+            .unwrap()
+            .map(|key| key.constraint_name(&database).unwrap().unwrap().into_owned())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["parent_first_key_fkey", "parent_second_key_fkey"]);
+    }
+}
