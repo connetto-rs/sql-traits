@@ -11741,7 +11741,7 @@ impl ParserDB {
                         &mut active_postgres_catalog,
                     )?;
                 }
-                Statement::DropDomain(DropDomain { if_exists, name, drop_behavior }) => {
+                Statement::DropDomain(DropDomain { if_exists, names, drop_behavior }) => {
                     let cascade = drop_behavior == Some(DropBehavior::Cascade);
                     // An operator or cast naming the type, its array or its
                     // domain keeps it from dropping without `CASCADE`.
@@ -11749,7 +11749,7 @@ impl ParserDB {
                         |name: &ObjectName| active_postgres_catalog.dependent_naming_type(name);
                     let (next_builder, drop) = user_defined_types::drop_types(
                         builder,
-                        core::slice::from_ref(&name),
+                        &names,
                         if_exists,
                         cascade,
                         domains::DropSpelling::Domain,

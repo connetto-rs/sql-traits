@@ -417,6 +417,33 @@ fn dropping_a_missing_domain_is_refused_unless_if_exists() {
 }
 
 #[test]
+fn drop_domain_drops_every_named_domain() {
+    let database = parse(
+        "CREATE DOMAIN span AS interval;
+         CREATE DOMAIN other AS real;
+         CREATE DOMAIN kept AS real;
+         DROP DOMAIN span, other;",
+    )
+    .expect("both domains exist");
+    assert_eq!(domains(&database), ["-.kept AS REAL"]);
+    let database = parse(
+        "CREATE DOMAIN span AS interval;
+         DROP DOMAIN IF EXISTS missing, span;",
+    )
+    .expect("IF EXISTS skips the missing name");
+    assert!(domains(&database).is_empty(), "{:?}", domains(&database));
+    let error = parse(
+        "CREATE DOMAIN span AS interval;
+         DROP DOMAIN span, missing;",
+    )
+    .expect_err("one name is missing");
+    assert!(
+        matches!(&error, Error::DropDomainNotFound { domain_name } if domain_name == "missing"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn dropping_a_catalog_type_as_a_domain_is_refused_even_if_exists() {
     let error = parse("DROP DOMAIN IF EXISTS name;").expect_err("`name` is a catalog type");
     assert!(matches!(error, Error::DropDomainNotFound { .. }), "{error:?}");
