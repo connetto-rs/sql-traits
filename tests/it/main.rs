@@ -170,6 +170,7 @@ mod reference_hierarchies;
 mod referenced_key_drops;
 mod relation_identity;
 mod relation_lookup_identifier_case;
+mod rename_alone;
 mod renamed_table_references;
 mod repeated_key_columns;
 mod replica_identity;

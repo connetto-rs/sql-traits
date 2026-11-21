@@ -3411,6 +3411,12 @@ pub enum Error {
         /// Table the statement alters.
         table_name: String,
     },
+    /// PostgreSQL requires a relation rename to be its statement's only action.
+    #[error("A rename on relation `{relation_name}` must be the only action of its statement.")]
+    RenameCommandNotAlone {
+        /// Relation the statement alters.
+        relation_name: String,
+    },
     #[error("Table `{table_name}` cannot inherit from partition `{parent_name}`.")]
     /// Error indicating that `INHERITS` names a partition, whose columns
     /// belong to the partitioned table it is part of.
