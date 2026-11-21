@@ -855,7 +855,7 @@ fn passes_down(slot: Slot<'_>) -> bool {
 
 /// Whether the constraint in `slot` is backed by an index, whose name it
 /// shares.
-fn backed_by_index(slot: Slot<'_>) -> bool {
+pub(super) fn backed_by_index(slot: Slot<'_>) -> bool {
     match slot {
         Slot::Column { held, .. } => {
             matches!(held.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
@@ -1074,15 +1074,25 @@ fn rename_on(
             .and_then(|position| slot_at(node, position))
             .map_or(slot, |(partner, _)| partner)
     };
-    if slot.declared_name().is_some() {
-        let position = slot.position();
+    let declared = slot.declared_name().is_some();
+    let position = slot.position();
+    let index_renamed = backed_by_index(slot);
+    let mut builder = builder;
+    let case = builder.identifier_case();
+    if index_renamed {
+        let (old, new) = (stored_ident_name(old), stored_ident_name(new));
+        for (_, metadata, _) in
+            builder.tables_mut().iter_mut().filter(|(stored, _, _)| table.matches(stored, case))
+        {
+            super::replica_identity::follow_rename(metadata, &old, &new);
+        }
+    }
+    if declared {
         return ParserDB::replace_table_node(builder, table, |_, node| {
             rename_declared(node, position, new);
             Ok(())
         });
     }
-    let mut builder = builder;
-    let case = builder.identifier_case();
     let name = stored_ident_name(new).into_owned();
     for (_, metadata, _) in
         builder.tables_mut().iter_mut().filter(|(stored, _, _)| table.matches(stored, case))

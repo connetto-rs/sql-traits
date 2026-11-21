@@ -711,6 +711,16 @@ impl TableLike for MemoryTable {
         Ok(false)
     }
 
+    fn replica_identity<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<ReplicaIdentity<'db, Self::DB>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(ReplicaIdentity::Default)
+    }
+
     fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(None)
     }

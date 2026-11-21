@@ -135,8 +135,6 @@ fn operations_over_things_the_model_does_not_describe_change_nothing() {
         // Rewrite rules, whose enablement has nothing to attach to.
         "ALTER TABLE t DISABLE RULE r",
         "ALTER TABLE t ENABLE ALWAYS RULE r",
-        // Replication identity.
-        "ALTER TABLE t REPLICA IDENTITY FULL",
     ];
 
     for tail in ignored {

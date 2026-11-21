@@ -378,6 +378,9 @@ pub enum RequiredValue {
     CoveredByKey,
     /// A parent requires it, so only the parent may lift the requirement.
     EnforcedByParent,
+    /// The index the table uses as its replica identity covers the column, and
+    /// that index identifies every row by a value.
+    InReplicaIdentity,
 }
 
 impl core::fmt::Display for RequiredValue {
@@ -385,7 +388,42 @@ impl core::fmt::Display for RequiredValue {
         f.write_str(match self {
             Self::CoveredByKey => "a key covers it",
             Self::EnforcedByParent => "a parent requires it",
+            Self::InReplicaIdentity => "the index used as replica identity covers it",
         })
+    }
+}
+
+/// Why an index cannot be a table's replica identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ReplicaIdentityRefusal {
+    /// The index is not unique, as an exclusion constraint's never is.
+    NotUnique,
+    /// The index belongs to a `DEFERRABLE` constraint, which checks
+    /// uniqueness only when it chooses to.
+    NotImmediate,
+    /// A key of the index is an expression.
+    Expression,
+    /// The index carries a `WHERE` predicate.
+    Partial,
+    /// The named key column of the index may hold nothing.
+    NullableColumn(String),
+    /// The named key column requires a value only through a `NOT VALID`
+    /// constraint, which `VALIDATE CONSTRAINT` makes usable.
+    UnvalidatedNotNull(String),
+}
+
+impl core::fmt::Display for ReplicaIdentityRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotUnique => f.write_str("it is not unique"),
+            Self::NotImmediate => f.write_str("it is not immediate"),
+            Self::Expression => f.write_str("it is an expression index"),
+            Self::Partial => f.write_str("it is a partial index"),
+            Self::NullableColumn(column) => write!(f, "column `{column}` is nullable"),
+            Self::UnvalidatedNotNull(column) => {
+                write!(f, "the not-null constraint on column `{column}` is not valid")
+            }
+        }
     }
 }
 
@@ -1853,6 +1891,37 @@ pub enum Error {
         column_name: String,
         /// What keeps the requirement in place.
         reason: RequiredValue,
+    },
+    #[error("Index `{index_name}` for table `{table_name}` does not exist.")]
+    /// Error indicating that `ALTER TABLE ... REPLICA IDENTITY USING INDEX`
+    /// named no index of the table's schema.
+    ReplicaIdentityIndexNotFound {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the index, as PostgreSQL stores it.
+        index_name: String,
+    },
+    #[error("`{index_name}` is not an index for table `{table_name}`.")]
+    /// Error indicating that `ALTER TABLE ... REPLICA IDENTITY USING INDEX`
+    /// named an index of another table.
+    ReplicaIdentityIndexOfOtherTable {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the index, as PostgreSQL stores it.
+        index_name: String,
+    },
+    #[error(
+        "Index `{index_name}` of table `{table_name}` cannot be used as replica identity because {reason}."
+    )]
+    /// Error indicating that `ALTER TABLE ... REPLICA IDENTITY USING INDEX`
+    /// named an index of the table that cannot identify a row.
+    ReplicaIdentityIndexRefused {
+        /// Name of the table the statement names.
+        table_name: String,
+        /// Name of the index, as PostgreSQL stores it.
+        index_name: String,
+        /// What makes the index unfit.
+        reason: ReplicaIdentityRefusal,
     },
     #[error(
         "Column `{column_name}` of table `{table_name}` must require a value before it can be given an identity."
@@ -4670,6 +4739,22 @@ mod tests {
         assert_eq!(InheritedChange::SetNotNull.to_string(), "require a value in a column of");
         assert_eq!(RequiredValue::CoveredByKey.to_string(), "a key covers it");
         assert_eq!(RequiredValue::EnforcedByParent.to_string(), "a parent requires it");
+        assert_eq!(
+            RequiredValue::InReplicaIdentity.to_string(),
+            "the index used as replica identity covers it"
+        );
+        assert_eq!(ReplicaIdentityRefusal::NotUnique.to_string(), "it is not unique");
+        assert_eq!(ReplicaIdentityRefusal::NotImmediate.to_string(), "it is not immediate");
+        assert_eq!(ReplicaIdentityRefusal::Expression.to_string(), "it is an expression index");
+        assert_eq!(ReplicaIdentityRefusal::Partial.to_string(), "it is a partial index");
+        assert_eq!(
+            ReplicaIdentityRefusal::NullableColumn("a".into()).to_string(),
+            "column `a` is nullable"
+        );
+        assert_eq!(
+            ReplicaIdentityRefusal::UnvalidatedNotNull("a".into()).to_string(),
+            "the not-null constraint on column `a` is not valid"
+        );
         assert_eq!(FixedPersistence::Temporary.to_string(), "it is temporary");
         assert_eq!(FixedPersistence::Partitioned.to_string(), "it is partitioned");
         assert_eq!(KeyConstraint::PrimaryKey.to_string(), "Primary key");

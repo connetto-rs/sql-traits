@@ -12,11 +12,14 @@ use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
         ActingRole, ColumnPrivilege, ForeignTableSource, ListDatum, ParserDB, PartitionBound,
-        RangeDatum, RevokedPrivilege, TableMetadata, TablePrivileges, VirtualTableSource,
+        RangeDatum, ReplicaIdentity, ReplicaIdentityIndex, RevokedPrivilege, StoredReplicaIdentity,
+        TableMetadata, TablePrivileges, VirtualTableSource,
     },
-    traits::{DatabaseLike, Metadata, PartitionStrategy, TableLike},
+    traits::{DatabaseLike, IndexLike, Metadata, PartitionStrategy, TableLike},
     utils::{
-        identifier_resolution::{identifiers_match, is_temporary_schema, stored_ident_name},
+        identifier_resolution::{
+            identifiers_match, is_temporary_schema, stored_ident_name, stored_identifier,
+        },
         last_str,
         object_name::{qualifier_of, resolve_bound_table, resolve_bound_table_or_foreign_table},
     },
@@ -400,6 +403,33 @@ impl TableLike for CreateTable {
     #[inline]
     fn has_forced_row_level_security(&self, database: &Self::DB) -> Result<bool, LookupError> {
         Ok(table_metadata(self, database)?.rls_forced())
+    }
+
+    fn replica_identity<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<ReplicaIdentity<'db, Self::DB>, LookupError>
+    where
+        Self: 'db,
+    {
+        let name = match table_metadata(self, database)?.replica_identity() {
+            StoredReplicaIdentity::Default => return Ok(ReplicaIdentity::Default),
+            StoredReplicaIdentity::Nothing => return Ok(ReplicaIdentity::Nothing),
+            StoredReplicaIdentity::Full => return Ok(ReplicaIdentity::Full),
+            StoredReplicaIdentity::Index(None) => return Ok(ReplicaIdentity::Index(None)),
+            StoredReplicaIdentity::Index(Some(name)) => name.as_str(),
+        };
+        if let Some(index) = self.indices(database)?.find(|index| {
+            index.name().is_some_and(|held| stored_identifier(held, index.name_is_quoted()) == name)
+        }) {
+            return Ok(ReplicaIdentity::Index(Some(ReplicaIdentityIndex::Index(index))));
+        }
+        for key in self.unique_indices(database)? {
+            if key.constraint_name(database)?.as_deref() == Some(name) {
+                return Ok(ReplicaIdentity::Index(Some(ReplicaIdentityIndex::UniqueIndex(key))));
+            }
+        }
+        Ok(ReplicaIdentity::Index(None))
     }
 
     #[inline]
