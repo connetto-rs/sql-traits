@@ -107,7 +107,7 @@ fn a_function_binds_only_by_its_exact_argument_types() {
         parse("CREATE OPERATOR app.<<< (FUNCTION = app.eq, LEFTARG = int2, RIGHTARG = int8);")
             .unwrap_err();
     assert!(
-        matches!(&error, Error::OperatorFunctionNotFound { function_name, .. } if function_name.as_ref() == "app.eq"),
+        matches!(&error, Error::OperatorFunctionNotFound { function_name, .. } if function_name.join(".") == "app.eq"),
         "{error:?}"
     );
 }
@@ -134,7 +134,7 @@ fn a_second_definition_is_refused() {
     )
     .unwrap_err();
     assert!(
-        matches!(&error, Error::OperatorAlreadyExists { operator_name } if operator_name.as_ref() == "<<<"),
+        matches!(&error, Error::OperatorAlreadyExists { operator_name, .. } if operator_name.as_ref() == "<<<"),
         "{error:?}"
     );
 }
@@ -300,7 +300,7 @@ fn flags_and_estimators_bind_as_declared() {
     )
     .unwrap_err();
     assert!(
-        matches!(&error, Error::OperatorFunctionNotFound { function_name, .. } if function_name.as_ref() == "nosuch"),
+        matches!(&error, Error::OperatorFunctionNotFound { function_name, .. } if function_name.join(".") == "nosuch"),
         "{error:?}"
     );
 }

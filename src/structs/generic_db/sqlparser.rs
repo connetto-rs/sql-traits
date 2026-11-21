@@ -166,7 +166,9 @@ use default_privileges::{
 pub(crate) use key_nullability::key_excludes_null;
 use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
-use parsed_source::{ParsedSource, SourceText, StatementSource};
+use parsed_source::{
+    ParsedSource, SourceText, StatementSource, respell_written_token, statement_text,
+};
 use postgres_catalog::CatalogName;
 pub(crate) use sqlite_autoindex::SqliteAutoindex;
 pub(crate) use sqlite_index_record::{constraint_index_record, created_index_record};
@@ -1307,6 +1309,7 @@ fn existing_child_column_conflict(
                 .stored_spelling(&parent.name, parent.name_quoted)
                 .into(),
             parent_type: inherited_def.data_type.to_string().into(),
+            origin: crate::errors::InheritedColumnConflict::Addition,
         });
     }
     if child_metadata.postgres_collation_matches(inherited_metadata) != Some(false) {
@@ -1334,6 +1337,7 @@ fn existing_child_column_conflict(
                 |name| builder.dialect().stored_object_name(name),
             )
             .into_boxed_str(),
+        origin: crate::errors::InheritedColumnConflict::Addition,
     })
 }
 
@@ -6354,12 +6358,34 @@ impl ParserDBIngestor {
         Ok(Self { catalog, access_resolution, transaction })
     }
 
+    /// Applies each statement of `source`, parsed from `sql`, in turn. When
+    /// one is refused, the token the refusal reports a syntax error at is
+    /// respelled as that statement writes it.
     fn apply_parsed(self, sql: &str, source: ParsedSource) -> Result<Self, crate::errors::Error> {
         let ParsedSource { statements, comments, line_starts } = source;
         let text = SourceText { sql, line_starts: &line_starts };
-        self.apply_statements(statements.into_iter().map(|(statement, start)| {
-            (statement, Some(StatementSource { comments: &comments, start, text }))
-        }))
+        let starts: Vec<sqlparser::tokenizer::Location> =
+            statements.iter().map(|(_, start)| *start).collect();
+        let dialect = *self.catalog.builder.dialect();
+        let Self { mut catalog, access_resolution, mut transaction } = self;
+        for (position, (statement, start)) in statements.into_iter().enumerate() {
+            catalog = transactions::apply(
+                catalog,
+                &mut transaction,
+                access_resolution,
+                statement,
+                Some(StatementSource { comments: &comments, start, text }),
+                None,
+            )
+            .map_err(|mut error| {
+                if let Some(token) = error.written_token_mut() {
+                    let statement = statement_text(text, start, starts.get(position + 1).copied());
+                    respell_written_token(token, statement, dialect.sqlparser_dialect());
+                }
+                error
+            })?;
+        }
+        Ok(Self { catalog, access_resolution, transaction })
     }
 
     /// Parses `sql` under the ingestor's dialect and applies its statements
@@ -8602,12 +8628,15 @@ impl ParserDB {
                     stored,
                     scope,
                     crate::errors::InheritedChange::AddConstraint,
+                    None,
                 )?;
             }
-            TableConstraint::ForeignKey(_) => {
+            TableConstraint::ForeignKey(foreign_key) => {
                 if scope.only && Self::stored_node(builder, stored)?.partition_by.is_some() {
                     return Err(crate::errors::Error::OnlyForeignKeyOnPartitionedTable {
                         table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
+                        referenced_table: dialect
+                            .stored_object_name_last(&foreign_key.foreign_table),
                     });
                 }
             }
@@ -8644,6 +8673,7 @@ impl ParserDB {
                     if existing_no_inherit != not_null.no_inherit {
                         return Err(crate::errors::Error::NotNullNoInheritStatusChange {
                             table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
+                            set_not_null: false,
                             constraint_name: existing,
                         });
                     }
@@ -8667,6 +8697,7 @@ impl ParserDB {
                         stored,
                         scope,
                         crate::errors::InheritedChange::AddConstraint,
+                        None,
                     )?;
                 }
             }
@@ -8953,9 +8984,12 @@ impl ParserDB {
                 {
                     let table_name =
                         builder.dialect().stored_spelling(&child.name, child.name_quoted);
+                    let reason =
+                        inheritance::constraint_conflict_reason(&builder, node, &copy, false);
                     return Err(crate::errors::Error::InheritedConstraintConflict {
                         table_name,
                         constraint_name: builder.dialect().stored_name(name),
+                        reason,
                     });
                 }
 
@@ -9117,7 +9151,11 @@ impl ParserDB {
         let on_dependents = if cascade {
             referenced_keys::OnDependents::Cascade
         } else {
-            referenced_keys::OnDependents::Refuse { key_name: &key_name, table_name: &table_name }
+            referenced_keys::OnDependents::Refuse {
+                key_name: &key_name,
+                table_name: &table_name,
+                dropping_index: false,
+            }
         };
         Self::drop_keys(builder, &removed, on_dependents, |builder| {
             Self::drop_named_constraint(builder, &stored, scope, name, if_exists)
@@ -9378,6 +9416,7 @@ impl ParserDB {
             return Err(crate::errors::Error::RequiredValueNotDroppable {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 column_name: builder.dialect().stored_name(&not_null.column),
+                constraint_name: None,
                 reason: crate::errors::RequiredValue::CoveredByKey,
             });
         }
@@ -9534,6 +9573,7 @@ impl ParserDB {
             return Err(crate::errors::Error::RequiredValueNotDroppable {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 column_name: builder.dialect().stored_name(written_on),
+                constraint_name: None,
                 reason: crate::errors::RequiredValue::CoveredByKey,
             });
         }
@@ -9837,6 +9877,8 @@ impl ParserDB {
                             .collect::<Vec<_>>()
                             .join(", "),
                     ),
+                    routine_name: builder.dialect().stored_object_name(&func_desc.name),
+                    procedure: routine == RoutineKeyword::Procedure,
                 });
             }
             if found.is_empty() {
@@ -9862,6 +9904,18 @@ impl ParserDB {
             require_alter_schema(builder, &func_desc.name)?;
             return Err(crate::errors::Error::AlterFunctionNotFound {
                 function_name: builder.dialect().stored_object_name(&func_desc.name),
+                argument_types: func_desc.args.as_ref().map(|arguments| {
+                    arguments
+                        .iter()
+                        .filter(|argument| argument.mode != Some(ArgMode::Out))
+                        .map(|argument| {
+                            domains::format_type_for_builder(
+                                builder,
+                                &crate::utils::postgres_types::PgType::of(&argument.data_type),
+                            )
+                        })
+                        .collect()
+                }),
             });
         };
 
@@ -10377,10 +10431,12 @@ impl ParserDB {
         stored: &StoredTable,
         scope: AlterTableScope,
         change: crate::errors::InheritedChange,
+        subject: Option<&Ident>,
     ) -> Result<(), crate::errors::Error> {
         if scope.only && !inheritance::direct_children(builder, stored).is_empty() {
             return Err(crate::errors::Error::OnlyRefusedWithChildren {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                subject_name: subject.map(|name| builder.dialect().stored_name(name)),
                 change,
             });
         }
@@ -10403,6 +10459,7 @@ impl ParserDB {
         if scope.only && has_partitions {
             return Err(crate::errors::Error::OnlyRefusedWithChildren {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                subject_name: None,
                 change,
             });
         }
@@ -10482,12 +10539,13 @@ impl ParserDB {
         }
         if matches!(dialect, SqlparserDialect::PostgreSql)
             && alter_table.operations.len() > 1
-            && alter_table.operations.iter().any(|operation| {
+            && let Some(position) = alter_table.operations.iter().position(|operation| {
                 alter_passes::standalone(operation) == Some(alter_passes::Standalone::Rename)
             })
         {
             return Err(crate::errors::Error::RenameCommandNotAlone {
                 relation_name: dialect.stored_object_name(&alter_table.name),
+                written_token: if position == 0 { "," } else { "RENAME" }.to_string(),
             });
         }
         if alter_table.operations.len() > 1
@@ -11125,7 +11183,7 @@ impl ParserDB {
             });
         }
         let change = InheritedChange::AddColumn;
-        Self::refuse_only_with_children(&builder, &stored, scope, change)?;
+        Self::refuse_only_with_children(&builder, &stored, scope, change, None)?;
 
         let deferred = Self::refuse_unaddable_column_options(&builder, &stored, &mut column_def)?;
         // Named against the schema as it stands, before the column lands.
@@ -11461,6 +11519,7 @@ impl ParserDB {
             &stored,
             scope,
             crate::errors::InheritedChange::RenameColumn,
+            Some(old_column_name),
         )?;
         let from = NamedColumn::of(old_column_name, builder.identifier_case());
         let to = NamedColumn::of(new_column_name, builder.identifier_case());
@@ -11803,6 +11862,7 @@ impl ParserDB {
         {
             return Err(crate::errors::Error::NotNullNoInheritStatusChange {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                set_not_null: true,
                 constraint_name: Self::not_null_requirement_name(
                     &builder,
                     &stored,
@@ -12089,6 +12149,7 @@ impl ParserDB {
                             .dialect()
                             .stored_spelling(&stored.name, stored.name_quoted),
                         column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
+                        constraint_name: None,
                         reason: crate::errors::RequiredValue::CoveredByKey,
                     });
                 }
@@ -12098,6 +12159,9 @@ impl ParserDB {
                             .dialect()
                             .stored_spelling(&stored.name, stored.name_quoted),
                         column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
+                        constraint_name: node.partition_of.is_none().then(|| {
+                            Self::not_null_requirement_name(builder, stored, node, &column.ident())
+                        }),
                         reason: crate::errors::RequiredValue::EnforcedByParent,
                     });
                 }
@@ -13003,6 +13067,13 @@ impl ParserDB {
                         ) {
                             return Err(crate::errors::Error::OperatorRequiredBySystem {
                                 operator_name: operator.name().into(),
+                                signature: operator_ddl::signature(
+                                    &builder,
+                                    &active_postgres_catalog,
+                                    &type_arrays,
+                                    &session_roles,
+                                    operator,
+                                ),
                             });
                         }
 
@@ -14352,8 +14423,25 @@ impl ParserDB {
                             )
                     }) else {
                         require_alter_schema(&builder, &table_name)?;
+                        object_name_identifiers(&table_name)?;
+                        match builder.relation_reached(&table_name) {
+                            Some((ObjectKind::Table, _)) => {}
+                            Some(_) => {
+                                return Err(crate::errors::Error::AlterPolicyRelationNotTable {
+                                    table_name: builder
+                                        .dialect()
+                                        .stored_object_name_last(&table_name),
+                                });
+                            }
+                            None => {
+                                return Err(crate::errors::Error::AlterPolicyTableNotFound {
+                                    table_name: builder.dialect().stored_object_name(&table_name),
+                                });
+                            }
+                        }
                         return Err(crate::errors::Error::AlterPolicyNotFound {
                             policy_name: builder.dialect().stored_name(&name),
+                            table_name: builder.dialect().stored_object_name_last(&table_name),
                         });
                     };
 

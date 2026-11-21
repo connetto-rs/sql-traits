@@ -318,6 +318,7 @@ pub(super) fn refuse_losing_requirement(
             table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
             column_name: builder.dialect().stored_name(column),
             reason: RequiredValue::InReplicaIdentity,
+            constraint_name: None,
         });
     }
     Ok(())

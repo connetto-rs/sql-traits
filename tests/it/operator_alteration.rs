@@ -89,7 +89,7 @@ fn set_refuses_a_link_to_an_absent_operator_and_changes_nothing() {
         parse("ALTER OPERATOR app.<<< (int4, int8) SET (RESTRICT = eqsel, COMMUTATOR = <->);")
             .unwrap_err();
     assert!(
-        matches!(&error, Error::OperatorNotFound { operator_name } if operator_name.as_ref() == "<->"),
+        matches!(&error, Error::OperatorNotFound { operator_name, .. } if operator_name.as_ref() == "<->"),
         "{error:?}"
     );
 }
@@ -265,7 +265,7 @@ fn a_rolled_back_drop_restores_the_operator_and_its_links() {
 fn set_refuses_an_absent_negator_and_the_operator_itself() {
     let error = parse("ALTER OPERATOR app.<<< (int4, int8) SET (NEGATOR = &<);").unwrap_err();
     assert!(
-        matches!(&error, Error::OperatorNotFound { operator_name } if operator_name.as_ref() == "&<"),
+        matches!(&error, Error::OperatorNotFound { operator_name, .. } if operator_name.as_ref() == "&<"),
         "{error:?}"
     );
     let error = parse("ALTER OPERATOR app.<<< (int4, int8) SET (NEGATOR = <<<);").unwrap_err();
@@ -307,7 +307,7 @@ fn set_schema_moves_the_negator_links_to_it() {
 fn a_built_in_operator_is_required_by_the_database_system() {
     let error = parse("DROP OPERATOR IF EXISTS pg_catalog.+ (int4, int4);").unwrap_err();
     assert!(
-        matches!(&error, Error::OperatorRequiredBySystem { operator_name } if operator_name.as_ref() == "+"),
+        matches!(&error, Error::OperatorRequiredBySystem { operator_name, .. } if operator_name.as_ref() == "+"),
         "{error:?}"
     );
     // A built-in moved out of `pg_catalog` stays required.

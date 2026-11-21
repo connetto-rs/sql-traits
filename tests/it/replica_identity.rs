@@ -285,6 +285,7 @@ fn a_key_column_of_the_identity_keeps_its_required_value() {
                     table_name,
                     column_name,
                     reason: RequiredValue::InReplicaIdentity,
+                    constraint_name: None,
                 } if table_name == "t" && column_name == "a"
             ),
             "{sql}"
@@ -324,6 +325,7 @@ fn a_table_below_losing_its_required_value_refuses_while_in_its_identity() {
                     table_name,
                     column_name,
                     reason: RequiredValue::InReplicaIdentity,
+                    constraint_name: None,
                 } if table_name == "c" && column_name == "a"
             ),
             "{sql}"

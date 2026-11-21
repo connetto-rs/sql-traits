@@ -379,6 +379,7 @@ pub(super) fn prepare(
                     &stored,
                     scope,
                     crate::errors::InheritedChange::DropExpression,
+                    Some(column_name),
                 )?;
             }
             let column = NamedColumn::of(column_name, builder.identifier_case());
@@ -407,6 +408,7 @@ pub(super) fn prepare(
                         &stored,
                         scope,
                         crate::errors::InheritedChange::AlterColumnType,
+                        Some(column_name),
                     )?;
                 }
                 AlterColumnOperation::DropExpression { .. } if postgres => {

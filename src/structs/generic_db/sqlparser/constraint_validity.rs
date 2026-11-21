@@ -135,10 +135,16 @@ pub(super) fn merged_copy_validated(
 ) -> Result<bool, Error> {
     let held_validated = is_validated(builder, table, held);
     match held {
-        TableConstraint::Check(_) if arriving_validated && !held_validated => {
+        TableConstraint::Check(check) if arriving_validated && !held_validated => {
             Err(Error::NotValidConstraintConflict {
                 table_name: builder.dialect().stored_spelling(&table.name, table.name_quoted),
                 constraint: held.to_string(),
+                constraint_name: constraint_names::check_name(
+                    builder,
+                    ParserDB::stored_node(builder, table)?,
+                    check,
+                )
+                .unwrap_or_default(),
             })
         }
         TableConstraint::ForeignKey(_) => Ok(held_validated || arriving_validated),
@@ -206,6 +212,7 @@ pub(super) fn validate_constraint(
                 &stored,
                 scope,
                 InheritedChange::ValidateConstraint,
+                None,
             )?;
         }
         let held = held.clone();

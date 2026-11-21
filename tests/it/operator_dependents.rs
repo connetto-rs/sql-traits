@@ -139,7 +139,7 @@ fn assert_held(sql: &str, kind: ObjectKind, name: &str) {
     assert!(
         matches!(
             &result,
-            Err(Error::OperatorReferenced { operator_name, dependent_kind, dependent_name })
+            Err(Error::OperatorReferenced { operator_name, dependent_kind, dependent_name, .. })
                 if &**operator_name == "<<<" && *dependent_kind == kind && dependent_name == name
         ),
         "{sql}\ngot {result:?}"
@@ -650,7 +650,7 @@ fn a_type_change_keeps_the_built_array() {
     assert!(
         matches!(
             &result,
-            Err(Error::OperatorReferenced { operator_name, dependent_kind, dependent_name })
+            Err(Error::OperatorReferenced { operator_name, dependent_kind, dependent_name, .. })
                 if &**operator_name == "=" && *dependent_kind == ObjectKind::CheckConstraint
                     && dependent_name == "public.d.ck"
         ),
