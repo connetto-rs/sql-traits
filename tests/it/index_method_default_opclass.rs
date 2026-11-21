@@ -329,3 +329,140 @@ fn serial_keys_use_integer_classes() {
         );
     }
 }
+
+#[test]
+fn relation_row_types_use_composite_classes() -> Result<(), Error> {
+    let setup = "CREATE TABLE coverage_row (value integer);
+        CREATE TABLE coverage_holder (value coverage_row);";
+    ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{setup} CREATE INDEX coverage_index ON coverage_holder USING hash(value)"
+    ))?;
+    assert!(matches!(
+        ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "{setup} CREATE INDEX coverage_index ON coverage_holder USING gist(value)"
+        )),
+        Err(Error::MissingDefaultOperatorClass { type_name, access_method: "gist" })
+            if type_name == "coverage_row"
+    ));
+    Ok(())
+}
+
+#[test]
+fn nested_array_dimensions_share_one_array_class() -> Result<(), Error> {
+    let setup = "CREATE TABLE coverage_nested (value integer[][]);";
+    ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{setup} CREATE INDEX coverage_index ON coverage_nested USING hash(value)"
+    ))?;
+    assert!(matches!(
+        ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "{setup} CREATE INDEX coverage_index ON coverage_nested USING gist(value)"
+        )),
+        Err(Error::MissingDefaultOperatorClass { type_name, access_method: "gist" })
+            if type_name == "integer[]"
+    ));
+    Ok(())
+}
+
+#[test]
+fn base_type_operator_classes_remain_unknown() -> Result<(), Error> {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TYPE coverage_base;
+         CREATE FUNCTION coverage_input(cstring) RETURNS coverage_base
+             AS 'int4in' LANGUAGE internal IMMUTABLE STRICT;
+         CREATE FUNCTION coverage_output(coverage_base) RETURNS cstring
+             AS 'int4out' LANGUAGE internal IMMUTABLE STRICT;
+         CREATE TYPE coverage_base (
+             INPUT=coverage_input, OUTPUT=coverage_output, INTERNALLENGTH=4,
+             PASSEDBYVALUE, ALIGNMENT=int4
+         );
+         CREATE TABLE coverage_custom (value coverage_base);
+         CREATE INDEX coverage_index ON coverage_custom USING gist(value);",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn shell_cast_operator_classes_remain_unknown() -> Result<(), Error> {
+    ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TYPE coverage_shell;
+         CREATE TABLE coverage_row (value integer);
+         CREATE INDEX coverage_index ON coverage_row USING gist((value::coverage_shell));",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn native_geometric_declarations_use_builtin_names() -> Result<(), Error> {
+    use sqlparser::{
+        ast::{DataType, GeometricTypeKind, Statement},
+        parser::Parser,
+    };
+
+    for (kind, expected) in [
+        (GeometricTypeKind::Point, "point"),
+        (GeometricTypeKind::Line, "line"),
+        (GeometricTypeKind::LineSegment, "lseg"),
+        (GeometricTypeKind::GeometricBox, "box"),
+        (GeometricTypeKind::GeometricPath, "path"),
+        (GeometricTypeKind::Polygon, "polygon"),
+        (GeometricTypeKind::Circle, "circle"),
+    ] {
+        let mut statements =
+            Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE r (value int PRIMARY KEY)")?;
+        for statement in &mut statements {
+            if let Statement::CreateTable(table) = statement {
+                for column in &mut table.columns {
+                    column.data_type = DataType::GeometricType(kind);
+                }
+            }
+        }
+        assert!(matches!(
+            ParserDB::from_statements_with_dialect(
+                statements, "postgres".to_owned(), SqlparserDialect::PostgreSql,
+            ),
+            Err(Error::MissingDefaultOperatorClass { type_name, access_method: "btree" })
+                if type_name == expected
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn runtime_type_qualifiers_keep_operator_classes_unknown() -> Result<(), Error> {
+    use sqlparser::{
+        ast::{
+            DataType, Expr, FunctionArg, FunctionArgExpr, Ident, ObjectNamePart,
+            ObjectNamePartFunction, Statement, Value,
+        },
+        parser::Parser,
+    };
+
+    for sql in [
+        "CREATE TABLE r (value pg_catalog.json PRIMARY KEY)",
+        "CREATE TABLE r (value pg_catalog.json); CREATE INDEX ix ON r USING gist(value)",
+    ] {
+        let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
+        for statement in &mut statements {
+            if let Statement::CreateTable(table) = statement {
+                for column in &mut table.columns {
+                    if let DataType::Custom(name, _) = &mut column.data_type
+                        && let Some(qualifier) = name.0.first_mut()
+                    {
+                        *qualifier = ObjectNamePart::Function(ObjectNamePartFunction {
+                            name: Ident::new("IDENTIFIER"),
+                            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
+                                Value::SingleQuotedString("unknown_schema".to_owned()).into(),
+                            )))],
+                        });
+                    }
+                }
+            }
+        }
+        ParserDB::from_statements_with_dialect(
+            statements,
+            "postgres".to_owned(),
+            SqlparserDialect::PostgreSql,
+        )?;
+    }
+    Ok(())
+}

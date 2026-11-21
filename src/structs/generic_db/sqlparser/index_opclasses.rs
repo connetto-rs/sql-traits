@@ -6,8 +6,8 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    ArrayElemTypeDef, ColumnOption, CreateIndex, CreateTable, DataType, Expr, GeometricTypeKind,
-    Ident, IndexColumn, IndexType, ObjectName, TableConstraint,
+    ArrayElemTypeDef, ColumnOption, CreateIndex, CreateTable, DataType, Expr, Ident, IndexColumn,
+    IndexType, ObjectName, TableConstraint,
 };
 
 use super::{ParserDBBuilder, SqlparserDialect, domains};
@@ -175,32 +175,13 @@ fn btree_missing_class<'name>(
     builder: &ParserDBBuilder,
 ) -> Option<MissingClass<'name>> {
     let builtin = match data_type {
-        DataType::JSON => "json",
-        DataType::GeometricType(kind) => {
-            match kind {
-                GeometricTypeKind::Point => "point",
-                GeometricTypeKind::Line => "line",
-                GeometricTypeKind::LineSegment => "lseg",
-                GeometricTypeKind::GeometricBox => "box",
-                GeometricTypeKind::GeometricPath => "path",
-                GeometricTypeKind::Polygon => "polygon",
-                GeometricTypeKind::Circle => "circle",
-            }
-        }
         DataType::Custom(name, _) => {
             let ident = name.0.last()?.as_ident()?;
             if let Some(position) = domains::named_domain(builder, data_type) {
                 return btree_missing_class(&builder.domains()[position].0.data_type, builder)
                     .map(|_| MissingClass::Domain(ident, position));
             }
-            let reached = match qualifier_of(name) {
-                Qualifier::Absent => domains::reach_type(builder, ident),
-                Qualifier::Named(schema, quoted) => {
-                    domains::reach_in_schema(builder, ident, (schema, quoted))
-                }
-                Qualifier::RunTime => return None,
-            };
-            if !matches!(reached, Some(domains::Reached::Catalog)) {
+            if !matches!(reached_type(name, builder), Some(domains::Reached::Catalog)) {
                 return None;
             }
             [
@@ -234,7 +215,14 @@ fn btree_missing_class<'name>(
                 )
             })?
         }
-        _ => return None,
+        _ => {
+            builtin_data_type_name(data_type).filter(|name| {
+                matches!(
+                    *name,
+                    "json" | "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle"
+                )
+            })?
+        }
     };
     Some(MissingClass::Builtin(builtin))
 }
@@ -435,23 +423,22 @@ fn type_display(data_type: &DataType, builder: &ParserDBBuilder) -> String {
         }
         return format!("{}[]", type_display(element, builder));
     }
-    if let DataType::Custom(name, _) = data_type {
+    if let DataType::Custom(name, _) = data_type
+        && let Some(identifier) = name.0.last().and_then(|part| part.as_ident())
+    {
         if matches!(reached_type(name, builder), Some(domains::Reached::Catalog))
             && let Some(builtin) = builtin_name(data_type)
         {
             return builtin_display(builtin).to_string();
         }
-        return named_display(name, builder);
+        return named_display(name, identifier, builder);
     }
     builtin_name(data_type)
         .map_or_else(|| data_type.to_string(), |name| builtin_display(name).to_string())
 }
 
 /// Qualifies a named type when the search path cannot reach it.
-fn named_display(name: &ObjectName, builder: &ParserDBBuilder) -> String {
-    let Some(identifier) = name.0.last().and_then(|part| part.as_ident()) else {
-        return name.to_string();
-    };
+fn named_display(name: &ObjectName, identifier: &Ident, builder: &ParserDBBuilder) -> String {
     let spelling =
         quote_identifier(&stored_identifier(&identifier.value, identifier.quote_style.is_some()));
     let visible = match (reached_type(name, builder), domains::reach_type(builder, identifier)) {
