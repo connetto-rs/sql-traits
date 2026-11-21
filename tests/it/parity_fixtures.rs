@@ -7,12 +7,17 @@
 #![cfg(feature = "parity-fixtures")]
 #![allow(clippy::expect_used, clippy::panic)]
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use serde_json::json;
 use sql_traits::parity::{
-    Answer, Case, CaseKnown, Direction, DiscrepancyKind, Engine, EngineAnswer, EngineKnown,
-    Fixture, KnownRow, Recorded, RecordedAnswer, Shape, Write, direction, fixtures, text_of,
+    Answer, Case, CaseKnown, ColumnCommand, Direction, DiscrepancyKind, Engine, EngineAnswer,
+    EngineKnown, Fixture, KnownRow, Recorded, RecordedAnswer, Shape, Write, direction, fixtures,
+    text_of,
 };
 
 /// Every embedded case, read and validated.
@@ -335,6 +340,8 @@ fn refusal_parity() {
     assert_eq!(unlisted.len(), 1);
     let text = unlisted[0].to_string();
     assert!(text.contains("partitioned") && text.contains("sqlite"), "{text}");
+    let text = fixture.judge(Engine::Openfga, Some("diverges"), &[])[0].to_string();
+    assert!(text.contains("diverges") && text.contains("openfga"), "{text}");
 }
 
 /// Visibility, write outcomes, translation refusals and execution failures
@@ -347,6 +354,11 @@ fn answer_directions() {
         (Answer::Visible, Answer::Hidden, Some(Direction::Narrower)),
         (Answer::Visible, Answer::Refused("unsupported".into()), Some(Direction::Refused)),
         (Answer::Visible, Answer::Error("failed".into()), Some(Direction::Error)),
+        (
+            Answer::Error("permission denied for table docs".into()),
+            Answer::Hidden,
+            Some(Direction::Error),
+        ),
         (Answer::Hidden, Answer::Hidden, None),
         (Answer::Skipped, Answer::Denied, None),
         (Answer::Rejected("42501".into()), Answer::Denied, None),
@@ -501,4 +513,82 @@ fn composite_key() {
         .row_key(|column| row.get(column).filter(|_| column == "order_id"))
         .expect_err("a row without line_no has no key");
     assert!(error.to_string().contains("no key column line_no"), "{error}");
+}
+
+/// A locking read is measured as a read of its table, after `SELECT`, and
+/// never as a write probe.
+#[test]
+fn locking_reads_are_reads() {
+    let case = named("select_for_update").case;
+    let table = case.table("docs").expect("docs is declared");
+    assert_eq!(case.reads(table).collect::<Vec<_>>(), vec![Shape::Select, Shape::SelectForUpdate]);
+    assert_eq!(case.writes().count(), 0);
+    let composite = named("composite_key").case;
+    let lines = composite.table("lines").expect("lines is declared");
+    assert_eq!(composite.reads(lines).collect::<Vec<_>>(), vec![Shape::Select]);
+    assert_eq!(
+        composite.writes().map(|write| write.shape).collect::<Vec<_>>(),
+        vec![Shape::Update, Shape::Delete, Shape::Insert]
+    );
+}
+
+/// Each write is spelled as the caller runs it and as the table owner runs it
+/// to learn the row it produces, and names the columns each command touches.
+#[test]
+fn write_probes() {
+    let case = named("composite_key").case;
+    let table = case.table("lines").expect("lines is declared");
+    let [update, delete, insert] = case.config.writes.as_slice() else {
+        panic!("composite_key declares an update, a delete and an insert");
+    };
+    let row = json!({ "order_id": 1, "line_no": 2, "owner": "bob" });
+    let key = || vec!["order_id".to_owned(), "line_no".to_owned()];
+    assert_eq!(
+        table.write_statement(insert, None),
+        "INSERT INTO \"lines\" (\"line_no\", \"order_id\", \"owner\", \"quantity\") \
+         VALUES (3, 1, 'alice', 1)"
+    );
+    assert_eq!(
+        table.resulting_statement(insert, None),
+        "INSERT INTO \"lines\" AS t (\"line_no\", \"order_id\", \"owner\", \"quantity\") \
+         VALUES (3, 1, 'alice', 1) RETURNING to_jsonb(t) AS row"
+    );
+    assert_eq!(
+        table.resulting_statement(update, Some(&row)),
+        "UPDATE \"lines\" AS t SET \"quantity\" = 2 WHERE \"order_id\" = 1 AND \"line_no\" = 2 \
+         RETURNING to_jsonb(t) AS row"
+    );
+    assert_eq!(
+        table.read_columns(),
+        BTreeMap::from([(
+            ColumnCommand::Select,
+            vec!["order_id".to_owned(), "line_no".to_owned(), "owner".to_owned()]
+        )])
+    );
+    assert_eq!(
+        update.columns(&table.key),
+        BTreeMap::from([
+            (ColumnCommand::Select, key()),
+            (ColumnCommand::Update, vec!["quantity".to_owned()]),
+        ])
+    );
+    assert_eq!(
+        delete.columns(&table.key),
+        BTreeMap::from([(ColumnCommand::Select, key()), (ColumnCommand::Update, Vec::new())])
+    );
+    assert_eq!(
+        insert.columns(&table.key),
+        BTreeMap::from([
+            (ColumnCommand::Select, Vec::new()),
+            (
+                ColumnCommand::Insert,
+                vec![
+                    "line_no".to_owned(),
+                    "order_id".to_owned(),
+                    "owner".to_owned(),
+                    "quantity".to_owned()
+                ]
+            ),
+        ])
+    );
 }
