@@ -1308,6 +1308,31 @@ where
     )
 }
 
+/// Resolves a table while retaining its owned schema handle.
+pub(crate) fn resolve_stored_table_object_name_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
+    namespaces: Namespaces,
+    tables: impl Iterator<Item = &'a alloc::sync::Arc<T>>,
+    object_name: &ObjectName,
+    search_path: impl Fn() -> I,
+    case: IdentifierCase,
+    claimed: impl Fn(&RelationKey) -> bool,
+) -> Result<Option<&'a alloc::sync::Arc<T>>, LookupError>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
+    let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
+    resolve_relation_on_search_path(
+        namespaces,
+        tables,
+        &target_name_of_idents(schema_ident, table_ident),
+        search_path,
+        case,
+        |namespaces, table, case| stored_table_key(namespaces, table.as_ref(), case),
+        claimed,
+        |table| render_table_candidate(table.as_ref()),
+    )
+}
+
 /// Resolves a one-part or two-part object name to a base table of `database`.
 ///
 /// This is the canonical entry point for trait-on-AST analysis that needs to

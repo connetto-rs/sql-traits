@@ -5,6 +5,7 @@ use alloc::{
     borrow::Cow,
     format,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::ops::ControlFlow;
@@ -15,8 +16,9 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, SqlparserDialect, StoredTable, generated_names,
-    inheritance, schema_qualifiers_match, table_schema_qualifier,
+    AlterTableScope, InstalledForeignKey, ParserDB, ParserDBBuilder, ResolvedForeignKey,
+    SqlparserDialect, StoredTable, generated_names, inheritance, schema_qualifiers_match,
+    table_schema_qualifier,
 };
 use crate::{
     errors::{Error, InheritedChange, ObjectKind},
@@ -39,7 +41,7 @@ pub(super) enum Slot<'node> {
 }
 
 /// Where a constraint sits in its table node.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum Position {
     /// The option at `.1` of the column at `.0`.
     Column(usize, usize),
@@ -91,7 +93,7 @@ impl<'node> Slot<'node> {
     }
 
     /// The slot as its key starts, before it is numbered among equal ones.
-    fn rendering(self) -> String {
+    pub(super) fn rendering(self) -> String {
         match self {
             Self::Column { def, held, .. } => format!("{} {held}", def.name),
             Self::Table(_, constraint) => constraint.to_string(),
@@ -271,7 +273,12 @@ pub(super) fn slots(node: &CreateTable) -> Vec<Slot<'_>> {
 /// The key of each slot: its rendering, numbered among the equal ones before
 /// it so that two constraints written alike keep apart.
 fn keys(slots: &[Slot<'_>]) -> Vec<String> {
-    let renderings: Vec<String> = slots.iter().map(|slot| slot.rendering()).collect();
+    let renderings: Vec<_> = slots.iter().map(|slot| Cow::Owned(slot.rendering())).collect();
+    numbered_keys(&renderings)
+}
+
+/// Numbers equal constraint renderings in installation order.
+fn numbered_keys(renderings: &[Cow<'_, str>]) -> Vec<String> {
     renderings
         .iter()
         .enumerate()
@@ -545,6 +552,46 @@ pub(super) fn index_name_held(
 /// The name a parent gave the constraint the table received as `slot`.
 fn received_name(builder: &ParserDBBuilder, node: &CreateTable, slot: Slot<'_>) -> Option<String> {
     let case = builder.identifier_case();
+    matching_parent_name(builder, node, |held| {
+        match (slot, held) {
+            (
+                Slot::Column { def, held: option, .. },
+                Slot::Column { def: parent_def, held: parent_option, .. },
+            ) => {
+                super::case_idents_match(&def.name, &parent_def.name, case)
+                    && inheritance::is_copy_of_option(option, parent_option)
+            }
+            (Slot::Table(_, constraint), Slot::Table(_, passed)) => {
+                inheritance::is_copy_of(constraint, passed)
+            }
+            (
+                Slot::Table(_, TableConstraint::NotNull(not_null)),
+                Slot::Column {
+                    def,
+                    held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
+                    ..
+                },
+            ) => super::case_idents_match(&not_null.column, &def.name, case),
+            (
+                Slot::Column {
+                    def,
+                    held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
+                    ..
+                },
+                Slot::Table(_, TableConstraint::NotNull(not_null)),
+            ) => super::case_idents_match(&def.name, &not_null.column, case),
+            _ => false,
+        }
+    })
+}
+
+/// Finds the installed parent name of a matching inherited constraint.
+fn matching_parent_name(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    matches: impl Fn(Slot<'_>) -> bool,
+) -> Option<String> {
+    let case = builder.identifier_case();
     inheritance::parent_names(node)
         .filter_map(|name| builder.resolve_bound_table_name(name).ok().flatten())
         .find_map(|parent| {
@@ -554,40 +601,45 @@ fn received_name(builder: &ParserDBBuilder, node: &CreateTable, slot: Slot<'_>) 
                 .find(|(table, _, _)| core::ptr::eq(table.as_ref(), parent))
                 .map_or(&[][..], |(_, metadata, _)| metadata.recorded_constraint_names());
             names(parent, recorded, case).into_iter().find_map(|(held, name)| {
-                let same = match (slot, held) {
-                    (
-                        Slot::Column { def, held: option, .. },
-                        Slot::Column { def: parent_def, held: parent_option, .. },
-                    ) => {
-                        super::case_idents_match(&def.name, &parent_def.name, case)
-                            && inheritance::is_copy_of_option(option, parent_option)
-                    }
-                    (Slot::Table(_, constraint), Slot::Table(_, passed)) => {
-                        inheritance::is_copy_of(constraint, passed)
-                    }
-                    // A `NOT NULL` and its copy are one constraint whether the
-                    // parent writes it on a column or on the table.
-                    (
-                        Slot::Table(_, TableConstraint::NotNull(not_null)),
-                        Slot::Column {
-                            def,
-                            held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
-                            ..
-                        },
-                    ) => super::case_idents_match(&not_null.column, &def.name, case),
-                    (
-                        Slot::Column {
-                            def,
-                            held: ColumnOptionDef { option: ColumnOption::NotNull, .. },
-                            ..
-                        },
-                        Slot::Table(_, TableConstraint::NotNull(not_null)),
-                    ) => super::case_idents_match(&def.name, &not_null.column, case),
-                    _ => false,
-                };
-                same.then_some(name).flatten().map(Cow::into_owned)
+                matches(held).then_some(name).flatten().map(Cow::into_owned)
             })
         })
+}
+
+/// Reads an inherited foreign key's parent name using its normalized
+/// declaration.
+fn received_foreign_key_name(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    key: &ResolvedForeignKey,
+) -> Option<String> {
+    let constraint = key.binding.key.attribute();
+    matching_parent_name(builder, node, |held| {
+        match (key.position, held) {
+            (
+                Position::Column(..),
+                Slot::Column {
+                    def,
+                    held: ColumnOptionDef { name, option: ColumnOption::ForeignKey(parent) },
+                    ..
+                },
+            ) => {
+                if !key.binding.columns.iter().all(|pair| {
+                    super::case_idents_match(&def.name, &pair.host.name, builder.identifier_case())
+                }) {
+                    return false;
+                }
+                let mut parent = parent.clone();
+                parent.name.clone_from(name);
+                parent.columns.clone_from(&constraint.columns);
+                parent == *constraint
+            }
+            (Position::Table(_), Slot::Table(_, TableConstraint::ForeignKey(parent))) => {
+                parent == constraint
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Whether the table received the slot from a parent rather than declaring it,
@@ -649,97 +701,205 @@ pub(super) fn name_pending(
         else {
             return Ok(());
         };
-        let names: Vec<Vec<RecordedConstraintName>> = builder
+        let pending_keys: Vec<_> = builder
+            .tables_mut()
+            .iter_mut()
+            .filter(|(table, _, _)| next.matches(table, case))
+            .map(|(_, metadata, _)| metadata.take_pending_foreign_keys())
+            .collect();
+        let names: Vec<AssignedNames> = builder
             .tables()
             .iter()
             .filter(|(table, _, _)| next.matches(table, case))
-            .map(|(table, metadata, _)| new_names(builder, table, metadata, order))
+            .zip(pending_keys)
+            .map(|((table, metadata, _), pending)| {
+                new_names(builder, table, metadata, order, pending)
+            })
             .collect::<Result<_, _>>()?;
+        let mut installed = core::mem::take(builder.installed_foreign_keys_mut());
         for ((_, metadata, _), names) in builder
             .tables_mut()
             .iter_mut()
             .filter(|(table, _, _)| next.matches(table, case))
             .zip(names)
         {
-            metadata.set_recorded_constraint_names(names);
+            metadata.set_recorded_constraint_names(names.recorded);
+            installed.extend(names.foreign_keys);
             metadata.set_constraint_names_pending(false);
+        }
+        *builder.installed_foreign_keys_mut() = installed;
+    }
+}
+
+/// Constraint names and foreign keys produced by one naming pass.
+struct AssignedNames {
+    recorded: Vec<RecordedConstraintName>,
+    foreign_keys: Vec<Arc<InstalledForeignKey>>,
+}
+
+/// A constraint carried through PostgreSQL's naming passes.
+enum NamingWork<'node> {
+    Ordinary { slot: Slot<'node>, index: usize },
+    ForeignKey(ResolvedForeignKey),
+}
+
+impl NamingWork<'_> {
+    /// Returns installation order and source position.
+    fn order(&self, order: CreationOrder) -> (u8, Position) {
+        match self {
+            Self::Ordinary { slot, .. } => (slot.creation_order(order), slot.position()),
+            Self::ForeignKey(key) => {
+                (
+                    match order {
+                        CreationOrder::CreateTable => 4,
+                        CreationOrder::AlterTable => 2,
+                    },
+                    key.position,
+                )
+            }
+        }
+    }
+
+    /// Returns the constraint's original rendering.
+    fn rendering(&self) -> Cow<'_, str> {
+        match self {
+            Self::Ordinary { slot, .. } => Cow::Owned(slot.rendering()),
+            Self::ForeignKey(key) => Cow::Borrowed(&key.rendering),
         }
     }
 }
 
-/// The installed names after assigning every pending constraint.
+/// Assigns every pending constraint and installs each resolved foreign key.
 fn new_names(
     builder: &ParserDBBuilder,
     node: &CreateTable,
     metadata: &TableMetadata<CreateTable>,
     order: CreationOrder,
-) -> Result<Vec<RecordedConstraintName>, Error> {
+    pending: Vec<ResolvedForeignKey>,
+) -> Result<AssignedNames, Error> {
     let mut recorded = metadata.recorded_constraint_names().to_vec();
     let mut slots = slots(node);
     slots.sort_by_key(|slot| slot.creation_order(order));
-    let keys = keys(&slots);
-    for ((index, slot), key) in slots.iter().copied().enumerate().zip(keys) {
-        if let Some(partner) = not_null_partner_index(&slots, index, builder.identifier_case()) {
-            let partner_is_table =
-                matches!(slots[partner], Slot::Table(_, TableConstraint::NotNull(_)));
-            if matches!(slot, Slot::Column { .. })
-                || slots[partner].declared_name().is_some()
-                || partner_is_table
-            {
-                continue;
-            }
-        }
-        if recorded.iter().any(|generated| generated.slot == key) {
-            continue;
-        }
-        let Some(naming) = slot.naming() else {
-            continue;
-        };
-        let received = is_received(builder, node, metadata, slot)
-            .then(|| received_name(builder, node, slot))
-            .flatten();
-        let own = |candidate: &str| recorded.iter().find(|held| held.name == candidate);
-        let name = if let Some(declared) = slot.declared_name() {
-            let name = stored_ident_name(declared).into_owned();
-            if let Some(held) = own(&name) {
-                return Err(if naming.names_index && held.names_index {
-                    Error::RelationNameAlreadyTaken {
-                        object_kind: ObjectKind::UniqueIndex,
-                        conflicting_kind: ObjectKind::UniqueIndex,
-                        object_name: name,
+    let mut work: Vec<_> = slots
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, slot)| !slot.is_foreign_key())
+        .map(|(index, slot)| NamingWork::Ordinary { slot, index })
+        .chain(pending.into_iter().map(NamingWork::ForeignKey))
+        .collect();
+    work.sort_by_key(|item| item.order(order));
+    let keys = numbered_keys(&work.iter().map(NamingWork::rendering).collect::<Vec<_>>());
+    let mut foreign_keys = Vec::new();
+    for (item, key) in work.into_iter().zip(keys) {
+        let (declared, naming, received) = match &item {
+            NamingWork::Ordinary { slot, index } => {
+                if let Some(partner) =
+                    not_null_partner_index(&slots, *index, builder.identifier_case())
+                {
+                    let partner_is_table =
+                        matches!(slots[partner], Slot::Table(_, TableConstraint::NotNull(_)));
+                    if matches!(slot, Slot::Column { .. })
+                        || slots[partner].declared_name().is_some()
+                        || partner_is_table
+                    {
+                        continue;
                     }
-                } else {
-                    Error::ConstraintAlreadyExists {
-                        table_name: node.table_name().to_string(),
-                        constraint_name: name,
-                    }
-                });
+                }
+                let Some(naming) = slot.naming() else {
+                    continue;
+                };
+                let received = is_received(builder, node, metadata, *slot)
+                    .then(|| received_name(builder, node, *slot))
+                    .flatten();
+                (slot.declared_name(), naming, received)
             }
-            name
-        } else {
-            received.unwrap_or_else(|| {
-                generated_names::constraint_name_on(
-                    node,
-                    naming.columns.as_deref(),
-                    naming.label,
-                    |candidate| {
-                        own(&candidate.value).is_some()
-                            || constraint_name_held(builder, node, &candidate.value)
-                            || naming.names_index
-                                && super::non_constraint_relation_name_holder(
-                                    builder,
-                                    candidate,
-                                    table_schema_qualifier(node),
-                                )
-                                .is_some()
-                    },
+            NamingWork::ForeignKey(key) => {
+                let received = match key.position {
+                    Position::Column(..) => {
+                        node.partition_of.is_some()
+                            || key.binding.columns.iter().any(|pair| {
+                                metadata.inherited_column_names().contains(&pair.host.name.value)
+                            })
+                    }
+                    Position::Table(_) => metadata.inherited_constraints().contains(&key.rendering),
+                };
+                let constraint = key.binding.key.attribute();
+                let columns: Vec<_> =
+                    constraint.columns.iter().map(generated_names::column_part).collect();
+                (
+                    constraint.name.as_ref(),
+                    Naming { columns: Some(columns.join("_")), label: "fkey", names_index: false },
+                    received.then(|| received_foreign_key_name(builder, node, key)).flatten(),
                 )
-                .value
-            })
+            }
         };
-        recorded.push(RecordedConstraintName { slot: key, name, names_index: naming.names_index });
+        let name = if let Some(held) = recorded.iter().find(|held| held.slot == key) {
+            held.name.clone()
+        } else {
+            let name = assign_name(builder, node, &recorded, declared, &naming, received)?;
+            recorded.push(RecordedConstraintName {
+                slot: key,
+                name: name.clone(),
+                names_index: naming.names_index,
+            });
+            name
+        };
+        if let NamingWork::ForeignKey(key) = item {
+            foreign_keys.push(Arc::new(key.install(name)));
+        }
     }
-    Ok(recorded)
+    Ok(AssignedNames { recorded, foreign_keys })
+}
+
+/// Chooses a declared, inherited or generated name without changing reservation
+/// order.
+fn assign_name(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    recorded: &[RecordedConstraintName],
+    declared: Option<&Ident>,
+    naming: &Naming,
+    received: Option<String>,
+) -> Result<String, Error> {
+    let own = |candidate: &str| recorded.iter().find(|held| held.name == candidate);
+    if let Some(declared) = declared {
+        let name = stored_ident_name(declared).into_owned();
+        if let Some(held) = own(&name) {
+            return Err(if naming.names_index && held.names_index {
+                Error::RelationNameAlreadyTaken {
+                    object_kind: ObjectKind::UniqueIndex,
+                    conflicting_kind: ObjectKind::UniqueIndex,
+                    object_name: name,
+                }
+            } else {
+                Error::ConstraintAlreadyExists {
+                    table_name: node.table_name().to_string(),
+                    constraint_name: name,
+                }
+            });
+        }
+        return Ok(name);
+    }
+    Ok(received.unwrap_or_else(|| {
+        generated_names::constraint_name_on(
+            node,
+            naming.columns.as_deref(),
+            naming.label,
+            |candidate| {
+                own(&candidate.value).is_some()
+                    || constraint_name_held(builder, node, &candidate.value)
+                    || naming.names_index
+                        && super::non_constraint_relation_name_holder(
+                            builder,
+                            candidate,
+                            table_schema_qualifier(node),
+                        )
+                        .is_some()
+            },
+        )
+        .value
+    }))
 }
 
 /// The names the slots of a node the builder holds answer to.
@@ -1238,6 +1398,12 @@ fn rename_on(
             })
             .collect();
         metadata.set_recorded_constraint_names(names);
+    }
+    for installed in builder.installed_foreign_keys_mut().iter_mut().filter(|installed| {
+        table.matches(installed.binding.key.table(), case)
+            && case.identifiers_match(&installed.name, true, &old.value, old.quote_style.is_some())
+    }) {
+        Arc::make_mut(installed).name = name.clone().into_boxed_str();
     }
     Ok(builder)
 }

@@ -13,7 +13,7 @@ use crate::{
         ColumnIdentity, GenericDB, IdentifierCase, IdentityCounter, KeyIdentity, Meta,
         RelationIdentity, RoleSetting, SchemaProfile,
         generic_db::{
-            Identified, RelationSlot, Stored,
+            Identified, InstalledForeignKey, RelationSlot, Stored,
             builtin_functions::{BuiltinTable, Builtins},
         },
     },
@@ -132,6 +132,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     unique_indices: Vec<Stored<P::UniqueIndex>>,
     /// List of foreign keys in the database.
     foreign_keys: Vec<Stored<P::ForeignKey>>,
+    /// PostgreSQL foreign keys with resolved columns and assigned names.
+    installed_foreign_keys: Vec<Arc<InstalledForeignKey>>,
     /// List of functions created in the database.
     functions: Vec<Stored<P::Function>>,
     /// The functions the engine provides without a declaration, less those
@@ -189,6 +191,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             materialized_view_indices: self.materialized_view_indices.clone(),
             unique_indices: self.unique_indices.clone(),
             foreign_keys: self.foreign_keys.clone(),
+            installed_foreign_keys: self.installed_foreign_keys.clone(),
             functions: self.functions.clone(),
             builtins: self.builtins.clone(),
             triggers: self.triggers.clone(),
@@ -258,6 +261,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             materialized_view_indices: Vec::new(),
             unique_indices: Vec::new(),
             foreign_keys: Vec::new(),
+            installed_foreign_keys: Vec::new(),
             functions: Vec::new(),
             builtins: Builtins::none(),
             triggers: Vec::new(),
@@ -295,6 +299,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             materialized_view_indices: Vec::new(),
             unique_indices: Vec::new(),
             foreign_keys: Vec::new(),
+            installed_foreign_keys: Vec::new(),
             functions: Vec::new(),
             builtins: Builtins::none(),
             triggers: Vec::new(),
@@ -596,6 +601,16 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &mut self.foreign_keys
     }
 
+    /// Returns the installed PostgreSQL foreign keys.
+    pub(crate) fn installed_foreign_keys(&self) -> &[Arc<InstalledForeignKey>] {
+        &self.installed_foreign_keys
+    }
+
+    /// Returns the installed PostgreSQL foreign keys for binding updates.
+    pub(crate) fn installed_foreign_keys_mut(&mut self) -> &mut Vec<Arc<InstalledForeignKey>> {
+        &mut self.installed_foreign_keys
+    }
+
     /// Returns a mutable reference to the check constraints list.
     pub(crate) fn check_constraints_mut(&mut self) -> &mut Vec<Stored<P::CheckConstraint>> {
         &mut self.check_constraints
@@ -677,6 +692,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             materialized_view_indices: Vec::new(),
             unique_indices: Vec::new(),
             foreign_keys: Vec::new(),
+            installed_foreign_keys: Vec::new(),
             functions: Vec::new(),
             builtins: Builtins::none(),
             triggers: Vec::new(),
@@ -1255,6 +1271,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             materialized_view_indices,
             unique_indices,
             foreign_keys,
+            installed_foreign_keys,
             functions,
             builtins,
             function_index: _,
@@ -1292,6 +1309,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             materialized_view_indices,
             unique_indices,
             foreign_keys,
+            installed_foreign_keys,
             functions,
             builtins,
             triggers,
@@ -1480,6 +1498,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             materialized_view_indices: self.materialized_view_indices,
             unique_indices: self.unique_indices,
             foreign_keys: self.foreign_keys,
+            installed_foreign_keys: self.installed_foreign_keys,
             functions: self.functions,
             builtins: self.builtins,
             function_index,

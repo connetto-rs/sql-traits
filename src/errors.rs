@@ -2285,12 +2285,6 @@ pub enum Error {
         /// Name of the referenced column.
         referenced_column: Box<str>,
     },
-    /// A stored PostgreSQL foreign key is missing its constraint name.
-    #[error("foreign key on table \"{host_table}\" has no recorded constraint name")]
-    ForeignKeyNameMissing {
-        /// Name of the referencing table.
-        host_table: Box<str>,
-    },
     #[error(
         "Cannot use the deferrable primary key of table `{referenced_table}` for the foreign key in table `{host_table}`."
     )]

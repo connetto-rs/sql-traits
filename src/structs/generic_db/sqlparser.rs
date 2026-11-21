@@ -67,6 +67,7 @@ use crate::{
             is_search_path_parameter, object_name_identifiers, object_name_last_part,
             overqualified_object_name, qualifier_of, require_local_object_name,
             require_static_object_name, resolve_sequence_on_search_path_in_iter,
+            resolve_stored_table_object_name_on_search_path_in_iter,
             resolve_table_object_name_in_iter, resolve_table_object_name_on_search_path_in_iter,
             resolve_target_on_search_path_in_iter, resolve_view_on_search_path_in_iter,
             search_path_change, search_path_entry, sequence_matches_key, stored_table_key,
@@ -96,6 +97,7 @@ mod duplicate_keys;
 mod existing_child;
 mod extensions;
 mod foreign_key_types;
+pub(crate) use foreign_key_types::{InstalledForeignKey, ResolvedForeignKey};
 mod foreign_options;
 mod function_bodies;
 mod function_cascade;
@@ -1396,6 +1398,7 @@ impl ParserDBBuilder {
         self.indices_mut().retain(|(index, _)| !is_target(TableAttribute::table(index)));
         self.unique_indices_mut().retain(|(index, _)| !is_target(TableAttribute::table(index)));
         self.foreign_keys_mut().retain(|(key, ())| !is_target(TableAttribute::table(key)));
+        self.installed_foreign_keys_mut().retain(|key| !is_target(key.binding.key.table()));
         self.check_constraints_mut()
             .retain(|(constraint, _)| !is_target(TableAttribute::table(constraint)));
 
@@ -1729,6 +1732,7 @@ impl ParserDBBuilder {
             !detached
         });
         self.foreign_keys_mut().retain(|(fk, ())| !belongs_to(TableAttribute::table(fk)));
+        self.installed_foreign_keys_mut().retain(|key| !belongs_to(key.binding.key.table()));
         let mut position = 0;
         self.check_constraints_mut().retain_mut(|(check, metadata)| {
             let table = TableAttribute::table(check);
@@ -6887,6 +6891,7 @@ impl ParserDB {
         carry(&mut carried);
 
         let replacement = Arc::new(replacement);
+        foreign_key_types::follow_target_replacement(&mut builder, &previous_node, &replacement);
 
         let renamed = !stored.matches(&replacement, builder.identifier_case());
         for (mut index, expression, selections, key_identity) in detached_indices {
@@ -7038,6 +7043,7 @@ impl ParserDB {
     /// Helper function to process column options.
     fn process_column_options(
         column: &Arc<TableAttribute<CreateTable, ColumnDef>>,
+        column_position: usize,
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
@@ -7071,6 +7077,12 @@ impl ParserDB {
                     foreign_key.columns.push(column.attribute().name.clone());
                     builder = Self::process_foreign_key_table_constraint(
                         &foreign_key,
+                        constraint_names::Slot::Column {
+                            column: column_position,
+                            option: position,
+                            def: column.attribute(),
+                            held: option,
+                        },
                         create_table,
                         table_metadata,
                         builder,
@@ -7159,16 +7171,16 @@ impl ParserDB {
     /// reference itself.
     fn foreign_key_target<'a>(
         builder: &'a ParserDBBuilder,
-        create_table: &'a CreateTable,
+        create_table: &'a Arc<CreateTable>,
         fk: &ForeignKeyConstraint,
-    ) -> Result<&'a CreateTable, crate::errors::Error> {
+    ) -> Result<&'a Arc<CreateTable>, crate::errors::Error> {
         let case = builder.identifier_case();
-        let referenced_table = resolve_table_object_name_on_search_path_in_iter(
+        let referenced_table = resolve_stored_table_object_name_on_search_path_in_iter(
             builder.namespaces(),
             builder
                 .tables()
                 .iter()
-                .map(|(t, _, _)| t.as_ref())
+                .map(|(table, _, _)| table)
                 .chain(core::iter::once(create_table)),
             &fk.foreign_table,
             || builder.search_path(),
@@ -7202,6 +7214,7 @@ impl ParserDB {
     /// Helper function to process a foreign key table constraint.
     fn process_foreign_key_table_constraint(
         fk: &ForeignKeyConstraint,
+        slot: constraint_names::Slot<'_>,
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
@@ -7217,21 +7230,20 @@ impl ParserDB {
         }
 
         let case = builder.identifier_case();
-        for col_ident in &fk.columns {
-            let column_exists = table_metadata.column_arcs().any(|col| {
-                case.identifiers_match(
-                    col.column_name(),
-                    col.column_name_is_quoted(),
-                    col_ident.value.as_str(),
-                    col_ident.quote_style.is_some(),
-                )
-            });
-
-            if !column_exists {
-                return Err(crate::errors::Error::HostColumnNotFoundForForeignKey {
-                    host_column: col_ident.value.clone(),
-                    host_table: create_table.name.to_string(),
-                });
+        let postgres = matches!(builder.dialect(), SqlparserDialect::PostgreSql);
+        let mut host_columns = Vec::new();
+        for column_ident in &fk.columns {
+            let column = table_metadata
+                .column_arcs()
+                .find(|column| case_idents_match(&column.attribute().name, column_ident, case))
+                .ok_or_else(|| {
+                    crate::errors::Error::HostColumnNotFoundForForeignKey {
+                        host_column: column_ident.value.clone(),
+                        host_table: create_table.name.to_string(),
+                    }
+                })?;
+            if postgres {
+                host_columns.push(foreign_key_types::BoundColumn::of(column.attribute()));
             }
         }
 
@@ -7273,13 +7285,30 @@ impl ParserDB {
             return Err(refusal);
         }
 
+        let fk_arc = Arc::new(TableAttribute::new(create_table.clone(), fk.clone()));
         if builder.dialect().binds_foreign_keys_on_use() {
             refuse_unequal_written_lists(create_table, fk)?;
         } else {
-            Self::refuse_unreachable_target(&builder, create_table, fk)?;
+            let (target, referenced_columns) =
+                Self::refuse_unreachable_target(&builder, create_table, fk)?;
+            if postgres {
+                table_metadata.add_pending_foreign_key(ResolvedForeignKey {
+                    binding: foreign_key_types::BoundForeignKey {
+                        key: fk_arc.clone(),
+                        target: target.clone(),
+                        columns: host_columns
+                            .into_iter()
+                            .zip(referenced_columns)
+                            .map(|(host, referenced)| {
+                                foreign_key_types::ColumnPair { host, referenced }
+                            })
+                            .collect(),
+                    },
+                    position: slot.position(),
+                    rendering: slot.rendering(),
+                });
+            }
         }
-
-        let fk_arc = Arc::new(TableAttribute::new(create_table.clone(), fk.clone()));
         table_metadata.add_foreign_key(fk_arc.clone());
         let builder = builder.add_foreign_key(fk_arc, ());
         Ok(builder)
@@ -7289,32 +7318,32 @@ impl ParserDB {
     /// the key is declared, which is an absent table, a column it lacks, a
     /// column named twice, or a column list with no unique key behind it or of
     /// another width.
-    fn refuse_unreachable_target(
-        builder: &ParserDBBuilder,
-        create_table: &CreateTable,
+    fn refuse_unreachable_target<'table>(
+        builder: &'table ParserDBBuilder,
+        create_table: &'table Arc<CreateTable>,
         fk: &ForeignKeyConstraint,
-    ) -> Result<(), crate::errors::Error> {
+    ) -> Result<(&'table Arc<CreateTable>, Vec<foreign_key_types::BoundColumn>), crate::errors::Error>
+    {
         let case = builder.identifier_case();
         let referenced_table_name = fk.foreign_table.to_string();
         let referenced_table = Self::foreign_key_target(builder, create_table, fk)?;
         refuse_reference_across_storage(create_table, referenced_table, &referenced_table_name)?;
 
-        for ref_col_ident in &fk.referred_columns {
-            let column_exists = referenced_table.columns.iter().any(|col| {
-                case.identifiers_match(
-                    col.name.value.as_str(),
-                    col.name.quote_style.is_some(),
-                    ref_col_ident.value.as_str(),
-                    ref_col_ident.quote_style.is_some(),
-                )
-            });
-
-            if !column_exists {
-                return Err(crate::errors::Error::ReferencedColumnNotFoundForForeignKey {
-                    referenced_column: ref_col_ident.value.clone(),
-                    referenced_table: referenced_table_name,
-                    host_table: create_table.name.to_string(),
-                });
+        let mut columns = Vec::new();
+        for column_ident in &fk.referred_columns {
+            let column = referenced_table
+                .columns
+                .iter()
+                .find(|column| case_idents_match(&column.name, column_ident, case))
+                .ok_or_else(|| {
+                    crate::errors::Error::ReferencedColumnNotFoundForForeignKey {
+                        referenced_column: column_ident.value.clone(),
+                        referenced_table: referenced_table_name.clone(),
+                        host_table: create_table.name.to_string(),
+                    }
+                })?;
+            if matches!(builder.dialect(), SqlparserDialect::PostgreSql) {
+                columns.push(foreign_key_types::BoundColumn::of(column));
             }
         }
 
@@ -7348,7 +7377,7 @@ impl ParserDB {
                 index.unique
                     && table_matches_object_name(
                         builder.namespaces(),
-                        referenced_table,
+                        referenced_table.as_ref(),
                         &index.table_name,
                     )
             });
@@ -7383,7 +7412,7 @@ impl ParserDB {
                 referenced_columns: referred.len(),
             });
         }
-        Ok(())
+        Ok((referenced_table, columns))
     }
 
     /// Helper function to process table constraints.
@@ -7395,7 +7424,7 @@ impl ParserDB {
         carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let case = builder.identifier_case();
-        for constraint in constraints {
+        for (position, constraint) in constraints.iter().enumerate() {
             Self::validate_key_columns(constraint, create_table, table_metadata, &builder)?;
             match constraint {
                 TableConstraint::Unique(uc) => {
@@ -7410,6 +7439,7 @@ impl ParserDB {
                 TableConstraint::ForeignKey(fk) => {
                     builder = Self::process_foreign_key_table_constraint(
                         fk,
+                        constraint_names::Slot::Table(position, constraint),
                         create_table,
                         table_metadata,
                         builder,
@@ -7663,11 +7693,12 @@ impl ParserDB {
             table_metadata.add_column(Arc::new(TableAttribute::new(create_table.clone(), column)));
         }
 
-        for column in table_metadata.clone().column_arcs() {
+        for (column_position, column) in table_metadata.clone().column_arcs().enumerate() {
             let preserved_identity = preserved_column_identity(column.attribute(), preserved);
             carried.operators.build_column(preserved_identity);
             builder = Self::process_column_options(
                 column,
+                column_position,
                 &create_table,
                 &mut table_metadata,
                 builder,

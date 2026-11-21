@@ -340,3 +340,15 @@ fn named_constraints() {
         ));
     }
 }
+
+/// Composite and catalog keys accept their measured equality inputs.
+#[test]
+fn additional_equality_families() {
+    for sql in [
+        "CREATE TYPE pair AS (value int);\nCREATE TABLE r (id pair PRIMARY KEY);\nCREATE TABLE c (x pair REFERENCES r);",
+        "CREATE TABLE r (id regclass PRIMARY KEY);\nCREATE TABLE c (x regclass REFERENCES r);",
+        "CREATE TABLE r (id cidr PRIMARY KEY);\nCREATE TABLE c (x inet REFERENCES r);",
+    ] {
+        assert_outcome(sql, true, 1);
+    }
+}

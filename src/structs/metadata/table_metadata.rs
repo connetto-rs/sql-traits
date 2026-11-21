@@ -9,7 +9,7 @@ use crate::{
     impls::PrivilegeKind,
     structs::{
         ForeignTableSource, KeyIdentity, RevokedPrivilege, StoredReplicaIdentity, TableAttribute,
-        VirtualTableSource,
+        VirtualTableSource, generic_db::ResolvedForeignKey,
     },
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
@@ -50,6 +50,8 @@ pub struct TableMetadata<T: TableLike> {
     unique_indices: Vec<Arc<<T::DB as DatabaseLike>::UniqueIndex>>,
     /// The foreign keys of the table.
     foreign_keys: Vec<Arc<<T::DB as DatabaseLike>::ForeignKey>>,
+    /// Resolved PostgreSQL foreign keys awaiting constraint naming.
+    pending_foreign_keys: Vec<ResolvedForeignKey>,
     /// The columns composing the primary key of the table.
     primary_key: Vec<Arc<<T::DB as DatabaseLike>::Column>>,
     /// The names of the columns the table takes from a parent rather than
@@ -148,6 +150,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             indices: Vec::new(),
             unique_indices: Vec::new(),
             foreign_keys: Vec::new(),
+            pending_foreign_keys: Vec::new(),
             primary_key: Vec::new(),
             inherited_column_names: Vec::new(),
             inherited_not_null: Vec::new(),
@@ -508,6 +511,16 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub(crate) fn set_constraint_names_pending(&mut self, pending: bool) {
         self.constraint_names_pending = pending;
+    }
+
+    /// Stages a resolved PostgreSQL foreign key for naming.
+    pub(crate) fn add_pending_foreign_key(&mut self, key: ResolvedForeignKey) {
+        self.pending_foreign_keys.push(key);
+    }
+
+    /// Transfers the resolved PostgreSQL foreign keys to constraint naming.
+    pub(crate) fn take_pending_foreign_keys(&mut self) -> Vec<ResolvedForeignKey> {
+        core::mem::take(&mut self.pending_foreign_keys)
     }
 
     /// Returns an iterator over the check constraints of the table.
