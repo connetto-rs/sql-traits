@@ -7,8 +7,8 @@ use alloc::string::ToString;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    AlterColumnOperation, ColumnDef, ColumnOption, CreateDomain, CreateIndex, CreateTable, Expr,
-    ForValues, PartitionBoundValue, Query, TableConstraint, Visit, Visitor,
+    AlterColumnOperation, ColumnOption, CreateDomain, CreateIndex, CreateTable, Expr, ForValues,
+    PartitionBoundValue, Query, TableConstraint, Visit, Visitor,
 };
 
 use super::ParserDBBuilder;
@@ -60,14 +60,11 @@ fn refuse<N: Visit + ?Sized>(node: &N, place: ExpressionPlace) -> Result<(), Err
     }
 }
 
-/// Refuses a subquery in the default, generation expression or checks of
-/// `column`, and a column reference in its default.
-fn column_options(column: &ColumnDef) -> Result<(), Error> {
-    for option in &column.options {
-        refuse_column_value(&option.option)?;
-        if let ColumnOption::Check(check) = &option.option {
-            refuse(&check.expr, ExpressionPlace::CheckConstraint)?;
-        }
+/// Refuses expressions forbidden in a stored column option.
+fn column_option(option: &ColumnOption) -> Result<(), Error> {
+    refuse_column_value(option)?;
+    if let ColumnOption::Check(check) = option {
+        refuse(&check.expr, ExpressionPlace::CheckConstraint)?;
     }
     Ok(())
 }
@@ -125,11 +122,12 @@ fn bound(bound: &ForValues) -> Result<(), Error> {
     Ok(())
 }
 
-/// Refuses a subquery in the default, generation expression or checks of
-/// `column`, a column `ALTER TABLE` adds, and a column reference in its
-/// default.
-pub(super) fn refuse_in_column(builder: &ParserDBBuilder, column: &ColumnDef) -> Result<(), Error> {
-    if postgres(builder) { column_options(column) } else { Ok(()) }
+/// Refuses expressions forbidden in a delayed inline constraint.
+pub(super) fn refuse_in_column_option(
+    builder: &ParserDBBuilder,
+    option: &ColumnOption,
+) -> Result<(), Error> {
+    if postgres(builder) { column_option(option) } else { Ok(()) }
 }
 
 /// Refuses a subquery in `added`, a constraint `ALTER TABLE` adds.

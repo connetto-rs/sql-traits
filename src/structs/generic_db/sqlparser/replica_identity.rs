@@ -38,11 +38,12 @@ use crate::{
 /// Returns [`Error::AlterTableNotFound`] for an absent table without `IF
 /// EXISTS`, and for `USING INDEX` the errors of [`usable_index`].
 pub(super) fn set(
-    builder: ParserDBBuilder,
+    mut builder: ParserDBBuilder,
     table_name: &ObjectName,
     if_exists: bool,
     identity: &ReplicaIdentity,
 ) -> Result<ParserDBBuilder, Error> {
+    constraint_names::name_pending(&mut builder, constraint_names::CreationOrder::AlterTable)?;
     let setting = match identity {
         ReplicaIdentity::Default => StoredReplicaIdentity::Default,
         ReplicaIdentity::Nothing => StoredReplicaIdentity::Nothing,

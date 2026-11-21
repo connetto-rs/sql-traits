@@ -38,10 +38,7 @@ pub(super) fn inherit(
         return Ok(builder);
     };
     let child_node = ParserDB::stored_node(&builder, &child)?;
-    refuse_partition_child(child_node, child_name)?;
-    if child_node.partition_by.is_some() {
-        return Err(Error::InheritanceChangeOnPartitioned { table_name: child_name.to_string() });
-    }
+    refuse_inheritance_child(child_node, child_name)?;
     let parent_node = resolve_parent(&builder, child_name, parent_name)?;
     let (table_name, parent_text) = (child_name.to_string(), parent_name.to_string());
     if parent_node.partition_by.is_some() {
@@ -187,6 +184,18 @@ pub(super) fn no_inherit(
         metadata.set_inherited_not_null(not_null);
     }
     Ok(builder)
+}
+
+/// Refuses a partition or partitioned table as a new inheritance child.
+pub(super) fn refuse_inheritance_child(
+    node: &CreateTable,
+    child_name: &ObjectName,
+) -> Result<(), Error> {
+    refuse_partition_child(node, child_name)?;
+    if node.partition_by.is_some() {
+        return Err(Error::InheritanceChangeOnPartitioned { table_name: child_name.to_string() });
+    }
+    Ok(())
 }
 
 /// Refuses a partition as the table whose parents change.
