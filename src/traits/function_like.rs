@@ -1859,6 +1859,59 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError>;
 
+    /// Returns the extension the function is a member of, the one whose
+    /// install script created it.
+    ///
+    /// PostgreSQL refuses `DROP FUNCTION` on a member and drops it along with
+    /// its extension, and the next `ALTER EXTENSION ... UPDATE` may replace
+    /// whatever an `ALTER FUNCTION` changed on it, so the schema owns neither
+    /// its existence nor its definition. A function the schema created answers
+    /// `None`, also once `ALTER FUNCTION ... DEPENDS ON EXTENSION` ties it to
+    /// an extension, since the schema still owns its definition.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance the function belongs
+    ///   to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     r#"
+    /// CREATE EXTENSION "uuid-ossp";
+    /// CREATE FUNCTION mine() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+    /// CREATE FUNCTION tied() RETURNS INT LANGUAGE sql AS 'SELECT 1';
+    /// ALTER FUNCTION tied() DEPENDS ON EXTENSION "uuid-ossp";
+    /// "#,
+    /// )?;
+    /// let extension = |name: &str| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .expect("unambiguous lookup")
+    ///         .expect("Function should exist")
+    ///         .extension(&db)
+    ///         .map(|extension| extension.map(ExtensionLike::name))
+    /// };
+    /// assert_eq!(extension("uuid_generate_v4")?, Some("uuid-ossp"));
+    /// assert_eq!(extension("mine")?, None);
+    /// assert_eq!(extension("tied")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn extension<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Extension>, LookupError>;
+
     /// Returns whether every role may execute the function, which is what
     /// `PUBLIC` holding `EXECUTE` on it means.
     ///
@@ -2721,6 +2774,26 @@ mod tests {
         assert!(matches!(missing, Err(Error::AlterFunctionNotFound { .. })), "got {missing:?}");
         let bare = parse("ALTER FUNCTION f DEPENDS ON EXTENSION plpgsql;");
         assert!(matches!(bare, Err(Error::AmbiguousAlterFunction { .. })), "got {bare:?}");
+    }
+
+    #[test]
+    fn test_postgis_members_answer_their_extension() {
+        // An unquoted name folds, so `POSTGIS` installs and owns the same
+        // functions `postgis` does.
+        let db = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE EXTENSION POSTGIS VERSION '3.7.0';
+             CREATE FUNCTION st_mine() RETURNS INT LANGUAGE sql AS 'SELECT 1';",
+        )
+        .expect("Failed to parse SQL");
+        let members: Vec<_> =
+            db.functions().filter(|function| function.name() == "st_geomfromgeojson").collect();
+        assert!(!members.is_empty(), "PostGIS registers st_geomfromgeojson");
+        for member in members {
+            let extension = member.extension(&db).expect("held").map(ExtensionLike::name);
+            assert_eq!(extension, Some("POSTGIS"));
+        }
+        let mine = db.functions().find(|function| function.name() == "st_mine").expect("held");
+        assert_eq!(mine.extension(&db), Ok(None));
     }
 
     #[test]

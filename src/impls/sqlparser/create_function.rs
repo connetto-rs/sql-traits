@@ -4,9 +4,9 @@
 use alloc::{borrow::Cow, format, string::ToString};
 
 use sqlparser::ast::{
-    ArgMode, CreateFunction, CreateFunctionBody, CreateRole, DataType, Expr, FunctionBehavior,
-    FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType, FunctionSecurity,
-    FunctionSetValue, Value, ValueWithSpan,
+    ArgMode, CreateExtension, CreateFunction, CreateFunctionBody, CreateRole, DataType, Expr,
+    FunctionBehavior, FunctionCalledOnNull, FunctionDefinitionSetParam, FunctionReturnType,
+    FunctionSecurity, FunctionSetValue, Value, ValueWithSpan,
 };
 
 use crate::{
@@ -345,6 +345,25 @@ impl FunctionLike for CreateFunction {
     #[inline]
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(function_metadata(self, database)?.owner())
+    }
+
+    #[inline]
+    fn extension<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db CreateExtension>, LookupError> {
+        let Some(member_of) = function_metadata(self, database)?.extension() else {
+            return Ok(None);
+        };
+        let case = database.identifier_case();
+        Ok(database.extensions().find(|extension| {
+            case.identifiers_match(
+                &extension.name.value,
+                extension.name.quote_style.is_some(),
+                &member_of.value,
+                member_of.quote_style.is_some(),
+            )
+        }))
     }
 
     #[inline]

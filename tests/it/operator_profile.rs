@@ -668,6 +668,13 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn extension<'db>(
+        &self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::Extension>, LookupError> {
+        self.unreach()
+    }
+
     fn is_executable_by_public(&self, _database: &Self::DB) -> Result<bool, LookupError> {
         self.unreach()
     }
