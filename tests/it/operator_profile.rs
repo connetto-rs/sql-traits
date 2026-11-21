@@ -501,6 +501,10 @@ impl<P: EmptyKinds> ForeignKeyLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn referenced_column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.unreach::<core::iter::Empty<(&str, bool)>>()
+    }
+
     fn host_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
