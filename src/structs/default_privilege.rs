@@ -128,8 +128,10 @@ impl<'a> DefaultGrant<'a> {
 /// let [entry] = entries.as_slice() else { unreachable!() };
 /// assert_eq!(entry.kind(), DefaultPrivilegeKind::Tables);
 /// assert_eq!(entry.schema(), Some("api"));
-/// let public = entry.grant_to(&DefaultGrantee::Public).unwrap();
-/// assert_eq!(public.privileges(), [Action::Select { columns: None }]);
+/// // A default limited to a schema lists only what it adds.
+/// let [grant] = entry.grants() else { unreachable!() };
+/// assert_eq!(grant.grantee(), &DefaultGrantee::Public);
+/// assert_eq!(grant.privileges(), [Action::Select { columns: None }]);
 /// # Ok(())
 /// # }
 /// ```
