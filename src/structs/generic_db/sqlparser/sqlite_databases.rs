@@ -14,7 +14,7 @@ use alloc::{
 };
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Statement};
+use sqlparser::ast::{CreateIndex, Ident, ObjectName, ObjectNamePart, Statement};
 
 use super::{ParserDBBuilder, declared_schema, object_name_last_identifier, relation_name_holder};
 use crate::{
@@ -58,13 +58,10 @@ pub(super) fn attach(builder: ParserDBBuilder, name: &Ident) -> Result<ParserDBB
 pub(super) fn place_created_object(statement: &mut Statement, database: &Ident) {
     let name = match statement {
         Statement::CreateTable(create_table) => &mut create_table.name,
-        Statement::CreateIndex(create_index) => {
-            let Some(name) = &mut create_index.name else { return };
-            name
-        }
+        Statement::CreateIndex(CreateIndex { name: Some(name), .. })
+        | Statement::CreateVirtualTable { name, .. } => name,
         Statement::CreateView(create_view) => &mut create_view.name,
         Statement::CreateTrigger(create_trigger) => &mut create_trigger.name,
-        Statement::CreateVirtualTable { name, .. } => name,
         _ => return,
     };
     if name.0.len() == 1 {

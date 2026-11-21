@@ -251,6 +251,36 @@ fn stored_text_of_temp_and_attached_databases_keeps_its_declared_types() {
 }
 
 #[test]
+fn stored_views_triggers_and_virtual_tables_stay_in_their_database() {
+    let aux = Ident::new("aux");
+    let db = ingestor_with_aux()
+        .apply_sql("CREATE TABLE x(main_only)")
+        .expect("SQLite stores x in main")
+        .apply_sql_in(&aux, "CREATE TABLE x(b int)")
+        .expect("SQLite stores x in aux")
+        .apply_sql_in(&aux, "CREATE VIEW v AS SELECT b FROM x")
+        .expect("SQLite stores v in aux, reading aux.x")
+        .apply_sql_in(&aux, "CREATE TRIGGER tr AFTER INSERT ON x BEGIN SELECT 1; END")
+        .expect("SQLite stores tr in aux, on aux.x")
+        .apply_sql_in(&aux, "CREATE VIRTUAL TABLE s USING fts5(body)")
+        .expect("SQLite stores s in aux")
+        .apply_sql_in(&aux, "ALTER TABLE aux.x ADD COLUMN c text")
+        .expect("SQLite adds c to aux.x")
+        .finish();
+    let view = db.views().next().expect("one view");
+    assert_eq!(view.view_schema(), Some("aux"));
+    let trigger = db.triggers().next().expect("one trigger");
+    let Ok(Relation::Table(table)) = trigger.relation(&db) else {
+        panic!("the trigger is on a table");
+    };
+    assert_eq!(table.table_schema(), Some("aux"));
+    assert!(stored(&db, "aux", "s").is_some());
+    assert!(stored(&db, "main", "s").is_none());
+    let x = stored(&db, "aux", "x").expect("x is in aux");
+    assert_eq!(column_types(&db, x), typed(&[("b", "INT"), ("c", "TEXT")]));
+}
+
+#[test]
 fn a_name_the_stored_text_qualifies_keeps_its_database() {
     let db = ingestor_with_aux()
         .apply_sql_in(&Ident::new("aux"), "CREATE TABLE main.m(c numeric( 5 ))")
