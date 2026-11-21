@@ -505,7 +505,7 @@ fn temporary_and_permanent_tables_do_not_mix() {
             "CREATE TABLE p (id INT) PARTITION BY LIST (id); CREATE TEMP TABLE c (id INT);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);"
         ),
-        Err(Error::TemporaryPartitionOfPermanent { table_name, parent_name })
+        Err(Error::TemporaryPartitionOfPermanent { table_name, parent_name, .. })
             if table_name == "c" && parent_name == "p"
     ));
     assert!(matches!(
@@ -513,7 +513,7 @@ fn temporary_and_permanent_tables_do_not_mix() {
             "CREATE TEMP TABLE p (id INT) PARTITION BY LIST (id); CREATE TABLE c (id INT);
              ALTER TABLE p ATTACH PARTITION c FOR VALUES IN (1);"
         ),
-        Err(Error::PermanentRelationInheritsTemporary { table_name, parent_name })
+        Err(Error::PermanentRelationInheritsTemporary { table_name, parent_name, .. })
             if table_name == "c" && parent_name == "p"
     ));
     database(

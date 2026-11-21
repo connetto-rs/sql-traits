@@ -10,7 +10,7 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    errors::Error,
+    errors::{Error, KeyConstraint},
     impls::SqlparserDialect,
     structs::IdentifierCase,
     traits::{PartitionStrategy, TableLike},
@@ -163,6 +163,7 @@ pub(super) fn validate_partitioned_table(
                 return Err(Error::PartitionKeyColumnNotFound {
                     table_name: table_name(),
                     column_name: dialect.stored_name(&ident),
+                    expression: matches!(item, KeyItem::Expression(_)),
                 });
             };
             if is_generated(column) {
@@ -173,8 +174,8 @@ pub(super) fn validate_partitioned_table(
             }
         }
     }
-    for covered in unique_constraints(table) {
-        covers_key(table, &items, &covered, case, dialect)?;
+    for (constraint, covered) in unique_constraints(table) {
+        covers_key(table, &items, &covered, case, dialect, constraint)?;
     }
     Ok(())
 }
@@ -193,7 +194,7 @@ pub(super) fn validate_unique_index(
     let Some((_, items)) = partition_key(table) else {
         return Ok(());
     };
-    covers_key(table, &items, &plain_columns(&index.columns), case, dialect)
+    covers_key(table, &items, &plain_columns(&index.columns), case, dialect, KeyConstraint::Unique)
 }
 
 /// The plain columns an index or key lists, leaving out its expressions.
@@ -211,22 +212,28 @@ fn plain_columns(columns: &[IndexColumn]) -> Vec<Ident> {
 
 /// The columns each primary key, unique and exclusion constraint of `table`
 /// enforces equality on, written on a column or as a table constraint.
-fn unique_constraints(table: &CreateTable) -> Vec<Vec<Ident>> {
-    let on_columns = table
-        .columns
-        .iter()
-        .filter(|column| {
-            column.options.iter().any(|option| {
-                matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
-            })
+fn unique_constraints(table: &CreateTable) -> Vec<(KeyConstraint, Vec<Ident>)> {
+    let on_columns = table.columns.iter().flat_map(|column| {
+        column.options.iter().filter_map(|option| {
+            let constraint = match option.option {
+                ColumnOption::PrimaryKey(_) => KeyConstraint::PrimaryKey,
+                ColumnOption::Unique(_) => KeyConstraint::Unique,
+                _ => return None,
+            };
+            Some((constraint, vec![column.name.clone()]))
         })
-        .map(|column| vec![column.name.clone()]);
+    });
     let on_table = table.constraints.iter().filter_map(|constraint| {
         match constraint {
-            TableConstraint::PrimaryKey(key) => Some(plain_columns(&key.columns)),
-            TableConstraint::Unique(key) => Some(plain_columns(&key.columns)),
+            TableConstraint::PrimaryKey(key) => {
+                Some((KeyConstraint::PrimaryKey, plain_columns(&key.columns)))
+            }
+            TableConstraint::Unique(key) => {
+                Some((KeyConstraint::Unique, plain_columns(&key.columns)))
+            }
             TableConstraint::Exclude(exclude) => {
-                Some(
+                Some((
+                    KeyConstraint::Exclusion,
                     exclude
                         .elements
                         .iter()
@@ -238,7 +245,7 @@ fn unique_constraints(table: &CreateTable) -> Vec<Vec<Ident>> {
                             }
                         })
                         .collect(),
-                )
+                ))
             }
             _ => None,
         }
@@ -253,12 +260,14 @@ fn covers_key(
     covered: &[Ident],
     case: IdentifierCase,
     dialect: SqlparserDialect,
+    constraint: KeyConstraint,
 ) -> Result<(), Error> {
     for item in items {
         match item {
             KeyItem::Expression(_) => {
                 return Err(Error::UniqueConstraintOverExpressionPartitionKey {
                     table_name: dialect.stored_object_name_last(&table.name),
+                    constraint,
                 });
             }
             KeyItem::Column(key) => {

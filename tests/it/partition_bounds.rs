@@ -139,7 +139,7 @@ fn a_range_bound_is_well_formed() {
             "r",
             "p"
         ),
-        InvalidBound::ValueCount { expected: 1, found: 2 }
+        InvalidBound::ValueCount { expected: 1, found: 2, upper: false }
     );
     assert_eq!(
         invalid(
@@ -156,7 +156,7 @@ fn a_range_bound_is_well_formed() {
             "rm",
             "p"
         ),
-        InvalidBound::ValueAfterInfinity
+        InvalidBound::ValueAfterInfinity { maximum: false }
     );
     assert_eq!(
         invalid(
@@ -362,7 +362,10 @@ fn a_bound_value_has_the_keys_type() {
         assert!(
             matches!(
                 invalid(&sql, root, "p"),
-                InvalidBound::ValueNotOfKeyType { value: written, .. } if written == value
+                InvalidBound::ValueNotOfKeyType { value: written, .. }
+                | InvalidBound::ValueOutOfRange { value: written, .. }
+                | InvalidBound::DateTimeOutOfRange { value: written }
+                    if written == value.trim_matches('\'')
             ),
             "{sql}"
         );
@@ -447,7 +450,7 @@ fn numeric_and_timestamp_bounds_are_ordered_exactly() {
                     "ts",
                     "p"
                 ),
-                InvalidBound::ValueNotOfKeyType { value: written, .. } if written == value
+                InvalidBound::DateTimeOutOfRange { value: written } if written == value.trim_matches('\'')
             ),
             "{value}"
         );
@@ -501,7 +504,7 @@ fn other_literal_spellings_read_or_stay_undecided() {
             "rm",
             "p"
         ),
-        InvalidBound::ValueAfterInfinity
+        InvalidBound::ValueAfterInfinity { maximum: false }
     );
     assert_eq!(
         invalid(&format!("{LIST} CREATE TABLE p PARTITION OF l FOR VALUES IN (x);"), "l", "p"),
@@ -540,7 +543,7 @@ fn literal_edges_read_as_postgresql_reads_them() {
             "i",
             "e"
         ),
-        InvalidBound::ValueNotOfKeyType { .. }
+        InvalidBound::ValueOutOfRange { .. }
     ));
     // A date key reads a time of day and other spellings PostgreSQL accepts,
     // which the model leaves undecided.
@@ -560,7 +563,7 @@ fn booleans_and_numbers_read_only_as_postgresql_casts_them() {
         ("CREATE TABLE k (x TIMESTAMP) PARTITION BY LIST (x);", "IN (1)"),
     ] {
         let sql = format!("{schema} CREATE TABLE p PARTITION OF k FOR VALUES {bound};");
-        assert!(matches!(invalid(&sql, "k", "p"), InvalidBound::ValueNotOfKeyType { .. }), "{sql}");
+        assert!(matches!(invalid(&sql, "k", "p"), InvalidBound::ValueCannotCast { .. }), "{sql}");
     }
     // A text key reads a number as PostgreSQL prints it, and a boolean as its
     // name.

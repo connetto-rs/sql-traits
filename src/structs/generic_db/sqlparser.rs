@@ -4791,12 +4791,14 @@ fn refuse_reference_across_storage(
             host_table: dialect.stored_object_name_last(&host.name),
             referenced_table: dialect.stored_object_name_last(&referenced.name),
             host_is_temporary: host.is_temporary(),
+            host_is_unlogged: host.unlogged,
         });
     }
     if referenced.unlogged && !host.unlogged && !host.is_temporary() {
         return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
             host_table: dialect.stored_object_name_last(&host.name),
             referenced_table: dialect.stored_object_name_last(&referenced.name),
+            set_unlogged: None,
         });
     }
     Ok(())
@@ -9966,6 +9968,22 @@ impl ParserDB {
             replacement.unlogged = unlogged;
             Ok(())
         })
+        .map_err(|error| {
+            match error {
+                crate::errors::Error::ForeignKeyReferencesUnloggedTable {
+                    host_table,
+                    referenced_table,
+                    ..
+                } => {
+                    crate::errors::Error::ForeignKeyReferencesUnloggedTable {
+                        host_table,
+                        referenced_table,
+                        set_unlogged: Some(unlogged),
+                    }
+                }
+                error => error,
+            }
+        })
     }
 
     /// Checks persistence against the statement's original catalog.
@@ -9988,6 +10006,7 @@ impl ParserDB {
             return Err(crate::errors::Error::PersistenceNotChangeable {
                 table_name: builder.dialect().stored_object_name_last(&node.name),
                 reason: crate::errors::FixedPersistence::Partitioned,
+                unlogged,
             });
         }
         if changed.is_some() {
@@ -9999,6 +10018,7 @@ impl ParserDB {
             return Err(crate::errors::Error::PersistenceNotChangeable {
                 table_name: builder.dialect().stored_object_name_last(&node.name),
                 reason: crate::errors::FixedPersistence::Temporary,
+                unlogged,
             });
         }
         if node.unlogged == unlogged {
@@ -10008,6 +10028,7 @@ impl ParserDB {
             return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
                 host_table: builder.dialect().stored_object_name_last(&host.name),
                 referenced_table: builder.dialect().stored_object_name_last(&node.name),
+                set_unlogged: Some(true),
             });
         }
         *changed = Some(node.unlogged);
@@ -10154,6 +10175,7 @@ impl ParserDB {
             return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
                 host_table: builder.dialect().stored_object_name_last(&host.name),
                 referenced_table: builder.dialect().stored_object_name_last(&referenced.name),
+                set_unlogged: None,
             });
         }
         Ok(())
@@ -10469,12 +10491,17 @@ impl ParserDB {
             });
         }
         if alter_table.operations.len() > 1
-            && alter_table.operations.iter().any(|operation| {
+            && let Some(position) = alter_table.operations.iter().position(|operation| {
                 alter_passes::standalone(operation) == Some(alter_passes::Standalone::Partition)
             })
         {
+            let keyword = match alter_table.operations[position] {
+                AlterTableOperation::DetachPartitionOf { .. } => "DETACH",
+                _ => "ATTACH",
+            };
             return Err(crate::errors::Error::PartitionCommandNotAlone {
                 table_name: dialect.stored_object_name_last(&alter_table.name),
+                written_token: if position == 0 { "," } else { keyword }.to_string(),
             });
         }
         // Rename handlers retain their operation-specific missing-name errors.
@@ -13272,6 +13299,7 @@ impl ParserDB {
                     )?;
                     // Placed first, so `IF NOT EXISTS` checks the schema it
                     // truly creates in.
+                    let explicit_temporary = create_table.temporary;
                     create_table.temporary = place_relation(
                         &builder,
                         &mut create_table.name,
@@ -13287,6 +13315,12 @@ impl ParserDB {
                             table_name: builder
                                 .dialect()
                                 .stored_object_name_last(&create_table.name),
+                            explicit_temporary,
+                            written_token: if explicit_temporary {
+                                "UNLOGGED".to_string()
+                            } else {
+                                String::new()
+                            },
                         });
                     }
 

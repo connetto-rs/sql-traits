@@ -108,7 +108,7 @@ fn an_unlogged_table_cannot_be_temporary() {
     ] {
         let error = refusal(sql);
         assert!(
-            matches!(&error, Error::UnloggedTemporaryTable { table_name } if table_name == "t"),
+            matches!(&error, Error::UnloggedTemporaryTable { table_name, .. } if table_name == "t"),
             "{sql} reported {error:?}"
         );
     }
@@ -141,7 +141,7 @@ fn a_temporary_or_partitioned_table_keeps_its_persistence() {
             assert!(
                 matches!(
                     &error,
-                    Error::PersistenceNotChangeable { table_name, reason: found }
+                    Error::PersistenceNotChangeable { table_name, reason: found, .. }
                         if table_name == "t" && *found == reason
                 ),
                 "{sql} reported {error:?}"
@@ -205,7 +205,7 @@ fn a_view_has_no_persistence_to_change() {
 fn references_unlogged(error: &Error, host: &str, referenced: &str) -> bool {
     matches!(
         error,
-        Error::ForeignKeyReferencesUnloggedTable { host_table, referenced_table }
+        Error::ForeignKeyReferencesUnloggedTable { host_table, referenced_table, .. }
             if host_table == host && referenced_table == referenced
     )
 }
