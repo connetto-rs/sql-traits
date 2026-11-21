@@ -399,6 +399,17 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
             conditions.join(" AND ")
         )
     });
+    let exclusions = grant.exclusions().iter().map(|exclusion| {
+        let arguments: Vec<String> =
+            exclusion.arguments().iter().map(ToString::to_string).collect();
+        format!(
+            "{} NOT IN {}({}) {{{}}}",
+            exclusion.column().column_name(),
+            exclusion.function().target_name(),
+            arguments.join(", "),
+            render(exclusion.set()),
+        )
+    });
     let conditions: Vec<String> = granted_to
         .into_iter()
         .chain(gate)
@@ -407,6 +418,7 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
         .chain(joins)
         .chain(grant.caps().iter().map(|cap| render_cap(cap, grant.joined_rows())))
         .chain(anti_joins)
+        .chain(exclusions)
         .collect();
     let filter = if conditions.is_empty() {
         String::new()
@@ -725,6 +737,11 @@ fn grant_rows(
                 .then(|| cap_rows(cap, request, fixture))
         })
         .collect();
+    let excluded: Vec<_> = grant
+        .exclusions()
+        .iter()
+        .map(|exclusion| evaluate(exclusion.set(), request, fixture))
+        .collect();
     for row in rows(fixture, grant.table().table_name()) {
         let restricted = grant.restrictions().iter().all(|restriction| restricts(restriction, row))
             && grant.joined_rows().iter().all(|joined| joins(row, joined, fixture));
@@ -741,7 +758,12 @@ fn grant_rows(
             GrantedTo::Anyone => true,
         };
         let unblocked = grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
-        if granted && restricted && unblocked && capped(grant, &caps, row, fixture) {
+        // `NOT IN` is `NULL` for a `NULL` compared with any value.
+        let outside = grant.exclusions().iter().zip(&excluded).all(|(exclusion, excluded)| {
+            nullable(row, exclusion.column().column_name())
+                .map_or(excluded.is_empty(), |value| !excluded.contains(value))
+        });
+        if granted && restricted && unblocked && outside && capped(grant, &caps, row, fixture) {
             let columns: Vec<Vec<&'static str>> = grant
                 .returned()
                 .iter()
@@ -5268,6 +5290,277 @@ fn an_anti_join_reads_its_correlations_by_postgres_name_resolution() {
         .expect("answered"),
         format!("{arm} AND NOT EXISTS (memberships WHERE user_id = grants.grantee_id)"),
         "a partial unique index keys only the rows its predicate holds for"
+    );
+}
+
+const EXCLUSIONS: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE ROLE app NOLOGIN;
+CREATE TABLE teams (id TEXT PRIMARY KEY);
+CREATE TABLE projects (
+  id TEXT PRIMARY KEY,
+  owner_id TEXT NOT NULL,
+  team_id TEXT REFERENCES teams (id)
+);
+CREATE TABLE project_blocks (
+  project_id TEXT NOT NULL REFERENCES projects (id),
+  principal_id TEXT NOT NULL,
+  PRIMARY KEY (project_id, principal_id)
+);
+CREATE TABLE team_blocks (
+  team_id TEXT NOT NULL REFERENCES teams (id),
+  principal_id TEXT NOT NULL,
+  PRIMARY KEY (team_id, principal_id)
+);
+CREATE FUNCTION blocked_projects() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT block.project_id FROM public.project_blocks block
+  WHERE block.principal_id = current_setting('app.user_id', true)
+$$;
+CREATE FUNCTION blocked_teams() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT block.team_id FROM public.team_blocks block
+  WHERE block.principal_id = current_setting('app.user_id', true)
+$$;
+CREATE FUNCTION visible_projects() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT project.id FROM public.projects project
+  WHERE project.owner_id = current_setting('app.user_id', true)
+    AND NOT (project.id = ANY (ARRAY(SELECT public.blocked_projects())))
+$$;
+CREATE FUNCTION unblocked_team_projects() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT project.id FROM public.projects project
+  WHERE project.team_id NOT IN (SELECT public.blocked_teams())
+$$;
+ALTER FUNCTION blocked_projects() OWNER TO authz_owner;
+ALTER FUNCTION blocked_teams() OWNER TO authz_owner;
+ALTER FUNCTION visible_projects() OWNER TO authz_owner;
+ALTER FUNCTION unblocked_team_projects() OWNER TO authz_owner;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION visible_projects(), unblocked_team_projects() TO app;
+GRANT SELECT ON teams, projects, project_blocks, team_blocks TO authz_owner;
+";
+
+const EXCLUSION_ROWS: Rows = &[
+    ("teams", &[("id", "t1")]),
+    ("teams", &[("id", "t2")]),
+    ("projects", &[("id", "p1"), ("owner_id", "alice"), ("team_id", "t1")]),
+    ("projects", &[("id", "p2"), ("owner_id", "alice"), ("team_id", "t2")]),
+    ("projects", &[("id", "p3"), ("owner_id", "alice")]),
+    ("projects", &[("id", "p4"), ("owner_id", "bob"), ("team_id", "t1")]),
+    ("projects", &[("id", "p5"), ("owner_id", "bob")]),
+    ("project_blocks", &[("project_id", "p2"), ("principal_id", "alice")]),
+    ("project_blocks", &[("project_id", "p4"), ("principal_id", "alice")]),
+    ("project_blocks", &[("project_id", "p4"), ("principal_id", "bob")]),
+    ("team_blocks", &[("team_id", "t2"), ("principal_id", "alice")]),
+    ("team_blocks", &[("team_id", "t1"), ("principal_id", "carol")]),
+];
+
+/// What PostgreSQL 18.7 returns for `(caller, helper)`, the helpers of
+/// [`EXCLUSIONS`] called as `app` over [`EXCLUSION_ROWS`].
+const EXCLUSIONS_MEASURED: &[(&str, &str, &[&str])] = &[
+    ("alice", "visible_projects", &["p1", "p3"]),
+    ("alice", "unblocked_team_projects", &["p1", "p4"]),
+    ("bob", "visible_projects", &["p5"]),
+    ("bob", "unblocked_team_projects", &["p1", "p2", "p3", "p4", "p5"]),
+    ("carol", "visible_projects", &[]),
+    ("carol", "unblocked_team_projects", &["p2"]),
+    ("zed", "visible_projects", &[]),
+    ("zed", "unblocked_team_projects", &["p1", "p2", "p3", "p4", "p5"]),
+];
+
+const VISIBLE_PROJECTS: &str = "projects.id WHERE owner_id = app.user_id AND id NOT IN \
+     blocked_projects() {project_blocks.project_id WHERE principal_id = app.user_id}";
+
+fn excluding<'db>(
+    database: &'db ParserDB,
+    deployment: &'db Deployment,
+    name: &str,
+) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    function(database, "public", name).helper_set_with_exclusions(&[], deployment, database)
+}
+
+#[test]
+fn an_exclusion_keeps_the_rows_outside_another_helpers_set() {
+    let database = postgres(EXCLUSIONS);
+    let deployment = deployment();
+    let visible = excluding(&database, &deployment, "visible_projects").expect("answered");
+    assert_eq!(render(&visible), VISIBLE_PROJECTS);
+    let unblocked = excluding(&database, &deployment, "unblocked_team_projects").expect("answered");
+    assert_eq!(
+        render(&unblocked),
+        "projects.id WHERE team_id NOT IN blocked_teams() \
+         {team_blocks.team_id WHERE principal_id = app.user_id}"
+    );
+    for &(caller, helper, measured) in EXCLUSIONS_MEASURED {
+        let set = if helper == "visible_projects" { &visible } else { &unblocked };
+        let returned: Vec<_> =
+            evaluate(set, Request::of(caller), EXCLUSION_ROWS).into_iter().collect();
+        assert_eq!(returned, measured, "{caller:?} calling {helper}()");
+    }
+}
+
+/// `visible_projects()` of [`EXCLUSIONS`] with `condition` in place of its
+/// exclusion, read with exclusions or without.
+fn excluded_as(condition: &str, reads_exclusions: bool) -> Result<String, HelperSetError> {
+    let written = "NOT (project.id = ANY (ARRAY(SELECT public.blocked_projects())))";
+    let sql = EXCLUSIONS.replace(written, condition);
+    assert!(sql.contains(condition), "the exclusion is replaced");
+    let caller = SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))
+        .expect("a custom setting name");
+    let blocked =
+        SessionSetting::value("app.blocked", delimited(",")).expect("a custom setting name");
+    let deployment =
+        Deployment::new("app", ["app"], [caller, blocked]).expect("a valid deployment");
+    let database = postgres(&sql);
+    let visible = function(&database, "public", "visible_projects");
+    let answered = if reads_exclusions {
+        visible.helper_set_with_exclusions(&[], &deployment, &database)
+    } else {
+        visible.helper_set(&[], &deployment, &database)
+    };
+    answered.map(|set| render(&set))
+}
+
+#[test]
+fn every_spelling_of_an_exclusion_reads_alike() {
+    for condition in [
+        "project.id NOT IN (SELECT public.blocked_projects())",
+        "NOT (project.id IN (SELECT public.blocked_projects()))",
+        "project.id <> ALL (ARRAY(SELECT public.blocked_projects()))",
+        "project.id <> ALL (SELECT public.blocked_projects())",
+        "NOT (project.id = ANY (SELECT public.blocked_projects()))",
+        "NOT ((id) = ANY (ARRAY(SELECT public.blocked_projects())))",
+    ] {
+        assert_eq!(excluded_as(condition, true).as_deref(), Ok(VISIBLE_PROJECTS), "{condition}");
+    }
+}
+
+/// A consumer reading no exclusion would keep the rows the helper excludes.
+#[test]
+fn a_reading_leaving_exclusions_unread_refuses_one() {
+    let condition = "project.id NOT IN (SELECT public.blocked_projects())";
+    let refused = excluded_as(condition, false);
+    assert!(
+        matches!(
+            &refused,
+            Err(HelperSetError::UnreadExclusion { function, condition })
+                if function == "visible_projects"
+                    && condition == "project.id NOT IN (SELECT public.blocked_projects())"
+        ),
+        "{refused:?}"
+    );
+    let calling = format!(
+        "{EXCLUSIONS}CREATE FUNCTION visible_teams() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT project.team_id FROM public.projects project
+           WHERE project.id IN (SELECT public.visible_projects())
+         $$;
+         ALTER FUNCTION visible_teams() OWNER TO authz_owner;"
+    );
+    let database = postgres(&calling);
+    let deployment = deployment();
+    let teams = answer(&database, &deployment, "public", "visible_teams", &[]);
+    assert!(
+        matches!(
+            &teams,
+            Err(HelperSetError::UnreadExclusion { function, .. })
+                if function == "visible_projects"
+        ),
+        "{teams:?}"
+    );
+    assert!(excluding(&database, &deployment, "visible_teams").is_ok());
+}
+
+#[test]
+fn a_negated_comparison_with_no_helper_is_no_exclusion() {
+    for condition in [
+        "project.id NOT IN (SELECT unnest(string_to_array(current_setting('app.blocked', true), ',')))",
+        "NOT (project.id = ANY (string_to_array(current_setting('app.blocked', true), ',')))",
+        "'p1' NOT IN (SELECT public.blocked_projects())",
+        "project.id <> ANY (ARRAY(SELECT public.blocked_projects()))",
+        "project.id <> ALL ('{p9}'::TEXT[])",
+        "NOT (lower(project.id) = ANY (ARRAY(SELECT public.blocked_projects())))",
+        "project.id NOT IN (SELECT public.blocked_projects() LIMIT 1)",
+        "project.id NOT IN (SELECT public.blocked_projects() UNION SELECT 'p9')",
+    ] {
+        for reads_exclusions in [false, true] {
+            let answered = excluded_as(condition, reads_exclusions);
+            assert!(
+                matches!(answered, Err(HelperSetError::Irreducible { .. })),
+                "{condition}: {answered:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_exclusion_calls_one_helper_returning_one_column() {
+    let unresolved = excluded_as("project.id NOT IN (SELECT public.unblocked())", true);
+    assert!(
+        matches!(
+            &unresolved,
+            Err(HelperSetError::UnresolvedCall { function, call })
+                if function == "visible_projects" && call == "public.unblocked"
+        ),
+        "{unresolved:?}"
+    );
+    let pairs = EXCLUSIONS.replace(
+        "CREATE FUNCTION blocked_projects() RETURNS SETOF TEXT\nLANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$\n  SELECT block.project_id FROM",
+        "CREATE FUNCTION blocked_projects() RETURNS TABLE (project_id TEXT, principal_id TEXT)\nLANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$\n  SELECT block.project_id, block.principal_id FROM",
+    );
+    assert_ne!(pairs, EXCLUSIONS, "the excluded helper returns two columns");
+    let database = postgres(&pairs);
+    let deployment = deployment();
+    let refused = excluding(&database, &deployment, "visible_projects");
+    assert!(matches!(refused, Err(HelperSetError::ArmShape { .. })), "{refused:?}");
+}
+
+#[test]
+fn an_exclusion_of_a_set_holding_nothing_takes_no_row_away() {
+    let condition = "block.principal_id = current_setting('app.user_id', true)\n$$;\nCREATE FUNCTION blocked_teams";
+    let empty = EXCLUSIONS.replace(
+        condition,
+        "block.principal_id = current_setting('app.user_id', true) AND false\n$$;\nCREATE FUNCTION blocked_teams",
+    );
+    assert_ne!(empty, EXCLUSIONS, "the excluded helper keeps no row");
+    let database = postgres(&empty);
+    let deployment = deployment();
+    assert_eq!(
+        excluding(&database, &deployment, "visible_projects").map(|set| render(&set)).as_deref(),
+        Ok("projects.id WHERE owner_id = app.user_id")
+    );
+}
+
+/// PostgreSQL runs the excluded helper as the owner of the helper excluding
+/// it, so the owner needs `EXECUTE` on it.
+#[test]
+fn an_exclusion_needs_its_owner_to_execute_the_helper_excluded() {
+    let sql = EXCLUSIONS.replace(
+        "ALTER FUNCTION blocked_projects() OWNER TO authz_owner;",
+        "CREATE ROLE blocks_owner NOLOGIN BYPASSRLS;
+         GRANT SELECT ON project_blocks TO blocks_owner;
+         ALTER FUNCTION blocked_projects() OWNER TO blocks_owner;",
+    );
+    let database = postgres(&sql);
+    let deployment = deployment();
+    let refused = excluding(&database, &deployment, "visible_projects");
+    assert!(
+        matches!(
+            &refused,
+            Err(HelperSetError::MissingExecute { function, owner, called })
+                if function == "visible_projects"
+                    && owner == "authz_owner"
+                    && called == "blocked_projects"
+        ),
+        "{refused:?}"
+    );
+    let granted = format!("{sql}GRANT EXECUTE ON FUNCTION blocked_projects() TO authz_owner;");
+    let database = postgres(&granted);
+    assert_eq!(
+        excluding(&database, &deployment, "visible_projects").map(|set| render(&set)).as_deref(),
+        Ok(VISIBLE_PROJECTS)
     );
 }
 

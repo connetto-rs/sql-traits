@@ -26,7 +26,7 @@ use super::{
 use crate::{
     errors::{AccessorRefusal, HelperSetError, LookupError},
     structs::{
-        AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, Deployment,
+        AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, Deployment, ExcludedSet,
         FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase,
         JoinedRow, LiteralSet, ParentArm, RequestNormalization, Restriction, Returned, RowCap,
         RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent,
@@ -51,14 +51,18 @@ use crate::{
     },
 };
 
-/// See [`FunctionLike::helper_set`].
+/// See [`FunctionLike::helper_set`] and
+/// [`FunctionLike::helper_set_with_exclusions`], which `reads_exclusions`
+/// chooses between.
 pub(crate) fn helper_set<'db, DB: DatabaseLike>(
     function: &'db DB::Function,
     arguments: &[Value],
     deployment: &'db Deployment,
     database: &'db DB,
+    reads_exclusions: bool,
 ) -> Result<HelperSet<'db, DB>, HelperSetError> {
-    Reader { deployment, database, answering: Vec::new() }.answer(function, arguments)
+    Reader { deployment, database, reads_exclusions, answering: Vec::new() }
+        .answer(function, arguments)
 }
 
 /// A literal the body compares, as far as comparing it goes.
@@ -739,6 +743,9 @@ struct Walk<'q> {
 struct Reader<'db, DB: DatabaseLike> {
     deployment: &'db Deployment,
     database: &'db DB,
+    /// Whether a grant arm's exclusions are read rather than refused, in
+    /// every helper answered.
+    reads_exclusions: bool,
     /// The helpers being answered, outermost first.
     answering: Vec<&'db DB::Function>,
 }
@@ -1945,10 +1952,18 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut grantees = None;
         let mut gates = Gates::default();
         let mut caps = Vec::new();
+        let mut exclusions = Vec::new();
         let mut conditions = Vec::new();
         for conjunct in own {
             if let Some(cap) = self.cap(scope, select, rows, conjunct)? {
                 caps.push(cap);
+                continue;
+            }
+            if let Some(exclusion) = self.exclusion(scope, select, table, conjunct)? {
+                // `NOT IN` an empty set holds for every row, `NULL` too.
+                if !exclusion.set.arms.is_empty() {
+                    exclusions.push(exclusion);
+                }
                 continue;
             }
             let named = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
@@ -2005,6 +2020,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
         let caps: Arc<[RowCap<'db, DB>]> = caps.into();
         let anti_joins: Arc<[AntiJoin<'db, DB>]> = anti_joins.into();
+        let exclusions: Arc<[ExcludedSet<'db, DB>]> = exclusions.into();
         let joined_rows: Arc<[JoinedRow<'db, DB>]> = joined_rows.into();
         let grant = |(granted_to, own): Grantee<'db, DB>,
                      kept: Kept<'db, DB>,
@@ -2020,6 +2036,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 time_bounds,
                 caps: Arc::clone(&caps),
                 anti_joins: Arc::clone(&anti_joins),
+                exclusions: Arc::clone(&exclusions),
                 joined_rows: Arc::clone(&joined_rows),
             }))
         };
@@ -2031,6 +2048,36 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         arms.extend(last.and_then(|last| grant(last, kept, gates.gate, time_bounds)));
         Ok(arms)
+    }
+
+    /// The exclusion `conjunct` writes on a column of the arm's `table`, if
+    /// it writes one, `<column> NOT IN (SELECT <helper>(<arguments>))` or
+    /// another spelling [`excluded_operands`] reads, refused where the
+    /// reading leaves exclusions unread. Excluding the elements of a setting
+    /// is no exclusion.
+    fn exclusion(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        table: &ArmTable<'_, 'db, DB>,
+        conjunct: &Expr,
+    ) -> Result<Option<ExcludedSet<'db, DB>>, HelperSetError> {
+        let Some((compared, subquery)) = excluded_operands(conjunct) else { return Ok(None) };
+        let (Some(column), Some(call)) = (table.column(compared), projected_call(subquery)) else {
+            return Ok(None);
+        };
+        if self.set_elements(scope, subquery)?.is_some() {
+            return Ok(None);
+        }
+        if !self.reads_exclusions {
+            return Err(HelperSetError::UnreadExclusion {
+                function: scope.name.clone(),
+                condition: conjunct.to_string(),
+            });
+        }
+        let Called { function, arguments, set } =
+            self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
+        Ok(Some(ExcludedSet { column, function, arguments, set: Box::new(set) }))
     }
 
     /// Splits the conditions of an arm reading `rows`, its table and then
@@ -2698,17 +2745,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             expression => (expression, None),
         };
         let Expr::Function(call) = expression else { return Ok(None) };
-        if let FunctionArguments::Subquery(query) = &call.args {
-            // `ARRAY(SELECT ...)` is a constructor, which no function shadows.
-            let [ObjectNamePart::Identifier(name)] = call.name.0.as_slice() else {
+        if let FunctionArguments::Subquery(_) = &call.args {
+            let Some(query) = array_constructor(call).filter(|_| cast.is_none()) else {
                 return Ok(None);
             };
-            if cast.is_some()
-                || name.quote_style.is_some()
-                || !name.value.eq_ignore_ascii_case("array")
-            {
-                return Ok(None);
-            }
             return self.set_elements(scope, query);
         }
         // A third argument names a string read as `NULL`, which changes the
@@ -3618,6 +3658,7 @@ fn keeps_every_row<DB: DatabaseLike>(arm: &GrantArm<'_, DB>) -> bool {
         && arm.time_bounds.is_empty()
         && arm.caps.is_empty()
         && arm.anti_joins.is_empty()
+        && arm.exclusions.is_empty()
         && arm.joined_rows.is_empty()
 }
 
@@ -3764,6 +3805,47 @@ fn projected(query: &Query) -> Option<&Expr> {
         && select.from.is_empty()
         && select.selection.is_none())
     .then_some(expression)
+}
+
+/// The subquery of `ARRAY(<query>)`, a constructor no function shadows.
+fn array_constructor(call: &Function) -> Option<&Query> {
+    let FunctionArguments::Subquery(query) = &call.args else { return None };
+    let [ObjectNamePart::Identifier(name)] = call.name.0.as_slice() else { return None };
+    (name.quote_style.is_none() && name.value.eq_ignore_ascii_case("array")).then_some(query)
+}
+
+/// The compared value and the subquery of `<value> NOT IN (<query>)`, also
+/// written `NOT (<value> IN (<query>))`, `<value> <> ALL (<set>)` or `NOT
+/// (<value> = ANY (<set>))`, `<set>` being `(<query>)` or `ARRAY(<query>)`,
+/// which PostgreSQL evaluates alike, `NULL` included.
+fn excluded_operands(conjunct: &Expr) -> Option<(&Expr, &Query)> {
+    fn set_query(set: &Expr) -> Option<&Query> {
+        match unnest(set) {
+            Expr::Subquery(query) => Some(query),
+            Expr::Function(call) => array_constructor(call),
+            _ => None,
+        }
+    }
+    match unnest(conjunct) {
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => {
+            match unnest(expr) {
+                Expr::In { expr, target: InTarget::Subquery(query), negated: false, .. } => {
+                    Some((expr, query))
+                }
+                Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
+                    Some((left, set_query(right)?))
+                }
+                _ => None,
+            }
+        }
+        Expr::In { expr, target: InTarget::Subquery(query), negated: true, .. } => {
+            Some((expr, query))
+        }
+        Expr::AllOp { left, compare_op: BinaryOperator::NotEq, right } => {
+            Some((left, set_query(right)?))
+        }
+        _ => None,
+    }
 }
 
 /// The arguments of `call`, where it is a plain call writing nothing but its
