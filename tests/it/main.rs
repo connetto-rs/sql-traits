@@ -109,6 +109,7 @@ mod materialized_view_indexes;
 mod names_outside_this_catalog;
 mod negated_length_checks;
 mod object_kind_reporting;
+mod only_drop_partition_keys;
 mod open_world_access;
 mod operator_alteration;
 mod operator_creation;
