@@ -43,6 +43,18 @@ fn typed_and_namespaced_refusals() {
             "invalid value for enum option \"vacuum_index_cleanup\": bad",
         ),
         ("toast.fillfactor=10", "unrecognized parameter \"fillfactor\""),
+        (
+            "autovacuum_vacuum_scale_factor='inf'",
+            "value inf out of bounds for option \"autovacuum_vacuum_scale_factor\"",
+        ),
+        (
+            "autovacuum_vacuum_scale_factor='-Infinity'",
+            "value -Infinity out of bounds for option \"autovacuum_vacuum_scale_factor\"",
+        ),
+        (
+            "log_autovacuum_min_duration='-1.5'",
+            "value -1.5 out of bounds for option \"log_autovacuum_min_duration\"",
+        ),
     ] {
         let result = ParserDB::parse::<PostgreSqlDialect>(&format!(
             "CREATE TABLE t(id TEXT) WITH({parameters});"
@@ -66,6 +78,9 @@ fn valid_values_and_resets() -> Result<(), Error> {
         "toast.autovacuum_enabled=false",
         "toast.autovacuum_vacuum_cost_delay=100",
         "autovacuum_vacuum_max_threshold=-1",
+        "fillfactor='99.5'",
+        "log_autovacuum_min_duration='-0.6'",
+        "log_autovacuum_min_duration='-0.5'",
     ] {
         ParserDB::parse::<PostgreSqlDialect>(&format!(
             "CREATE TABLE t(id TEXT) WITH({parameters}); ALTER TABLE t SET({parameters}); ALTER TABLE t RESET(unknown,other.unknown);"
@@ -78,6 +93,12 @@ fn valid_values_and_resets() -> Result<(), Error> {
         ("gin", "INT[]", "fastupdate=off,gin_pending_list_limit=64"),
         ("brin", "INT", "pages_per_range=1,autosummarize=true"),
         ("spgist", "int4range", "fillfactor=10"),
+        ("\"btree\"", "INT", "deduplicate_items"),
+        ("\"hash\"", "INT", "fillfactor=100"),
+        ("\"gist\"", "int4range", "buffering=auto"),
+        ("\"gin\"", "INT[]", "fastupdate=off"),
+        ("\"brin\"", "INT", "pages_per_range=1"),
+        ("\"spgist\"", "int4range", "fillfactor=10"),
         ("custom_method", "INT", "unknown=999"),
     ] {
         ParserDB::parse::<PostgreSqlDialect>(&format!(
@@ -191,16 +212,30 @@ fn numeric_and_boolean_spellings() -> Result<(), Error> {
 
 #[test]
 fn hexadecimal_reals_and_numeric_range_errors() -> Result<(), Error> {
-    for parameters in ["fillfactor='0x1.8p4'", "autovacuum_vacuum_scale_factor='0x1p0'"] {
+    for parameters in [
+        "fillfactor='0x1.8p4'",
+        "autovacuum_vacuum_scale_factor='0x1p0'",
+        "autovacuum_vacuum_scale_factor='0x1p1'",
+        "autovacuum_vacuum_scale_factor='0x1p-1'",
+        "autovacuum_vacuum_scale_factor='0x0p0'",
+    ] {
         ParserDB::parse::<PostgreSqlDialect>(&format!(
             "CREATE TABLE t(id INT) WITH({parameters});"
         ))?;
     }
-    for value in ["1e-999", "1e999"] {
+    for value in ["1e-999", "1e999", "0x1pbad", "0x.p1", "0x1p9999", "0x1p-9999"] {
         let result = ParserDB::parse::<PostgreSqlDialect>(&format!(
             "CREATE TABLE t(id INT) WITH(autovacuum_vacuum_scale_factor='{value}');"
         ));
-        assert!(matches!(result, Err(Error::InvalidStorageParameterValue { .. })), "{value}");
+        assert!(result.is_err(), "{value}");
+        if let Err(error) = result {
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid value for floating point option \"autovacuum_vacuum_scale_factor\": {value}"
+                )
+            );
+        }
     }
     Ok(())
 }
@@ -321,4 +356,48 @@ fn missing_altered_column_precedes_storage_options() {
             matches!(result, Err(Error::IdentifierLookupError(sql_traits::errors::LookupError::ColumnNotFound { table_name, column_name })) if table_name == "t" && column_name == "absent")
         );
     }
+}
+
+#[test]
+fn storage_options_require_names() -> Result<(), Error> {
+    for (statement, option, relation) in [
+        ("CREATE TABLE t(a int); CREATE INDEX i ON t(a) WITH(1=2);", "1 = 2", "i"),
+        (
+            "CREATE TABLE t(a int); CREATE INDEX i ON t USING custom_method(a) WITH(1=2);",
+            "1 = 2",
+            "i",
+        ),
+        (
+            "CREATE TABLE t(a int) WITH(toast.extra.fillfactor=10);",
+            "toast.extra.fillfactor = 10",
+            "t",
+        ),
+        (
+            "CREATE TABLE t(a int); CREATE INDEX i ON t(a) WITH(toast.extra.fillfactor=10);",
+            "toast.extra.fillfactor = 10",
+            "i",
+        ),
+        (
+            "CREATE TABLE t(a int) WITH(CLUSTERED COLUMNSTORE INDEX);",
+            "CLUSTERED COLUMNSTORE INDEX",
+            "t",
+        ),
+    ] {
+        let statements = sqlparser::parser::Parser::parse_sql(&GenericDialect {}, statement)?;
+        let result = ParserDB::from_statements_with_dialect(
+            statements,
+            "postgres".into(),
+            SqlparserDialect::PostgreSql,
+        );
+        assert!(result.is_err(), "{statement}");
+        if let Err(error) = result {
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Storage parameter `{option}` of relation `{relation}` must be a name with an optional value."
+                )
+            );
+        }
+    }
+    Ok(())
 }

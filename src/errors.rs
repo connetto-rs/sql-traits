@@ -2762,6 +2762,17 @@ pub enum Error {
         /// Reason why the index is invalid.
         reason: String,
     },
+    #[error(
+        "Storage parameter `{option}` of relation `{relation_name}` must be a name with an optional value."
+    )]
+    /// PostgreSQL rejects a malformed storage option with syntax-error SQLSTATE
+    /// `42601`.
+    StorageParameterNotNamed {
+        /// The rendered storage option.
+        option: String,
+        /// The relation named by the statement.
+        relation_name: String,
+    },
     #[error("unrecognized parameter \"{parameter_name}\"")]
     /// PostgreSQL refuses an unknown storage parameter with SQLSTATE `22023`.
     UnrecognizedStorageParameter {

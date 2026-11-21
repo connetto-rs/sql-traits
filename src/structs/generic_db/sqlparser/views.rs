@@ -105,7 +105,9 @@ pub(super) fn create_view(
         && let sqlparser::ast::CreateTableOptions::With(options) = &node.options
     {
         refuse_plain_view_options(&node.name, options)?;
-        super::storage_parameters::heap(&builder, options)?;
+        if *builder.dialect() == super::SqlparserDialect::PostgreSql {
+            super::storage_parameters::heap(&node.name, options)?;
+        }
     }
 
     if node.materialized && node.or_replace {
@@ -810,7 +812,9 @@ fn set_view_options(
 ) -> Result<ParserDBBuilder, Error> {
     if kind == ObjectKind::MaterializedView {
         refuse_plain_view_options(name, options)?;
-        super::storage_parameters::heap(&builder, options)?;
+        if *builder.dialect() == super::SqlparserDialect::PostgreSql {
+            super::storage_parameters::heap(name, options)?;
+        }
     }
     if kind == ObjectKind::View
         && let Some(position) = plain_view_position(&builder, name)

@@ -2,13 +2,13 @@
 
 use alloc::{borrow::Cow, format, string::ToString};
 
-use sqlparser::ast::{BinaryOperator, CreateIndex, CreateTable, Expr, Ident, IndexType, SqlOption};
+use sqlparser::ast::{
+    BinaryOperator, CreateIndex, CreateTable, Expr, Ident, IndexType, ObjectName, ObjectNamePart,
+    SqlOption,
+};
 
-use super::ParserDBBuilder;
 use crate::{
-    errors::Error,
-    impls::{SqlparserDialect, parameter_value},
-    utils::identifier_resolution::stored_ident_name,
+    errors::Error, impls::parameter_value, utils::identifier_resolution::stored_ident_name,
 };
 
 const HEAP: u16 = 1;
@@ -241,13 +241,20 @@ fn validate_value(name: &str, value: &str, specification: ValueType) -> Result<(
 
 /// Validates borrowed name parts and values against one relation kind.
 fn validate<'parameter>(
-    kind: u16,
+    kind: Option<u16>,
     parameters: impl Iterator<
-        Item = (Option<&'parameter Ident>, &'parameter Ident, Option<&'parameter Expr>),
+        Item = Result<
+            (Option<&'parameter Ident>, &'parameter Ident, Option<&'parameter Expr>),
+            Error,
+        >,
     >,
 ) -> Result<(), Error> {
     let mut seen = [[false; PARAMETERS.len()]; 2];
-    for (namespace, identifier, value) in parameters {
+    for parameter in parameters {
+        let (namespace, identifier, value) = parameter?;
+        let Some(kind) = kind else {
+            continue;
+        };
         let namespace = namespace.map(stored_ident_name);
         let selected = match namespace.as_deref() {
             None => kind,
@@ -277,75 +284,72 @@ fn validate<'parameter>(
     Ok(())
 }
 
-/// Checks heap and TOAST options only for PostgreSQL ingestion.
-pub(super) fn heap(builder: &ParserDBBuilder, options: &[SqlOption]) -> Result<(), Error> {
-    if *builder.dialect() != SqlparserDialect::PostgreSql {
-        return Ok(());
-    }
+/// Checks heap and TOAST options for PostgreSQL ingestion.
+pub(super) fn heap(relation_name: &ObjectName, options: &[SqlOption]) -> Result<(), Error> {
     validate(
-        HEAP,
-        options.iter().filter_map(|option| {
+        Some(HEAP),
+        options.iter().map(|option| {
+            let invalid = || {
+                Error::StorageParameterNotNamed {
+                    option: option.to_string(),
+                    relation_name: relation_name.to_string(),
+                }
+            };
             let (key, value) = match option {
                 SqlOption::KeyValue { key, value } => (key, Some(value)),
                 SqlOption::Ident(key) => (key, None),
-                _ => return None,
+                _ => return Err(invalid()),
             };
-            let name = key.0.last()?.as_ident()?;
-            let namespace = if key.0.len() > 1 { key.0.first()?.as_ident() } else { None };
-            Some((namespace, name, value))
+            match key.0.as_slice() {
+                [ObjectNamePart::Identifier(name)] => Ok((None, name, value)),
+                [ObjectNamePart::Identifier(namespace), ObjectNamePart::Identifier(name)] => {
+                    Ok((Some(namespace), name, value))
+                }
+                _ => Err(invalid()),
+            }
         }),
     )
 }
 
 /// Checks a table's storage options before recording it.
-pub(super) fn table(
-    builder: &ParserDBBuilder,
-    table: &CreateTable,
-    options: &[SqlOption],
-) -> Result<(), Error> {
-    if *builder.dialect() == SqlparserDialect::PostgreSql {
-        if table.partition_by.is_some()
-            && options.iter().any(|option| {
-                super::storage_parameter_key(option).is_some_and(|key| key.0.len() == 1)
-            })
-        {
-            return Err(Error::StorageParametersOnPartitionedTable {
-                table_name: table.name.to_string(),
-            });
-        }
-        heap(builder, options)?;
+pub(super) fn table(table: &CreateTable, options: &[SqlOption]) -> Result<(), Error> {
+    if table.partition_by.is_some()
+        && options
+            .iter()
+            .any(|option| super::storage_parameter_key(option).is_some_and(|key| key.0.len() == 1))
+    {
+        return Err(Error::StorageParametersOnPartitionedTable {
+            table_name: table.name.to_string(),
+        });
     }
-    Ok(())
+    heap(&table.name, options)
 }
 
 /// Checks built-in index parameters while leaving extension methods opaque.
-pub(super) fn index(builder: &ParserDBBuilder, index: &CreateIndex) -> Result<(), Error> {
-    if *builder.dialect() != SqlparserDialect::PostgreSql {
-        return Ok(());
-    }
+pub(super) fn index(index: &CreateIndex) -> Result<(), Error> {
     let kind = match &index.using {
-        None | Some(IndexType::BTree) => BTREE,
-        Some(IndexType::Hash) => HASH,
-        Some(IndexType::GiST) => GIST,
-        Some(IndexType::GIN) => GIN,
-        Some(IndexType::BRIN) => BRIN,
-        Some(IndexType::SPGiST) => SPGIST,
+        None | Some(IndexType::BTree) => Some(BTREE),
+        Some(IndexType::Hash) => Some(HASH),
+        Some(IndexType::GiST) => Some(GIST),
+        Some(IndexType::GIN) => Some(GIN),
+        Some(IndexType::BRIN) => Some(BRIN),
+        Some(IndexType::SPGiST) => Some(SPGIST),
         Some(IndexType::Custom(name)) => {
             match stored_ident_name(name).as_ref() {
-                "btree" => BTREE,
-                "hash" => HASH,
-                "gist" => GIST,
-                "gin" => GIN,
-                "brin" => BRIN,
-                "spgist" => SPGIST,
-                _ => return Ok(()),
+                "btree" => Some(BTREE),
+                "hash" => Some(HASH),
+                "gist" => Some(GIST),
+                "gin" => Some(GIN),
+                "brin" => Some(BRIN),
+                "spgist" => Some(SPGIST),
+                _ => None,
             }
         }
-        Some(IndexType::Bloom) => return Ok(()),
+        Some(IndexType::Bloom) => None,
     };
     validate(
         kind,
-        index.with.iter().filter_map(|expression| {
+        index.with.iter().map(|expression| {
             let (key, value) = match expression {
                 Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
                     (left.as_ref(), Some(right.as_ref()))
@@ -353,9 +357,16 @@ pub(super) fn index(builder: &ParserDBBuilder, index: &CreateIndex) -> Result<()
                 expression => (expression, None),
             };
             match key {
-                Expr::Identifier(name) => Some((None, name, value)),
-                Expr::CompoundIdentifier(names) => Some((names.first(), names.last()?, value)),
-                _ => None,
+                Expr::Identifier(name) => Ok((None, name, value)),
+                Expr::CompoundIdentifier(names) if names.len() == 2 => {
+                    Ok((names.first(), &names[1], value))
+                }
+                _ => {
+                    Err(Error::StorageParameterNotNamed {
+                        option: expression.to_string(),
+                        relation_name: index.name.as_ref().unwrap_or(&index.table_name).to_string(),
+                    })
+                }
             }
         }),
     )

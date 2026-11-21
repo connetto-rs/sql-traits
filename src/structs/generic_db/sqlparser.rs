@@ -6867,8 +6867,9 @@ impl ParserDB {
             &[ObjectKind::ForeignTable, ObjectKind::VirtualTable],
         )?;
         index_access_methods::refuse_in_index(builder, &create_index)?;
-        storage_parameters::index(builder, &create_index)?;
-        if *builder.dialect() != SqlparserDialect::PostgreSql {
+        if *builder.dialect() == SqlparserDialect::PostgreSql {
+            storage_parameters::index(&create_index)?;
+        } else {
             validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
         }
         index_opclasses::index(&create_index, Some(table), builder)?;
@@ -9603,12 +9604,13 @@ impl ParserDB {
             return Ok(builder);
         };
         let node = Self::stored_node(&builder, &stored)?;
-        if *builder.dialect() != SqlparserDialect::PostgreSql && node.partition_by.is_some() {
+        if *builder.dialect() == SqlparserDialect::PostgreSql {
+            storage_parameters::table(node, &options)?;
+        } else if node.partition_by.is_some() {
             return Err(crate::errors::Error::StorageParametersOnPartitionedTable {
                 table_name: stored.name,
             });
         }
-        storage_parameters::table(&builder, node, &options)?;
         // Another dialect's table options, such as MySQL's `ENGINE`, leave the
         // parameters nowhere to go.
         if !matches!(node.table_options, CreateTableOptions::None | CreateTableOptions::With(_)) {
@@ -12886,7 +12888,7 @@ impl ParserDB {
                     if matches!(dialect, SqlparserDialect::PostgreSql) {
                         refuse_unlogged_partitioned(&create_table)?;
                         if let CreateTableOptions::With(options) = &create_table.table_options {
-                            storage_parameters::table(&builder, &create_table, options)?;
+                            storage_parameters::table(&create_table, options)?;
                         }
                         validate_distinct_columns(&create_table, case)?;
                         Self::take_over_table_shell(&mut builder, &create_table)?;
