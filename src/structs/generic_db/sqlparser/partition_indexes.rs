@@ -29,10 +29,7 @@ use super::{
 use crate::{
     errors::{AttachIndexRefusal, Error},
     traits::TableLike,
-    utils::{
-        identifier_resolution::{stored_ident_name, stored_identifier},
-        last_str,
-    },
+    utils::identifier_resolution::{stored_ident_name, stored_identifier},
 };
 
 /// Whether two identifiers name the same stored object.
@@ -352,8 +349,8 @@ pub(super) fn refuse_drop(
             metadata.partition_indexes().iter().find(|(held, _)| same_name(builder, held, name))
         {
             return Err(Error::IndexRequiredByParent {
-                index_name: held.value.clone(),
-                parent_index_name: parent.value.clone(),
+                index_name: builder.dialect().stored_name(held),
+                parent_index_name: builder.dialect().stored_name(parent),
             });
         }
     }
@@ -584,7 +581,8 @@ fn member_on(
 
 /// The index `name` reaches, [`None`] for an index on a materialized view.
 fn resolve(builder: &ParserDBBuilder, name: &ObjectName) -> Result<Option<NamedIndex>, Error> {
-    let not_found = || Error::AlterIndexNotFound { index_name: last_str(name).to_string() };
+    let not_found =
+        || Error::AlterIndexNotFound { index_name: builder.dialect().stored_object_name(name) };
     if let Some(ident) = object_name_last_identifier(name)
         && let Some((table, _)) = constraint_names::key_index_owner(builder, name, ident)
         && let Some(member) = member_on(builder, &table, ident)?
@@ -894,25 +892,27 @@ pub(super) fn attach(
     parent_name: &ObjectName,
     child_name: &ObjectName,
 ) -> Result<ParserDBBuilder, Error> {
-    let not_supported =
-        || Error::AttachIndexNotSupported { index_name: last_str(parent_name).to_string() };
+    let dialect = *builder.dialect();
+    let not_supported = || {
+        Error::AttachIndexNotSupported { index_name: dialect.stored_object_name_last(parent_name) }
+    };
     let parent = resolve(&builder, parent_name)?.ok_or_else(not_supported)?;
     let parent_node = ParserDB::stored_node(&builder, &parent.table)?;
     if parent_node.partition_by.is_none() {
         return Err(not_supported());
     }
-    let parent_table_name = parent_node.table_name().to_string();
+    let parent_table_name = dialect.stored_object_name_last(&parent_node.name);
     let child = resolve(&builder, child_name)?;
     let refused = |index_name: String, reason: AttachIndexRefusal| {
         Error::AttachIndexRefused {
             index_name,
-            parent_index_name: parent.name.value.clone(),
+            parent_index_name: dialect.stored_name(&parent.name),
             reason,
         }
     };
     let Some(child) = child else {
         return Err(refused(
-            last_str(child_name).to_string(),
+            dialect.stored_object_name_last(child_name),
             AttachIndexRefusal::NotOnPartition { table_name: parent_table_name },
         ));
     };
@@ -925,16 +925,17 @@ pub(super) fn attach(
         revalidate(&mut builder, parent.table, parent.name)?;
         return Ok(builder);
     }
+    let child_index_name = || dialect.stored_name(&child.name);
     if links.iter().any(|(_, attached_to)| same_name(&builder, attached_to, &parent.name)) {
         let partition_name =
-            ParserDB::stored_node(&builder, &child.table)?.table_name().to_string();
+            dialect.stored_object_name_last(&ParserDB::stored_node(&builder, &child.table)?.name);
         return Err(refused(
-            child.name.value,
+            child_index_name(),
             AttachIndexRefusal::PartitionHasIndex { partition_name },
         ));
     }
     if attached_to.is_some() {
-        return Err(refused(child.name.value, AttachIndexRefusal::AttachedElsewhere));
+        return Err(refused(child_index_name(), AttachIndexRefusal::AttachedElsewhere));
     }
     let child_node = ParserDB::stored_node(&builder, &child.table)?;
     let case = builder.identifier_case();
@@ -943,7 +944,7 @@ pub(super) fn attach(
         .any(|(kind, table)| *kind == ParentKind::PartitionOf && table.matches(child_node, case))
     {
         return Err(refused(
-            child.name.value,
+            child_index_name(),
             AttachIndexRefusal::NotOnPartition { table_name: parent_table_name },
         ));
     }
@@ -954,11 +955,11 @@ pub(super) fn attach(
         },
     );
     if !matching {
-        return Err(refused(child.name.value, AttachIndexRefusal::DefinitionsDiffer));
+        return Err(refused(child_index_name(), AttachIndexRefusal::DefinitionsDiffer));
     }
     if matches!(parent.member, Member::Key(..)) && matches!(child.member, Member::Standalone(_)) {
         return Err(refused(
-            child.name.value,
+            child_index_name(),
             AttachIndexRefusal::ConstraintMissing { table_name: parent_table_name },
         ));
     }

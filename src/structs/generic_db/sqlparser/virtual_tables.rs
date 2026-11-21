@@ -161,7 +161,7 @@ pub(super) fn declare_columns(
             })
             .unzip();
         create_table.columns = columns;
-        validate_distinct_columns(create_table, builder.identifier_case())?;
+        validate_distinct_columns(create_table, builder.identifier_case(), *builder.dialect())?;
         return Ok(ModuleDeclaration {
             hidden_column_names,
             shadow_suffixes,
@@ -247,7 +247,7 @@ fn derive_columns(
             create_table.columns = columns;
             // SQLite declares the columns, refusing a repeated one, before it
             // counts the dimensions.
-            validate_distinct_columns(create_table, builder.identifier_case())?;
+            validate_distinct_columns(create_table, builder.identifier_case(), *builder.dialect())?;
             rtree_dimensions(arguments).map_err(refuse)?;
             return Ok(DerivedColumns { hidden: Vec::new(), declared_types });
         }
@@ -953,7 +953,7 @@ pub(super) fn rename_table(
                 table_name: followers.table.name,
                 column_name: named_column.name,
                 dependent_kind: reader.kind(),
-                dependent_name: reader.name().to_string(),
+                dependent_name: reader.stored_name(*builder.dialect()),
             });
         }
         let renamed_to = renamed.name.clone();

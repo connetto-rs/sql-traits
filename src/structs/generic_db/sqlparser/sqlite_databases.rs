@@ -22,7 +22,6 @@ use crate::{
     structs::Schema,
     traits::TableLike,
     utils::{
-        last_str,
         object_name::{Namespaces, qualifier_of},
         walk::walk_relations,
     },
@@ -218,7 +217,7 @@ fn refuse_other_databases(
     other.map_or(Ok(()), |database_name| {
         Err(Error::CrossDatabaseReference {
             object_kind,
-            object_name: last_str(object_name).to_string(),
+            object_name: builder.dialect().stored_object_name_last(object_name),
             database_name,
         })
     })

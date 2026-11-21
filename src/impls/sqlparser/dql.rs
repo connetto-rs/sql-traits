@@ -509,10 +509,11 @@ struct FromScope<'query, 'db, DB: DatabaseLike, D: Copy> {
     /// The comparison a written column, relation or output name is read
     /// under, fixed for the whole scope at the moment it is built.
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 }
 
 impl<DB: DatabaseLike, D: Copy> FromScope<'_, '_, DB, D> {
-    fn new(case: IdentifierCase) -> Self {
+    fn new(case: IdentifierCase, dialect: crate::impls::SqlparserDialect) -> Self {
         Self {
             bases: Vec::new(),
             derived: Vec::new(),
@@ -524,6 +525,7 @@ impl<DB: DatabaseLike, D: Copy> FromScope<'_, '_, DB, D> {
             unqualified_poison: false,
             qualified_only: false,
             case,
+            dialect,
         }
     }
 
@@ -657,6 +659,7 @@ trait DerivationProfile<'query, 'db, DB: DatabaseLike> {
 /// [`DatabaseLike::identifier_case`].
 struct SourceDerivation {
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 }
 
 impl<'query, 'db, DB> DerivationProfile<'query, 'db, DB> for SourceDerivation
@@ -679,7 +682,7 @@ where
         _select: AstRef<'query, 'db, Select>,
         _parent: Self::Cursor,
     ) -> Self::Scope {
-        FromScope::new(self.case)
+        FromScope::new(self.case, self.dialect)
     }
 
     fn begin_join_scope(
@@ -687,7 +690,7 @@ where
         _join: AstRef<'query, 'db, TableFactor>,
         _parent: Self::Cursor,
     ) -> Self::Scope {
-        FromScope::new(self.case)
+        FromScope::new(self.case, self.dialect)
     }
 
     fn scope<'scope>(
@@ -834,7 +837,10 @@ fn collect_source_from_clause<'query, 'db, DB: DatabaseLike>(
     };
     let case = database.identifier_case();
     let deriving = Deriving::of(database, case);
-    let mut profile = SourceDerivation { case };
+    let mut profile = SourceDerivation {
+        case,
+        dialect: crate::impls::SqlparserDialect::for_error_names(database.dialect()),
+    };
     let parent = ();
     let cte_scope = match &query.with {
         Some(with) => derive_cte_shapes(AstRef::Query(with), &[], deriving, parent, &mut profile)?,
@@ -4026,7 +4032,10 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
         _ => {
             candidates.sort_unstable();
             candidates.dedup();
-            Err(LookupError::AmbiguousTableLookup { object_name: column.value.clone(), candidates })
+            Err(LookupError::AmbiguousTableLookup {
+                object_name: scope.dialect.stored_name(column),
+                candidates,
+            })
         }
     }
 }
@@ -4150,7 +4159,7 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
                 }
                 Some(DerivedMatch::Ambiguous) => {
                     Err(LookupError::AmbiguousTableLookup {
-                        object_name: column.value.clone(),
+                        object_name: scope.dialect.stored_name(column),
                         candidates: vec![relation_key_display(relation)],
                     })
                 }
@@ -5155,9 +5164,14 @@ mod tests {
     fn source_profile_and_non_select_bodies_take_their_explicit_fallbacks() {
         fn exercise_source_profile<'query, 'db>(
             select: &'query sqlparser::ast::Select,
-            _database: &'db ParserDB,
+            database: &'db ParserDB,
         ) {
-            let mut profile = SourceDerivation { case: IdentifierCase::AsWritten };
+            let mut profile = SourceDerivation {
+                case: IdentifierCase::AsWritten,
+                dialect: crate::impls::SqlparserDialect::for_error_names(
+                    crate::traits::DatabaseLike::dialect(database),
+                ),
+            };
             assert!(
                 <SourceDerivation as DerivationProfile<'query, 'db, ParserDB>>::location_of_select(
                     &profile,

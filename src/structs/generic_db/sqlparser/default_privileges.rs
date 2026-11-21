@@ -38,7 +38,6 @@ use crate::{
     },
     utils::{
         identifier_resolution::{SessionPrincipal, stored_identifier},
-        last_str,
         object_name::{Namespaces, qualifier_of, search_path_entry},
     },
 };
@@ -632,7 +631,9 @@ impl DefaultPrivileges {
                     .iter()
                     .any(|(declared, ())| role_matches_lookup_ident(declared, role))
             }) {
-                return Err(Error::RoleNotFoundForGrant { role_name: absent.value.clone() });
+                return Err(Error::RoleNotFoundForGrant {
+                    role_name: builder.dialect().stored_name(absent),
+                });
             }
             validate_access_targets_against_builder(builder, &grantees, None)?;
         }
@@ -641,13 +642,13 @@ impl DefaultPrivileges {
             // PostgreSQL's grammar takes a bare schema name here.
             let [ObjectNamePart::Identifier(ident)] = schema.0.as_slice() else {
                 return Err(Error::SchemaNotFoundForDefaultPrivileges {
-                    schema_name: schema.to_string(),
+                    schema_name: builder.dialect().stored_object_name(schema),
                 });
             };
             let (name, quoted) = (ident.value.as_str(), ident.quote_style.is_some());
             if !schema_is_declared(builder, name, quoted) {
                 return Err(Error::SchemaNotFoundForDefaultPrivileges {
-                    schema_name: name.to_string(),
+                    schema_name: builder.dialect().stored_name(ident),
                 });
             }
             row_schemas.push(Some((name.to_string(), quoted)));
@@ -1067,7 +1068,7 @@ pub(super) fn require_creator_executes(
     match creator_lacking_execute(builder, session, metadata) {
         Some(creator) => {
             Err(Error::FunctionNotExecutableByCreator {
-                function_name: last_str(&function.name).to_string(),
+                function_name: builder.dialect().stored_object_name_last(&function.name),
                 role_name: creator.to_string(),
             })
         }

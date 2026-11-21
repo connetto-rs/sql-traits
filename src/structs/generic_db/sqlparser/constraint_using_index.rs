@@ -1,5 +1,7 @@
 //! Adoption of standalone indexes by key constraints.
 
+use alloc::string::String;
+
 use sqlparser::ast::{CreateIndex, Ident, KeyOrIndexDisplay, NullsDistinctOption};
 
 use super::{
@@ -16,11 +18,12 @@ pub(super) fn validate_adoption(
 ) -> Result<usize, Error> {
     let table = ParserDB::stored_node(builder, stored)?;
     let schema = table_schema_qualifier(table);
+    let stored_index_name = builder.dialect().stored_name(index_name);
     if constraint_names::index_name_held(builder, index_name, schema)
         || super::index_name_holder(builder, index_name, schema)
             == Some(super::ObjectKind::UniqueIndex)
     {
-        return Err(Error::AdoptedIndexAlreadyConstrained { index_name: index_name.value.clone() });
+        return Err(Error::AdoptedIndexAlreadyConstrained { index_name: stored_index_name });
     }
     let position = builder
         .indices()
@@ -34,19 +37,19 @@ pub(super) fn validate_adoption(
                 builder.identifier_case(),
             )
         })
-        .ok_or_else(|| Error::AdoptedIndexNotFound { index_name: index_name.value.clone() })?;
+        .ok_or_else(|| Error::AdoptedIndexNotFound { index_name: stored_index_name.clone() })?;
     let (index, metadata) = &builder.indices()[position];
     if !stored.matches(index.table(), builder.identifier_case()) {
         return Err(Error::AdoptedIndexWrongTable {
-            index_name: index_name.value.clone(),
-            table_name: stored.name.clone(),
+            index_name: stored_index_name,
+            table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
         });
     }
     if !metadata.is_valid() {
-        return Err(Error::AdoptedIndexInvalid { index_name: index_name.value.clone() });
+        return Err(Error::AdoptedIndexInvalid { index_name: stored_index_name });
     }
     let index = index.attribute();
-    validate(index, index_name)?;
+    validate(index, stored_index_name)?;
     if table.partition_by.is_some() {
         return Err(Error::AdoptedIndexOnPartitionedTable);
     }
@@ -114,29 +117,27 @@ pub(super) fn adopt(
     Ok(())
 }
 
-/// Refuses index definitions that cannot back a key constraint.
-fn validate(index: &CreateIndex, name: &sqlparser::ast::Ident) -> Result<(), Error> {
+/// Refuses index definitions that cannot back a key constraint, naming the
+/// index by its stored `index_name`.
+fn validate(index: &CreateIndex, index_name: String) -> Result<(), Error> {
     if !index.unique {
-        return Err(Error::AdoptedIndexNotUnique { index_name: name.value.clone() });
+        return Err(Error::AdoptedIndexNotUnique { index_name });
     }
     if index
         .columns
         .iter()
         .any(|column| !matches!(column.column.expr, sqlparser::ast::Expr::Identifier(_)))
     {
-        return Err(Error::AdoptedIndexExpressions { index_name: name.value.clone() });
+        return Err(Error::AdoptedIndexExpressions { index_name });
     }
     if index.predicate.is_some() {
-        return Err(Error::AdoptedIndexPartial { index_name: name.value.clone() });
+        return Err(Error::AdoptedIndexPartial { index_name });
     }
     if let Some(position) = index.columns.iter().position(|column| {
         matches!(column.column.options.sort, Some(sqlparser::ast::OrderBySort::Desc))
             || column.column.options.nulls_first == Some(true)
     }) {
-        return Err(Error::AdoptedIndexSorting {
-            index_name: name.value.clone(),
-            column_number: position + 1,
-        });
+        return Err(Error::AdoptedIndexSorting { index_name, column_number: position + 1 });
     }
     Ok(())
 }

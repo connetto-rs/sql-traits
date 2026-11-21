@@ -22,22 +22,25 @@ use super::{
 };
 use crate::{
     errors::Error,
+    impls::SqlparserDialect,
     structs::{
         TableAttribute, UserDefinedType,
         metadata::{BoundCall, ExpressionCalls},
     },
-    traits::FunctionLike,
     utils::call_sites::{call_reaches, for_each_call_name_mut},
 };
 
 /// The functions a statement moves, each with the name it is stored under
 /// afterwards.
-pub(super) struct Moves(Vec<(Arc<CreateFunction>, ObjectName)>);
+pub(super) struct Moves(Vec<(Arc<CreateFunction>, ObjectName)>, SqlparserDialect);
 
 impl Moves {
     /// Moves each function of `moving` to the name paired with it.
-    pub(super) fn new(moving: Vec<(Arc<CreateFunction>, ObjectName)>) -> Self {
-        Self(moving)
+    pub(super) fn new(
+        moving: Vec<(Arc<CreateFunction>, ObjectName)>,
+        dialect: SqlparserDialect,
+    ) -> Self {
+        Self(moving, dialect)
     }
 
     /// The name the stored function `function` moves to, if it moves.
@@ -113,7 +116,7 @@ fn renamed_call(
         Ok(renamed) => Ok(renamed.cloned()),
         Err(function) => {
             Err(Error::MovedFunctionCallAmbiguous {
-                function_name: function.name().to_string(),
+                function_name: moves.1.stored_object_name_last(&function.name),
                 call: call.to_string(),
             })
         }

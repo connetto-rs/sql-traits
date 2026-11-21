@@ -118,6 +118,7 @@ fn match_output<'entries>(
     entries: &'entries [OutputEntry<'_, '_>],
     key: &Ident,
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<OutputMatch<'entries>, LookupError> {
     let matches = || {
         entries.iter().filter_map(|entry| {
@@ -158,7 +159,7 @@ fn match_output<'entries>(
         .collect::<Vec<_>>();
     candidates.sort_unstable();
     candidates.dedup();
-    Err(LookupError::AmbiguousTableLookup { object_name: key.value.clone(), candidates })
+    Err(LookupError::AmbiguousTableLookup { object_name: dialect.stored_name(key), candidates })
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
@@ -398,7 +399,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         key: &Ident,
         case: IdentifierCase,
     ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
-        Ok(match match_output(entries, key, case)? {
+        Ok(match match_output(entries, key, case, self.dialect)? {
             OutputMatch::Found { definition, name, quoted } => {
                 Some((
                     self.definition(definition),

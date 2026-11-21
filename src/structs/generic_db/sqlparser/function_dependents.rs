@@ -18,13 +18,14 @@ use super::{
 };
 use crate::{
     errors::{Error, ObjectKind},
+    impls::SqlparserDialect,
     structs::{
         OperatorRow, TableAttribute,
         generic_db::builtin_functions::Builtins,
         metadata::{ExpressionCalls, operator_node_count},
     },
     traits::{DomainLike, IndexLike, UserDefinedTypeLike},
-    utils::{call_sites::for_each_call, last_str},
+    utils::call_sites::for_each_call,
 };
 
 /// An object holding a function or an operator, by its kind and the name a
@@ -83,9 +84,9 @@ impl Holder {
         Self { named: (kind, name), held }
     }
 
-    /// The reader `reader`, named as it is stored.
-    fn reader(reader: views::Dependent) -> Self {
-        Self::new(reader.kind(), reader.name().to_string(), Held::Reader(reader))
+    /// The reader `reader`, named as `dialect`'s engine stores it.
+    fn reader(reader: views::Dependent, dialect: SqlparserDialect) -> Self {
+        Self::new(reader.kind(), reader.stored_name(dialect), Held::Reader(reader))
     }
 }
 
@@ -209,7 +210,7 @@ impl ParserDBBuilder {
                 .unwrap_or_else(|| check.attribute().to_string());
             return Some(Holder::new(
                 ObjectKind::CheckConstraint,
-                alloc::format!("{}.{name}", table.name),
+                alloc::format!("{}.{name}", self.dialect().stored_object_name(&table.name)),
                 Held::Check(StoredTable::of(table), slot.position()),
             ));
         }
@@ -219,7 +220,13 @@ impl ParserDBBuilder {
             let mut cursor = Cursor::default();
             for option in &declared.options {
                 let held = dropped.is_held_in(metadata.calls(), &mut cursor, &option.option);
-                let name = || alloc::format!("{}.{}", table.name, declared.name);
+                let name = || {
+                    alloc::format!(
+                        "{}.{}",
+                        self.dialect().stored_object_name(&table.name),
+                        self.dialect().stored_name(&declared.name)
+                    )
+                };
                 let holder = match option.option {
                     // A column's check is a constraint of its own.
                     ColumnOption::Check(_) => continue,
@@ -276,7 +283,7 @@ impl ParserDBBuilder {
             {
                 return Some(Holder::new(
                     ObjectKind::Table,
-                    table.name.to_string(),
+                    self.dialect().stored_object_name(&table.name),
                     Held::PartitionedTable(StoredTable::of(table)),
                 ));
             }
@@ -290,8 +297,13 @@ impl ParserDBBuilder {
         let on_tables =
             self.indices().iter().enumerate().find_map(|(position, (index, metadata))| {
                 dropped.is_held_by(metadata.calls()).then(|| {
-                    let name = IndexLike::name(index.as_ref())
-                        .map_or_else(|| index.attribute().to_string(), ToString::to_string);
+                    let name = IndexLike::name(index.as_ref()).map_or_else(
+                        || index.attribute().to_string(),
+                        |name| {
+                            self.dialect()
+                                .stored_spelling(name, IndexLike::name_is_quoted(index.as_ref()))
+                        },
+                    );
                     Holder::new(ObjectKind::Index, name, Held::Index(IndexSlot::Table(position)))
                 })
             });
@@ -299,8 +311,15 @@ impl ParserDBBuilder {
             self.materialized_view_indices().iter().enumerate().find_map(
                 |(position, (index, metadata))| {
                     dropped.is_held_by(metadata.calls()).then(|| {
-                        let name = IndexLike::name(index.as_ref())
-                            .map_or_else(|| index.index().to_string(), ToString::to_string);
+                        let name = IndexLike::name(index.as_ref()).map_or_else(
+                            || index.index().to_string(),
+                            |name| {
+                                self.dialect().stored_spelling(
+                                    name,
+                                    IndexLike::name_is_quoted(index.as_ref()),
+                                )
+                            },
+                        );
                         let slot = IndexSlot::MaterializedView(position);
                         Holder::new(ObjectKind::Index, name, Held::Index(slot))
                     })
@@ -323,8 +342,13 @@ impl ParserDBBuilder {
                     sqlparser::ast::TableConstraint::Unique(held) if held == unique_key.attribute()
                 )
             })?;
-            let name = IndexLike::name(unique_key.as_ref())
-                .map_or_else(|| unique_key.attribute().to_string(), ToString::to_string);
+            let name = IndexLike::name(unique_key.as_ref()).map_or_else(
+                || unique_key.attribute().to_string(),
+                |name| {
+                    self.dialect()
+                        .stored_spelling(name, IndexLike::name_is_quoted(unique_key.as_ref()))
+                },
+            );
             Some(Holder::new(
                 ObjectKind::UniqueIndex,
                 name,
@@ -333,46 +357,57 @@ impl ParserDBBuilder {
         })
     }
 
+    /// The first view or materialized view whose definition holds `dropped`.
+    fn view_holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
+        let calls_dropped = |calls: &ExpressionCalls<CreateFunction>| dropped.is_held_by(calls);
+        let (namespaces, dialect, case) =
+            (self.namespaces(), *self.dialect(), self.identifier_case());
+        let reader = if let Some((view, _, _)) =
+            self.views().iter().find(|(_, metadata, _)| calls_dropped(metadata.calls()))
+        {
+            views::Dependent::view(namespaces, dialect, ObjectKind::View, view.as_ref(), case)
+        } else {
+            let (view, _, _) = self
+                .materialized_views()
+                .iter()
+                .find(|(_, metadata, _)| calls_dropped(metadata.calls()))?;
+            views::Dependent::view(
+                namespaces,
+                dialect,
+                ObjectKind::MaterializedView,
+                view.as_ref(),
+                case,
+            )
+        };
+        Some(Holder::reader(reader, dialect))
+    }
+
     /// The first object outside a table's own parts holding `dropped`, but
     /// the functions a function's statement drops with it.
     fn object_holder(&self, dropped: &Dropped<'_>) -> Option<Holder> {
         let calls_dropped = |calls: &ExpressionCalls<CreateFunction>| dropped.is_held_by(calls);
-        if let Some((view, _, _)) =
-            self.views().iter().find(|(_, metadata, _)| calls_dropped(metadata.calls()))
-        {
-            return Some(Holder::reader(views::Dependent::view(
-                self.namespaces(),
-                ObjectKind::View,
-                view.as_ref(),
-                self.identifier_case(),
-            )));
-        }
-        if let Some((view, _, _)) = self
-            .materialized_views()
-            .iter()
-            .find(|(_, metadata, _)| calls_dropped(metadata.calls()))
-        {
-            return Some(Holder::reader(views::Dependent::view(
-                self.namespaces(),
-                ObjectKind::MaterializedView,
-                view.as_ref(),
-                self.identifier_case(),
-            )));
+        if let Some(holder) = self.view_holder(dropped) {
+            return Some(holder);
         }
         if let Some((policy, _)) = self.policies().iter().find(|(_, metadata)| {
             calls_dropped(metadata.using_calls()) || calls_dropped(metadata.check_calls())
         }) {
             return Some(Holder::new(
                 ObjectKind::Policy,
-                policy.name.value.clone(),
+                self.dialect().stored_name(&policy.name),
                 Held::Policy(Arc::clone(policy)),
             ));
         }
         if let Some((rule, _)) = self.rules().iter().find(|(_, calls)| calls_dropped(calls)) {
             return Some(Holder::new(
                 ObjectKind::Rule,
-                rule.name.value.clone(),
-                Held::Reader(rules::dependent(self.namespaces(), rule, self.identifier_case())),
+                self.dialect().stored_name(&rule.name),
+                Held::Reader(rules::dependent(
+                    self.namespaces(),
+                    *self.dialect(),
+                    rule,
+                    self.identifier_case(),
+                )),
             ));
         }
         // A bound name left bare is one in the default schema.
@@ -400,7 +435,7 @@ impl ParserDBBuilder {
         {
             return Some(Holder::new(
                 ObjectKind::Trigger,
-                last_str(&trigger.name).to_string(),
+                self.dialect().stored_object_name_last(&trigger.name),
                 Held::Trigger(Arc::clone(trigger)),
             ));
         }
@@ -417,7 +452,10 @@ impl ParserDBBuilder {
         if let Some((caller, _)) = self.functions().iter().find(|(caller, metadata)| {
             !dropping_too(caller) && calls_dropped(metadata.body_calls())
         }) {
-            return Some(Holder::reader(views::Dependent::Function(Arc::clone(caller))));
+            return Some(Holder::reader(
+                views::Dependent::Function(Arc::clone(caller)),
+                *self.dialect(),
+            ));
         }
         if let Some(holder) = self.domain_holder(dropped) {
             return Some(holder);
@@ -427,7 +465,11 @@ impl ParserDBBuilder {
             .enumerate()
             .find(|(_, (_, calls))| calls_dropped(calls))
             .map(|(position, (type_, _))| {
-                Holder::new(ObjectKind::Type, type_.name().to_string(), Held::Type(position))
+                Holder::new(
+                    ObjectKind::Type,
+                    self.dialect().stored_spelling(type_.name(), type_.name_is_quoted()),
+                    Held::Type(position),
+                )
             })
     }
 
@@ -445,15 +487,23 @@ impl ParserDBBuilder {
                     .position(|check| dropped.is_held_in(calls, &mut cursor, check))?;
                 Held::DomainCheck(position, check)
             };
-            Some(Holder::new(ObjectKind::Domain, domain.name().to_string(), held))
+            Some(Holder::new(
+                ObjectKind::Domain,
+                self.dialect().stored_spelling(domain.name(), domain.name_is_quoted()),
+                held,
+            ))
         })
     }
 }
 
 /// The refusal to drop `function`, which `dependent` still holds.
-pub(super) fn referenced(function: &CreateFunction, (kind, name): Dependent) -> Error {
+pub(super) fn referenced(
+    builder: &ParserDBBuilder,
+    function: &CreateFunction,
+    (kind, name): Dependent,
+) -> Error {
     Error::FunctionReferenced {
-        function_name: last_str(&function.name).to_string(),
+        function_name: builder.dialect().stored_object_name_last(&function.name),
         dependent_kind: kind,
         dependent_name: name,
     }

@@ -1,7 +1,7 @@
 //! Implement the [`ForeignKeyConstraint`] trait for the `sqlparser` crate's
 //! [`TableAttribute`] wrapper.
 
-use alloc::{borrow::Cow, string::ToString, vec::Vec};
+use alloc::{borrow::Cow, vec::Vec};
 
 use sqlparser::ast::{
     ConstraintReferenceMatchKind, CreateTable, ForeignKeyConstraint, Ident, ObjectName,
@@ -69,7 +69,11 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
         let (schema, table) = object_name_identifiers(foreign_table)?;
         database
             .table_by_target(target_name_of_idents(schema, table), database.identifier_case())?
-            .ok_or_else(|| LookupError::TableNotFound { object_name: foreign_table.to_string() })
+            .ok_or_else(|| {
+                LookupError::TableNotFound {
+                    object_name: database.dialect().stored_object_name(foreign_table),
+                }
+            })
     }
 
     #[inline]
@@ -136,20 +140,24 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     {
         let foreign_key = self.attribute();
         let referenced_table = self.referenced_table(database)?;
-        let host_table = || self.table().name.to_string();
+        let host_table = || database.dialect().stored_object_name_last(&self.table().name);
         if foreign_key.referred_columns.is_empty() {
             let primary_key: Vec<_> = referenced_table.primary_key_columns(database)?.collect();
             if primary_key.is_empty() {
                 return Err(LookupError::ReferencedPrimaryKeyNotFound {
                     host_table: host_table(),
-                    referenced_table: foreign_key.foreign_table.to_string(),
+                    referenced_table: database
+                        .dialect()
+                        .stored_object_name_last(&foreign_key.foreign_table),
                 });
             }
             if primary_key.len() != foreign_key.columns.len() {
                 return Err(LookupError::ForeignKeyColumnCountMismatch {
                     host_table: host_table(),
                     host_columns: foreign_key.columns.len(),
-                    referenced_table: foreign_key.foreign_table.to_string(),
+                    referenced_table: database
+                        .dialect()
+                        .stored_object_name_last(&foreign_key.foreign_table),
                     referenced_columns: primary_key.len(),
                 });
             }
@@ -171,11 +179,13 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
             ) {
                 return Err(LookupError::ReferencedColumnsNotUnique {
                     host_table: host_table(),
-                    referenced_table: foreign_key.foreign_table.to_string(),
+                    referenced_table: database
+                        .dialect()
+                        .stored_object_name_last(&foreign_key.foreign_table),
                     referenced_columns: foreign_key
                         .referred_columns
                         .iter()
-                        .map(|column| column.value.as_str())
+                        .map(|column| database.dialect().stored_name(column))
                         .collect::<Vec<_>>()
                         .join(", "),
                 });
@@ -265,8 +275,10 @@ fn resolve_columns<'db>(
             })
             .ok_or_else(|| {
                 LookupError::ColumnNotFound {
-                    table_name: table.table_name().to_string(),
-                    column_name: column_name.value.clone(),
+                    table_name: database
+                        .dialect()
+                        .stored_spelling(table.table_name(), table.table_name_is_quoted()),
+                    column_name: database.dialect().stored_name(column_name),
                 }
             })?;
         columns.push(column);

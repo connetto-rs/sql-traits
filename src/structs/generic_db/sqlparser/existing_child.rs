@@ -41,7 +41,7 @@ fn refuse_column(
     (parent_node, parent_column): (&CreateTable, &ColumnDef),
     child_node: &CreateTable,
 ) -> Result<(), ChildMismatch> {
-    let column_name = parent_column.name.value.clone();
+    let column_name = builder.dialect().stored_name(&parent_column.name);
     let Some(column) = child_node.columns.iter().find(|held| {
         super::case_idents_match(&held.name, &parent_column.name, builder.identifier_case())
     }) else {
@@ -135,6 +135,12 @@ fn merged_checks(
 ) -> Result<Vec<(TableConstraint, bool)>, ChildMismatch> {
     let held = checks_of(builder, child, child_node);
     let mut merged = Vec::new();
+    let stored_name = |held: &HeldCheck| {
+        held.check.name.as_ref().map_or_else(
+            || held.name.clone().unwrap_or_else(|| held.check.to_string()),
+            |name| builder.dialect().stored_name(name),
+        )
+    };
 
     for passed in checks_of(builder, parent, parent_node) {
         if passed.check.no_inherit {
@@ -150,11 +156,9 @@ fn merged_checks(
             }
         });
         let Some(own) = found else {
-            return Err(ChildMismatch::MissingConstraint {
-                constraint_name: passed.name.clone().unwrap_or_else(|| passed.check.to_string()),
-            });
+            return Err(ChildMismatch::MissingConstraint { constraint_name: stored_name(&passed) });
         };
-        let constraint_name = || own.name.clone().unwrap_or_else(|| own.check.to_string());
+        let constraint_name = || stored_name(own);
         if !same_expr(&own.check) {
             return Err(ChildMismatch::ConstraintDiffers { constraint_name: constraint_name() });
         }

@@ -7,6 +7,7 @@ use sqlparser::ast::{
     SqlOption,
 };
 
+use super::SqlparserDialect;
 use crate::{
     errors::Error, impls::parameter_value, utils::identifier_resolution::stored_ident_name,
 };
@@ -292,7 +293,7 @@ pub(super) fn heap(relation_name: &ObjectName, options: &[SqlOption]) -> Result<
             let invalid = || {
                 Error::StorageParameterNotNamed {
                     option: option.to_string(),
-                    relation_name: relation_name.to_string(),
+                    relation_name: SqlparserDialect::PostgreSql.stored_object_name(relation_name),
                 }
             };
             let (key, value) = match option {
@@ -319,7 +320,7 @@ pub(super) fn table(table: &CreateTable, options: &[SqlOption]) -> Result<(), Er
             .any(|option| super::storage_parameter_key(option).is_some_and(|key| key.0.len() == 1))
     {
         return Err(Error::StorageParametersOnPartitionedTable {
-            table_name: table.name.to_string(),
+            table_name: SqlparserDialect::PostgreSql.stored_object_name_last(&table.name),
         });
     }
     heap(&table.name, options)
@@ -364,7 +365,8 @@ pub(super) fn index(index: &CreateIndex) -> Result<(), Error> {
                 _ => {
                     Err(Error::StorageParameterNotNamed {
                         option: expression.to_string(),
-                        relation_name: index.name.as_ref().unwrap_or(&index.table_name).to_string(),
+                        relation_name: SqlparserDialect::PostgreSql
+                            .stored_object_name(index.name.as_ref().unwrap_or(&index.table_name)),
                     })
                 }
             }

@@ -104,7 +104,7 @@ pub(super) fn create_domain(
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Domain,
             conflicting_kind,
-            object_name: name.value.clone(),
+            object_name: builder.dialect().stored_name(name),
         });
     }
     if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &domain.name) {
@@ -358,7 +358,9 @@ pub(super) fn bind_type(
         Reached::UserType(position, _is_multirange) => {
             let type_ = &builder.user_defined_types()[position].0;
             if type_.is_shell() {
-                return Err(Error::TypeIsOnlyShell { type_name: type_.name().to_string() });
+                return Err(Error::TypeIsOnlyShell {
+                    type_name: builder.dialect().stored_object_name(&type_.name),
+                });
             }
             user_type_qualifier(type_)
         }
@@ -444,7 +446,9 @@ pub(super) fn require_existing_type(
     if let Some((type_, _multirange)) = bound_user_type(types, name, builder.identifier_case())
         && type_.is_shell()
     {
-        return Err(Error::TypeIsOnlyShell { type_name: name.to_string() });
+        return Err(Error::TypeIsOnlyShell {
+            type_name: builder.dialect().stored_object_name(name),
+        });
     }
     Ok(())
 }

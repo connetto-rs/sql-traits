@@ -5,7 +5,7 @@
 //! on `Grant` to support both use cases.
 //! Session-principal grantees bind to known DDL-time roles during ingestion.
 
-use alloc::{string::ToString, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 use core::mem;
 
 use sqlparser::ast::{
@@ -13,12 +13,13 @@ use sqlparser::ast::{
     Ident, ObjectName, ObjectNamePart, Privileges, Revoke,
 };
 
+use super::dialect::SqlparserDialect;
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{
-        ColumnGrantLike, ColumnLike, DatabaseLike, GrantLike, Metadata, Relation, RoleLike,
-        TableGrantLike, TableLike, grant::GrantTarget,
+        ColumnGrantLike, ColumnLike, DatabaseLike, DialectLike, GrantLike, Metadata, Relation,
+        RoleLike, TableGrantLike, TableLike, grant::GrantTarget,
     },
     utils::{
         identifier_resolution::{
@@ -286,11 +287,11 @@ fn action_columns(action: &Action) -> Option<&[Ident]> {
 /// [`crate::errors::Error::IdentifierLookupError`] when a resolvable name
 /// matches more than one table.
 pub(crate) fn validate_granted_columns(
-    namespaces: Namespaces,
     privileges: &Privileges,
     objects: Option<&GrantObjects>,
     database_tables: &[&CreateTable],
     search_path: &[(&str, bool)],
+    dialect: SqlparserDialect,
     case: IdentifierCase,
     claimed: impl Fn(&RelationKey) -> bool,
 ) -> Result<(), crate::errors::Error> {
@@ -301,9 +302,11 @@ pub(crate) fn validate_granted_columns(
         return Ok(());
     };
 
+    let namespaces = Namespaces::of(dialect.sqlparser_dialect());
     for name in names {
         let resolved = if object_name_identifiers(name).is_ok() {
             resolve_table_object_name_on_search_path_in_iter(
+                dialect,
                 namespaces,
                 database_tables.iter().copied(),
                 name,
@@ -336,8 +339,8 @@ pub(crate) fn validate_granted_columns(
             });
             if !known {
                 return Err(crate::errors::Error::ColumnNotFoundForGrant {
-                    column_name: column.value.clone(),
-                    table_name: table.name.to_string(),
+                    column_name: dialect.stored_name(column),
+                    table_name: dialect.stored_object_name_last(&table.name),
                 });
             }
         }

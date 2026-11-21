@@ -1053,7 +1053,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
-            matches!(err, crate::errors::Error::AlterPolicyNotFound { policy_name } if policy_name == "nonexistent")
+            matches!(err, crate::errors::Error::AlterPolicyNotFound { policy_name, .. } if policy_name == "nonexistent")
         );
     }
 

@@ -277,8 +277,14 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
 
     /// The relation `of` names under the path the body compiles with.
     fn relation(&self, of: &ObjectName) -> Result<Relation<'db, DB>, LookupError> {
-        resolve_on_body_path(of, self.database, &self.declaration_path)?
-            .ok_or_else(|| LookupError::RelationNotFound { object_name: of.to_string() })
+        resolve_on_body_path(of, self.database, &self.declaration_path)?.ok_or_else(|| {
+            LookupError::RelationNotFound {
+                object_name: crate::impls::SqlparserDialect::for_error_names(
+                    self.database.dialect(),
+                )
+                .stored_object_name(of),
+            }
+        })
     }
 
     /// The type of the column `relation.column` names.
@@ -287,6 +293,13 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
             of.0.split_last().filter(|(_, relation)| !relation.is_empty())
         else {
             return Err(unresolvable(self.function.name(), &format_args!("{of}%TYPE")));
+        };
+        let dialect = if crate::traits::DialectLike::sqlparser_dialect(self.database.dialect())
+            .is::<sqlparser::dialect::PostgreSqlDialect>()
+        {
+            crate::impls::SqlparserDialect::PostgreSql
+        } else {
+            crate::impls::SqlparserDialect::Generic
         };
         let relation = ObjectName(relation.to_vec());
         let (Relation::Table(table) | Relation::ForeignTable(table)) = self.relation(&relation)?
@@ -298,8 +311,8 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
             table.column(&column.to_string(), self.database, self.database.identifier_case())?;
         let column = column.ok_or_else(|| {
             LookupError::ColumnNotFound {
-                table_name: relation.to_string(),
-                column_name: of.0.last().map(ToString::to_string).unwrap_or_default(),
+                table_name: dialect.stored_object_name(&relation),
+                column_name: dialect.stored_object_name_last(of),
             }
         })?;
         Ok(column_type(self.database, column.data_type(self.database)))

@@ -121,6 +121,7 @@ impl Labels {
 
 /// Resolves the column references visited in an expression.
 struct ColumnsRead<'a, 't, Resolve> {
+    dialect: crate::impls::SqlparserDialect,
     catalog_name: &'a str,
     table: &'a TargetName<'t>,
     resolve: Resolve,
@@ -170,7 +171,9 @@ impl<Resolve: FnMut(&Ident) -> bool> ColumnsRead<'_, '_, Resolve> {
                 if !qualifier_names_table(qualifier, self.catalog_name, self.table, self.case) {
                     return Err(crate::errors::Error::ForeignColumnReference {
                         reference: rendered_reference(idents),
-                        table_name: self.table.name().to_string(),
+                        table_name: self
+                            .dialect
+                            .stored_spelling(self.table.name(), self.table.name_is_quoted()),
                     });
                 }
                 self.column(column, expr)
@@ -234,6 +237,7 @@ impl<Resolve: FnMut(&Ident) -> bool> Visitor for ColumnsRead<'_, '_, Resolve> {
 /// * `case` - The comparison a written name is read under, the catalog's
 ///   [`DatabaseLike::identifier_case`](crate::traits::DatabaseLike::identifier_case)
 ///   for an expression a catalog stores.
+/// * `dialect` - The engine's identifier storage rules.
 ///
 /// # Returns
 ///
@@ -253,9 +257,15 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
     table: &TargetName<'_>,
     columns: &[C],
     case: IdentifierCase,
+    dialect: &dyn sqlparser::dialect::Dialect,
 ) -> Result<Vec<C>, crate::errors::Error> {
+    let dialect = if dialect.is::<sqlparser::dialect::PostgreSqlDialect>() {
+        crate::impls::SqlparserDialect::PostgreSql
+    } else {
+        crate::impls::SqlparserDialect::Generic
+    };
     let mut read = Vec::new();
-    visit_columns(expr, catalog_name, table, case, |ident| {
+    visit_columns(expr, catalog_name, table, case, dialect, |ident| {
         let Some(column) = columns.iter().find(|column| {
             column_named_by(column.column_name(), column.column_name_is_quoted(), ident, case)
         }) else {
@@ -278,8 +288,9 @@ pub(crate) fn validate_columns_in_expression<'column>(
     table: &TargetName<'_>,
     columns: impl Iterator<Item = &'column Ident> + Clone,
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<(), crate::errors::Error> {
-    visit_columns(expr, catalog_name, table, case, |ident| {
+    visit_columns(expr, catalog_name, table, case, dialect, |ident| {
         columns
             .clone()
             .any(|column| column_named_by(&column.value, column.quote_style.is_some(), ident, case))
@@ -293,9 +304,11 @@ fn visit_columns(
     catalog_name: &str,
     table: &TargetName<'_>,
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
     resolve: impl FnMut(&Ident) -> bool,
 ) -> Result<(), crate::errors::Error> {
     let mut visitor = ColumnsRead {
+        dialect,
         catalog_name,
         table,
         resolve,
@@ -358,14 +371,27 @@ mod tests {
             Ident::new("id"),
         ]);
         assert!(matches!(
-            columns_in_expression(&deep, "catalog", &table, &columns, IdentifierCase::AsWritten),
+            columns_in_expression(
+                &deep,
+                "catalog",
+                &table,
+                &columns,
+                IdentifierCase::AsWritten,
+                &GenericDialect,
+            ),
             Err(crate::errors::Error::ForeignColumnReference { .. })
         ));
 
         let empty = Expr::CompoundIdentifier(Vec::new());
-        let found =
-            columns_in_expression(&empty, "catalog", &table, &columns, IdentifierCase::AsWritten)
-                .expect("a reference with no parts reads no column");
+        let found = columns_in_expression(
+            &empty,
+            "catalog",
+            &table,
+            &columns,
+            IdentifierCase::AsWritten,
+            &GenericDialect,
+        )
+        .expect("a reference with no parts reads no column");
         assert_eq!(
             found.iter().map(ColumnLike::column_name).collect::<Vec<_>>(),
             Vec::<&str>::new()
@@ -384,6 +410,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -402,6 +429,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -425,6 +453,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .unwrap();
         assert_eq!(result.len(), 2);
@@ -449,6 +478,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -483,6 +513,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .unwrap();
         assert_eq!(result.len(), 1);
@@ -509,6 +540,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .unwrap();
         assert_eq!(result.len(), 3);
@@ -536,6 +568,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .unwrap();
         assert_eq!(result.len(), 2);
@@ -555,6 +588,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         );
         assert!(matches!(
             result,
@@ -578,6 +612,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         );
         assert!(matches!(
             result,
@@ -606,6 +641,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .expect("tuple of known columns parses");
         let names: Vec<&str> = result.iter().map(ColumnLike::column_name).collect();
@@ -629,6 +665,7 @@ mod tests {
             &TargetName::new("t", false),
             &[column],
             IdentifierCase::AsWritten,
+            &GenericDialect,
         )
         .expect("column resolves");
         assert_eq!(result.len(), 1);
@@ -655,6 +692,7 @@ mod tests {
                 &TargetName::new("t", false),
                 &columns,
                 IdentifierCase::AsWritten,
+                &GenericDialect,
             )
             .expect("local columns resolve");
             let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
@@ -675,6 +713,7 @@ mod tests {
             &TargetName::new("t", false),
             &[create_column("a")],
             IdentifierCase::AsWritten,
+            &SQLiteDialect {},
         );
         assert!(matches!(
             result,
@@ -699,6 +738,7 @@ mod tests {
                 &TargetName::new("t", false),
                 &columns,
                 IdentifierCase::AsWritten,
+                &GenericDialect,
             )
             .expect("local columns resolve");
             let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
@@ -719,6 +759,7 @@ mod tests {
             &TargetName::new("t", false),
             &[create_column("a"), create_column("b")],
             IdentifierCase::AsWritten,
+            &sqlparser::dialect::PostgreSqlDialect {},
         )
         .expect("argument values resolve");
         let names: Vec<_> = found.iter().map(ColumnLike::column_name).collect();
@@ -743,6 +784,7 @@ mod tests {
             &TargetName::new("t", false),
             &columns,
             IdentifierCase::AsWritten,
+            dialect,
         )?
         .iter()
         .map(|column| ColumnLike::column_name(column).to_owned())

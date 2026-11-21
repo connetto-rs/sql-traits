@@ -1010,6 +1010,7 @@ struct ParentApplication<'a> {
     builder: &'a ParserDBBuilder,
     parents: &'a [(ParentKind, ObjectName)],
     child_name: &'a str,
+    child_object_name: &'a ObjectName,
     collations: &'a [super::CreatedCollationMetadata],
     catalog: &'a super::PostgresCatalog,
     search_path: &'a [(String, bool)],
@@ -1020,11 +1021,12 @@ impl<'a> ParentApplication<'a> {
         builder: &'a ParserDBBuilder,
         parents: &'a [(ParentKind, ObjectName)],
         child_name: &'a str,
+        child_object_name: &'a ObjectName,
         collations: &'a [super::CreatedCollationMetadata],
         catalog: &'a super::PostgresCatalog,
         search_path: &'a [(String, bool)],
     ) -> Self {
-        Self { builder, parents, child_name, collations, catalog, search_path }
+        Self { builder, parents, child_name, child_object_name, collations, catalog, search_path }
     }
 }
 
@@ -1046,10 +1048,13 @@ fn local_collation_conflict(
         return Ok(None);
     }
     Ok(Some(Error::InheritedColumnCollationConflict {
-        column_name: column.name.value.clone().into_boxed_str(),
+        column_name: context.builder.dialect().stored_name(&column.name).into_boxed_str(),
         child_table: context.child_name.to_string().into_boxed_str(),
         child_collation: local_collation
-            .map_or_else(|| "default".to_string(), ObjectName::to_string)
+            .map_or_else(
+                || "default".to_string(),
+                |name| context.builder.dialect().stored_object_name(name),
+            )
             .into_boxed_str(),
         parent_table: parent_owning(context.builder, context.parents, &column.name)
             .unwrap_or_else(|| "a parent".to_string())
@@ -1057,7 +1062,10 @@ fn local_collation_conflict(
         parent_collation: inherited_metadata
             .collation
             .as_ref()
-            .map_or_else(|| "default".to_string(), ObjectName::to_string)
+            .map_or_else(
+                || "default".to_string(),
+                |name| context.builder.dialect().stored_object_name(name),
+            )
             .into_boxed_str(),
     }))
 }
@@ -1074,12 +1082,15 @@ fn inherited_collation_conflict(
         return None;
     }
     Some(Error::InheritedColumnCollationConflict {
-        column_name: column.value.clone().into_boxed_str(),
+        column_name: context.builder.dialect().stored_name(column).into_boxed_str(),
         child_table: context.child_name.to_string().into_boxed_str(),
         child_collation: incoming_metadata
             .collation
             .as_ref()
-            .map_or_else(|| "default".to_string(), ObjectName::to_string)
+            .map_or_else(
+                || "default".to_string(),
+                |name| context.builder.dialect().stored_object_name(name),
+            )
             .into_boxed_str(),
         parent_table: parent_owning(context.builder, context.parents, column)
             .unwrap_or_else(|| "a parent".to_string())
@@ -1087,7 +1098,10 @@ fn inherited_collation_conflict(
         parent_collation: inherited_metadata
             .collation
             .as_ref()
-            .map_or_else(|| "default".to_string(), ObjectName::to_string)
+            .map_or_else(
+                || "default".to_string(),
+                |name| context.builder.dialect().stored_object_name(name),
+            )
             .into_boxed_str(),
     })
 }
@@ -1105,8 +1119,11 @@ fn merge_local_columns(
         // PostgreSQL refuses before it reaches any parent.
         if local_columns[..index].iter().any(|earlier| same_column(&earlier.name, &column.name)) {
             return Err(Error::ColumnAlreadyExists {
-                table_name: context.child_name.to_string(),
-                column_name: column.name.value.clone(),
+                table_name: context
+                    .builder
+                    .dialect()
+                    .stored_object_name_last(context.child_object_name),
+                column_name: context.builder.dialect().stored_name(&column.name),
             });
         }
         if let Some(position) =
@@ -1114,7 +1131,7 @@ fn merge_local_columns(
         {
             if types_conflict(context.builder, &columns[position].data_type, &column.data_type) {
                 return Err(Error::InheritedColumnTypeConflict {
-                    column_name: column.name.value.clone(),
+                    column_name: context.builder.dialect().stored_name(&column.name),
                     child_table: context.child_name.to_string(),
                     child_type: column.data_type.to_string(),
                     parent_table: parent_owning(context.builder, context.parents, &column.name)
@@ -1137,10 +1154,10 @@ fn merge_local_columns(
             // A partition declares no column of its own, only options on the
             // columns its root passes down.
             return Err(crate::errors::LookupError::ColumnNotFound {
-                table_name: resolve_parent(context.builder, root, context.child_name)?
-                    .table_name()
-                    .to_string(),
-                column_name: column.name.value.clone(),
+                table_name: context.builder.dialect().stored_object_name_last(
+                    &resolve_parent(context.builder, root, context.child_name)?.name,
+                ),
+                column_name: context.builder.dialect().stored_name(&column.name),
             }
             .into());
         } else {
@@ -1167,8 +1184,11 @@ fn refuse_default_on_generated(
         written.options.iter().any(|option| matches!(option.option, ColumnOption::Default(_)));
     if generated(received) && defaulted && !generated(written) {
         return Err(Error::DefaultOnInheritedGeneratedColumn {
-            table_name: context.child_name.to_string(),
-            column_name: written.name.value.clone(),
+            table_name: context
+                .builder
+                .dialect()
+                .stored_object_name_last(context.child_object_name),
+            column_name: context.builder.dialect().stored_name(&written.name),
         });
     }
     Ok(())
@@ -1233,7 +1253,7 @@ fn copy_parent_constraint(
     {
         return Err(Error::InheritedConstraintConflict {
             table_name: child_name.to_string(),
-            constraint_name: name.value.clone(),
+            constraint_name: builder.dialect().stored_name(name),
         });
     }
     constraints.push(copy);
@@ -1300,8 +1320,8 @@ pub(super) fn apply_parents(
     collations: &[super::CreatedCollationMetadata],
     catalog: &super::PostgresCatalog,
 ) -> Result<Inherited, Error> {
-    let child_name = create_table.name.to_string();
-    bind_parents(builder, create_table, &child_name)?;
+    let child_name = builder.dialect().stored_object_name_last(&create_table.name);
+    bind_parents(builder, create_table)?;
     let parents: Vec<(ParentKind, ObjectName)> =
         parents_with_kind(create_table).map(|(kind, name)| (kind, name.clone())).collect();
     if parents.is_empty() {
@@ -1322,8 +1342,15 @@ pub(super) fn apply_parents(
     let mut column_metadata: Vec<super::PreservedColumnMetadata> = Vec::new();
     let mut constraints: Vec<TableConstraint> = Vec::new();
 
-    let context =
-        ParentApplication::new(builder, &parents, &child_name, collations, catalog, &search_path);
+    let context = ParentApplication::new(
+        builder,
+        &parents,
+        &child_name,
+        &create_table.name,
+        collations,
+        catalog,
+        &search_path,
+    );
     let case = builder.identifier_case();
 
     for (kind, parent_name) in &parents {
@@ -1497,28 +1524,29 @@ fn parent_owning(
                 .iter()
                 .any(|held| super::case_idents_match(&held.name, column, builder.identifier_case()))
         })
-        .map(|parent| parent.name.to_string())
+        .map(|parent| builder.dialect().stored_object_name_last(&parent.name))
 }
 
-/// Resolves a parent's written name through the current search path.
+/// Resolves a parent's written name through the current search path, for
+/// the table `child_name` names.
 pub(super) fn resolve_unbound_parent<'builder>(
     builder: &'builder ParserDBBuilder,
     parent_name: &ObjectName,
-    child_name: &str,
+    child_name: &ObjectName,
 ) -> Result<&'builder CreateTable, Error> {
     builder.resolve_table_object_name(parent_name)?.ok_or_else(|| {
         match builder.relation_reached(parent_name) {
             Some((object_kind, _)) => {
                 Error::InheritsFromNonTable {
-                    table_name: child_name.to_string(),
-                    parent_name: parent_name.to_string(),
+                    table_name: builder.dialect().stored_object_name_last(child_name),
+                    parent_name: builder.dialect().stored_object_name_last(parent_name),
                     object_kind,
                 }
             }
             None => {
                 Error::ParentTableNotFound {
-                    parent_table: parent_name.to_string(),
-                    child_table: child_name.to_string(),
+                    parent_table: builder.dialect().stored_object_name(parent_name),
+                    child_table: builder.dialect().stored_object_name_last(child_name),
                 }
             }
         }
@@ -1531,17 +1559,16 @@ pub(super) fn resolve_unbound_parent<'builder>(
 /// without a partition key, an `INHERITS` parent that has one or is itself a
 /// partition, and one named twice. A partitioned table takes no `INHERITS`
 /// parent at all.
-fn bind_parents(
-    builder: &ParserDBBuilder,
-    create_table: &mut CreateTable,
-    child_name: &str,
-) -> Result<(), Error> {
+fn bind_parents(builder: &ParserDBBuilder, create_table: &mut CreateTable) -> Result<(), Error> {
     if create_table.partition_by.is_some()
         && create_table.inherits.iter().flatten().next().is_some()
     {
-        return Err(Error::PartitionedTableInherits { table_name: child_name.to_string() });
+        return Err(Error::PartitionedTableInherits {
+            table_name: builder.dialect().stored_object_name_last(&create_table.name),
+        });
     }
     let child_temporary = create_table.is_temporary();
+    let stored_child_name = || builder.dialect().stored_object_name_last(&create_table.name);
     let case = builder.identifier_case();
     let mut bound: Vec<StoredTable> = Vec::new();
     let parents =
@@ -1549,44 +1576,44 @@ fn bind_parents(
             create_table.partition_of.iter_mut().map(|name| (ParentKind::PartitionOf, name)),
         );
     for (kind, parent_name) in parents {
-        let parent = resolve_unbound_parent(builder, parent_name, child_name)?;
+        let parent = resolve_unbound_parent(builder, parent_name, &create_table.name)?;
         if parent.is_temporary() && !child_temporary {
             return Err(Error::PermanentRelationInheritsTemporary {
-                table_name: child_name.to_string(),
-                parent_name: parent_name.to_string(),
+                table_name: stored_child_name(),
+                parent_name: builder.dialect().stored_object_name_last(&parent.name),
             });
         }
         if !parent.is_temporary() && child_temporary && kind == ParentKind::PartitionOf {
             return Err(Error::TemporaryPartitionOfPermanent {
-                table_name: child_name.to_string(),
-                parent_name: parent_name.to_string(),
+                table_name: stored_child_name(),
+                parent_name: builder.dialect().stored_object_name_last(&parent.name),
             });
         }
         match kind {
             ParentKind::PartitionOf if parent.partition_by.is_none() => {
                 return Err(Error::ParentNotPartitioned {
-                    table_name: child_name.to_string(),
-                    parent_name: parent_name.to_string(),
+                    table_name: stored_child_name(),
+                    parent_name: builder.dialect().stored_object_name_last(&parent.name),
                 });
             }
             ParentKind::Inherits if parent.partition_by.is_some() => {
                 return Err(Error::InheritsFromPartitionedTable {
-                    table_name: child_name.to_string(),
-                    parent_name: parent_name.to_string(),
+                    table_name: stored_child_name(),
+                    parent_name: builder.dialect().stored_object_name_last(&parent.name),
                 });
             }
             ParentKind::Inherits if parent.partition_of.is_some() => {
                 return Err(Error::InheritsFromPartition {
-                    table_name: child_name.to_string(),
-                    parent_name: parent_name.to_string(),
+                    table_name: stored_child_name(),
+                    parent_name: builder.dialect().stored_object_name_last(&parent.name),
                 });
             }
             ParentKind::PartitionOf | ParentKind::Inherits => {}
         }
         if bound.iter().any(|earlier| earlier.matches(parent, case)) {
             return Err(Error::ParentRepeated {
-                table_name: child_name.to_string(),
-                parent_name: parent.table_name().to_string(),
+                table_name: stored_child_name(),
+                parent_name: builder.dialect().stored_object_name_last(&parent.name),
             });
         }
         bound.push(StoredTable::of(parent));
@@ -1604,7 +1631,7 @@ fn resolve_parent<'builder>(
 ) -> Result<&'builder CreateTable, Error> {
     builder.resolve_bound_table_name(parent_name)?.ok_or_else(|| {
         Error::ParentTableNotFound {
-            parent_table: parent_name.to_string(),
+            parent_table: builder.dialect().stored_object_name(parent_name),
             child_table: child_name.to_string(),
         }
     })

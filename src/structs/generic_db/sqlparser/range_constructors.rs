@@ -17,13 +17,7 @@
 //! REPLACE FUNCTION` turns a constructor into an ordinary function, dropping
 //! the dependency.
 
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    sync::Arc,
-    vec,
-    vec::Vec,
-};
+use alloc::{boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
 
 use sqlparser::{
     ast::{
@@ -43,8 +37,7 @@ use crate::{
     errors::Error,
     impls::{SqlparserDialect, bound_user_type},
     structs::{UserDefinedType, metadata::RangeConstructor},
-    traits::UserDefinedTypeLike,
-    utils::{last_str, object_name::qualifier_of},
+    utils::object_name::qualifier_of,
 };
 
 /// A type named by a stored name.
@@ -154,7 +147,7 @@ pub(super) fn create_range_constructors(
         });
         if taken {
             return Err(Error::FunctionAlreadyExists {
-                function_name: last_str(&function.name).to_string(),
+                function_name: builder.dialect().stored_object_name_last(&function.name),
             });
         }
         let mut metadata = creator.function_metadata(schema, case);
@@ -179,21 +172,18 @@ fn constructs(
 
 /// The name of the type that requires the constructor `constructor`: its
 /// range, or the range's multirange for a multirange constructor.
-pub(super) fn requiring_type(
-    builder: &ParserDBBuilder,
+pub(super) fn requiring_type<'builder>(
+    builder: &'builder ParserDBBuilder,
     constructor: &RangeConstructor,
-) -> Option<String> {
+) -> Option<&'builder ObjectName> {
     let case = builder.identifier_case();
     let range = builder
         .user_defined_types()
         .iter()
         .map(|(type_, _)| type_.as_ref())
         .find(|range| constructs(constructor, range, case))?;
-    let multirange = constructor
-        .multirange
-        .then(|| range.multirange_name().and_then(object_name_last_identifier))
-        .flatten();
-    Some(multirange.map_or_else(|| range.name().to_string(), |multirange| multirange.value.clone()))
+    let multirange = constructor.multirange.then(|| range.multirange_name()).flatten();
+    Some(multirange.unwrap_or(&range.name))
 }
 
 /// Drops the constructors of the ranges at the positions `doomed` accepts,

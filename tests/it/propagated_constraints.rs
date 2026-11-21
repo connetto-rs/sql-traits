@@ -377,6 +377,7 @@ fn only_refuses_to_add_a_constraint_when_tables_inherit() {
         Err(Error::OnlyRefusedWithChildren {
             ref table_name,
             change: InheritedChange::AddConstraint,
+            ..
         }) if table_name == "par"
     ));
 

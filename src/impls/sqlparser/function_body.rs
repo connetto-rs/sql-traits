@@ -74,12 +74,14 @@ fn checked_body<F: FunctionLike>(function: &F) -> Result<(FunctionBody<'_>, bool
     let procedural = language.as_deref() == Some("plpgsql");
     if let Some(language) = language.filter(|language| language != "sql" && !procedural) {
         return Err(LookupError::FunctionBodyNotSql {
-            function: function.name().to_string(),
+            function: function.stored_name().into_owned(),
             language: language.into_owned(),
         });
     }
     let Some(body) = function.written_body() else {
-        return Err(LookupError::FunctionBodyUnavailable { function: function.name().to_string() });
+        return Err(LookupError::FunctionBodyUnavailable {
+            function: function.stored_name().into_owned(),
+        });
     };
     Ok((body, procedural))
 }
@@ -149,7 +151,7 @@ fn bound_definition_body<F: FunctionLike>(
 /// The error naming `function` for a body that does not parse.
 fn unparsable<F: FunctionLike>(function: &F, reason: &dyn ToString) -> LookupError {
     LookupError::FunctionBodyUnparsable {
-        function: function.name().to_string(),
+        function: function.stored_name().into_owned(),
         reason: reason.to_string(),
     }
 }
@@ -214,12 +216,24 @@ pub(crate) fn body_reads<'db, F: FunctionLike>(
         SqlBody::Statements(statements) => {
             let path = run_time_path(function, database)?;
             let body = RunTimeBody::Sql(&statements);
-            reads_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
+            reads_of_body(
+                &function.stored_name(),
+                body,
+                database,
+                path,
+                hex_strings_may_be_integers,
+            )
         }
         SqlBody::PlPgSql(block) => {
             let path = run_time_path(function, database)?;
             let body = RunTimeBody::PlPgSql(&block);
-            reads_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
+            reads_of_body(
+                &function.stored_name(),
+                body,
+                database,
+                path,
+                hex_strings_may_be_integers,
+            )
         }
         SqlBody::Expression(expression) => {
             reads_on_path(expression, database, Some(run_time_path(function, database)?))
@@ -233,7 +247,7 @@ pub(crate) fn body_reads<'db, F: FunctionLike>(
         // default path reaches first.
         SqlBody::Atomic(statements) => {
             let body = RunTimeBody::Sql(&statements);
-            reads_of_body(function.name(), body, database, BodyPath::default_path(), false)
+            reads_of_body(&function.stored_name(), body, database, BodyPath::default_path(), false)
         }
     }
 }
@@ -256,12 +270,24 @@ pub(crate) fn body_calls<'db, F: FunctionLike>(
         Some(SqlBody::Statements(statements)) => {
             let path = run_time_path(function, database)?;
             let body = RunTimeBody::Sql(&statements);
-            calls_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
+            calls_of_body(
+                &function.stored_name(),
+                body,
+                database,
+                path,
+                hex_strings_may_be_integers,
+            )
         }
         Some(SqlBody::PlPgSql(block)) => {
             let path = run_time_path(function, database)?;
             let body = RunTimeBody::PlPgSql(&block);
-            calls_of_body(function.name(), body, database, path, hex_strings_may_be_integers)
+            calls_of_body(
+                &function.stored_name(),
+                body,
+                database,
+                path,
+                hex_strings_may_be_integers,
+            )
         }
         Some(SqlBody::Expression(expression)) => {
             calls_on_path(expression, database, run_time_path(function, database)?)
@@ -298,13 +324,13 @@ pub(crate) fn body_unqualified_names<'db, F: FunctionLike>(
         Some(SqlBody::Statements(statements)) => {
             let mut names = start()?;
             let body = RunTimeBody::Sql(&statements);
-            walk_body(function.name(), body, &mut names, hex_strings_may_be_integers)?;
+            walk_body(&function.stored_name(), body, &mut names, hex_strings_may_be_integers)?;
             names.into_names()
         }
         Some(SqlBody::PlPgSql(block)) => {
             let mut names = start()?;
             let body = RunTimeBody::PlPgSql(&block);
-            walk_body(function.name(), body, &mut names, hex_strings_may_be_integers)?;
+            walk_body(&function.stored_name(), body, &mut names, hex_strings_may_be_integers)?;
             names.into_names()
         }
         Some(SqlBody::Expression(expression)) => {

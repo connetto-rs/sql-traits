@@ -569,53 +569,53 @@ impl core::fmt::Display for TriggerFiringRefusal {
 pub enum ChildMismatch {
     /// The table lacks a column of the parent.
     MissingColumn {
-        /// The parent's column.
+        /// The stored column name.
         column_name: String,
     },
     /// The column has another type than the parent's.
     ColumnType {
-        /// The column.
+        /// The stored column name.
         column_name: String,
     },
     /// The column has another collation than the parent's.
     ColumnCollation {
-        /// The column.
+        /// The stored column name.
         column_name: String,
     },
     /// The parent requires the column to hold a value and the table does not.
     ColumnNullable {
-        /// The column.
+        /// The stored column name.
         column_name: String,
     },
     /// The parent generates the column and the table does not.
     MustBeGenerated {
-        /// The column.
+        /// The stored column name.
         column_name: String,
     },
     /// The table generates the column and the parent does not.
     MustNotBeGenerated {
-        /// The column.
+        /// The stored column name.
         column_name: String,
     },
     /// The table lacks a check the parent passes down, named as the parent
     /// names it or, for an unnamed check, written as the check.
     MissingConstraint {
-        /// The check's name, or the check itself.
+        /// The stored constraint name.
         constraint_name: String,
     },
     /// The table holds a check of the parent's name with another expression.
     ConstraintDiffers {
-        /// The check's name.
+        /// The stored constraint name.
         constraint_name: String,
     },
     /// The table's check of the parent's name is marked `NO INHERIT`.
     ConstraintNotInherited {
-        /// The check's name.
+        /// The stored constraint name.
         constraint_name: String,
     },
     /// The table holds the parent's validated check `NOT VALID`.
     ConstraintNotValid {
-        /// The check's name.
+        /// The stored constraint name.
         constraint_name: String,
     },
 }
@@ -682,7 +682,7 @@ pub enum InvalidBound {
     DefaultOnHash,
     /// The partitioned table already has a default partition.
     DefaultExists {
-        /// The existing default partition.
+        /// The stored default partition name.
         default_partition: String,
     },
     /// The hash modulus is zero.
@@ -692,7 +692,7 @@ pub enum InvalidBound {
     /// The hash modulus and the modulus of a sibling partition do not divide
     /// one another.
     ModulusNotFactor {
-        /// The sibling partition.
+        /// The stored sibling partition name.
         other_partition: String,
     },
     /// The range takes no value, its lower bound not being below its upper.
@@ -757,12 +757,12 @@ pub enum UnattachablePartition {
     Circular,
     /// The table declares a column the partitioned table does not.
     ExtraColumn {
-        /// Name of the column.
+        /// The stored column name.
         column_name: String,
     },
     /// The table declares an identity column of its own.
     IdentityColumn {
-        /// Name of the column.
+        /// The stored column name.
         column_name: String,
     },
     /// The table lacks the partitioned table's shape.
@@ -924,7 +924,7 @@ pub enum LookupError {
     /// Table resolution matched multiple candidates.
     #[error("Ambiguous table lookup `{object_name}`; candidates: {candidates:?}")]
     AmbiguousTableLookup {
-        /// Lookup object name as rendered by sqlparser.
+        /// The stored name requested by the lookup.
         object_name: String,
         /// Deterministically ordered list of matching candidates.
         candidates: Vec<String>,
@@ -933,7 +933,7 @@ pub enum LookupError {
     /// happens when a name carries several argument lists.
     #[error("Ambiguous function lookup `{object_name}`; candidates: {candidates:?}")]
     AmbiguousFunctionLookup {
-        /// Name the lookup asked for, as written.
+        /// Stored name requested by the lookup.
         object_name: String,
         /// Deterministically ordered list of matching declarations.
         candidates: Vec<String>,
@@ -942,14 +942,14 @@ pub enum LookupError {
     /// denote one.
     #[error("Table `{object_name}` not found.")]
     TableNotFound {
-        /// Lookup object name as rendered by sqlparser.
+        /// Stored, optionally qualified name requested by the lookup.
         object_name: String,
     },
     /// Relation resolution found neither a table nor a view for a name that is
     /// required to denote one of the two.
     #[error("Relation `{object_name}` not found.")]
     RelationNotFound {
-        /// Lookup object name as rendered by sqlparser.
+        /// Stored, optionally qualified name requested by the lookup.
         object_name: String,
     },
     /// Adding a table would create semantic lookup ambiguity.
@@ -957,9 +957,9 @@ pub enum LookupError {
         "Cannot add table `{table}` because existing table `{conflicting_table}` already uses that name under the {case} identifier comparison."
     )]
     TableLookupConflict {
-        /// Table being inserted.
+        /// Stored, unqualified name of the table being inserted.
         table: String,
-        /// Existing conflicting table.
+        /// Stored name of the existing conflicting table.
         conflicting_table: String,
         /// Comparison under which the two names are one.
         case: IdentifierCase,
@@ -981,9 +981,9 @@ pub enum LookupError {
     /// constraint resolves it against.
     #[error("Column `{column_name}` is not declared by table `{table_name}`.")]
     ColumnNotFound {
-        /// Name of the table the column was looked up in.
+        /// Stored name of the relation the column was looked up in.
         table_name: String,
-        /// Name of the column that was not found.
+        /// Stored name of the column that was not found.
         column_name: String,
     },
     /// A foreign key naming no referenced columns targets a table holding no
@@ -993,9 +993,9 @@ pub enum LookupError {
         "Foreign key in table `{host_table}` references the primary key of table `{referenced_table}`, which has none."
     )]
     ReferencedPrimaryKeyNotFound {
-        /// Name of the host table containing the foreign key.
+        /// Stored name of the host table containing the foreign key.
         host_table: String,
-        /// Name of the referenced table, as the key names it.
+        /// Stored, unqualified name of the referenced table.
         referenced_table: String,
     },
     /// A foreign key's referenced columns are neither the primary key of the
@@ -1005,11 +1005,11 @@ pub enum LookupError {
         "Foreign key in table `{host_table}` references columns ({referenced_columns}) of table `{referenced_table}`, which are neither its primary key nor unique."
     )]
     ReferencedColumnsNotUnique {
-        /// Name of the host table containing the foreign key.
+        /// Stored name of the host table containing the foreign key.
         host_table: String,
-        /// Name of the referenced table, as the key names it.
+        /// Stored, unqualified name of the referenced table.
         referenced_table: String,
-        /// The referenced columns, comma separated.
+        /// Stored names of the referenced columns, comma separated.
         referenced_columns: String,
     },
     /// A foreign key names a different number of host columns than the
@@ -1020,11 +1020,11 @@ pub enum LookupError {
         "Foreign key in table `{host_table}` names {host_columns} column(s), but its target in table `{referenced_table}` has {referenced_columns}."
     )]
     ForeignKeyColumnCountMismatch {
-        /// Name of the host table containing the foreign key.
+        /// Stored name of the host table containing the foreign key.
         host_table: String,
         /// Number of host columns the foreign key names.
         host_columns: usize,
-        /// Name of the referenced table, as the key names it.
+        /// Stored, unqualified name of the referenced table.
         referenced_table: String,
         /// Number of columns in the referenced key.
         referenced_columns: usize,
@@ -1059,7 +1059,7 @@ pub enum LookupError {
     /// A function body is written in a language other than SQL or PL/pgSQL.
     #[error("Function `{function}` is written in `{language}`, which is not read as SQL.")]
     FunctionBodyNotSql {
-        /// Name of the function, as written.
+        /// Stored name of the function.
         function: String,
         /// Language the function declares, as PostgreSQL stores it.
         language: String,
@@ -1068,7 +1068,7 @@ pub enum LookupError {
     /// remote endpoint, or loads a class from a `USING` resource.
     #[error("Function `{function}` has no body in the schema to read.")]
     FunctionBodyUnavailable {
-        /// Name of the function, as written.
+        /// Stored name of the function.
         function: String,
     },
     /// A function body runs code outside it, such as `CALL`, `EXECUTE` or a
@@ -1077,7 +1077,7 @@ pub enum LookupError {
         "The body of function `{function}` runs `{statement}`, so what it reads is not known here."
     )]
     FunctionBodyUnresolvable {
-        /// Name of the function, as written.
+        /// Stored name of the function.
         function: String,
         /// The statement that hides what the body reads.
         statement: String,
@@ -1088,7 +1088,7 @@ pub enum LookupError {
     /// at creation.
     #[error("The body of function `{function}` does not parse: {reason}")]
     FunctionBodyUnparsable {
-        /// Name of the function, as written.
+        /// Stored name of the function.
         function: String,
         /// The parser's account of what it could not read.
         reason: String,
@@ -1706,7 +1706,7 @@ pub enum Error {
     ForeignColumnReference {
         /// The reference as written.
         reference: String,
-        /// Name of the table the expression is declared on.
+        /// Stored name of the table the expression is declared on.
         table_name: String,
     },
     /// PostgreSQL refuses more than one primary key on a table.
@@ -1719,7 +1719,7 @@ pub enum Error {
     /// A primary key constraint referenced something other than a plain column,
     /// such as an expression like `PRIMARY KEY (a - b)`.
     InvalidPrimaryKey {
-        /// Name of the table the primary key belongs to.
+        /// Stored name of the table the primary key belongs to.
         table_name: String,
         /// Human-readable reason describing why the primary key is invalid.
         reason: String,
@@ -1730,18 +1730,18 @@ pub enum Error {
     /// Error indicating that a foreign key references a table that does not
     /// exist.
     ReferencedTableNotFoundForForeignKey {
-        /// Name of the referenced table.
+        /// Stored name of the referenced table.
         referenced_table: String,
-        /// Name of the host table containing the foreign key.
+        /// Stored name of the host table containing the foreign key.
         host_table: String,
     },
     #[error("Parent table `{parent_table}` not found for table `{child_table}`.")]
     /// Error indicating that a table derives its shape from a table that does
     /// not exist, spelled either `INHERITS` or `PARTITION OF`.
     ParentTableNotFound {
-        /// Name of the parent table the child names.
+        /// Stored name of the parent table the child names.
         parent_table: String,
-        /// Name of the table naming the parent.
+        /// Stored name of the table naming the parent.
         child_table: String,
     },
     #[error(
@@ -1750,9 +1750,9 @@ pub enum Error {
     /// Error indicating that `INHERITS` names a view, materialized view or
     /// sequence.
     InheritsFromNonTable {
-        /// Table naming the parent.
+        /// Stored name of the table naming the parent.
         table_name: String,
-        /// Parent it names, as written.
+        /// Stored name of the parent.
         parent_name: String,
         /// What the name reaches.
         object_kind: ObjectKind,
@@ -1761,18 +1761,18 @@ pub enum Error {
     /// Error indicating that a table copies its columns from a table that
     /// does not exist.
     CopiedTableNotFound {
-        /// Name of the table the `LIKE` names.
+        /// Stored name of the table the `LIKE` names.
         copied_table: String,
-        /// Name of the table doing the copying.
+        /// Stored name of the table doing the copying.
         table_name: String,
     },
     #[error("Cannot drop column `{column_name}` of table `{table_name}` because it is inherited.")]
     /// Error indicating that a table tried to drop a column it receives from
     /// a parent, which only the parent can drop.
     InheritedColumnNotDroppable {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the inherited column.
+        /// Stored name of the inherited column.
         column_name: String,
     },
     #[error(
@@ -1782,9 +1782,9 @@ pub enum Error {
     /// a parent, which only the parent can rename, for every table below it at
     /// once.
     InheritedColumnNotRenamable {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the inherited column.
+        /// Stored name of the inherited column.
         column_name: String,
     },
     #[error("Cannot add column `{column_name}` to table `{table_name}` because it is a partition.")]
@@ -1792,9 +1792,9 @@ pub enum Error {
     /// whose columns are all its root's, even when `IF NOT EXISTS` would skip
     /// the column.
     ColumnAddedToPartition {
-        /// Name of the partition the statement names.
+        /// Stored name of the partition the statement names.
         table_name: String,
-        /// Name of the column the statement adds.
+        /// Stored name of the column the statement adds.
         column_name: String,
     },
     #[error(
@@ -1804,9 +1804,9 @@ pub enum Error {
     /// names a column of a partition, which only its root may make an
     /// identity.
     IdentityAddedToPartitionColumn {
-        /// Name of the partition the statement names.
+        /// Stored name of the partition the statement names.
         table_name: String,
-        /// Name of the column.
+        /// Stored name of the column.
         column_name: String,
     },
     #[error(
@@ -1816,9 +1816,9 @@ pub enum Error {
     /// IDENTITY` names a partitioned table, whose partitions would then lack
     /// the identity, which PostgreSQL refuses even before any partition exists.
     IdentityAddedToOnlyPartitionedTable {
-        /// Name of the partitioned table the statement names.
+        /// Stored name of the partitioned table the statement names.
         table_name: String,
-        /// Name of the column.
+        /// Stored name of the column.
         column_name: String,
     },
     #[error(
@@ -1828,9 +1828,9 @@ pub enum Error {
     /// receives from a parent, which only the parent can change, for every
     /// table below it at once.
     InheritedColumnTypeNotAlterable {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the inherited column.
+        /// Stored name of the inherited column.
         column_name: String,
     },
     /// A generation expression cannot be removed from this column.
@@ -1849,9 +1849,9 @@ pub enum Error {
     /// Error indicating that a table tried to drop a constraint it receives
     /// from a parent, which only the parent can drop.
     InheritedConstraintNotDroppable {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the inherited constraint.
+        /// Stored name of the inherited constraint.
         constraint_name: String,
     },
     #[error(
@@ -1860,7 +1860,7 @@ pub enum Error {
     /// Error indicating that `ALTER TABLE ONLY` asked for a change PostgreSQL
     /// refuses to withhold from the tables below.
     OnlyRefusedWithChildren {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
         /// The change that cannot stop at the named table.
         change: InheritedChange,
@@ -1873,9 +1873,9 @@ pub enum Error {
     /// because the expressions differ or because the table's own is marked
     /// `NO INHERIT`.
     InheritedConstraintConflict {
-        /// Name of the table holding the conflicting constraint.
+        /// Stored name of the table holding the conflicting constraint.
         table_name: String,
-        /// Name the two constraints share.
+        /// Stored name the two constraints share.
         constraint_name: String,
     },
     #[error("Cannot add a `NO INHERIT` check to partitioned table `{table_name}`.")]
@@ -1883,7 +1883,7 @@ pub enum Error {
     /// table, which PostgreSQL refuses because every constraint of a
     /// partitioned table is enforced on its partitions.
     NoInheritCheckOnPartitionedTable {
-        /// Name of the partitioned table.
+        /// Stored name of the partitioned table.
         table_name: String,
     },
     #[error("Cannot use `ONLY` to add a foreign key on partitioned table `{table_name}`.")]
@@ -1891,7 +1891,7 @@ pub enum Error {
     /// partitioned table, which PostgreSQL refuses whether or not any
     /// partition exists yet.
     OnlyForeignKeyOnPartitionedTable {
-        /// Name of the partitioned table.
+        /// Stored name of the partitioned table.
         table_name: String,
     },
     #[error("Cannot add a `NO INHERIT` not-null constraint to partitioned table `{table_name}`.")]
@@ -1899,7 +1899,7 @@ pub enum Error {
     /// on a partitioned table, which PostgreSQL refuses because a partitioned
     /// table's not-null constraints are enforced on its partitions.
     NoInheritNotNullOnPartitionedTable {
-        /// Name of the partitioned table.
+        /// Stored name of the partitioned table.
         table_name: String,
     },
     #[error(
@@ -1909,13 +1909,13 @@ pub enum Error {
     /// is written twice under two different names, which PostgreSQL refuses
     /// because the two spellings are one constraint and carry one name.
     ConflictingNotNullConstraintNames {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the column the constraint holds.
+        /// Stored name of the column the constraint holds.
         column_name: String,
-        /// Name of the first spelling.
+        /// Stored name of the first spelling.
         first_name: String,
-        /// Name of the second spelling.
+        /// Stored name of the second spelling.
         second_name: String,
     },
     #[error(
@@ -1926,9 +1926,9 @@ pub enum Error {
     /// second table-level one, which PostgreSQL refuses because the two
     /// spellings are one constraint that cannot hold both inheritabilities.
     ConflictingNoInheritNotNull {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the column the constraint holds.
+        /// Stored name of the column the constraint holds.
         column_name: String,
     },
     #[error(
@@ -1938,13 +1938,13 @@ pub enum Error {
     /// named a column the table already requires a value of, whichever
     /// spelling states it, so PostgreSQL refuses the second requirement.
     NotNullConstraintAlreadyExists {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the column the constraint would hold.
+        /// Stored name of the column the constraint would hold.
         column_name: String,
-        /// Name the statement wrote for the arriving constraint.
+        /// Stored name the statement wrote for the arriving constraint.
         constraint_name: String,
-        /// Name of the requirement the column already holds.
+        /// Stored name of the requirement the column already holds.
         existing_name: String,
     },
     #[error(
@@ -1955,9 +1955,9 @@ pub enum Error {
     /// status beside the one the column already holds or by `SET NOT NULL`
     /// over a `NO INHERIT` requirement, which PostgreSQL refuses.
     NotNullNoInheritStatusChange {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the requirement the column already holds.
+        /// Stored name of the requirement the column already holds.
         constraint_name: String,
     },
     #[error(
@@ -1969,9 +1969,9 @@ pub enum Error {
     /// PostgreSQL grants the statement only where every table below already
     /// requires the keyed columns.
     OnlyPrimaryKeyOnNullableColumn {
-        /// Name of the table whose column may still hold nothing.
+        /// Stored name of the table whose column may still hold nothing.
         table_name: String,
-        /// Name of the keyed column.
+        /// Stored name of the keyed column.
         column_name: String,
     },
     #[error(
@@ -1980,9 +1980,9 @@ pub enum Error {
     /// Error indicating that `ALTER COLUMN ... DROP NOT NULL` named a column
     /// something else requires a value in.
     RequiredValueNotDroppable {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the column.
+        /// Stored name of the column.
         column_name: String,
         /// What keeps the requirement in place.
         reason: RequiredValue,
@@ -2024,9 +2024,9 @@ pub enum Error {
     /// Error indicating that `ALTER COLUMN ... ADD GENERATED AS IDENTITY` named
     /// a column that may still hold nothing, which PostgreSQL refuses.
     IdentityNeedsRequiredValue {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the column.
+        /// Stored name of the column.
         column_name: String,
     },
     #[error(
@@ -2035,13 +2035,13 @@ pub enum Error {
     /// Error indicating that a table redeclares an inherited column with a
     /// different type, which PostgreSQL refuses.
     InheritedColumnTypeConflict {
-        /// Name of the column declared twice.
+        /// Stored name of the column declared twice.
         column_name: String,
-        /// Name of the table redeclaring the column.
+        /// Stored name of the table redeclaring the column.
         child_table: String,
         /// Type the child declares.
         child_type: String,
-        /// Name of the parent the column comes from.
+        /// Stored name of the parent the column comes from.
         parent_table: String,
         /// Type the parent declares.
         parent_type: String,
@@ -2052,33 +2052,33 @@ pub enum Error {
     /// Error indicating that a table redeclares an inherited column with a
     /// different collation.
     InheritedColumnCollationConflict {
-        /// Name of the column declared twice.
+        /// Stored name of the column declared twice.
         column_name: Box<str>,
-        /// Name of the table redeclaring the column.
+        /// Stored name of the table redeclaring the column.
         child_table: Box<str>,
-        /// Collation the child declares.
+        /// Stored collation name the child declares.
         child_collation: Box<str>,
-        /// Name of the parent the column comes from.
+        /// Stored name of the parent the column comes from.
         parent_table: Box<str>,
-        /// Collation the parent declares.
+        /// Stored collation name the parent declares.
         parent_collation: Box<str>,
     },
     #[error("Collation `{collation_name}` cannot be copied.")]
     /// Error indicating that a built-in collation cannot be copied.
     CollationCannotBeCopied {
-        /// Name of the collation the statement copies.
+        /// Stored name of the collation the statement copies.
         collation_name: Box<str>,
     },
     #[error("Collation `{collation_name}` not found.")]
     /// Error indicating that a copied collation source does not exist.
     CollationNotFound {
-        /// Name of the collation the statement copies.
+        /// Stored name of the collation the statement copies.
         collation_name: Box<str>,
     },
     #[error("Collation `{collation_name}` already exists.")]
     /// Error indicating that a collation name is already taken.
     CollationAlreadyExists {
-        /// Name of the collation the statement creates.
+        /// Stored name of the collation the statement creates.
         collation_name: Box<str>,
     },
     #[error("Operator `{operator_name}` declares no right operand type.")]
@@ -2095,7 +2095,7 @@ pub enum Error {
     OperatorFunctionNotFound {
         /// Symbol of the operator the statement creates or alters.
         operator_name: Box<str>,
-        /// Name of the function as written.
+        /// Stored name of the function.
         function_name: Box<str>,
     },
     #[error("Operator `{operator_name}` already exists.")]
@@ -2152,9 +2152,9 @@ pub enum Error {
     OperatorFunctionNotExecutable {
         /// Symbol of the operator the statement creates.
         operator_name: Box<str>,
-        /// Name of the function.
+        /// Stored name of the function.
         function_name: Box<str>,
-        /// Name of the creating role.
+        /// Stored name of the creating role.
         role_name: Box<str>,
     },
     #[error("Operator `{operator_name}` not found.")]
@@ -2220,10 +2220,9 @@ pub enum Error {
     /// database does not hold, qualified with it or on the search path,
     /// since the extension or the schema may supply the operator.
     UnresolvedOperator {
-        /// Symbol of the operator as written.
+        /// Operator symbol with its stored schema qualifier when written.
         operator_name: Box<str>,
-        /// Type of each operand, the left one first, `unknown` for an
-        /// untyped literal.
+        /// Diagnostic type of each operand, the left one first.
         operand_types: Vec<Box<str>>,
         /// Why PostgreSQL refuses the application.
         reason: Unresolved,
@@ -2239,9 +2238,9 @@ pub enum Error {
     /// does not hold, qualified with it or on the search path, since the
     /// extension or the schema may supply the function.
     UnresolvedCall {
-        /// Name of the function as written.
+        /// Stored parts of the function name joined with dots.
         function_name: String,
-        /// Type of each argument, `unknown` for an untyped literal.
+        /// Diagnostic type of each argument, `unknown` for an untyped literal.
         argument_types: Vec<Box<str>>,
         /// Why PostgreSQL refuses the call.
         reason: Unresolved,
@@ -2257,7 +2256,7 @@ pub enum Error {
     /// the database does not hold is refused only for clauses no function
     /// combines, since that schema may supply a function of another kind.
     MisappliedCall {
-        /// Name of the function as written, each part unquoted.
+        /// Stored parts of the function name joined with dots.
         function_name: String,
         /// The rule the call breaks.
         rule: Misapplied,
@@ -2265,7 +2264,7 @@ pub enum Error {
     #[error("Invalid value `{option_value}` for collation option `{option_name}`.")]
     /// Error indicating that a `CREATE COLLATION` option is malformed.
     InvalidCollationOption {
-        /// Name of the option whose value is invalid.
+        /// Name of the option, as stored.
         option_name: Box<str>,
         /// Value the statement supplied.
         option_value: Box<str>,
@@ -2273,21 +2272,21 @@ pub enum Error {
     #[error("Collation option `{option_name}` appears more than once.")]
     /// Error indicating that a `CREATE COLLATION` option is repeated.
     RepeatedCollationOption {
-        /// Name of the repeated option.
+        /// Name of the repeated option, as stored.
         option_name: Box<str>,
     },
     #[error("Column `{column_name}` declares more than one collation.")]
     /// Error indicating that a column declares multiple `COLLATE` clauses.
     RepeatedColumnCollation {
-        /// Name of the column carrying repeated collation clauses.
+        /// Name of the column, as stored.
         column_name: Box<str>,
     },
     #[error("Column `{column_name}` of type `{type_name}` cannot use a collation.")]
     /// Error indicating that a known PostgreSQL type is not collatable.
     NonCollatableColumnType {
-        /// Name of the column carrying the collation.
+        /// Name of the column, as stored.
         column_name: Box<str>,
-        /// Type of the column carrying the collation.
+        /// Diagnostic type of the column carrying the collation.
         type_name: Box<str>,
     },
     #[error(
@@ -2296,7 +2295,7 @@ pub enum Error {
     /// Error indicating that a custom type is missing from the PostgreSQL
     /// catalog.
     ColumnTypeCollatabilityNotInCatalog {
-        /// Name of the column carrying the collation.
+        /// Name of the column, as stored.
         column_name: Box<str>,
         /// Type missing from the configured catalog.
         type_name: Box<str>,
@@ -2305,9 +2304,9 @@ pub enum Error {
     /// Error indicating that a `DROP TABLE` would leave a child naming a
     /// parent that no longer exists.
     DropTableInheritedFrom {
-        /// Name of the table the statement drops.
+        /// Name of the table the statement drops, as stored.
         parent_table: String,
-        /// Name of a table inheriting from it.
+        /// Name of a table inheriting from it, as stored.
         child_table: String,
     },
     #[error(
@@ -2316,11 +2315,11 @@ pub enum Error {
     /// Error indicating that a foreign key references a column that does not
     /// exist.
     ReferencedColumnNotFoundForForeignKey {
-        /// Name of the referenced column.
+        /// Name of the referenced column, as stored.
         referenced_column: String,
-        /// Name of the referenced table.
+        /// Name of the referenced table, as stored.
         referenced_table: String,
-        /// Name of the host table containing the foreign key.
+        /// Name of the host table, as stored.
         host_table: String,
     },
     #[error("foreign key referenced-columns list must not contain duplicates")]
@@ -2337,11 +2336,11 @@ pub enum Error {
     /// PostgreSQL, MySQL and SQLite all refuse such a constraint, since without
     /// a unique key on the far side a row could match more than one parent.
     ReferencedColumnsNotUniqueForForeignKey {
-        /// Comma-separated names of the referenced columns.
+        /// Comma-separated stored names of the referenced columns.
         referenced_columns: String,
-        /// Name of the referenced table.
+        /// Name of the referenced table, as stored.
         referenced_table: String,
-        /// Name of the host table containing the foreign key.
+        /// Name of the host table, as stored.
         host_table: String,
     },
     /// PostgreSQL refuses update actions that assign an expression-generated
@@ -2407,11 +2406,11 @@ pub enum Error {
     /// refuse lists of different lengths. An omitted referenced list stands
     /// for the primary key of the referenced table, as in PostgreSQL.
     ForeignKeyColumnCountMismatch {
-        /// Name of the host table containing the foreign key.
+        /// Name of the host table, as stored.
         host_table: String,
         /// Number of host columns the foreign key names.
         host_columns: usize,
-        /// Name of the referenced table.
+        /// Name of the referenced table, as stored.
         referenced_table: String,
         /// Number of columns in the referenced key.
         referenced_columns: usize,
@@ -2423,18 +2422,18 @@ pub enum Error {
     /// under SQLite, whose foreign key clause takes a bare table name and
     /// looks it up in the schema of the host table.
     QualifiedForeignKeyTarget {
-        /// Name of the host table containing the foreign key.
+        /// Name of the host table, as stored.
         host_table: String,
-        /// The target, as the key names it.
+        /// Stored parts of the target name joined with dots.
         referenced_table: String,
     },
     #[error("Host column `{host_column}` not found in table `{host_table}` for foreign key.")]
     /// Error indicating that a foreign key references a host column that does
     /// not exist.
     HostColumnNotFoundForForeignKey {
-        /// Name of the host column.
+        /// Name of the host column, as stored.
         host_column: String,
-        /// Name of the host table containing the foreign key.
+        /// Name of the host table, as stored.
         host_table: String,
     },
     #[error(
@@ -2445,16 +2444,16 @@ pub enum Error {
     /// declared INITIALLY DEFERRED must be DEFERRABLE". Ingestion accepts it
     /// under SQLite, which stores such a key and checks it immediately.
     InitiallyDeferredNotDeferrable {
-        /// Name of the table the foreign key is declared on.
+        /// Name of the table, as stored.
         table_name: String,
     },
     #[error("Relation `{relation_name}` not found for trigger `{trigger_name}`.")]
     /// Error indicating that a trigger names a table or view that does not
     /// exist.
     RelationNotFoundForTrigger {
-        /// Name of the relation the trigger is declared on.
+        /// Stored parts of the relation name joined with dots.
         relation_name: String,
-        /// Name of the trigger.
+        /// Name of the trigger, as stored.
         trigger_name: String,
     },
     #[error("Trigger `{trigger_name}` on `{relation_name}` is refused because {reason}.")]
@@ -2462,9 +2461,9 @@ pub enum Error {
     /// event or a clause the engine of the dialect refuses on the kind of
     /// relation it names.
     TriggerFiringRefused {
-        /// Name of the trigger.
+        /// Name of the trigger, as stored.
         trigger_name: String,
-        /// Name of the table or view the trigger names.
+        /// Name of the table or view, as stored.
         relation_name: String,
         /// What the engine refuses.
         reason: TriggerFiringRefusal,
@@ -2475,9 +2474,9 @@ pub enum Error {
     /// A policy exists only on its table, so the database refuses one whose
     /// table is absent, and so does this crate.
     TableNotFoundForPolicy {
-        /// Name of the table the policy is declared on.
+        /// Stored parts of the table name joined with dots.
         table_name: String,
-        /// Name of the policy.
+        /// Name of the policy, as stored.
         policy_name: String,
     },
     #[error("Relation `{relation_name}` not found for rule `{rule_name}`.")]
@@ -2486,9 +2485,9 @@ pub enum Error {
     /// A rule exists only on its relation, so the database refuses one whose
     /// relation is absent, and so does this crate.
     RelationNotFoundForRule {
-        /// Name of the relation the rule is declared on.
+        /// Stored parts of the relation name joined with dots.
         relation_name: String,
-        /// Name of the rule.
+        /// Name of the rule, as stored.
         rule_name: String,
     },
     #[error(
@@ -2498,11 +2497,11 @@ pub enum Error {
     /// off: rules exist on tables and plain views only, so a foreign table, a
     /// materialized view or a sequence refuses one.
     RuleOnUnsupportedRelation {
-        /// Name of the rule.
+        /// Name of the rule, as stored.
         rule_name: String,
         /// Kind of relation the rule names.
         relation_kind: ObjectKind,
-        /// Name of the relation the rule names.
+        /// Name of the relation, as stored.
         relation_name: String,
     },
     #[error(
@@ -2514,9 +2513,9 @@ pub enum Error {
     /// only replaces the query behind the view, which `CREATE OR REPLACE
     /// VIEW` spells directly. The model records neither conversion.
     SelectRuleUnsupported {
-        /// Name of the rule.
+        /// Name of the rule, as stored.
         rule_name: String,
-        /// Name of the relation the rule names.
+        /// Name of the relation, as stored.
         relation_name: String,
     },
     #[error("Relation `{relation_name}` not found for rule `{rule_name}`.")]
@@ -2528,9 +2527,9 @@ pub enum Error {
     /// action or condition names a relation it cannot reach is refused
     /// before it records the rule.
     RelationNotFoundForRuleAction {
-        /// Name of the relation the action or condition names.
+        /// Stored parts of the relation name joined with dots.
         relation_name: String,
-        /// Name of the rule the statement declares.
+        /// Name of the rule, as stored.
         rule_name: String,
     },
     #[error("Column `{column_name}` is ambiguous in the action of rule `{rule_name}`.")]
@@ -2538,9 +2537,9 @@ pub enum Error {
     /// more than one relation in its scope exposes that column, which
     /// PostgreSQL refuses at creation.
     RuleActionReferenceAmbiguous {
-        /// Name of the column the action references ambiguously.
+        /// Name of the column, as stored.
         column_name: String,
-        /// Name of the rule the statement declares.
+        /// Name of the rule, as stored.
         rule_name: String,
     },
     #[error("Rule `{rule_name}`'s `INSERT` has more expressions than target columns.")]
@@ -2548,7 +2547,7 @@ pub enum Error {
     /// expressions than its target has columns, which PostgreSQL refuses at
     /// creation.
     RuleActionInsertTooWide {
-        /// Name of the rule whose action holds the `INSERT`.
+        /// Name of the rule, as stored.
         rule_name: String,
     },
     #[error("Role `{role_name}` not found for the owner of `{object_name}`.")]
@@ -2562,9 +2561,9 @@ pub enum Error {
     /// [`AccessResolution`](crate::structs::AccessResolution), because a schema
     /// dump names an owner while creating no role.
     RoleNotFoundForOwner {
-        /// Name of the role named as the owner.
+        /// Name of the role, as stored.
         role_name: String,
-        /// Name of the object being owned.
+        /// Name of the object being owned, as stored.
         object_name: String,
     },
     #[error("Column `{column_name}` not found in table `{table_name}` for a grant or revoke.")]
@@ -2574,17 +2573,17 @@ pub enum Error {
     /// The statement may name several tables, and the database requires the
     /// column on each of them, so this names the table that lacks it.
     ColumnNotFoundForGrant {
-        /// Name of the column the grant names.
+        /// Name of the column, as stored.
         column_name: String,
-        /// Name of the table that does not have it.
+        /// Name of the table, as stored.
         table_name: String,
     },
     #[error("Table `{table_name}` not found for index `{index_name}`.")]
     /// Error indicating that an index references a table that does not exist.
     TableNotFoundForIndex {
-        /// Name of the table the index belongs to.
+        /// Stored parts of the table name joined with dots.
         table_name: String,
-        /// Name of the index.
+        /// Name of the index, as stored.
         index_name: String,
     },
     #[error(
@@ -2597,19 +2596,19 @@ pub enum Error {
     /// qualifier on the name, and SQLite takes one only when it names the
     /// table's schema.
     IndexInAnotherSchema {
-        /// Name of the index.
+        /// Name of the index, as stored.
         index_name: String,
-        /// Schema the index name was qualified by.
+        /// Name of the schema qualifier, as stored.
         schema_name: String,
-        /// Name of the table the index is built on.
+        /// Name of the table, as stored.
         table_name: String,
     },
     #[error("Relation `{relation_name}` not found for the owner of sequence `{sequence_name}`.")]
     /// Error indicating that `OWNED BY` names a relation that does not exist.
     RelationNotFoundForSequenceOwner {
-        /// Name of the relation `OWNED BY` names.
+        /// Stored parts of the relation name joined with dots.
         relation_name: String,
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
     },
     #[error(
@@ -2618,27 +2617,27 @@ pub enum Error {
     /// Error indicating that `OWNED BY` names a column its relation does not
     /// have.
     ColumnNotFoundForSequenceOwner {
-        /// Name of the column `OWNED BY` names.
+        /// Name of the column, as stored.
         column_name: String,
-        /// Name of the relation `OWNED BY` names.
+        /// Name of the relation, as stored.
         relation_name: String,
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
     },
     #[error("Sequence `{sequence_name}` cannot be owned by `{owner}`: write a table and a column.")]
     /// Error indicating that `OWNED BY` names something other than a column
     /// of a relation or `NONE`, which PostgreSQL refuses.
     InvalidSequenceOwner {
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
-        /// The owner the statement wrote.
+        /// Stored parts of the owner name joined with dots.
         owner: String,
     },
     #[error("`COMMENT ON COLUMN {column_name}` names no relation before the column.")]
     /// Error indicating that `COMMENT ON COLUMN` names a bare column, which
     /// PostgreSQL refuses because a column name must be qualified.
     UnqualifiedCommentColumn {
-        /// The column the statement wrote.
+        /// Name of the column, as stored.
         column_name: String,
     },
     #[error(
@@ -2651,9 +2650,9 @@ pub enum Error {
     /// and the temporary schema is a schema of its own, so a temporary
     /// sequence cannot be owned by a permanent table nor the other way round.
     SequenceOwnerInAnotherSchema {
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
-        /// Name of the relation `OWNED BY` names.
+        /// Name of the relation, as stored.
         relation_name: String,
     },
     #[error("Sequence `{sequence_name}` cannot be owned by {relation_kind} `{relation_name}`.")]
@@ -2663,9 +2662,9 @@ pub enum Error {
     /// PostgreSQL lets a table or a plain view own one, and refuses a
     /// materialized view, an index and another sequence.
     SequenceOwnerKindUnsupported {
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
-        /// Name of the relation `OWNED BY` names.
+        /// Name of the relation, as stored.
         relation_name: String,
         /// Kind of that relation.
         relation_kind: ObjectKind,
@@ -2677,9 +2676,9 @@ pub enum Error {
     /// columns the model cannot list, and which its declaration's own column
     /// list does not name, so the column the owner means is unknown.
     UnsupportedSequenceOwner {
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
-        /// The owner the statement wrote.
+        /// Stored parts of the owner name joined with dots.
         owner: String,
     },
     #[error(
@@ -2689,11 +2688,11 @@ pub enum Error {
     /// identity column, which PostgreSQL refuses even under `CASCADE`. The
     /// sequence leaves with the column.
     SequenceRequiredByColumn {
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
-        /// Name of the table holding the identity column.
+        /// Name of the table, as stored.
         table_name: String,
-        /// Name of the identity column.
+        /// Name of the identity column, as stored.
         column_name: String,
     },
     #[error(
@@ -2707,11 +2706,11 @@ pub enum Error {
     /// the sequence as a `regclass` constant draws from it too. `CASCADE`
     /// removes those defaults instead.
     SequenceUsedByDefault {
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
-        /// Name of the table holding the default.
+        /// Name of the table, as stored.
         table_name: String,
-        /// Name of the column holding the default.
+        /// Name of the column, as stored.
         column_name: String,
     },
     #[error("Sequence `{sequence_name}` is refused: {reason}.")]
@@ -2719,7 +2718,7 @@ pub enum Error {
     /// for an identity column, has parameters PostgreSQL refuses, including
     /// after a type change of its identity column.
     InvalidSequenceParameters {
-        /// Name of the sequence.
+        /// Name of the sequence, as stored.
         sequence_name: String,
         /// Why the parameters are refused.
         reason: SequenceParameterError,
@@ -2733,11 +2732,11 @@ pub enum Error {
     /// PostgreSQL resolves such a constant when the default is created, the
     /// argument of `nextval('s')` included, and refuses one reaching nothing.
     RelationNotFoundForDefault {
-        /// The name the constant wrote.
+        /// Stored parts of the relation name joined with dots.
         relation_name: String,
-        /// Name of the table holding the default.
+        /// Name of the table, as stored.
         table_name: String,
-        /// Name of the column holding the default.
+        /// Name of the column, as stored.
         column_name: String,
     },
     #[error(
@@ -2749,15 +2748,15 @@ pub enum Error {
     InvalidRelationNameForDefault {
         /// The text the constant wrote.
         relation_name: String,
-        /// Name of the table holding the default.
+        /// Name of the table, as stored.
         table_name: String,
-        /// Name of the column holding the default.
+        /// Name of the column, as stored.
         column_name: String,
     },
     #[error("Invalid index `{index_name}`: {reason}")]
     /// Error indicating that an index definition is invalid.
     InvalidIndex {
-        /// Name of the invalid index.
+        /// Name of the index, as stored.
         index_name: String,
         /// Reason why the index is invalid.
         reason: String,
@@ -2845,9 +2844,9 @@ pub enum Error {
     /// Error indicating that a trigger references a function that does not
     /// exist.
     FunctionNotFoundForTrigger {
-        /// Name of the function the trigger executes.
+        /// Stored parts of the function name joined with dots.
         function_name: String,
-        /// Name of the trigger.
+        /// Name of the trigger, as stored.
         trigger_name: String,
     },
     /// Wrapper around SQL parser errors.
@@ -2883,7 +2882,7 @@ pub enum Error {
     /// Error indicating that a grant or a revoke names a role that does not
     /// exist.
     RoleNotFoundForGrant {
-        /// Name of the undefined role.
+        /// The stored name of the undefined role.
         role_name: String,
     },
     #[error("Role `{role_name}` not found for a role membership.")]
@@ -2897,7 +2896,7 @@ pub enum Error {
     /// `PUBLIC`, which names no role under either setting and which
     /// PostgreSQL refuses as `role "public" does not exist`.
     RoleNotFoundForMembership {
-        /// Name of the undefined role.
+        /// The stored name of the undefined role.
         role_name: String,
     },
     #[error(
@@ -2907,9 +2906,9 @@ pub enum Error {
     /// itself, directly or through other memberships, which PostgreSQL refuses
     /// as `role "..." is a member of role "..."`.
     CircularRoleMembership {
-        /// Name of the role being granted.
+        /// The stored name of the role being granted.
         role_name: String,
-        /// Name of the role it would be granted to.
+        /// The stored name of the member.
         member_name: String,
     },
     #[error("Unrecognized role option `{option}` in a role membership grant or revoke.")]
@@ -2917,7 +2916,7 @@ pub enum Error {
     /// `REVOKE option OPTION FOR role FROM role` names an option other than
     /// `ADMIN`, `INHERIT` and `SET`, which PostgreSQL refuses.
     UnrecognizedRoleOption {
-        /// The option as written.
+        /// The stored option name.
         option: String,
     },
     #[error(
@@ -2929,26 +2928,23 @@ pub enum Error {
     /// memberships it granted depend on it, which PostgreSQL refuses with
     /// `dependent privileges exist`.
     DependentRoleMemberships {
-        /// Name of the revoked role, as written.
+        /// The stored name of the revoked role.
         role_name: String,
-        /// Name of the member losing the `ADMIN` option, as written.
+        /// The stored name of the member losing the `ADMIN` option.
         member_name: String,
     },
     #[error("Table `{table_name}` not found for a grant or revoke.")]
     /// Error indicating that a grant or a revoke names a table that does not
     /// exist.
     TableNotFoundForGrant {
-        /// Name of the undefined table.
+        /// The stored, possibly qualified name of the undefined table.
         table_name: String,
     },
     #[error("Function `{function_name}` not found for a grant or revoke.")]
     /// Error indicating that a grant or a revoke names a function or procedure
     /// that does not exist.
-    ///
-    /// The name is reported with the argument list the statement wrote, since
-    /// that list is what tells overloads apart.
     FunctionNotFoundForGrant {
-        /// Name of the undefined function, with its argument list if written.
+        /// The stored, possibly qualified name of the undefined function.
         function_name: String,
     },
     #[error(
@@ -2957,7 +2953,7 @@ pub enum Error {
     /// Error indicating that a grant or a revoke omits the argument list of a
     /// function whose name covers more than one function.
     AmbiguousFunctionForGrant {
-        /// The name covering more than one function.
+        /// The stored, possibly qualified name covering multiple routines.
         function_name: String,
     },
     #[error("Privilege `{privilege}` cannot be granted on a function.")]
@@ -2971,14 +2967,14 @@ pub enum Error {
     /// Error indicating that a DROP FUNCTION statement references a function
     /// that does not exist.
     DropFunctionNotFound {
-        /// Name of the function that was not found.
+        /// The stored, possibly qualified name of the missing function.
         function_name: String,
     },
     #[error("Procedure `{procedure_name}` not found for DROP PROCEDURE statement.")]
     /// Error indicating that a `DROP PROCEDURE` statement without `IF EXISTS`
     /// names a procedure that does not exist.
     DropProcedureNotFound {
-        /// Name of the procedure that was not found.
+        /// The stored, possibly qualified name of the missing procedure.
         procedure_name: String,
     },
     #[error("`{function_name}` is not a function.")]
@@ -2990,7 +2986,7 @@ pub enum Error {
     /// statement once it finds a routine of the other kind, `IF EXISTS`
     /// notwithstanding.
     NotAFunction {
-        /// The signature the statement wrote.
+        /// The stored, possibly qualified function name.
         function_name: String,
     },
     #[error("`{procedure_name}` is not a procedure.")]
@@ -3002,7 +2998,7 @@ pub enum Error {
     /// statement once it finds a routine of the other kind, `IF EXISTS`
     /// notwithstanding.
     NotAProcedure {
-        /// The signature the statement wrote.
+        /// The stored, possibly qualified procedure name.
         procedure_name: String,
     },
     #[error(
@@ -3012,7 +3008,7 @@ pub enum Error {
     /// of statements after `AS`, a spelling of other engines, where
     /// PostgreSQL takes a string or a `BEGIN ATOMIC` block.
     ProcedureBodyUnsupported {
-        /// Name of the procedure.
+        /// The stored procedure name.
         procedure_name: String,
     },
     #[error(
@@ -3025,7 +3021,7 @@ pub enum Error {
     /// the function. Functions dropped by the same statement do not hold each
     /// other, so the function named is the one something else holds.
     FunctionReferenced {
-        /// Name of the function being dropped.
+        /// The stored function name.
         function_name: String,
         /// [`ObjectKind::Column`] for a generated column,
         /// [`ObjectKind::ColumnDefault`], [`ObjectKind::CheckConstraint`],
@@ -3044,9 +3040,9 @@ pub enum Error {
     /// Error indicating that a DROP FUNCTION statement names a function an
     /// extension created, which only dropping the extension removes.
     FunctionRequiredByExtension {
-        /// Name of the function being dropped.
+        /// The stored function name.
         function_name: String,
-        /// Name of the extension that created it.
+        /// The stored extension name.
         extension_name: String,
     },
     #[error("Cannot drop function `{function_name}`: type `{type_name}` requires it.")]
@@ -3055,23 +3051,23 @@ pub enum Error {
     /// removes. The type is the range for its own constructors and the
     /// multirange for the multirange's.
     FunctionRequiredByType {
-        /// Name of the function being dropped.
+        /// The stored function name.
         function_name: String,
-        /// Name of the type that requires it.
+        /// The stored name of the requiring type.
         type_name: String,
     },
     #[error("Table `{table_name}` not found for DROP TABLE statement.")]
     /// Error indicating that a DROP TABLE statement references a table
     /// that does not exist.
     DropTableNotFound {
-        /// Name of the table that was not found.
+        /// The stored name of the missing table.
         table_name: String,
     },
     #[error("Cannot drop table `{table_name}`: still referenced in the schema.")]
     /// Error indicating that a DROP TABLE statement references a table
     /// that is still referenced by foreign keys from other tables.
     TableReferenced {
-        /// Name of the table being dropped.
+        /// The stored table name.
         table_name: String,
     },
     #[error(
@@ -3083,9 +3079,9 @@ pub enum Error {
     /// Indexes and constraints on the table itself are dropped along with the
     /// column and never raise this.
     ColumnReferenced {
-        /// Name of the table the column belongs to.
+        /// The stored table name.
         table_name: String,
-        /// Name of the column being dropped.
+        /// The stored column name.
         column_name: String,
     },
     #[error(
@@ -3118,22 +3114,22 @@ pub enum Error {
     /// when the type stays the same. Indexes, checks and foreign keys on the
     /// column are rebuilt instead and never raise this.
     ColumnTypeChangeBlocked {
-        /// Name of the table the column belongs to.
+        /// The stored table name.
         table_name: String,
-        /// Name of the column whose type the statement changes.
+        /// The stored column name.
         column_name: String,
         /// Kind of the object reading the column.
         dependent_kind: ObjectKind,
-        /// Name of the object reading the column.
+        /// The stored name of the dependent object.
         dependent_name: String,
     },
     #[error("Column `{column_name}` already exists on table `{table_name}`.")]
     /// Error indicating that a statement tries to introduce a column name the
     /// table already declares.
     ColumnAlreadyExists {
-        /// Name of the table the column belongs to.
+        /// The stored table name.
         table_name: String,
-        /// Name of the column that already exists.
+        /// The stored column name.
         column_name: String,
     },
     #[error(
@@ -3146,7 +3142,7 @@ pub enum Error {
     /// applied or reported here, so nothing that would leave the model wrong is
     /// silently discarded.
     UnsupportedAlterTableOperation {
-        /// Name of the table the statement targets.
+        /// The stored name of the target table.
         table_name: String,
         /// The operation rendered by sqlparser.
         operation: String,
@@ -3158,19 +3154,19 @@ pub enum Error {
     /// The default schema is exempt, since no dump emits a statement creating
     /// it.
     SchemaNotFoundForRelation {
-        /// Name of the schema that was not found.
+        /// The stored name of the missing schema.
         schema_name: String,
         /// Kind of relation qualified with it.
         object_kind: ObjectKind,
-        /// Name of the relation qualified with it.
+        /// The stored relation name.
         relation_name: String,
     },
     #[error("Schema `{schema_name}` not found for collation `{collation_name}`.")]
     /// Error indicating that a collation is created in an absent schema.
     SchemaNotFoundForCollation {
-        /// Name of the schema that was not found.
+        /// The stored name of the missing schema.
         schema_name: String,
-        /// Name of the collation qualified with it.
+        /// The stored, possibly qualified collation name.
         collation_name: String,
     },
     #[error("Schema `{schema_name}` not found for extension `{extension_name}`.")]
@@ -3181,16 +3177,16 @@ pub enum Error {
     /// `pg_temp` is refused, since PostgreSQL resolves no schema by that
     /// spelling here.
     SchemaNotFoundForExtension {
-        /// Name of the schema that was not found.
+        /// The stored name of the missing schema.
         schema_name: String,
-        /// Name of the extension the statement installs.
+        /// The stored extension name.
         extension_name: String,
     },
     #[error("No schema has been selected to create extension `{extension_name}` in.")]
     /// Error indicating that a `CREATE EXTENSION` statement names no schema
     /// while the search path names no schema that exists either.
     NoSchemaSelectedForExtension {
-        /// Name of the extension the statement installs.
+        /// The stored extension name.
         extension_name: String,
     },
     #[error("No schema has been selected to create {object_kind} `{relation_name}` in.")]
@@ -3200,7 +3196,7 @@ pub enum Error {
     NoSchemaSelectedForRelation {
         /// Kind of object that named no schema.
         object_kind: ObjectKind,
-        /// Name of the object that named no schema.
+        /// The stored object name.
         relation_name: String,
     },
     #[error("Permission denied to create {object_kind} `pg_catalog.{relation_name}`.")]
@@ -3210,7 +3206,7 @@ pub enum Error {
     SystemSchemaRelationRefused {
         /// Kind of relation the statement creates.
         object_kind: ObjectKind,
-        /// Name of the relation.
+        /// The stored relation name.
         relation_name: String,
     },
     #[error(
@@ -3226,16 +3222,16 @@ pub enum Error {
     TemporaryRelationInPermanentSchema {
         /// Kind of relation the statement creates.
         object_kind: ObjectKind,
-        /// Name of the relation the statement creates.
+        /// The stored relation name.
         relation_name: String,
-        /// The non-temporary schema the statement named.
+        /// The stored schema name.
         schema_name: String,
     },
     #[error("Database `{database_name}` is already in use.")]
     /// Error indicating that SQLite's `ATTACH DATABASE` names `main`, `temp`
     /// or a database already attached, which SQLite refuses.
     DatabaseAlreadyInUse {
-        /// Name the statement attaches the database as.
+        /// The stored database name.
         database_name: String,
     },
     #[error(
@@ -3249,9 +3245,9 @@ pub enum Error {
     CrossDatabaseReference {
         /// Kind of object the statement creates.
         object_kind: ObjectKind,
-        /// Name of the object the statement creates.
+        /// The stored object name.
         object_name: String,
-        /// The other database the statement named.
+        /// The stored database name.
         database_name: String,
     },
     #[error("SQL applied into database `{database_name}` needs the SQLite dialect.")]
@@ -3268,16 +3264,16 @@ pub enum Error {
     /// error. A materialized view becomes temporary only by being created in
     /// `pg_temp`.
     TemporaryMaterializedView {
-        /// Name the statement wrote.
+        /// The stored view name.
         view_name: String,
     },
     #[error("Materialized view `{view_name}` cannot read temporary relation `{relation_name}`.")]
     /// Error indicating that a materialized view's definition reads a
     /// temporary table or view, which PostgreSQL refuses.
     MaterializedViewReadsTemporaryRelation {
-        /// Name of the materialized view the statement creates.
+        /// The stored view name.
         view_name: String,
-        /// Name the definition wrote for the temporary relation.
+        /// The stored relation name.
         relation_name: String,
     },
     #[error(
@@ -3286,9 +3282,9 @@ pub enum Error {
     /// Error indicating that a foreign key joins a temporary table and a
     /// permanent one, in either direction, which PostgreSQL refuses.
     ForeignKeyCrossesTemporaryStorage {
-        /// Table declaring the foreign key.
+        /// The stored referencing table name.
         host_table: String,
-        /// Table the foreign key references.
+        /// The stored referenced table name.
         referenced_table: String,
         /// Whether the declaring table is the temporary one.
         host_is_temporary: bool,
@@ -3303,9 +3299,9 @@ pub enum Error {
     /// `SET LOGGED` on a table whose foreign key references an unlogged one,
     /// and for `SET UNLOGGED` on a table a permanent one references.
     ForeignKeyReferencesUnloggedTable {
-        /// The permanent table declaring the foreign key.
+        /// The stored referencing table name.
         host_table: String,
-        /// The unlogged table it references.
+        /// The stored referenced table name.
         referenced_table: String,
     },
     #[error("Table `{table_name}` cannot be both temporary and unlogged.")]
@@ -3316,14 +3312,14 @@ pub enum Error {
     /// `CREATE UNLOGGED TABLE pg_temp.t` because only temporary relations live
     /// in the temporary schema.
     UnloggedTemporaryTable {
-        /// Name of the table the statement creates.
+        /// The stored table name.
         table_name: String,
     },
     #[error("Partitioned table `{table_name}` cannot be unlogged.")]
     /// Error indicating that `CREATE UNLOGGED TABLE` declares a partitioned
     /// table, which PostgreSQL 18 refuses.
     UnloggedPartitionedTable {
-        /// Name of the table the statement creates.
+        /// The stored table name.
         table_name: String,
     },
     #[error("Cannot change logged status of table `{table_name}` because {reason}.")]
@@ -3331,7 +3327,7 @@ pub enum Error {
     /// names a table whose persistence is fixed, refused even when the table
     /// already holds the state named.
     PersistenceNotChangeable {
-        /// Name of the table the statement names.
+        /// The stored table name.
         table_name: String,
         /// What fixes the table's persistence.
         reason: FixedPersistence,
@@ -3343,14 +3339,14 @@ pub enum Error {
     /// A clause naming the state the table already holds changes nothing, so
     /// only a clause after an actual change is refused.
     PersistenceChangedTwice {
-        /// Name of the table the statement names.
+        /// The stored table name.
         table_name: String,
     },
     #[error("Partitioned table `{table_name}` cannot take storage parameters.")]
     /// Error indicating that `ALTER TABLE ... SET (...)` names a partitioned
     /// table, which PostgreSQL 18 refuses because it holds no rows.
     StorageParametersOnPartitionedTable {
-        /// Name of the table the statement names.
+        /// The stored table name.
         table_name: String,
     },
     #[error(
@@ -3359,9 +3355,9 @@ pub enum Error {
     /// Error indicating that a permanent table names a temporary parent in
     /// `INHERITS` or `PARTITION OF`, or is attached as its partition.
     PermanentRelationInheritsTemporary {
-        /// Table the statement creates or attaches.
+        /// The stored table name.
         table_name: String,
-        /// Temporary parent it names.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error(
@@ -3371,9 +3367,9 @@ pub enum Error {
     /// permanent one or attached as its partition. A temporary table may still
     /// inherit from a permanent one through `INHERITS`.
     TemporaryPartitionOfPermanent {
-        /// Table the statement creates or attaches.
+        /// The stored table name.
         table_name: String,
-        /// Permanent parent it names.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error(
@@ -3382,9 +3378,9 @@ pub enum Error {
     /// Error indicating that a table is declared `PARTITION OF` a table that
     /// has no partition key, which PostgreSQL refuses as "is not partitioned".
     ParentNotPartitioned {
-        /// Table the statement creates.
+        /// The stored table name.
         table_name: String,
-        /// Parent it names, as written.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error("Partitioned table `{table_name}` cannot inherit from another table.")]
@@ -3392,16 +3388,16 @@ pub enum Error {
     /// `INHERITS` parents, which PostgreSQL refuses as "cannot create
     /// partitioned table as inheritance child".
     PartitionedTableInherits {
-        /// Table the statement creates.
+        /// The stored table name.
         table_name: String,
     },
     #[error("Table `{table_name}` names parent `{parent_name}` more than once.")]
     /// Error indicating that `INHERITS` reaches the same table twice, however
     /// the two names are spelled.
     ParentRepeated {
-        /// Table the statement creates.
+        /// The stored table name.
         table_name: String,
-        /// Repeated parent, as stored.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error(
@@ -3410,27 +3406,27 @@ pub enum Error {
     /// Error indicating that a table redeclares a stored generated column it
     /// receives with a `DEFAULT`, which PostgreSQL refuses.
     DefaultOnInheritedGeneratedColumn {
-        /// Table the statement creates.
+        /// The stored table name.
         table_name: String,
-        /// The generated column.
+        /// The stored column name.
         column_name: String,
     },
     #[error("Table `{table_name}` cannot inherit from partitioned table `{parent_name}`.")]
     /// Error indicating that `INHERITS` names a partitioned table, which only
     /// takes partitions through `PARTITION OF`.
     InheritsFromPartitionedTable {
-        /// Table the statement creates.
+        /// The stored table name.
         table_name: String,
-        /// Partitioned parent it names, as written.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error("Table `{table_name}` cannot inherit from `{parent_name}` because {reason}.")]
     /// Error indicating that `ALTER TABLE ... INHERIT` names a parent whose
     /// shape the table does not already have.
     InheritanceChildMismatch {
-        /// Table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Parent it names, as written.
+        /// The stored parent relation name.
         parent_name: String,
         /// What the table lacks.
         reason: ChildMismatch,
@@ -3439,41 +3435,41 @@ pub enum Error {
     /// Error indicating that `INHERIT` or `NO INHERIT` names a partition, whose
     /// only parent is its partitioned table.
     InheritanceChangeOnPartition {
-        /// Table the statement alters.
+        /// The stored table name.
         table_name: String,
     },
     #[error("Cannot change the parents of partitioned table `{table_name}`.")]
     /// Error indicating that `INHERIT` names a partitioned table, which takes
     /// no `INHERITS` parent.
     InheritanceChangeOnPartitioned {
-        /// Table the statement alters.
+        /// The stored table name.
         table_name: String,
     },
     #[error("Table `{table_name}` cannot inherit from `{parent_name}`, which inherits from it.")]
     /// Error indicating that `INHERIT` names the table itself or one of the
     /// tables inheriting from it.
     CircularInheritance {
-        /// Table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Parent it names, as written.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error("Relation `{parent_name}` is not a parent of table `{table_name}`.")]
     /// Error indicating that `NO INHERIT` names a relation the table does not
     /// inherit from.
     NotAParentOf {
-        /// Table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Parent it names, as written.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error("Relation `{partition_name}` is not a partition of table `{table_name}`.")]
     /// Error indicating that `DETACH PARTITION` names a relation that is not
     /// one of the table's partitions.
     NotAPartitionOf {
-        /// Partitioned table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Relation the statement detaches, as written.
+        /// The stored partition name.
         partition_name: String,
     },
     #[error(
@@ -3482,9 +3478,9 @@ pub enum Error {
     /// Error indicating that `DETACH PARTITION ... CONCURRENTLY` runs inside
     /// `BEGIN`, which PostgreSQL refuses.
     DetachConcurrentlyInTransaction {
-        /// Partitioned table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Partition the statement detaches.
+        /// The stored partition name.
         partition_name: String,
     },
     #[error(
@@ -3493,9 +3489,9 @@ pub enum Error {
     /// Error indicating that `DETACH PARTITION ... CONCURRENTLY` names a table
     /// with a default partition, the detached one included.
     DetachConcurrentlyWithDefault {
-        /// Partitioned table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Partition the statement detaches.
+        /// The stored partition name.
         partition_name: String,
     },
     #[error("No detach of partition `{partition_name}` of table `{table_name}` is pending.")]
@@ -3503,9 +3499,9 @@ pub enum Error {
     /// no interrupted `CONCURRENTLY` left pending, which an ingested schema
     /// never holds.
     NoDetachPending {
-        /// Partitioned table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Partition the statement names.
+        /// The stored partition name.
         partition_name: String,
     },
     #[error(
@@ -3515,7 +3511,7 @@ pub enum Error {
     /// `DETACH PARTITION` beside another action, which PostgreSQL's grammar
     /// does not accept.
     PartitionCommandNotAlone {
-        /// Table the statement alters.
+        /// The stored table name.
         table_name: String,
     },
     /// PostgreSQL requires a relation rename to be its statement's only action.
@@ -3528,9 +3524,9 @@ pub enum Error {
     /// Error indicating that `INHERITS` names a partition, whose columns
     /// belong to the partitioned table it is part of.
     InheritsFromPartition {
-        /// Table the statement creates.
+        /// The stored table name.
         table_name: String,
-        /// Partition it names, as written.
+        /// The stored parent relation name.
         parent_name: String,
     },
     #[error(
@@ -3539,9 +3535,9 @@ pub enum Error {
     /// Error indicating that a `PARTITION BY` key names a column its table does
     /// not declare or receive.
     PartitionKeyColumnNotFound {
-        /// Table the statement partitions.
+        /// The stored table name.
         table_name: String,
-        /// Column the key names, as written.
+        /// The stored column name.
         column_name: String,
     },
     #[error(
@@ -3550,9 +3546,9 @@ pub enum Error {
     /// Error indicating that a `PARTITION BY` key reads a stored generated
     /// column, which PostgreSQL refuses.
     GeneratedColumnInPartitionKey {
-        /// Table the statement partitions.
+        /// The stored table name.
         table_name: String,
-        /// Generated column the key reads.
+        /// The stored column name.
         column_name: String,
     },
     #[error(
@@ -3560,7 +3556,7 @@ pub enum Error {
     )]
     /// Error indicating that `PARTITION BY LIST` names more than one key.
     ListPartitionKeyHasManyColumns {
-        /// Table the statement partitions.
+        /// The stored table name.
         table_name: String,
     },
     #[error(
@@ -3570,7 +3566,7 @@ pub enum Error {
     /// a unique index, on a partitioned table leaves out a column of its
     /// partition key, so the partitions could not enforce it on their own.
     UniqueConstraintMissesPartitionKey {
-        /// Partitioned table the constraint or index is on.
+        /// The stored table name.
         table_name: String,
     },
     #[error(
@@ -3579,7 +3575,7 @@ pub enum Error {
     /// Error indicating that a unique constraint or index is put on a table
     /// partitioned by an expression, which PostgreSQL does not support.
     UniqueConstraintOverExpressionPartitionKey {
-        /// Partitioned table the constraint or index is on.
+        /// The stored table name.
         table_name: String,
     },
     #[error(
@@ -3588,9 +3584,9 @@ pub enum Error {
     /// Error indicating that `CREATE TABLE ... PARTITION OF` or `ATTACH
     /// PARTITION` gives a partition a bound PostgreSQL refuses.
     PartitionBoundInvalid {
-        /// Name of the partitioned table.
+        /// The stored table name.
         table_name: String,
-        /// Name of the partition.
+        /// The stored partition name.
         partition_name: String,
         /// What makes the bound invalid.
         reason: InvalidBound,
@@ -3601,11 +3597,11 @@ pub enum Error {
     /// Error indicating that a partition's bound takes rows a sibling
     /// partition already takes.
     PartitionBoundOverlaps {
-        /// Name of the partitioned table.
+        /// The stored table name.
         table_name: String,
-        /// Name of the partition.
+        /// The stored partition name.
         partition_name: String,
-        /// The sibling partition the bound overlaps.
+        /// The stored sibling partition name.
         other_partition: String,
     },
     #[error(
@@ -3614,9 +3610,9 @@ pub enum Error {
     /// Error indicating that `ALTER TABLE ... ATTACH PARTITION` names a table
     /// PostgreSQL refuses to make a partition of the one the statement alters.
     PartitionNotAttachable {
-        /// Name of the partitioned table the statement alters.
+        /// The stored table name.
         table_name: String,
-        /// Name of the table being attached.
+        /// The stored partition name.
         partition_name: String,
         /// What keeps the table from becoming a partition.
         reason: UnattachablePartition,
@@ -3806,7 +3802,7 @@ pub enum Error {
     /// the role the session runs as, as `SET ROLE` or `SET SESSION
     /// AUTHORIZATION` left it, which PostgreSQL refuses.
     RoleInUseBySession {
-        /// Name of the role, as written.
+        /// Stored name of the role.
         role_name: String,
     },
     #[error("Role `{role_name}` not found for the session to run as.")]
@@ -3816,7 +3812,7 @@ pub enum Error {
     /// Like the other role checks this one follows
     /// [`AccessResolution`](crate::structs::AccessResolution).
     RoleNotFoundForSession {
-        /// Name of the role, as written.
+        /// Stored name of the role.
         role_name: String,
     },
     #[error("`{statement}` names no single role for the session to run as.")]
@@ -3876,7 +3872,7 @@ pub enum Error {
     ///
     /// `public` is exempt, since every database holds it.
     SchemaNotFoundForDefaultPrivileges {
-        /// Name of the schema, as written.
+        /// The stored name of the schema.
         schema_name: String,
     },
     #[error("ALTER DEFAULT PRIVILEGES cannot use IN SCHEMA with ON {object_type}.")]
@@ -3899,7 +3895,7 @@ pub enum Error {
     /// Error indicating that a CREATE SCHEMA statement tries to create a schema
     /// that already exists.
     SchemaAlreadyExists {
-        /// Name of the schema that already exists.
+        /// The stored name of the schema.
         schema_name: String,
     },
     #[error(
@@ -3919,7 +3915,7 @@ pub enum Error {
         object_kind: ObjectKind,
         /// Kind of object already holding the name.
         conflicting_kind: ObjectKind,
-        /// The contested name.
+        /// The contested stored name.
         object_name: String,
     },
     #[error("{object_kind} `{object_name}` not found.")]
@@ -3928,14 +3924,14 @@ pub enum Error {
     RelationNotFound {
         /// Kind of relation the statement asked for.
         object_kind: ObjectKind,
-        /// Name the statement wrote.
+        /// The stored relation name.
         object_name: String,
     },
     #[error("Domain `{domain_name}` not found for DROP DOMAIN statement.")]
     /// Error indicating that a `DROP DOMAIN` statement without `IF EXISTS`
     /// names a domain the input never creates.
     DropDomainNotFound {
-        /// Name the statement wrote.
+        /// The stored domain name.
         domain_name: String,
     },
     #[error(
@@ -3948,7 +3944,7 @@ pub enum Error {
     /// the domains and the functions along with it. A column of an array of
     /// the domain uses it too.
     DomainHasDependents {
-        /// Name of the domain the statement drops.
+        /// The stored name of the domain the statement drops.
         domain_name: String,
         /// [`ObjectKind::Column`], [`ObjectKind::Domain`] or
         /// [`ObjectKind::Function`].
@@ -3966,7 +3962,7 @@ pub enum Error {
     /// drop nothing but a sequence, and `DROP DOMAIN` will not drop the row
     /// type of a table or a view.
     RelationKindMismatch {
-        /// Name the statement wrote.
+        /// The stored object name.
         object_name: String,
         /// Kind the statement's spelling asked for.
         expected_kind: ObjectKind,
@@ -3979,14 +3975,14 @@ pub enum Error {
     /// type of the database system, or that an operator statement names an
     /// operand type no stored type spells.
     TypeNotFound {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
     },
     #[error("Type `{type_name}` cannot be dropped: the database system requires it.")]
     /// Error indicating that a `DROP TYPE` statement names a type of the
     /// database system, which PostgreSQL refuses even with `IF EXISTS`.
     TypeRequiredBySystem {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
     },
     #[error("Type `{type_name}` is only a shell.")]
@@ -3994,7 +3990,7 @@ pub enum Error {
     /// with a type `CREATE TYPE name;` recorded as a shell and never filled,
     /// or alters one.
     TypeIsOnlyShell {
-        /// Name of the shell type.
+        /// The stored name of the shell type.
         type_name: String,
     },
     #[error(
@@ -4008,7 +4004,7 @@ pub enum Error {
     /// the composite attributes, the domains, the ranges and the functions
     /// along with it.
     TypeHasDependents {
-        /// Name of the type the statement drops.
+        /// The stored name of the type the statement drops.
         type_name: String,
         /// [`ObjectKind::Column`], [`ObjectKind::Domain`],
         /// [`ObjectKind::Type`], [`ObjectKind::Table`] or
@@ -4025,19 +4021,19 @@ pub enum Error {
     /// which PostgreSQL removes only with the object that needs it, whatever
     /// the statement asks.
     TypeDropRequiredBy {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
         /// [`ObjectKind::Type`] for a range or a base type, or the kind of
         /// relation whose row type the name holds.
         requiring_kind: ObjectKind,
-        /// Name of the object that requires the dropped one.
+        /// The stored name of the object requiring the dropped type.
         requiring_name: String,
     },
     #[error("Type `{type_name}` is a {relation_kind}'s row type.")]
     /// Error indicating that an `ALTER TYPE` statement names the row type of
     /// a relation, which only the statement for the relation changes.
     TypeIsRowType {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
         /// Kind of relation that owns the row type.
         relation_kind: ObjectKind,
@@ -4054,7 +4050,7 @@ pub enum Error {
     /// Error indicating that an `ALTER TYPE ... ADD VALUE` or `RENAME VALUE`
     /// statement writes a label the enum already holds.
     EnumLabelExists {
-        /// Name of the enum.
+        /// The stored name of the enum.
         type_name: String,
         /// Label the statement wrote.
         label: String,
@@ -4063,7 +4059,7 @@ pub enum Error {
     /// Error indicating that an `ALTER TYPE ... ADD VALUE ... BEFORE/AFTER`
     /// or `RENAME VALUE` statement names a label the enum does not hold.
     EnumLabelNotFound {
-        /// Name of the enum.
+        /// The stored name of the enum.
         type_name: String,
         /// Label the statement wrote.
         label: String,
@@ -4072,21 +4068,21 @@ pub enum Error {
     /// Error indicating that an `ALTER TYPE ... ADD VALUE` or `RENAME VALUE`
     /// statement names a type of another kind than enum.
     NotAnEnum {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
     },
     #[error("The type attribute `subtype` is required for type `{type_name}`.")]
     /// Error indicating that a `CREATE TYPE ... AS RANGE` statement names no
     /// `SUBTYPE`.
     RangeSubtypeRequired {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
     },
     #[error("Enum label `{label}` of type `{type_name}` is written more than once.")]
     /// Error indicating that a `CREATE TYPE ... AS ENUM` statement writes the
     /// same label twice.
     DuplicateEnumLabel {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
         /// Label the statement wrote twice.
         label: String,
@@ -4095,16 +4091,16 @@ pub enum Error {
     /// Error indicating that a `CREATE TYPE ... AS (...)` statement writes the
     /// same attribute name twice.
     DuplicateCompositeAttribute {
-        /// Name the statement wrote.
+        /// The stored type name.
         type_name: String,
-        /// Attribute the statement wrote twice.
+        /// The stored name of the repeated attribute.
         attribute: String,
     },
     #[error("{constraint} constraints are not supported on foreign table `{table_name}`.")]
     /// Error indicating that a statement gives a foreign table a primary key,
     /// unique, exclusion or foreign key constraint, which PostgreSQL refuses.
     ConstraintUnsupportedOnForeignTable {
-        /// Name of the foreign table.
+        /// The stored name of the foreign table.
         table_name: String,
         /// The kind of constraint refused.
         constraint: KeyConstraint,
@@ -4255,10 +4251,10 @@ pub enum Error {
     /// Error indicating that an `ALTER` sets or drops an option the list of a
     /// foreign table or of one of its columns does not hold.
     ForeignOptionNotFound {
-        /// Name of the foreign table.
+        /// Stored name of the foreign table.
         table_name: String,
-        /// Name of the column whose list lacks the key, or `None` for the
-        /// table's own list.
+        /// Stored name of the column whose list lacks the key, or `None` for
+        /// the table's own list.
         column_name: Option<String>,
         /// The missing key, as PostgreSQL stores it.
         option_name: String,
@@ -4269,9 +4265,9 @@ pub enum Error {
     /// Error indicating that a unique index would reach a foreign table through
     /// the partitions of the table it is created on, which PostgreSQL refuses.
     UniqueIndexOverForeignPartition {
-        /// Name of the partitioned table the unique index is created on.
+        /// Stored name of the partitioned table the unique index is created on.
         table_name: String,
-        /// Name of the foreign table below it.
+        /// Stored name of the foreign table below it.
         partition_name: String,
     },
     #[error(
@@ -4285,11 +4281,11 @@ pub enum Error {
     /// replacing shapes can be read, which an explicit column list always
     /// allows and a definition the resolver cannot see into does not.
     ViewColumnRenamedByReplace {
-        /// Name of the view being replaced.
+        /// Stored name of the view being replaced.
         view_name: String,
-        /// Name the recorded shape exposes at that position.
+        /// Stored name the recorded shape exposes at that position.
         existing_column: String,
-        /// Name the replacement would expose there.
+        /// Stored name the replacement would expose there.
         new_column: String,
     },
     #[error("Cannot drop columns from view `{view_name}`.")]
@@ -4298,7 +4294,7 @@ pub enum Error {
     ///
     /// A replacement may only add columns on the end.
     ViewColumnsDroppedByReplace {
-        /// Name of the view being replaced.
+        /// Stored name of the view being replaced.
         view_name: String,
     },
     #[error("Materialized view `{view_name}` cannot be replaced.")]
@@ -4306,7 +4302,7 @@ pub enum Error {
     /// VIEW`, which the parser accepts and PostgreSQL rejects as a syntax
     /// error: a materialized view has no replace form at all.
     MaterializedViewCannotBeReplaced {
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         view_name: String,
     },
     #[error("`CREATE VIEW` does not take `IF NOT EXISTS`, so view `{view_name}` cannot use it.")]
@@ -4315,7 +4311,7 @@ pub enum Error {
     /// `CREATE OR REPLACE VIEW` is the spelling PostgreSQL offers instead, and
     /// the materialized form does take `IF NOT EXISTS`.
     ViewIfNotExistsUnsupported {
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         view_name: String,
     },
     #[error("View `{view_name}` specifies more column names than columns.")]
@@ -4324,7 +4320,7 @@ pub enum Error {
     ///
     /// Checked only when the definition's output columns can be counted.
     ViewColumnListTooLong {
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         view_name: String,
     },
     #[error("Table `{table_name}` specifies more column names than its query produces.")]
@@ -4334,7 +4330,7 @@ pub enum Error {
     ///
     /// Checked only when the query's output columns can be counted.
     TableColumnListTooLong {
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         table_name: String,
     },
     #[error("{object_kind} `{view_name}` takes no option `{option_name}`.")]
@@ -4347,7 +4343,7 @@ pub enum Error {
     UnrecognizedViewOption {
         /// Kind of view the option is written on.
         object_kind: ObjectKind,
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         view_name: String,
         /// Option name the statement wrote.
         option_name: String,
@@ -4356,7 +4352,7 @@ pub enum Error {
     /// Error indicating that a view option is given a value PostgreSQL does
     /// not read as that option's type.
     InvalidViewOptionValue {
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         view_name: String,
         /// The option, as PostgreSQL names it.
         option_name: String,
@@ -4366,7 +4362,7 @@ pub enum Error {
     #[error("Option `{option_name}` of view `{view_name}` is written more than once.")]
     /// Error indicating that one option list names a view option twice.
     RepeatedViewOption {
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         view_name: String,
         /// The option, as PostgreSQL names it.
         option_name: String,
@@ -4378,11 +4374,11 @@ pub enum Error {
     RelationHasDependents {
         /// Kind of relation the statement drops.
         object_kind: ObjectKind,
-        /// Name of the relation the statement drops.
+        /// Stored name of the relation the statement drops.
         object_name: String,
         /// Kind of the dependent object.
         dependent_kind: ObjectKind,
-        /// Name of the dependent object.
+        /// Stored name of the dependent object.
         dependent_name: String,
     },
     #[error(
@@ -4394,7 +4390,7 @@ pub enum Error {
     AlterActionUnsupportedOnRelation {
         /// Kind of relation the name holds.
         object_kind: ObjectKind,
-        /// Name the statement wrote.
+        /// Stored name the statement wrote.
         relation_name: String,
         /// The action, rendered by the parser.
         operation: String,
@@ -4405,9 +4401,9 @@ pub enum Error {
     /// Error indicating that `RENAME CONSTRAINT` names a constraint the table
     /// holds under no such name, written or given by PostgreSQL.
     RenameConstraintNotFound {
-        /// Name of the table.
+        /// Stored name of the table.
         table_name: String,
-        /// Name the statement renames.
+        /// Stored name the statement renames.
         constraint_name: String,
     },
     #[error(
@@ -4417,18 +4413,18 @@ pub enum Error {
     /// constraint it receives from a parent, which only the parent can rename,
     /// for every table below it at once.
     InheritedConstraintNotRenamable {
-        /// Name of the table the statement names.
+        /// Stored name of the table the statement names.
         table_name: String,
-        /// Name of the inherited constraint.
+        /// Stored name of the inherited constraint.
         constraint_name: String,
     },
     #[error("Constraint `{constraint_name}` already exists on table `{table_name}`.")]
     /// PostgreSQL refuses a constraint whose declared name belongs to another
     /// constraint of the table.
     ConstraintAlreadyExists {
-        /// Name of the table.
+        /// Stored name of the table.
         table_name: String,
-        /// Name the statement gives the constraint.
+        /// Stored name the statement gives the constraint.
         constraint_name: String,
     },
     #[error("Policy `{policy_name}` already exists on table `{table_name}`.")]
@@ -4436,9 +4432,9 @@ pub enum Error {
     /// table already carries. A policy name is unique per table, whatever
     /// command it is declared `FOR`.
     PolicyAlreadyExists {
-        /// Name of the policy that already exists.
+        /// Stored name of the policy that already exists.
         policy_name: String,
-        /// Name of the table carrying it.
+        /// Stored name of the table carrying it.
         table_name: String,
     },
     #[error("Trigger `{trigger_name}` already exists on relation `{relation_name}`.")]
@@ -4446,9 +4442,9 @@ pub enum Error {
     /// table or view already carries. A trigger name is unique per relation,
     /// so the same name on another relation is fine.
     TriggerAlreadyExists {
-        /// Name of the trigger that already exists.
+        /// Stored name of the trigger that already exists.
         trigger_name: String,
-        /// Name of the table or view carrying it.
+        /// Stored name of the table or view carrying it.
         relation_name: String,
     },
     #[error(
@@ -4459,11 +4455,11 @@ pub enum Error {
     /// PostgreSQL keeps on a partition of a row trigger on the partitioned
     /// table above it, which only goes with the trigger it copies.
     ClonedTriggerDropped {
-        /// Name of the trigger.
+        /// Stored name of the trigger.
         trigger_name: String,
-        /// Name of the partition carrying the copy.
+        /// Stored name of the partition carrying the copy.
         table_name: String,
-        /// Name of the partitioned table carrying the trigger it copies.
+        /// Stored name of the partitioned table carrying the trigger it copies.
         parent_table_name: String,
     },
     #[error(
@@ -4474,9 +4470,9 @@ pub enum Error {
     /// copy PostgreSQL keeps on a partition of a row trigger on the
     /// partitioned table above it.
     ClonedTriggerReplaced {
-        /// Name of the trigger.
+        /// Stored name of the trigger.
         trigger_name: String,
-        /// Name of the partition carrying the copy.
+        /// Stored name of the partition carrying the copy.
         table_name: String,
     },
     #[error(
@@ -4486,18 +4482,18 @@ pub enum Error {
     /// table, whether written on it or copied onto it as a partition, which
     /// PostgreSQL refuses.
     ConstraintTriggerOnForeignTable {
-        /// Name of the trigger.
+        /// Stored name of the trigger.
         trigger_name: String,
-        /// Name of the foreign table.
+        /// Stored name of the foreign table.
         table_name: String,
     },
     #[error("Trigger `{trigger_name}` for table `{table_name}` does not exist.")]
     /// Error indicating that an `ALTER TABLE` enabling or disabling a trigger
     /// names one the table does not carry.
     AlterTableTriggerNotFound {
-        /// Name of the trigger that was not found.
+        /// Stored name of the trigger that was not found.
         trigger_name: String,
-        /// Name of the table the statement alters.
+        /// Stored name of the table the statement alters.
         table_name: String,
     },
     #[error("Rule `{rule_name}` already exists on relation `{relation_name}`.")]
@@ -4505,9 +4501,9 @@ pub enum Error {
     /// or view already carries without `OR REPLACE`. A rule name is unique per
     /// relation, so the same name on another relation is fine.
     RuleAlreadyExists {
-        /// Name of the rule that already exists.
+        /// Stored name of the rule that already exists.
         rule_name: String,
-        /// Name of the relation carrying it.
+        /// Stored name of the relation carrying it.
         relation_name: String,
     },
     #[error("Extension `{extension_name}` already exists.")]
@@ -4515,7 +4511,7 @@ pub enum Error {
     /// EXISTS` names an extension the database already holds. An extension
     /// name is unique in the database, whatever schema each was created in.
     ExtensionAlreadyExists {
-        /// Name of the extension that already exists.
+        /// Stored name of the extension that already exists.
         extension_name: String,
     },
     #[error("Role `{role_name}` already exists.")]
@@ -4528,7 +4524,7 @@ pub enum Error {
     /// excuses a dump that omits role creation, and this statement is the
     /// creation.
     RoleAlreadyExists {
-        /// Name of the role that already exists.
+        /// Stored name of the role that already exists.
         role_name: String,
     },
     #[error("Function `{function_name}` already exists with the same argument types.")]
@@ -4539,7 +4535,7 @@ pub enum Error {
     /// as they take different arguments. The return type is not part of the
     /// identity. `CREATE OR REPLACE` replaces the existing function instead.
     FunctionAlreadyExists {
-        /// Name of the function whose signature is repeated.
+        /// Stored name of the function whose signature is repeated.
         function_name: String,
     },
     #[error(
@@ -4553,7 +4549,7 @@ pub enum Error {
     /// since the validator lets a superuser through and an unnamed or
     /// undeclared role may be one.
     FunctionNotExecutableByCreator {
-        /// Name of the function.
+        /// Stored name of the function.
         function_name: String,
         /// The role running the statement, as stored.
         role_name: String,
@@ -4567,7 +4563,7 @@ pub enum Error {
     /// The replacement keeps the function's `pg_proc` row, and PostgreSQL
     /// refuses one that would change the row's `prokind`.
     FunctionKindChange {
-        /// Name of the function the statement would replace.
+        /// Stored name of the function the statement would replace.
         function_name: String,
         /// The kind of the function the statement would replace.
         kind: FunctionKind,
@@ -4600,9 +4596,9 @@ pub enum Error {
     /// time, so a statement whose body names a relation it cannot reach is
     /// refused before it records or replaces anything.
     RelationNotFoundForFunctionBody {
-        /// Name of the relation the body names.
+        /// Stored name of the relation the body names.
         relation_name: String,
-        /// Name of the function the statement declares.
+        /// Stored name of the function the statement declares.
         function_name: String,
     },
     #[error("`{statement}` is not supported in the body of function `{function_name}`.")]
@@ -4615,7 +4611,7 @@ pub enum Error {
     FunctionBodyStatementUnsupported {
         /// The statement the body holds.
         statement: String,
-        /// Name of the function the statement declares.
+        /// Stored name of the function the statement declares.
         function_name: String,
     },
     #[error(
@@ -4632,11 +4628,11 @@ pub enum Error {
     /// needs the form `t.*::t`, which the parser does not read. Either way the
     /// rename is refused before it changes anything.
     FunctionBodyBlocksColumnRename {
-        /// Name of the column the statement renames.
+        /// Stored name of the column the statement renames.
         column_name: String,
-        /// Name of the relation the function writes to.
+        /// Stored name of the relation the function writes to.
         relation_name: String,
-        /// Name of the function whose body writes to the relation.
+        /// Stored name of the function whose body writes to the relation.
         function_name: String,
     },
     #[error(
@@ -4646,7 +4642,8 @@ pub enum Error {
     /// while its block is empty or ends in a data-modifying statement without
     /// `RETURNING`, which PostgreSQL refuses at creation.
     FunctionBodyResultMissing {
-        /// Name of the function whose final statement produces no result.
+        /// Stored name of the function whose final statement produces no
+        /// result.
         function_name: String,
     },
     #[error("Column `{column_name}` is ambiguous in the body of function `{function_name}`.")]
@@ -4654,9 +4651,9 @@ pub enum Error {
     /// more than one relation in its scope exposes that column, which
     /// PostgreSQL refuses at creation.
     FunctionBodyReferenceAmbiguous {
-        /// Name of the column the statement references ambiguously.
+        /// Stored name of the column the statement references ambiguously.
         column_name: String,
-        /// Name of the function whose body is ambiguous.
+        /// Stored name of the function whose body is ambiguous.
         function_name: String,
     },
     #[error("Function `{function_name}`'s `INSERT` has more expressions than target columns.")]
@@ -4664,7 +4661,7 @@ pub enum Error {
     /// more expressions than its target has columns, which PostgreSQL
     /// refuses at creation.
     FunctionBodyInsertTooWide {
-        /// Name of the function whose body holds the `INSERT`.
+        /// Stored name of the function whose body holds the `INSERT`.
         function_name: String,
     },
     #[error(
@@ -4673,7 +4670,7 @@ pub enum Error {
     /// Error indicating that a `DROP FUNCTION` statement omits the argument
     /// list while the name it gives covers more than one function.
     AmbiguousDropFunction {
-        /// The name covering more than one function.
+        /// Qualified name of the function, as stored.
         function_name: String,
     },
     #[error(
@@ -4682,7 +4679,7 @@ pub enum Error {
     /// Error indicating that a `DROP PROCEDURE` statement omits the argument
     /// list while the name it gives covers more than one procedure.
     AmbiguousDropProcedure {
-        /// The name covering more than one procedure.
+        /// Qualified name of the procedure, as stored.
         procedure_name: String,
     },
     #[error(
@@ -4692,51 +4689,51 @@ pub enum Error {
     /// argument list without modes that matches one routine by its input
     /// types and another by every type it declares, `OUT` ones included.
     AmbiguousRoutineSignature {
-        /// The signature as the statement spelled it.
+        /// The signature with stored names and diagnostic type spellings.
         signature: String,
     },
     #[error("Schema `{schema_name}` not found for DROP SCHEMA statement.")]
     /// Error indicating that a DROP SCHEMA statement references a schema
     /// that does not exist.
     DropSchemaNotFound {
-        /// Name of the schema that was not found.
+        /// Name of the schema, as stored.
         schema_name: String,
     },
     #[error("Extension `{extension_name}` not found for DROP EXTENSION statement.")]
     /// Error indicating that a `DROP EXTENSION` statement without `IF EXISTS`
     /// names an extension the database does not hold.
     DropExtensionNotFound {
-        /// Name of the extension that was not found.
+        /// Name of the extension, as stored.
         extension_name: String,
     },
     #[error("Extension `{extension_name}` not found for function `{function_name}` to depend on.")]
     /// Error indicating that `ALTER FUNCTION ... [NO] DEPENDS ON EXTENSION`
     /// names an extension the database does not hold.
     AlterFunctionExtensionNotFound {
-        /// Name of the extension that was not found.
+        /// Name of the extension, as stored.
         extension_name: String,
-        /// Name of the function the statement alters.
+        /// Name of the function, as stored.
         function_name: String,
     },
     #[error("Cannot drop schema `{schema_name}`: still contains objects.")]
     /// Error indicating that a DROP SCHEMA statement references a schema
     /// that still contains objects (tables, functions, etc.).
     SchemaNotEmpty {
-        /// Name of the schema being dropped.
+        /// Name of the schema, as stored.
         schema_name: String,
     },
     #[error("Table `{table_name}` not found for RENAME TABLE statement.")]
     /// Error indicating that a RENAME TABLE statement references a table
     /// that does not exist.
     RenameTableNotFound {
-        /// Name of the table that was not found.
+        /// Qualified name of the table, as stored.
         table_name: String,
     },
     #[error("Policy `{policy_name}` not found for ALTER POLICY statement.")]
     /// Error indicating that an ALTER POLICY statement references a policy
     /// that does not exist.
     AlterPolicyNotFound {
-        /// Name of the policy that was not found.
+        /// Name of the policy, as stored.
         policy_name: String,
     },
     #[error("Function `{function_name}` not found for ALTER FUNCTION statement.")]
@@ -4744,7 +4741,7 @@ pub enum Error {
     /// clause or an owner reassignment references a function that does not
     /// exist.
     AlterFunctionNotFound {
-        /// Name of the function that was not found.
+        /// Qualified name of the function, as stored.
         function_name: String,
     },
     #[error(
@@ -4754,7 +4751,7 @@ pub enum Error {
     /// clause or an owner reassignment omits the argument list while the name
     /// it gives covers more than one function.
     AmbiguousAlterFunction {
-        /// The name covering more than one function.
+        /// Qualified name of the function, as stored.
         function_name: String,
     },
     #[error(
@@ -4770,28 +4767,28 @@ pub enum Error {
     /// and passing it over would read an ownership change and drop it, so the
     /// statement is refused instead.
     AggregateOwnerUnsupported {
-        /// Name of the aggregate the statement names.
+        /// Name of the aggregate, as stored.
         aggregate_name: String,
     },
     #[error("Index `{index_name}` not found for ALTER INDEX statement.")]
     /// Error indicating that an ALTER INDEX statement references an index that
     /// does not exist.
     AlterIndexNotFound {
-        /// Name of the index that was not found.
+        /// Qualified name of the index, as stored.
         index_name: String,
     },
     #[error("Role `{role_name}` not found for ALTER ROLE statement.")]
     /// Error indicating that an ALTER ROLE statement references a role that
     /// does not exist.
     AlterRoleNotFound {
-        /// Name of the role that was not found.
+        /// Name of the role, as stored.
         role_name: String,
     },
     #[error("Table `{table_name}` not found for ALTER TABLE statement.")]
     /// Error indicating that an ALTER TABLE statement references a table that
     /// does not exist.
     AlterTableNotFound {
-        /// Name of the table that was not found.
+        /// Qualified name of the table, as stored.
         table_name: String,
     },
     #[error(
@@ -4801,9 +4798,9 @@ pub enum Error {
     /// names a constraint the table does not declare. Constraints declared
     /// without a name have no name to drop them by.
     DropConstraintNotFound {
-        /// Name of the table the constraint was looked up on.
+        /// Name of the table, as stored.
         table_name: String,
-        /// Name of the constraint that was not found.
+        /// Name of the constraint, as stored.
         constraint_name: String,
     },
     #[error(
@@ -4813,9 +4810,9 @@ pub enum Error {
     /// statement names a constraint the table does not declare. Constraints
     /// declared without a name have no name to validate them by.
     ValidateConstraintNotFound {
-        /// Name of the table the constraint was looked up on.
+        /// Name of the table, as stored.
         table_name: String,
-        /// Name of the constraint that was not found.
+        /// Name of the constraint, as stored.
         constraint_name: String,
     },
     #[error(
@@ -4825,9 +4822,9 @@ pub enum Error {
     /// statement names a key, which is checked against every row the moment
     /// it is added and so has nothing left to validate.
     ConstraintNotValidatable {
-        /// Name of the table the statement names.
+        /// Name of the table, as stored.
         table_name: String,
-        /// Name of the constraint the statement names.
+        /// Name of the constraint, as stored.
         constraint_name: String,
     },
     #[error(
@@ -4837,7 +4834,7 @@ pub enum Error {
     /// checking existing rows against a key, which PostgreSQL refuses while
     /// reading the statement.
     NotValidRefused {
-        /// Name of the table the statement names.
+        /// Name of the table, as stored.
         table_name: String,
         /// The constraint as the statement wrote it.
         constraint: String,
@@ -4849,7 +4846,7 @@ pub enum Error {
     /// below already holds `NOT VALID`, which PostgreSQL refuses because the
     /// merged check would claim rows nobody has checked.
     NotValidConstraintConflict {
-        /// Name of the table holding the unvalidated copy.
+        /// Name of the table, as stored.
         table_name: String,
         /// The constraint as the table holds it.
         constraint: String,
@@ -4858,7 +4855,7 @@ pub enum Error {
     /// Error indicating that an ALTER SCHEMA statement references a schema
     /// that does not exist.
     AlterSchemaNotFound {
-        /// Name of the schema that was not found.
+        /// Name of the schema, as stored.
         schema_name: String,
     },
     #[error(
@@ -4871,7 +4868,7 @@ pub enum Error {
     /// which of them PostgreSQL bound the call to, and respelling the call
     /// either way could point it at the wrong one.
     MovedFunctionCallAmbiguous {
-        /// Name of the function being moved or renamed.
+        /// Name of the function, as stored.
         function_name: String,
         /// The call as written.
         call: String,
@@ -4880,9 +4877,9 @@ pub enum Error {
     /// Error indicating that `ALTER FUNCTION ... SET SCHEMA` names a schema
     /// that does not exist.
     AlterFunctionSchemaNotFound {
-        /// Name of the schema that was not found.
+        /// Name of the schema, as stored.
         schema_name: String,
-        /// Name of the function being moved.
+        /// Name of the function, as stored.
         function_name: String,
     },
     #[error(
@@ -4893,14 +4890,14 @@ pub enum Error {
     /// PostgreSQL refuses to reach a function through `ALTER AGGREGATE`, so
     /// the statement is refused rather than read as naming a function.
     AggregateAlterationUnsupported {
-        /// Name of the aggregate the statement names.
+        /// Name of the aggregate, as stored.
         aggregate_name: String,
     },
     #[error("Failed to build the table dependency graph of database `{catalog_name}`: {reason}")]
     /// Error indicating that the foreign key graph of a database could not be
     /// assembled.
     TableDependencyGraph {
-        /// Name of the database whose graph could not be assembled.
+        /// Name of the database, as stored.
         catalog_name: String,
         /// Human-readable reason describing the failure.
         reason: String,
@@ -4909,7 +4906,7 @@ pub enum Error {
     /// Error indicating that the foreign keys of a database form a cycle, so
     /// its tables have no topological order.
     CyclicTableDependencies {
-        /// Name of the database whose tables form a cycle.
+        /// Name of the database, as stored.
         catalog_name: String,
     },
     #[error("A {object_kind} was declared with no name.")]
@@ -4954,7 +4951,7 @@ pub enum Error {
     /// A release of, or rollback to, a savepoint the open transaction does not
     /// hold.
     SavepointNotFound {
-        /// Name of the savepoint as written.
+        /// Name of the savepoint, as stored.
         savepoint_name: String,
     },
     #[error(
