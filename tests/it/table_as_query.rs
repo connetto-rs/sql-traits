@@ -306,6 +306,13 @@ fn computed_outputs_resolve_to_their_defining_expression() {
 }
 
 #[test]
+fn a_query_over_two_computed_tables_resolves_each_definition() {
+    let db = computed("CREATE TABLE cu AS SELECT name || 'y' AS u FROM t2;");
+    assert_eq!(definition_in(&db, "ce, cu", "n"), "= id + 1");
+    assert_eq!(definition_in(&db, "ce, cu", "u"), "= name || 'y'");
+}
+
+#[test]
 fn a_computed_column_names_the_output_it_was_created_from() {
     let db = computed("CREATE TABLE ct AS SELECT id FROM t2;");
     let ordinal = |table, name| {
