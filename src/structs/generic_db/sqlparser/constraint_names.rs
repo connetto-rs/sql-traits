@@ -1,10 +1,5 @@
-//! The names PostgreSQL gives the constraints of a table it is not told a name
-//! for.
-//!
-//! A name is chosen when the constraint arrives and never changes after, not
-//! when the table or a column is renamed. The model keeps the statement as
-//! written, so the names live in the table's metadata, keyed by the slot each
-//! constraint fills in the node.
+//! PostgreSQL constraint names and name reservations in statement execution
+//! order.
 
 use alloc::{
     borrow::Cow,
@@ -27,8 +22,9 @@ use crate::{
     errors::{Error, InheritedChange, ObjectKind},
     structs::{
         IdentifierCase, TableMetadata,
-        metadata::{GeneratedConstraintName, KeyCreation},
+        metadata::{KeyCreation, RecordedConstraintName},
     },
+    traits::TableLike,
     utils::{identifier_resolution::stored_ident_name, walk::walk_expressions},
 };
 
@@ -49,6 +45,16 @@ pub(super) enum Position {
     Column(usize, usize),
     /// The entry at the position of the constraint list.
     Table(usize),
+}
+
+/// The PostgreSQL statement whose constraint installation passes apply.
+#[derive(Clone, Copy)]
+pub(super) enum CreationOrder {
+    /// Checks, not-null constraints, primary keys, other indexes, then foreign
+    /// keys.
+    CreateTable,
+    /// Not-null constraints, indexes, then checks and foreign keys.
+    AlterTable,
 }
 
 /// How PostgreSQL builds a constraint's name: the column part, the label, and
@@ -135,6 +141,34 @@ impl<'node> Slot<'node> {
             } => Some(&def.name),
             Self::Table(_, TableConstraint::NotNull(not_null)) => Some(&not_null.column),
             _ => None,
+        }
+    }
+
+    /// The order PostgreSQL installs newly declared constraint kinds.
+    fn creation_order(self, order: CreationOrder) -> u8 {
+        if matches!(order, CreationOrder::AlterTable) {
+            return if self.not_null_of().is_some() {
+                0
+            } else if backed_by_index(self) {
+                1
+            } else {
+                2
+            };
+        }
+        if self.is_check() {
+            0
+        } else if self.not_null_of().is_some() {
+            1
+        } else if matches!(
+            self,
+            Self::Column { held: ColumnOptionDef { option: ColumnOption::PrimaryKey(_), .. }, .. }
+                | Self::Table(_, TableConstraint::PrimaryKey(_))
+        ) {
+            2
+        } else if self.is_foreign_key() {
+            4
+        } else {
+            3
         }
     }
 
@@ -256,7 +290,7 @@ fn keys(slots: &[Slot<'_>]) -> Vec<String> {
 /// pair's name.
 pub(super) fn names<'a>(
     node: &'a CreateTable,
-    recorded: &'a [GeneratedConstraintName],
+    recorded: &'a [RecordedConstraintName],
     case: IdentifierCase,
 ) -> Vec<(Slot<'a>, Option<Cow<'a, str>>)> {
     let slots = slots(node);
@@ -283,7 +317,7 @@ pub(super) fn names<'a>(
 /// ever answers to.
 fn slot_names<'a>(
     slots: &[Slot<'a>],
-    recorded: &'a [GeneratedConstraintName],
+    recorded: &'a [RecordedConstraintName],
 ) -> Vec<(Slot<'a>, Option<Cow<'a, str>>)> {
     slots
         .iter()
@@ -353,7 +387,7 @@ fn not_null_partner_index(slots: &[Slot<'_>], index: usize, case: IdentifierCase
 /// `NOT NULL` naming its column under `case`.
 pub(super) fn locate(
     node: &CreateTable,
-    recorded: &[GeneratedConstraintName],
+    recorded: &[RecordedConstraintName],
     name: &Ident,
     case: IdentifierCase,
 ) -> Option<Position> {
@@ -379,17 +413,24 @@ pub(super) trait SlotRecord: Clone {
     /// The key of the slot the record belongs to.
     fn slot(&self) -> &str;
 
-    /// The record moved to the slot keyed `slot`.
-    fn moved_to(&self, slot: String) -> Self;
+    /// The record moved to `slot`, retaining its current declared name.
+    fn moved_to(&self, slot: String, declared_name: Option<&Ident>) -> Self;
 }
 
-impl SlotRecord for GeneratedConstraintName {
+impl SlotRecord for RecordedConstraintName {
     fn slot(&self) -> &str {
         &self.slot
     }
 
-    fn moved_to(&self, slot: String) -> Self {
-        Self { slot, ..self.clone() }
+    fn moved_to(&self, slot: String, declared_name: Option<&Ident>) -> Self {
+        Self {
+            slot,
+            name: declared_name.map_or_else(
+                || self.name.clone(),
+                |declared| stored_ident_name(declared).into_owned(),
+            ),
+            names_index: self.names_index,
+        }
     }
 }
 
@@ -398,7 +439,7 @@ impl SlotRecord for KeyCreation {
         &self.slot
     }
 
-    fn moved_to(&self, slot: String) -> Self {
+    fn moved_to(&self, slot: String, _declared_name: Option<&Ident>) -> Self {
         Self { slot, identity: self.identity }
     }
 }
@@ -408,7 +449,7 @@ impl SlotRecord for String {
         self
     }
 
-    fn moved_to(&self, slot: String) -> Self {
+    fn moved_to(&self, slot: String, _declared_name: Option<&Ident>) -> Self {
         slot
     }
 }
@@ -435,16 +476,17 @@ pub(super) fn follow<R: SlotRecord>(
         .filter(|(position, _)| Some(*position) != gone)
         .map(|(_, key)| key)
         .collect();
-    let after = keys(&slots(replacement));
+    let replacement_slots = slots(replacement);
+    let after = keys(&replacement_slots);
     if before.len() == after.len() {
         before
             .iter()
-            .zip(&after)
-            .filter_map(|(before, after)| {
+            .zip(after.iter().zip(&replacement_slots))
+            .filter_map(|(before, (after, slot))| {
                 recorded
                     .iter()
                     .find(|record| record.slot() == before)
-                    .map(|record| record.moved_to(after.clone()))
+                    .map(|record| record.moved_to(after.clone(), slot.declared_name()))
             })
             .collect()
     } else {
@@ -464,16 +506,17 @@ pub(super) fn keyed_slots(node: &CreateTable) -> Vec<(Slot<'_>, String)> {
     slots.into_iter().zip(keys).collect()
 }
 
-/// Whether a constraint of the schema `node` sits in, other than those still
-/// being named, holds `name`.
-fn constraint_name_held(builder: &ParserDBBuilder, node: &CreateTable, name: &str) -> bool {
+/// Whether an installed constraint in the table's schema holds the name.
+pub(super) fn constraint_name_held(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    name: &str,
+) -> bool {
     let schema = table_schema_qualifier(node);
     let case = builder.identifier_case();
     builder.tables().iter().any(|(table, metadata, _)| {
         schema_qualifiers_match(builder.namespaces(), table_schema_qualifier(table), schema, case)
-            && names(table, metadata.generated_constraint_names(), case)
-                .iter()
-                .any(|(_, held)| held.as_deref() == Some(name))
+            && metadata.recorded_constraint_names().iter().any(|held| held.name == name)
     })
 }
 
@@ -488,7 +531,7 @@ pub(super) fn index_name_held(
     builder.tables().iter().any(|(table, metadata, _)| {
         schema_qualifiers_match(builder.namespaces(), table_schema_qualifier(table), schema, case)
             && metadata
-                .generated_constraint_names()
+                .recorded_constraint_names()
                 .iter()
                 .any(|generated| generated.names_index && generated.name == wanted)
     })
@@ -504,7 +547,7 @@ fn received_name(builder: &ParserDBBuilder, node: &CreateTable, slot: Slot<'_>) 
                 .tables()
                 .iter()
                 .find(|(table, _, _)| core::ptr::eq(table.as_ref(), parent))
-                .map_or(&[][..], |(_, metadata, _)| metadata.generated_constraint_names());
+                .map_or(&[][..], |(_, metadata, _)| metadata.recorded_constraint_names());
             names(parent, recorded, case).into_iter().find_map(|(held, name)| {
                 let same = match (slot, held) {
                     (
@@ -565,12 +608,17 @@ fn is_received(
     }
 }
 
-/// Gives every constraint that arrived since the last statement the name
-/// PostgreSQL gives it, parents before the tables receiving from them so a
-/// copy can take the name of its original.
-pub(super) fn name_pending(builder: &mut ParserDBBuilder) {
+/// Installs pending constraint names in PostgreSQL creation order.
+///
+/// # Errors
+///
+/// Returns a name-collision error when a declared name is already installed.
+pub(super) fn name_pending(
+    builder: &mut ParserDBBuilder,
+    order: CreationOrder,
+) -> Result<(), Error> {
     if !matches!(*builder.dialect(), SqlparserDialect::PostgreSql) {
-        return;
+        return Ok(());
     }
     let case = builder.identifier_case();
     loop {
@@ -594,40 +642,38 @@ pub(super) fn name_pending(builder: &mut ParserDBBuilder) {
             })
             .or(pending.first())
         else {
-            return;
+            return Ok(());
         };
-        let names: Vec<Vec<GeneratedConstraintName>> = builder
+        let names: Vec<Vec<RecordedConstraintName>> = builder
             .tables()
             .iter()
             .filter(|(table, _, _)| next.matches(table, case))
-            .map(|(table, metadata, _)| new_names(builder, table, metadata))
-            .collect();
+            .map(|(table, metadata, _)| new_names(builder, table, metadata, order))
+            .collect::<Result<_, _>>()?;
         for ((_, metadata, _), names) in builder
             .tables_mut()
             .iter_mut()
             .filter(|(table, _, _)| next.matches(table, case))
             .zip(names)
         {
-            metadata.set_generated_constraint_names(names);
+            metadata.set_recorded_constraint_names(names);
             metadata.set_constraint_names_pending(false);
         }
     }
 }
 
-/// The table's generated names once every constraint without one has one.
+/// The installed names after assigning every pending constraint.
 fn new_names(
     builder: &ParserDBBuilder,
     node: &CreateTable,
     metadata: &TableMetadata<CreateTable>,
-) -> Vec<GeneratedConstraintName> {
-    let mut recorded = metadata.generated_constraint_names().to_vec();
-    let slots = slots(node);
+    order: CreationOrder,
+) -> Result<Vec<RecordedConstraintName>, Error> {
+    let mut recorded = metadata.recorded_constraint_names().to_vec();
+    let mut slots = slots(node);
+    slots.sort_by_key(|slot| slot.creation_order(order));
     let keys = keys(&slots);
-    for ((index, slot), key) in slots.iter().enumerate().zip(&keys) {
-        let slot = *slot;
-        // The requirement's name is one: the column's option answers the
-        // table's slot, a table slot a named option spells answers the
-        // option's, and a repeated entry answers the first one's.
+    for ((index, slot), key) in slots.iter().copied().enumerate().zip(keys) {
         if let Some(partner) = not_null_partner_index(&slots, index, builder.identifier_case()) {
             let partner_is_table =
                 matches!(slots[partner], Slot::Table(_, TableConstraint::NotNull(_)));
@@ -638,39 +684,57 @@ fn new_names(
                 continue;
             }
         }
-        let key = key.clone();
-        let unnamed = slot.declared_name().is_none()
-            && !recorded.iter().any(|generated| generated.slot == key);
-        let Some(naming) = unnamed.then(|| slot.naming()).flatten() else {
+        if recorded.iter().any(|generated| generated.slot == key) {
+            continue;
+        }
+        let Some(naming) = slot.naming() else {
             continue;
         };
         let received = is_received(builder, node, metadata, slot)
             .then(|| received_name(builder, node, slot))
             .flatten();
-        let name = received.unwrap_or_else(|| {
-            let own =
-                |candidate: &str| recorded.iter().any(|generated| generated.name == candidate);
-            if naming.names_index {
-                generated_names::index_name_on_table(
-                    builder,
-                    node,
-                    naming.columns.as_deref(),
-                    naming.label,
-                    |candidate| own(&candidate.value),
-                )
-                .value
-            } else {
+        let own = |candidate: &str| recorded.iter().find(|held| held.name == candidate);
+        let name = if let Some(declared) = slot.declared_name() {
+            let name = stored_ident_name(declared).into_owned();
+            if let Some(held) = own(&name) {
+                return Err(if naming.names_index && held.names_index {
+                    Error::RelationNameAlreadyTaken {
+                        object_kind: ObjectKind::UniqueIndex,
+                        conflicting_kind: ObjectKind::UniqueIndex,
+                        object_name: name,
+                    }
+                } else {
+                    Error::ConstraintAlreadyExists {
+                        table_name: node.table_name().to_string(),
+                        constraint_name: name,
+                    }
+                });
+            }
+            name
+        } else {
+            received.unwrap_or_else(|| {
                 generated_names::constraint_name_on(
                     node,
                     naming.columns.as_deref(),
                     naming.label,
-                    |candidate| own(candidate) || constraint_name_held(builder, node, candidate),
+                    |candidate| {
+                        own(&candidate.value).is_some()
+                            || constraint_name_held(builder, node, &candidate.value)
+                            || naming.names_index
+                                && super::non_constraint_relation_name_holder(
+                                    builder,
+                                    candidate,
+                                    table_schema_qualifier(node),
+                                )
+                                .is_some()
+                    },
                 )
-            }
-        });
-        recorded.push(GeneratedConstraintName { slot: key, name, names_index: naming.names_index });
+                .value
+            })
+        };
+        recorded.push(RecordedConstraintName { slot: key, name, names_index: naming.names_index });
     }
-    recorded
+    Ok(recorded)
 }
 
 /// The names the slots of a node the builder holds answer to.
@@ -682,7 +746,7 @@ fn answers<'a>(
         .tables()
         .iter()
         .find(|(table, _, _)| core::ptr::eq(table.as_ref(), node))
-        .map_or(&[][..], |(_, metadata, _)| metadata.generated_constraint_names());
+        .map_or(&[][..], |(_, metadata, _)| metadata.recorded_constraint_names());
     names(node, recorded, builder.identifier_case())
 }
 
@@ -722,7 +786,7 @@ pub(super) fn exclusion_name(
 /// `recorded` holding the names PostgreSQL gave those written without one.
 pub(super) fn check_names(
     node: &CreateTable,
-    recorded: &[GeneratedConstraintName],
+    recorded: &[RecordedConstraintName],
 ) -> Vec<Option<String>> {
     slot_names(&slots(node), recorded)
         .into_iter()
@@ -736,7 +800,7 @@ pub(super) fn check_names(
 /// without one.
 pub(super) fn exclusion_names(
     node: &CreateTable,
-    recorded: &[GeneratedConstraintName],
+    recorded: &[RecordedConstraintName],
 ) -> Vec<Option<String>> {
     slot_names(&slots(node), recorded)
         .into_iter()
@@ -1013,7 +1077,7 @@ pub(super) fn key_index_owner<'name>(
                         table_schema_qualifier(table),
                         Some(schema),
                         case,
-                    ) && locate(table, metadata.generated_constraint_names(), index_name, case)
+                    ) && locate(table, metadata.recorded_constraint_names(), index_name, case)
                         .and_then(|position| slot_at(table, position))
                         .is_some_and(|(slot, _)| backed_by_index(slot))
                 })
@@ -1053,7 +1117,7 @@ fn rename_constraint_of(
     new: &Ident,
 ) -> Result<ParserDBBuilder, Error> {
     let node = ParserDB::stored_node(&builder, &stored)?;
-    let recorded = super::generated_constraint_names(&builder, &stored);
+    let recorded = super::recorded_constraint_names(&builder, &stored);
     let case = builder.identifier_case();
     let Some((slot, _)) =
         locate(node, recorded, old, case).and_then(|position| slot_at(node, position))
@@ -1112,7 +1176,7 @@ fn rename_on(
     new: &Ident,
 ) -> Result<ParserDBBuilder, Error> {
     let node = ParserDB::stored_node(&builder, table)?;
-    let recorded = super::generated_constraint_names(&builder, table);
+    let recorded = super::recorded_constraint_names(&builder, table);
     let case = builder.identifier_case();
     let Some((slot, key)) =
         locate(node, recorded, old, case).and_then(|position| slot_at(node, position))
@@ -1154,17 +1218,17 @@ fn rename_on(
         builder.tables_mut().iter_mut().filter(|(stored, _, _)| table.matches(stored, case))
     {
         let names = metadata
-            .generated_constraint_names()
+            .recorded_constraint_names()
             .iter()
             .map(|generated| {
                 if generated.slot == key {
-                    GeneratedConstraintName { name: name.clone(), ..generated.clone() }
+                    RecordedConstraintName { name: name.clone(), ..generated.clone() }
                 } else {
                     generated.clone()
                 }
             })
             .collect();
-        metadata.set_generated_constraint_names(names);
+        metadata.set_recorded_constraint_names(names);
     }
     Ok(builder)
 }

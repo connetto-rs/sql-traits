@@ -91,7 +91,7 @@ struct HeldCheck {
 fn checks_of(builder: &ParserDBBuilder, table: &StoredTable, node: &CreateTable) -> Vec<HeldCheck> {
     constraint_names::names(
         node,
-        super::generated_constraint_names(builder, table),
+        super::recorded_constraint_names(builder, table),
         builder.identifier_case(),
     )
     .into_iter()

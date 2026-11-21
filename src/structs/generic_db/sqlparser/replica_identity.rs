@@ -24,7 +24,7 @@ use crate::{
     errors::{Error, ObjectKind, ReplicaIdentityRefusal, RequiredValue},
     structs::{
         ConstraintDeferral, IdentifierCase, StoredReplicaIdentity, TableAttribute, TableMetadata,
-        metadata::GeneratedConstraintName,
+        metadata::RecordedConstraintName,
     },
     traits::TableLike,
     utils::identifier_resolution::stored_ident_name,
@@ -107,7 +107,7 @@ fn usable_index(
     } else {
         let key = builder.tables().iter().filter(|(other, _, _)| in_schema(other)).find_map(
             |(other, metadata, _)| {
-                constraint_names::names(other, metadata.generated_constraint_names(), case)
+                constraint_names::names(other, metadata.recorded_constraint_names(), case)
                     .into_iter()
                     .find(|(slot, name)| {
                         constraint_names::backed_by_index(*slot)
@@ -286,7 +286,7 @@ fn covers_column(builder: &ParserDBBuilder, table: &CreateTable, column: &Ident)
     let columns = match created {
         Some(created) => key_columns(&created.attribute().columns).unwrap_or_default(),
         None => {
-            constraint_names::names(table, metadata.generated_constraint_names(), case)
+            constraint_names::names(table, metadata.recorded_constraint_names(), case)
                 .into_iter()
                 .find(|(_, name)| name.as_deref() == Some(wanted))
                 .map(|(slot, _)| key_slot_columns(slot))
@@ -372,20 +372,20 @@ pub(super) fn forget(metadata: &mut TableMetadata<CreateTable>, name: &str) {
 pub(super) fn follow_rebuild(
     metadata: &mut TableMetadata<CreateTable>,
     previous: &CreateTable,
-    previous_names: &[GeneratedConstraintName],
+    previous_names: &[RecordedConstraintName],
     replacement: &CreateTable,
     case: IdentifierCase,
 ) {
     let Some(name) = metadata.replica_identity().index_name() else {
         return;
     };
-    let key_named = |node: &CreateTable, names: &[GeneratedConstraintName]| {
+    let key_named = |node: &CreateTable, names: &[RecordedConstraintName]| {
         constraint_names::names(node, names, case).into_iter().any(|(slot, held)| {
             constraint_names::backed_by_index(slot) && held.as_deref() == Some(name)
         })
     };
     if key_named(previous, previous_names)
-        && !key_named(replacement, metadata.generated_constraint_names())
+        && !key_named(replacement, metadata.recorded_constraint_names())
     {
         metadata.set_replica_identity(StoredReplicaIdentity::Index(None));
     }

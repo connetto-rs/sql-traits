@@ -4212,8 +4212,8 @@ pub enum Error {
         constraint_name: String,
     },
     #[error("Constraint `{constraint_name}` already exists on table `{table_name}`.")]
-    /// Error indicating that `ADD CONSTRAINT` names a constraint the table
-    /// already holds under that name, written or given by PostgreSQL.
+    /// PostgreSQL refuses a constraint whose declared name belongs to another
+    /// constraint of the table.
     ConstraintAlreadyExists {
         /// Name of the table.
         table_name: String,

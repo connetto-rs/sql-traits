@@ -171,7 +171,7 @@ pub(super) fn validate_constraint(
 
     let located = constraint_names::locate(
         node,
-        super::generated_constraint_names(&builder, &stored),
+        super::recorded_constraint_names(&builder, &stored),
         name,
         builder.identifier_case(),
     );

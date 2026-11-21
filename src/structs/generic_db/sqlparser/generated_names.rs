@@ -169,15 +169,15 @@ pub(super) fn constraint_name_on(
     table: &CreateTable,
     columns: Option<&str>,
     label: &str,
-    mut taken: impl FnMut(&str) -> bool,
-) -> String {
+    mut taken: impl FnMut(&Ident) -> bool,
+) -> Ident {
     let table_name = stored(table.table_name(), table.table_name_is_quoted());
     let mut pass = 0u32;
     loop {
         let candidate = if pass == 0 {
-            object_name(&table_name, columns, Some(label))
+            spelled(object_name(&table_name, columns, Some(label)))
         } else {
-            object_name(&table_name, columns, Some(&format!("{label}{pass}")))
+            spelled(object_name(&table_name, columns, Some(&format!("{label}{pass}"))))
         };
         if !taken(&candidate) {
             return candidate;

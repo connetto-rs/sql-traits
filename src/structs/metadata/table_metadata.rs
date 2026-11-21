@@ -14,9 +14,9 @@ use crate::{
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 
-/// The name PostgreSQL gave a constraint written without one.
+/// The stored name of an installed constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GeneratedConstraintName {
+pub(crate) struct RecordedConstraintName {
     /// Which constraint of the table node it names, as its rendering numbered
     /// among equal renderings.
     pub(crate) slot: String,
@@ -31,7 +31,7 @@ pub(crate) struct GeneratedConstraintName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KeyCreation {
     /// Which constraint of the table node it is, keyed the way
-    /// [`GeneratedConstraintName::slot`] is.
+    /// [`RecordedConstraintName::slot`] is.
     pub(crate) slot: String,
     /// The identity, ordered as the keys were created.
     pub(crate) identity: KeyIdentity,
@@ -83,15 +83,14 @@ pub struct TableMetadata<T: TableLike> {
     /// CONSTRAINT ... NOT VALID` leaves until `VALIDATE CONSTRAINT` runs. Held
     /// as renderings for the same reason as the inherited constraints above.
     unvalidated_constraints: Vec<String>,
-    /// The name PostgreSQL gave each constraint the table holds without one,
-    /// fixed when the constraint arrived and kept through every later rename.
-    generated_constraint_names: Vec<GeneratedConstraintName>,
+    /// The names reserved by constraints already installed on the table.
+    recorded_constraint_names: Vec<RecordedConstraintName>,
     /// The identity each primary key and unique constraint of the table was
     /// given when it arrived, which orders them as PostgreSQL's object
     /// identifiers do.
     key_creations: Vec<KeyCreation>,
     /// The slot of each foreign key the table declared naming no referenced
-    /// columns, keyed the way [`GeneratedConstraintName::slot`] is.
+    /// columns, keyed the way [`RecordedConstraintName::slot`] is.
     ///
     /// Such a key depends on the primary key of the table it references
     /// whatever older key covers the same columns, while one naming its
@@ -152,7 +151,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             inherited_not_null: Vec::new(),
             inherited_constraints: Vec::new(),
             unvalidated_constraints: Vec::new(),
-            generated_constraint_names: Vec::new(),
+            recorded_constraint_names: Vec::new(),
             key_creations: Vec::new(),
             primary_key_references: Vec::new(),
             constraint_names_pending: false,
@@ -448,16 +447,16 @@ impl<T: TableLike> TableMetadata<T> {
         self.inherited_not_null = columns;
     }
 
-    /// Returns the name PostgreSQL gave each constraint written without one.
+    /// Returns the names reserved by installed constraints.
     #[inline]
-    pub(crate) fn generated_constraint_names(&self) -> &[GeneratedConstraintName] {
-        &self.generated_constraint_names
+    pub(crate) fn recorded_constraint_names(&self) -> &[RecordedConstraintName] {
+        &self.recorded_constraint_names
     }
 
-    /// Records the name PostgreSQL gave each constraint written without one.
+    /// Records the names reserved by installed constraints.
     #[inline]
-    pub(crate) fn set_generated_constraint_names(&mut self, names: Vec<GeneratedConstraintName>) {
-        self.generated_constraint_names = names;
+    pub(crate) fn set_recorded_constraint_names(&mut self, names: Vec<RecordedConstraintName>) {
+        self.recorded_constraint_names = names;
     }
 
     /// Returns the identity each key of the table was given when it arrived.
