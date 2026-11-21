@@ -89,6 +89,7 @@ pub struct ColumnMetadata {
     postgres_collation: Option<ResolvedCollation>,
     mysql_padding: Option<MySqlCollationPadding>,
     documentation: Option<String>,
+    declared_type_text: Option<String>,
     creation: Option<ColumnCreation>,
     calls: ExpressionCalls<CreateFunction>,
 }
@@ -118,6 +119,22 @@ impl ColumnMetadata {
     /// Replaces the documentation of the column, as `COMMENT ON COLUMN` does.
     pub(crate) fn set_documentation(&mut self, documentation: Option<String>) {
         self.documentation = documentation;
+    }
+
+    /// Stores the declared type text the engine reports for the column.
+    pub(crate) fn with_declared_type_text(mut self, declared_type_text: Option<String>) -> Self {
+        self.declared_type_text = declared_type_text;
+        self
+    }
+
+    /// Replaces the declared type text, for a column a later statement adds.
+    pub(crate) fn set_declared_type_text(&mut self, declared_type_text: Option<String>) {
+        self.declared_type_text = declared_type_text;
+    }
+
+    /// The declared type text the engine reports for the column, when known.
+    pub(crate) fn declared_type_text(&self) -> Option<&str> {
+        self.declared_type_text.as_deref()
     }
 
     pub(crate) fn with_postgres_default_collation(mut self) -> Self {

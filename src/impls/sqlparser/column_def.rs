@@ -165,6 +165,14 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     }
 
     #[inline]
+    fn declared_type_text<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db str>, LookupError> {
+        Ok(held_column_metadata(self, database)?.declared_type_text())
+    }
+
+    #[inline]
     fn data_type<'db>(&'db self, _database: &'db Self::DB) -> &'db DataType {
         &self.attribute().data_type
     }

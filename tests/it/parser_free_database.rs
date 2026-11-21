@@ -2812,6 +2812,7 @@ fn the_inherited_virtual_table_accessors_answer_no_virtual_table() -> Result<(),
         .expect("the catalog holds it");
     let id = notes.columns(&catalog)?.next().expect("a column");
     assert!(!id.is_hidden(&catalog)?);
+    assert_eq!(id.declared_type_text(&catalog)?, None);
     Ok(())
 }
 

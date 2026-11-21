@@ -10,15 +10,45 @@ use sqlparser::{
     tokenizer::{Location, Token},
 };
 
+/// The statements of one SQL text, with the comments and line starts that
+/// tie them back to it.
 pub(super) struct ParsedSource {
     pub(super) statements: Vec<(Statement, Location)>,
     pub(super) comments: Comments,
+    /// The byte offset each line of the text starts at.
+    pub(super) line_starts: Vec<usize>,
 }
 
+/// One statement's place in the SQL text it was parsed from.
 #[derive(Clone, Copy)]
 pub(super) struct StatementSource<'a> {
     pub(super) comments: &'a Comments,
     pub(super) start: Location,
+    pub(super) text: SourceText<'a>,
+}
+
+/// The SQL text a statement was parsed from, addressable by token location.
+#[derive(Clone, Copy)]
+pub(super) struct SourceText<'a> {
+    pub(super) sql: &'a str,
+    pub(super) line_starts: &'a [usize],
+}
+
+impl SourceText<'_> {
+    /// The byte offset of `location`, or `None` for an empty location or one
+    /// outside the text.
+    pub(super) fn offset(&self, location: Location) -> Option<usize> {
+        let line_index = usize::try_from(location.line).ok()?.checked_sub(1)?;
+        let column_index = usize::try_from(location.column).ok()?.checked_sub(1)?;
+        let line_start = *self.line_starts.get(line_index)?;
+        let line = &self.sql[line_start..];
+        let within = line
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain(core::iter::once(line.len()))
+            .nth(column_index)?;
+        Some(line_start + within)
+    }
 }
 
 impl ParsedSource {
@@ -45,6 +75,8 @@ impl ParsedSource {
             statements.push((statement, start));
             expecting_delimiter = true;
         }
-        Ok(Self { statements, comments: parser.into_comments() })
+        let line_starts =
+            core::iter::once(0).chain(sql.match_indices('\n').map(|(at, _)| at + 1)).collect();
+        Ok(Self { statements, comments: parser.into_comments(), line_starts })
     }
 }

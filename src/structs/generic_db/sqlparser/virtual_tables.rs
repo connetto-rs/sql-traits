@@ -4,7 +4,7 @@
 //! a table of any module, and the shadow tables the modules keep.
 
 use alloc::{
-    borrow::Cow,
+    borrow::{Cow, ToOwned},
     format,
     string::{String, ToString},
     sync::Arc,
@@ -20,9 +20,9 @@ use sqlparser::{
 };
 
 use super::{
-    NamedColumn, ParserDBBuilder, StoredTable, postgres_catalog::PostgresCatalog,
-    schema_qualifiers_match, table_schema_qualifier, type_arrays::TypeArrays,
-    validate_distinct_columns, views,
+    NamedColumn, ParserDBBuilder, StoredTable, column_texts::ColumnTexts,
+    postgres_catalog::PostgresCatalog, schema_qualifiers_match, table_schema_qualifier,
+    type_arrays::TypeArrays, validate_distinct_columns, views,
 };
 use crate::{
     errors::{Error, VirtualTableArgumentRefusal as Refusal},
@@ -90,6 +90,8 @@ pub(super) struct ModuleDeclaration {
     pub(super) hidden_column_names: Vec<String>,
     /// The suffixes of the shadow tables the module keeps.
     pub(super) shadow_suffixes: Vec<String>,
+    /// The declared type text of each column the module declares.
+    pub(super) declared_types: ColumnTexts,
 }
 
 /// Gives `create_table` the columns its module declares, derived from the
@@ -122,9 +124,11 @@ pub(super) fn declare_columns(
                 module_name: source.module_name().to_string(),
             });
         };
+        let derived = derive_columns(builder, create_table, source, module)?;
         return Ok(ModuleDeclaration {
-            hidden_column_names: derive_columns(builder, create_table, source, module)?,
+            hidden_column_names: derived.hidden,
             shadow_suffixes: module.kept_suffixes(),
+            declared_types: derived_types(create_table, derived.declared_types),
         });
     };
     let (declared_columns, shadow_suffixes) = declared.into_parts();
@@ -146,28 +150,44 @@ pub(super) fn declare_columns(
     let Some(module) = module else {
         let hidden_column_names = columns
             .iter()
-            .filter(|(_, hidden)| *hidden)
-            .map(|(column, _)| column.name.value.clone())
+            .filter(|(_, _, hidden)| *hidden)
+            .map(|(column, _, _)| column.name.value.clone())
             .collect();
-        create_table.columns = columns.into_iter().map(|(column, _)| column).collect();
+        let (columns, declared_types): (Vec<_>, Vec<_>) = columns
+            .into_iter()
+            .map(|(column, declared_type, _)| {
+                let key = column.name.clone();
+                (column, (key, declared_type))
+            })
+            .unzip();
+        create_table.columns = columns;
         validate_distinct_columns(create_table, builder.identifier_case())?;
-        return Ok(ModuleDeclaration { hidden_column_names, shadow_suffixes });
+        return Ok(ModuleDeclaration {
+            hidden_column_names,
+            shadow_suffixes,
+            declared_types: declared_types.into_iter().collect(),
+        });
     };
-    let hidden_column_names = derive_columns(builder, create_table, source, module)?;
+    let derived = derive_columns(builder, create_table, source, module)?;
     let differing = (0..columns.len().max(create_table.columns.len())).find_map(|position| {
-        let supplied = columns.get(position).map(|(column, hidden)| (column, *hidden));
-        let derived = create_table
-            .columns
-            .get(position)
-            .map(|column| (column, hidden_column_names.contains(&column.name.value)));
-        let same = supplied.zip(derived).is_some_and(
-            |((supplied, supplied_hidden), (derived, derived_hidden))| {
-                supplied.name.value == derived.name.value
-                    && supplied.data_type == derived.data_type
-                    && supplied_hidden == derived_hidden
+        let supplied = columns.get(position);
+        let module_column =
+            create_table.columns.get(position).zip(derived.declared_types.get(position));
+        let same = supplied.zip(module_column).is_some_and(
+            |((supplied, supplied_type, supplied_hidden), (column, declared_type))| {
+                supplied.name.value == column.name.value
+                    && supplied_type.as_str() == *declared_type
+                    && *supplied_hidden == derived.hidden.contains(&column.name.value)
             },
         );
-        if same { None } else { supplied.or(derived).map(|(column, _)| column.name.value.clone()) }
+        if same {
+            None
+        } else {
+            supplied
+                .map(|(column, _, _)| column)
+                .or(module_column.map(|(column, _)| column))
+                .map(|column| column.name.value.clone())
+        }
     });
     if let Some(column_name) = differing {
         return Err(Error::VirtualTableColumnsMismatch {
@@ -176,17 +196,33 @@ pub(super) fn declare_columns(
             column_name,
         });
     }
-    Ok(ModuleDeclaration { hidden_column_names, shadow_suffixes: module.kept_suffixes() })
+    Ok(ModuleDeclaration {
+        declared_types: derived_types(create_table, derived.declared_types),
+        hidden_column_names: derived.hidden,
+        shadow_suffixes: module.kept_suffixes(),
+    })
+}
+
+/// The declared type texts a module derived for the columns of
+/// `create_table`, in their order.
+fn derived_types(create_table: &CreateTable, declared_types: Vec<&'static str>) -> ColumnTexts {
+    create_table
+        .columns
+        .iter()
+        .zip(declared_types)
+        .map(|(column, declared_type)| (column.name.clone(), declared_type.to_owned()))
+        .collect()
 }
 
 /// Gives `create_table` the columns `module` declares for the arguments of
-/// `source` and returns the names of those it hides.
+/// `source`, returning the names of those it hides and the declared type
+/// text of each.
 fn derive_columns(
     builder: &ParserDBBuilder,
     create_table: &mut CreateTable,
     source: &VirtualTableSource,
     module: Module,
-) -> Result<Vec<String>, Error> {
+) -> Result<DerivedColumns, Error> {
     let table_name = create_table.table_name().to_string();
     let refuse = |refusal| {
         Error::VirtualTableArgumentsRefused {
@@ -202,16 +238,18 @@ fn derive_columns(
         Module::Fts5 => fts5(&table_name, arguments).map_err(refuse)?,
         Module::Rtree | Module::RtreeI32 => {
             let coordinate = if matches!(module, Module::RtreeI32) {
-                DataType::Int(None)
+                (DataType::Int(None), "INT")
             } else {
-                DataType::Real
+                (DataType::Real, "REAL")
             };
-            create_table.columns = rtree_columns(arguments, &coordinate).map_err(refuse)?;
+            let (columns, declared_types) =
+                rtree_columns(arguments, &coordinate).map_err(refuse)?.into_iter().unzip();
+            create_table.columns = columns;
             // SQLite declares the columns, refusing a repeated one, before it
             // counts the dimensions.
             validate_distinct_columns(create_table, builder.identifier_case())?;
             rtree_dimensions(arguments).map_err(refuse)?;
-            return Ok(Vec::new());
+            return Ok(DerivedColumns { hidden: Vec::new(), declared_types });
         }
     };
     create_table.columns = declared
@@ -220,30 +258,37 @@ fn derive_columns(
         .chain(declared.hidden.iter().cloned())
         .map(|name| column(name, DataType::Unspecified))
         .collect();
-    Ok(declared.hidden)
+    let declared_types = vec![""; create_table.columns.len()];
+    Ok(DerivedColumns { hidden: declared.hidden, declared_types })
+}
+
+/// What a module declares for the columns it derives, in their order.
+struct DerivedColumns {
+    hidden: Vec<String>,
+    declared_types: Vec<&'static str>,
 }
 
 /// Each of `columns` as a column definition, its declared type read with
-/// `dialect` and an empty one leaving it untyped, beside whether it is
-/// hidden.
+/// `dialect` and an empty one leaving it untyped, beside its declared type
+/// text and whether it is hidden.
 fn typed_columns(
     dialect: &dyn Dialect,
     columns: Vec<DeclaredColumn>,
-) -> Result<Vec<(ColumnDef, bool)>, Error> {
+) -> Result<Vec<(ColumnDef, String, bool)>, Error> {
     columns
         .into_iter()
         .map(|declared| {
             let (name, declared_type, hidden) = declared.into_parts();
-            let declared_type = declared_type.trim();
-            let data_type = if declared_type.is_empty() {
+            let trimmed = declared_type.trim();
+            let data_type = if trimmed.is_empty() {
                 DataType::Unspecified
             } else {
-                let mut parser = Parser::new(dialect).try_with_sql(declared_type)?;
+                let mut parser = Parser::new(dialect).try_with_sql(trimmed)?;
                 let data_type = parser.parse_data_type()?;
                 parser.expect_token(&Token::EOF)?;
                 data_type
             };
-            Ok((column(name, data_type), hidden))
+            Ok((column(name, data_type), declared_type, hidden))
         })
         .collect()
 }
@@ -742,10 +787,13 @@ fn fts5_word(text: &str) -> Option<(String, bool, &str)> {
     (length > 0).then(|| (text[..length].to_string(), false, &text[length..]))
 }
 
-/// The columns of an `rtree` table as `rtreeInit` declares them, the
-/// integer id first, then the coordinates of type `coordinate`, then the
-/// untyped auxiliary columns.
-fn rtree_columns(arguments: &[String], coordinate: &DataType) -> Result<Vec<ColumnDef>, Refusal> {
+/// The columns of an `rtree` table as `rtreeInit` declares them, each beside
+/// its declared type text: the integer id first, then the coordinates of
+/// type `coordinate`, then the untyped auxiliary columns.
+fn rtree_columns(
+    arguments: &[String],
+    coordinate: &(DataType, &'static str),
+) -> Result<Vec<(ColumnDef, &'static str)>, Refusal> {
     if arguments.len() < 3 {
         return Err(Refusal::TooFewColumns);
     }
@@ -756,16 +804,18 @@ fn rtree_columns(arguments: &[String], coordinate: &DataType) -> Result<Vec<Colu
         sql_name(argument)
             .ok_or_else(|| Refusal::MalformedArgument { argument: written.to_string() })
     };
-    let mut columns = vec![column(name(&arguments[0], &arguments[0])?, DataType::Int(None))];
+    let mut columns =
+        vec![(column(name(&arguments[0], &arguments[0])?, DataType::Int(None)), "INT")];
     let mut auxiliary = false;
     for argument in &arguments[1..] {
         if let Some(auxiliary_name) = argument.strip_prefix('+') {
             auxiliary = true;
-            columns.push(column(name(auxiliary_name, argument)?, DataType::Unspecified));
+            columns.push((column(name(auxiliary_name, argument)?, DataType::Unspecified), ""));
         } else if auxiliary {
             return Err(Refusal::AuxiliaryColumnNotLast);
         } else {
-            columns.push(column(name(argument, argument)?, coordinate.clone()));
+            let (data_type, declared_type) = coordinate;
+            columns.push((column(name(argument, argument)?, data_type.clone()), declared_type));
         }
     }
     Ok(columns)

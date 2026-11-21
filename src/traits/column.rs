@@ -709,6 +709,53 @@ pub trait ColumnLike:
         Ok(false)
     }
 
+    /// Returns the declared type text SQLite reports for the column in
+    /// `pragma_table_xinfo.type`, empty for an untyped column.
+    ///
+    /// A standard type name such as `int` reads back as `INT`, a quoted name
+    /// is unquoted, and any other spelling keeps its whitespace and comments,
+    /// as SQLite stores the declaration. A virtual table's columns answer
+    /// what their module declares.
+    ///
+    /// The answer is `None` for every other dialect, for a column whose
+    /// statement was applied without its text, as
+    /// [`ParserDBIngestor::apply_statement`] applies it, and for a column
+    /// of `CREATE TABLE … AS`, whose type SQLite derives from the query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the column.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE t (a integer, b VARCHAR( 10 ), c \"my  Type\", d);",
+    /// )?;
+    /// let t = db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let types: Vec<Option<&str>> = t
+    ///     .columns(&db)?
+    ///     .map(|column| column.declared_type_text(&db))
+    ///     .collect::<Result<_, sql_traits::errors::LookupError>>()?;
+    /// assert_eq!(types, [Some("INTEGER"), Some("VARCHAR( 10 )"), Some("my  Type"), Some("")]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`ParserDBIngestor::apply_statement`]: crate::structs::ParserDBIngestor::apply_statement
+    #[inline]
+    fn declared_type_text<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db str>, LookupError> {
+        Ok(None)
+    }
+
     /// Returns whether the column is the primary key of its table (not just
     /// part of it).
     ///
@@ -2087,6 +2134,14 @@ where
     }
 
     #[inline]
+    fn declared_type_text<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db str>, LookupError> {
+        (*self).declared_type_text(database)
+    }
+
+    #[inline]
     fn is_nullable(&self, database: &Self::DB) -> Result<bool, LookupError> {
         (*self).is_nullable(database)
     }
@@ -2205,6 +2260,14 @@ where
     #[inline]
     fn is_hidden(&self, database: &Self::DB) -> Result<bool, LookupError> {
         (**self).is_hidden(database)
+    }
+
+    #[inline]
+    fn declared_type_text<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db str>, LookupError> {
+        (**self).declared_type_text(database)
     }
 
     #[inline]

@@ -1,19 +1,19 @@
 //! Documentation from standalone comments above opening tokens.
 
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
 
 use sqlparser::{
-    ast::{CreateTable, Ident, Spanned, comments::Comments},
+    ast::{CreateTable, Spanned, comments::Comments},
     tokenizer::Location,
 };
 
-use super::parsed_source::StatementSource;
+use super::{column_texts::ColumnTexts, parsed_source::StatementSource};
 
 /// Documentation declared by a `CREATE TABLE` statement.
 #[derive(Debug, Default)]
 pub(super) struct TableDocumentation {
     pub(super) table: Option<String>,
-    columns: Vec<(Ident, String)>,
+    pub(super) columns: ColumnTexts,
 }
 
 impl TableDocumentation {
@@ -29,14 +29,6 @@ impl TableDocumentation {
                 })
                 .collect(),
         }
-    }
-
-    /// Moves out the documentation written for the column `name`.
-    pub(super) fn take_column(&mut self, name: &Ident) -> Option<String> {
-        let position = self.columns.iter().position(|(column, _)| {
-            column.value == name.value && column.quote_style.is_some() == name.quote_style.is_some()
-        })?;
-        Some(self.columns.swap_remove(position).1)
     }
 }
 
