@@ -534,12 +534,11 @@ pub(super) fn drop_index(
 /// An index a partitioned index tree may hold, either a standalone index at
 /// its position in the builder or the index behind the primary key or unique
 /// constraint at its position in the table node.
-#[derive(Clone, Copy)]
 enum Member {
     /// The standalone index at the position.
     Standalone(usize),
-    /// The index of the key at the position.
-    Key(Position),
+    /// The index of the constraint at the position and its metadata key.
+    Key(Position, String),
 }
 
 /// An index of a table, with the name it answers to.
@@ -573,13 +572,14 @@ fn member_on(
     let node = ParserDB::stored_node(builder, table)?;
     Ok(constraint_names::answers(builder, node)
         .into_iter()
-        .find(|(slot, key)| {
+        .zip(constraint_names::keyed_slots(node))
+        .find(|((slot, held_name), _)| {
             slot.is_unique_key()
-                && key.as_ref().is_some_and(|key| {
+                && held_name.as_ref().is_some_and(|key| {
                     case.identifiers_match(key, true, &name.value, name.quote_style.is_some())
                 })
         })
-        .map(|(slot, _)| Member::Key(slot.position())))
+        .map(|((slot, _), (_, key))| Member::Key(slot.position(), key)))
 }
 
 /// The index `name` reaches, [`None`] for an index on a materialized view.
@@ -617,15 +617,15 @@ fn definition<'builder>(
     builder: &'builder ParserDBBuilder,
     index: &NamedIndex,
 ) -> Result<Option<Cow<'builder, CreateIndex>>, Error> {
-    match index.member {
+    match &index.member {
         Member::Standalone(position) => {
-            Ok(Some(Cow::Borrowed(builder.indices()[position].0.attribute())))
+            Ok(Some(Cow::Borrowed(builder.indices()[*position].0.attribute())))
         }
-        Member::Key(position) => {
+        Member::Key(position, _) => {
             let node = ParserDB::stored_node(builder, &index.table)?;
             Ok(constraint_names::slots(node)
                 .into_iter()
-                .find(|slot| slot.position() == position)
+                .find(|slot| slot.position() == *position)
                 .and_then(|slot| constraint_index(node, slot, &index.name.value))
                 .map(Cow::Owned))
         }
@@ -633,12 +633,16 @@ fn definition<'builder>(
 }
 
 /// Whether the index `member` of `table` is valid.
-fn is_valid(builder: &ParserDBBuilder, table: &StoredTable, member: Member) -> Result<bool, Error> {
+fn is_valid(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+    member: &Member,
+) -> Result<bool, Error> {
     match member {
-        Member::Standalone(position) => Ok(builder.indices()[position].1.is_valid()),
-        Member::Key(position) => {
+        Member::Standalone(position) => Ok(builder.indices()[*position].1.is_valid()),
+        Member::Key(position, _) => {
             let node = ParserDB::stored_node(builder, table)?;
-            Ok(!referenced_keys::invalid_keys(builder, node).contains(&position))
+            Ok(!referenced_keys::invalid_keys(builder, node).contains(position))
         }
     }
 }
@@ -801,7 +805,7 @@ fn partitions_attached(
         let Some(member) = member_on(builder, &child, &held)? else {
             return Ok(false);
         };
-        if !is_valid(builder, &child, member)? {
+        if !is_valid(builder, &child, &member)? {
             return Ok(false);
         }
     }
@@ -820,13 +824,13 @@ fn revalidate(
         let Some(member) = member_on(builder, &table, &name)? else {
             return Ok(());
         };
-        if is_valid(builder, &table, member)? || !partitions_attached(builder, &table, &name)? {
+        if is_valid(builder, &table, &member)? || !partitions_attached(builder, &table, &name)? {
             return Ok(());
         }
         match member {
             Member::Standalone(position) => builder.indices_mut()[position].1.set_validity(true),
-            Member::Key(position) => {
-                referenced_keys::set_key_validity(builder, &table, position, true)?;
+            Member::Key(_, key) => {
+                referenced_keys::set_key_validity(builder, &table, &key, true);
             }
         }
         let Some(parent_name) = links(builder, &table)?
@@ -865,11 +869,13 @@ pub(super) fn invalidate_key_above_partitions(
     {
         return Ok(());
     }
-    let Some(added) = ParserDB::stored_node(builder, table)?.constraints.len().checked_sub(1)
+    let Some((_, key)) =
+        constraint_names::keyed_slots(ParserDB::stored_node(builder, table)?).pop()
     else {
         return Ok(());
     };
-    referenced_keys::set_key_validity(builder, table, Position::Table(added), false)
+    referenced_keys::set_key_validity(builder, table, &key, false);
+    Ok(())
 }
 
 /// Applies `ALTER INDEX parent ATTACH PARTITION child`, making the index
@@ -950,16 +956,16 @@ pub(super) fn attach(
     if !matching {
         return Err(refused(child.name.value, AttachIndexRefusal::DefinitionsDiffer));
     }
-    if matches!(parent.member, Member::Key(_)) && matches!(child.member, Member::Standalone(_)) {
+    if matches!(parent.member, Member::Key(..)) && matches!(child.member, Member::Standalone(_)) {
         return Err(refused(
             child.name.value,
             AttachIndexRefusal::ConstraintMissing { table_name: parent_table_name },
         ));
     }
-    if let (Member::Key(_), Member::Key(position)) = (parent.member, child.member)
+    if let (Member::Key(..), Member::Key(position, _)) = (&parent.member, &child.member)
         && let Some(form) = constraint_names::slots(child_node)
             .into_iter()
-            .find(|slot| slot.position() == position)
+            .find(|slot| slot.position() == *position)
             .and_then(constraint_form)
             .map(Cow::into_owned)
     {

@@ -219,29 +219,19 @@ pub(super) fn primary_key_is_valid(builder: &ParserDBBuilder, node: &CreateTable
         })
 }
 
-/// Marks the index of the key at `position` of the stored table `table`
-/// valid or invalid.
+/// Marks the index of the recorded key of `table` valid or invalid.
 pub(super) fn set_key_validity(
     builder: &mut ParserDBBuilder,
     table: &StoredTable,
-    position: Position,
+    key: &str,
     valid: bool,
-) -> Result<(), Error> {
-    let node = ParserDB::stored_node(builder, table)?;
-    let Some(key) = constraint_names::keyed_slots(node)
-        .into_iter()
-        .find(|(held, _)| held.position() == position)
-        .map(|(_, key)| key)
-    else {
-        return Ok(());
-    };
+) {
     let case = builder.identifier_case();
     for (_, metadata, _) in
         builder.tables_mut().iter_mut().filter(|(node, _, _)| table.matches(node, case))
     {
-        metadata.set_key_validity(&key, valid);
+        metadata.set_key_validity(key, valid);
     }
-    Ok(())
 }
 
 /// Whether the foreign key at `slot` of `node`, keyed `key`, depends on the
