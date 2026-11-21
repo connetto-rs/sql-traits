@@ -454,13 +454,7 @@ impl SlotRecord for String {
     }
 }
 
-/// Carries the records kept per constraint across a rebuild of the node.
-///
-/// An edit that rewrites constraints in place, which is what a column rename
-/// does, keeps the number of slots, so the records follow position, and so do
-/// the survivors of an edit removing the slot at `removed`, which leaves them
-/// in order. An edit that otherwise adds or removes one leaves the
-/// survivors' renderings alone, so those are recognised by key.
+/// Carries records by stable keys or the order of rewritten slots.
 pub(super) fn follow<R: SlotRecord>(
     recorded: &[R],
     previous: &CreateTable,
@@ -479,10 +473,21 @@ pub(super) fn follow<R: SlotRecord>(
     let replacement_slots = slots(replacement);
     let after = keys(&replacement_slots);
     if before.len() == after.len() {
+        let mut rewritten =
+            after.iter().zip(&replacement_slots).filter(|(key, _)| !before.contains(key));
         before
             .iter()
-            .zip(after.iter().zip(&replacement_slots))
-            .filter_map(|(before, (after, slot))| {
+            .enumerate()
+            .filter_map(|(position, before)| {
+                let (after, slot) = if gone.is_some() {
+                    (&after[position], &replacement_slots[position])
+                } else {
+                    after
+                        .iter()
+                        .zip(&replacement_slots)
+                        .find(|(key, _)| *key == before)
+                        .or_else(|| rewritten.next())?
+                };
                 recorded
                     .iter()
                     .find(|record| record.slot() == before)

@@ -8212,7 +8212,7 @@ impl ParserDB {
             })?;
         let name = constraint_names::names(
             node,
-            generated_constraint_names(builder, stored),
+            recorded_constraint_names(builder, stored),
             builder.identifier_case(),
         )
         .into_iter()
