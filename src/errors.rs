@@ -344,6 +344,8 @@ pub enum InheritedChange {
     ValidateConstraint,
     /// `ALTER TABLE ONLY ... ALTER COLUMN ... TYPE`.
     AlterColumnType,
+    /// `ALTER TABLE ONLY ... ALTER COLUMN ... DROP EXPRESSION`.
+    DropExpression,
     /// `ALTER TABLE ONLY ... DROP COLUMN` on a partitioned table with
     /// partitions, which hold every column of their root.
     DropColumn,
@@ -363,6 +365,7 @@ impl core::fmt::Display for InheritedChange {
             Self::RenameColumn => "rename a column of",
             Self::ValidateConstraint => "validate a constraint of",
             Self::AlterColumnType => "change a column type of",
+            Self::DropExpression => "drop a generation expression of",
             Self::DropColumn => "drop a column of",
             Self::SetNotNull => "require a value in a column of",
             Self::RenameConstraint => "rename a constraint of",
@@ -389,6 +392,27 @@ impl core::fmt::Display for RequiredValue {
             Self::CoveredByKey => "a key covers it",
             Self::EnforcedByParent => "a parent requires it",
             Self::InReplicaIdentity => "the index used as replica identity covers it",
+        })
+    }
+}
+
+/// Why a generation expression cannot be removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationExpressionRefusal {
+    /// The column has no generation expression.
+    NotGenerated,
+    /// The column computes its value without storing it.
+    Virtual,
+    /// The column inherits its generation expression.
+    Inherited,
+}
+
+impl core::fmt::Display for GenerationExpressionRefusal {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotGenerated => "the column is not generated",
+            Self::Virtual => "the column is virtual",
+            Self::Inherited => "the column is inherited",
         })
     }
 }
@@ -1760,6 +1784,16 @@ pub enum Error {
         table_name: String,
         /// Name of the inherited column.
         column_name: String,
+    },
+    /// A generation expression cannot be removed from this column.
+    #[error("Cannot drop generation expression of `{table_name}.{column_name}` because {reason}.")]
+    GenerationExpressionNotDroppable {
+        /// Name of the table.
+        table_name: String,
+        /// Name of the column.
+        column_name: String,
+        /// Reason the expression must remain.
+        reason: GenerationExpressionRefusal,
     },
     #[error(
         "Cannot drop constraint `{constraint_name}` of table `{table_name}` because it is inherited."

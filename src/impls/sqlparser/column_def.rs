@@ -51,6 +51,30 @@ pub(crate) fn serial_sequence_type(data_type: &DataType) -> Option<DataType> {
     })
 }
 
+/// Returns the storage mode of a generated expression under the given dialect.
+pub(crate) fn generation_storage(
+    column: &ColumnDef,
+    dialect: SqlparserDialect,
+) -> Option<GeneratedExpressionMode> {
+    column.options.iter().find_map(|option| {
+        let ColumnOption::Generated { generation_expr: Some(_), generation_expr_mode, .. } =
+            &option.option
+        else {
+            return None;
+        };
+        generation_expr_mode.or_else(|| {
+            matches!(
+                dialect,
+                SqlparserDialect::SQLite
+                    | SqlparserDialect::MySql
+                    | SqlparserDialect::PostgreSql
+                    | SqlparserDialect::Generic
+            )
+            .then_some(GeneratedExpressionMode::Virtual)
+        })
+    })
+}
+
 /// Whether the declared type names a serial pseudo-type.
 fn is_serial_type(data_type: &DataType) -> bool {
     serial_sequence_type(data_type).is_some()
@@ -259,23 +283,7 @@ impl ColumnLike for TableAttribute<CreateTable, ColumnDef> {
     }
 
     fn generation_storage(&self, database: &Self::DB) -> Option<GeneratedExpressionMode> {
-        self.attribute().options.iter().find_map(|option| {
-            let ColumnOption::Generated { generation_expr: Some(_), generation_expr_mode, .. } =
-                &option.option
-            else {
-                return None;
-            };
-            generation_expr_mode.or_else(|| {
-                matches!(
-                    database.dialect(),
-                    SqlparserDialect::SQLite
-                        | SqlparserDialect::MySql
-                        | SqlparserDialect::PostgreSql
-                        | SqlparserDialect::Generic
-                )
-                .then_some(GeneratedExpressionMode::Virtual)
-            })
-        })
+        generation_storage(self.attribute(), *database.dialect())
     }
 
     /// The calls of the whole declaration are bound in one record, so a

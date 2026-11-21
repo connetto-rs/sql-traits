@@ -10140,6 +10140,30 @@ impl ParserDB {
         Ok(builder)
     }
 
+    /// Validates generation-expression removal across an inheritance tree.
+    fn refuse_inherited_expression_drop(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        node: &CreateTable,
+        scope: AlterTableScope,
+        column: &NamedColumn,
+        column_name: &Ident,
+    ) -> Result<(), crate::errors::Error> {
+        if inheritance::is_inherited_column(builder, node, column_name) {
+            return Err(crate::errors::Error::GenerationExpressionNotDroppable {
+                table_name: stored.name.clone(),
+                column_name: column.name.clone(),
+                reason: crate::errors::GenerationExpressionRefusal::Inherited,
+            });
+        }
+        Self::refuse_only_with_children(
+            builder,
+            stored,
+            scope,
+            crate::errors::InheritedChange::DropExpression,
+        )
+    }
+
     /// Applies an `ALTER COLUMN` operation, refusing the ones PostgreSQL will
     /// not perform before anything moves.
     fn alter_table_alter_column(
@@ -10163,6 +10187,18 @@ impl ParserDB {
             if column.declared_by(node) {
                 if matches!(operation, AlterColumnOperation::AddGenerated { .. }) {
                     Self::refuse_partition_identity(&stored, node, scope, &column)?;
+                }
+                if matches!(operation, AlterColumnOperation::DropExpression { .. })
+                    && matches!(builder.dialect(), SqlparserDialect::PostgreSql)
+                {
+                    Self::refuse_inherited_expression_drop(
+                        &builder,
+                        &stored,
+                        node,
+                        scope,
+                        &column,
+                        column_name,
+                    )?;
                 }
                 Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
                 if matches!(operation, AlterColumnOperation::SetDataType { .. }) {
@@ -10436,6 +10472,14 @@ impl ParserDB {
                     .options
                     .retain(|option| !matches!(option.option, ColumnOption::Default(_)));
             }
+            AlterColumnOperation::DropExpression { .. } => {
+                declared.options.retain(|option| {
+                    !matches!(
+                        option.option,
+                        ColumnOption::Generated { generation_expr: Some(_), .. }
+                    )
+                });
+            }
             AlterColumnOperation::SetDataType { data_type, .. } => {
                 declared.data_type = data_type;
             }
@@ -10475,6 +10519,17 @@ impl ParserDB {
                 ColumnOption::Default(Expr::Value(sqlparser::ast::Value::Null.with_empty_span()))
             }
             AlterColumnOperation::SetDataType { .. } => ColumnOption::NotNull,
+            AlterColumnOperation::DropExpression { .. } => {
+                ColumnOption::Generated {
+                    generated_as: GeneratedAs::Always,
+                    sequence_options: None,
+                    generation_expr: Some(Expr::Value(
+                        sqlparser::ast::Value::Null.with_empty_span(),
+                    )),
+                    generation_expr_mode: None,
+                    generated_keyword: true,
+                }
+            }
             AlterColumnOperation::AddGenerated { generated_as, sequence_options } => {
                 ColumnOption::Generated {
                     generated_as: generated_as.unwrap_or(GeneratedAs::ByDefault),
@@ -10508,6 +10563,29 @@ impl ParserDB {
         let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
 
         match operation {
+            AlterColumnOperation::DropExpression { if_exists }
+                if matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
+            {
+                let generated = declared.and_then(|declared| {
+                    crate::impls::generation_storage(declared, *builder.dialect())
+                });
+                let reason = match generated {
+                    Some(sqlparser::ast::GeneratedExpressionMode::Virtual) => {
+                        Some(crate::errors::GenerationExpressionRefusal::Virtual)
+                    }
+                    None if !if_exists => {
+                        Some(crate::errors::GenerationExpressionRefusal::NotGenerated)
+                    }
+                    Some(sqlparser::ast::GeneratedExpressionMode::Stored) | None => None,
+                };
+                if let Some(reason) = reason {
+                    return Err(crate::errors::Error::GenerationExpressionNotDroppable {
+                        table_name: stored.name.clone(),
+                        column_name: column.name.clone(),
+                        reason,
+                    });
+                }
+            }
             AlterColumnOperation::DropNotNull => {
                 if node.constraints.iter().any(|constraint| {
                     matches!(constraint, TableConstraint::PrimaryKey(_))

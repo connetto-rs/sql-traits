@@ -47,6 +47,7 @@ mod deployment;
 mod descendant_drops;
 mod do_blocks;
 mod domains;
+mod drop_expression;
 mod dropped_column_readers;
 mod dropped_policies;
 mod duplicate_keys;
