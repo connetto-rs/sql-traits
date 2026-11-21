@@ -17,12 +17,15 @@ use sqlparser::ast::{
 };
 
 use super::{
-    case_idents_match,
+    ParserDBBuilder, case_idents_match,
     constraint_names::{Slot, slots},
     key_nullability::is_integer_primary_key,
     object_name_last_identifier,
 };
-use crate::{structs::IdentifierCase, traits::TableLike};
+use crate::{
+    structs::{IdentifierCase, TableMetadata},
+    traits::TableLike,
+};
 
 /// One entry of a key as SQLite compares it: the column, and the collation
 /// it is compared under.
@@ -53,12 +56,25 @@ struct Key<'node> {
     entries: Vec<KeyEntry<'node>>,
 }
 
+/// Records on `table_metadata` the name of the index SQLite builds behind
+/// each primary key and unique constraint of `node`, a table `builder`
+/// ingests. Under every other dialect it records none.
+pub(super) fn record_autoindex_names(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    table_metadata: &mut TableMetadata<CreateTable>,
+) {
+    if builder.dialect().is_sqlite() {
+        table_metadata.set_sqlite_autoindex_names(autoindex_names(node, builder.identifier_case()));
+    }
+}
+
 /// The name of the index SQLite builds behind each primary key and unique
 /// constraint of `node`, in the order of [`slots`], with keys naming columns
 /// under `case`. Constraints sharing an index answer the same name.
 ///
 /// [`None`] for the rowid alias, which SQLite keys without an index.
-pub(super) fn autoindex_names(node: &CreateTable, case: IdentifierCase) -> Vec<Option<String>> {
+fn autoindex_names(node: &CreateTable, case: IdentifierCase) -> Vec<Option<String>> {
     let without_rowid = node.is_without_rowid();
     let mut built: Vec<Vec<KeyEntry<'_>>> = Vec::new();
     let mut ordinals: Vec<Option<usize>> = Vec::new();

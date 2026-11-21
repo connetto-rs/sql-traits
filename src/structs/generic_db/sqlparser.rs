@@ -7775,12 +7775,7 @@ impl ParserDB {
         }
         builder = Self::process_foreign_keys(&create_table, &mut table_metadata, builder)?;
         Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
-        if builder.dialect().is_sqlite() {
-            table_metadata.set_sqlite_autoindex_names(sqlite_autoindex::autoindex_names(
-                &create_table,
-                builder.identifier_case(),
-            ));
-        }
+        sqlite_autoindex::record_autoindex_names(&builder, &create_table, &mut table_metadata);
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
         referenced_keys::settle_key_creations(&mut builder, &create_table, &mut table_metadata);
