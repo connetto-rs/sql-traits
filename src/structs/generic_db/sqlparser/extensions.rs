@@ -37,7 +37,6 @@ use crate::{
     structs::metadata::FunctionMetadata,
     utils::{
         identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
-        last_str,
         object_name::{PG_CATALOG, TEMPORARY_SCHEMA},
     },
 };
@@ -173,7 +172,7 @@ fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Resu
         belongs(metadata)
             .then(|| builder.function_dependent(function, &[]))
             .flatten()
-            .map(|dependent| super::function_dependents::referenced(function, dependent))
+            .map(|dependent| super::function_dependents::referenced(builder, function, dependent))
     });
     if let Some(error) = held {
         return Err(error);
@@ -213,7 +212,9 @@ pub(super) fn create_extension(
         if extension.if_not_exists {
             return Ok(builder);
         }
-        return Err(Error::ExtensionAlreadyExists { extension_name: extension.name.value });
+        return Err(Error::ExtensionAlreadyExists {
+            extension_name: builder.dialect().stored_name(&extension.name),
+        });
     }
     extension.schema = match extension.schema.take() {
         Some(schema) => Some(named_schema(&builder, schema, &extension.name)?),
@@ -251,7 +252,11 @@ pub(super) fn drop_extensions(
                 drop_extension_functions(&mut builder, &extension.name)?;
             }
             None if drop.if_exists => {}
-            None => return Err(Error::DropExtensionNotFound { extension_name: name.value }),
+            None => {
+                return Err(Error::DropExtensionNotFound {
+                    extension_name: builder.dialect().stored_name(&name),
+                });
+            }
         }
     }
     Ok(builder)
@@ -281,11 +286,12 @@ pub(super) fn set_function_dependency(
                 .is_some_and(|named| case_idents_match(held, named, case))
         })
         .cloned();
+    let dialect = *builder.dialect();
     let (function, metadata) = &mut builder.functions_mut()[position];
     let Some(extension) = extension else {
         return Err(Error::AlterFunctionExtensionNotFound {
-            extension_name: last_str(extension_name).to_string(),
-            function_name: last_str(&function.name).to_string(),
+            extension_name: dialect.stored_object_name_last(extension_name),
+            function_name: dialect.stored_object_name_last(&function.name),
         });
     };
     metadata.set_extension_dependency(&extension, depends, |held, named| {
@@ -369,8 +375,8 @@ fn named_schema(
         return Ok(schema);
     }
     Err(Error::SchemaNotFoundForExtension {
-        schema_name: schema.value,
-        extension_name: extension_name.value.clone(),
+        schema_name: builder.dialect().stored_name(&schema),
+        extension_name: builder.dialect().stored_name(extension_name),
     })
 }
 
@@ -402,7 +408,9 @@ fn search_path_schema(
             return Ok(Some(stored_ident(schema.name(), schema.is_quoted())));
         }
     }
-    Err(Error::NoSchemaSelectedForExtension { extension_name: extension_name.value.clone() })
+    Err(Error::NoSchemaSelectedForExtension {
+        extension_name: builder.dialect().stored_name(extension_name),
+    })
 }
 
 #[cfg(test)]

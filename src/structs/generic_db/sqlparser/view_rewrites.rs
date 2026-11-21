@@ -33,7 +33,6 @@ use crate::{
     traits::{ColumnLike, DatabaseLike, TableLike, ViewLike},
     utils::{
         identifier_resolution::{identifiers_match, is_temporary_schema},
-        last_str,
         object_name::{
             Namespaces, RelationKey, overqualified_object_name, relation_name_is_claimed,
             resolve_view_on_search_path_in_iter, stored_table_key, stored_view_key,
@@ -128,8 +127,12 @@ impl Block {
     /// The name errors and respelling call the sequence's object by.
     fn holder_name(self, builder: &ParserDBBuilder) -> String {
         match self {
-            Self::Function(position) => last_str(&builder.functions()[position].0.name).to_string(),
-            Self::Rule(position) => builder.rules()[position].0.name.value.clone(),
+            Self::Function(position) => {
+                builder.dialect().stored_object_name_last(&builder.functions()[position].0.name)
+            }
+            Self::Rule(position) => {
+                builder.dialect().stored_name(&builder.rules()[position].0.name)
+            }
         }
     }
 }
@@ -408,6 +411,7 @@ fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> Dependent {
         Slot::Plain(position) => {
             Dependent::view(
                 builder.namespaces(),
+                *builder.dialect(),
                 ObjectKind::View,
                 builder.views()[position].0.as_ref(),
                 builder.identifier_case(),
@@ -416,6 +420,7 @@ fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> Dependent {
         Slot::Materialized(position) => {
             Dependent::view(
                 builder.namespaces(),
+                *builder.dialect(),
                 ObjectKind::MaterializedView,
                 builder.materialized_views()[position].0.as_ref(),
                 builder.identifier_case(),
@@ -427,6 +432,7 @@ fn slot_reader(builder: &ParserDBBuilder, slot: Slot) -> Dependent {
         Slot::Rule(position) => {
             rules::dependent(
                 builder.namespaces(),
+                *builder.dialect(),
                 &builder.rules()[position].0,
                 builder.identifier_case(),
             )
@@ -2870,6 +2876,7 @@ fn resolved_factor_key(catalog: &ParserDB, name: &ObjectName) -> RelationKey {
     let claimed = |key: &RelationKey| relation_name_is_claimed(catalog, key, case);
     let path = || catalog.search_path();
     let plain = resolve_view_on_search_path_in_iter(
+        *catalog.dialect(),
         namespaces,
         catalog.views(),
         &target,
@@ -2878,6 +2885,7 @@ fn resolved_factor_key(catalog: &ParserDB, name: &ObjectName) -> RelationKey {
         claimed,
     );
     let materialized = resolve_view_on_search_path_in_iter(
+        *catalog.dialect(),
         namespaces,
         catalog.materialized_views(),
         &target,
@@ -3292,7 +3300,15 @@ fn respell_shell(
     if let Some(mut dml) = statement_dml_mut(statement) {
         rename_lists(&mut dml, &factors, renames);
     }
-    if whole_row_outcomes(&mut edits, &factors, &sites, renames, &returning, holder_name)? {
+    if whole_row_outcomes(
+        &mut edits,
+        &factors,
+        &sites,
+        renames,
+        &returning,
+        holder_name,
+        *before.dialect(),
+    )? {
         return Ok(None);
     }
     captured_sites(&mut edits, &sites, &factors, renames, holder_name);
@@ -3319,6 +3335,7 @@ fn whole_row_outcomes(
     renames: &[Rename],
     returning: &BTreeSet<usize>,
     holder_name: &str,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<bool, Error> {
     for (index, factor) in factors.iter().enumerate() {
         let whole_row_sites = sites
@@ -3360,7 +3377,7 @@ fn whole_row_outcomes(
             }
             if whole_row_sites.iter().any(|site| returning.contains(&site.address)) {
                 return Err(Error::FunctionBodyBlocksColumnRename {
-                    column_name: columns[*ordinal].value.clone(),
+                    column_name: dialect.stored_name(&columns[*ordinal]),
                     relation_name: relation_name.clone(),
                     function_name: holder_name.to_string(),
                 });
@@ -3672,7 +3689,7 @@ fn shield_shell(
                 Rename::Column { ordinal, columns, relation_name, .. } => {
                     if position == 0 {
                         return Err(Error::FunctionBodyBlocksColumnRename {
-                            column_name: columns[*ordinal].value.clone(),
+                            column_name: before.dialect().stored_name(&columns[*ordinal]),
                             relation_name: relation_name.clone(),
                             function_name: holder_name.to_string(),
                         });

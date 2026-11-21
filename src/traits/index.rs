@@ -654,6 +654,7 @@ pub trait TableIndexLike: IndexLike {
             &target,
             &all_columns,
             database.identifier_case(),
+            crate::traits::DialectLike::sqlparser_dialect(database.dialect()),
         )
         .unwrap_or_default();
 

@@ -38,9 +38,12 @@ pub(super) fn inherit(
         return Ok(builder);
     };
     let child_node = ParserDB::stored_node(&builder, &child)?;
-    refuse_inheritance_child(child_node, child_name)?;
+    refuse_inheritance_child(&builder, child_node)?;
     let parent_node = resolve_parent(&builder, child_name, parent_name)?;
-    let (table_name, parent_text) = (child_name.to_string(), parent_name.to_string());
+    let (table_name, parent_text) = (
+        builder.dialect().stored_object_name_last(&child_node.name),
+        builder.dialect().stored_object_name_last(&parent_node.name),
+    );
     if parent_node.partition_by.is_some() {
         return Err(Error::InheritsFromPartitionedTable { table_name, parent_name: parent_text });
     }
@@ -57,7 +60,7 @@ pub(super) fn inherit(
     if inheritance::parent_names(child_node).any(|name| parent.named_by(name)) {
         return Err(Error::ParentRepeated {
             table_name,
-            parent_name: parent_node.table_name().to_string(),
+            parent_name: builder.dialect().stored_object_name_last(&parent_node.name),
         });
     }
     let case = builder.identifier_case();
@@ -99,24 +102,24 @@ pub(super) fn no_inherit(
     let Some(child) = ParserDB::alter_table_target(&builder, child_name, scope)? else {
         return Ok(builder);
     };
-    refuse_partition_child(ParserDB::stored_node(&builder, &child)?, child_name)?;
+    refuse_partition_child(&builder, ParserDB::stored_node(&builder, &child)?)?;
     let not_a_parent = || {
         Error::NotAParentOf {
-            table_name: child_name.to_string(),
-            parent_name: parent_name.to_string(),
+            table_name: builder.dialect().stored_object_name_last(child_name),
+            parent_name: builder.dialect().stored_object_name_last(parent_name),
         }
     };
     let Some(parent_node) = builder.resolve_table_object_name(parent_name)? else {
         return Err(if builder.relation_reached(parent_name).is_some() {
             not_a_parent()
         } else {
-            absent_parent(child_name, parent_name)
+            absent_parent(&builder, child_name, parent_name)
         });
     };
     if parent_node.partition_by.is_some() {
         return Err(Error::NotAPartitionOf {
-            table_name: parent_name.to_string(),
-            partition_name: child_name.to_string(),
+            table_name: builder.dialect().stored_object_name_last(parent_name),
+            partition_name: builder.dialect().stored_object_name_last(child_name),
         });
     }
     let parent = StoredTable::of(parent_node);
@@ -188,20 +191,24 @@ pub(super) fn no_inherit(
 
 /// Refuses a partition or partitioned table as a new inheritance child.
 pub(super) fn refuse_inheritance_child(
+    builder: &ParserDBBuilder,
     node: &CreateTable,
-    child_name: &ObjectName,
 ) -> Result<(), Error> {
-    refuse_partition_child(node, child_name)?;
+    refuse_partition_child(builder, node)?;
     if node.partition_by.is_some() {
-        return Err(Error::InheritanceChangeOnPartitioned { table_name: child_name.to_string() });
+        return Err(Error::InheritanceChangeOnPartitioned {
+            table_name: builder.dialect().stored_object_name_last(&node.name),
+        });
     }
     Ok(())
 }
 
 /// Refuses a partition as the table whose parents change.
-fn refuse_partition_child(node: &CreateTable, child_name: &ObjectName) -> Result<(), Error> {
+fn refuse_partition_child(builder: &ParserDBBuilder, node: &CreateTable) -> Result<(), Error> {
     if node.partition_of.is_some() {
-        return Err(Error::InheritanceChangeOnPartition { table_name: child_name.to_string() });
+        return Err(Error::InheritanceChangeOnPartition {
+            table_name: builder.dialect().stored_object_name_last(&node.name),
+        });
     }
     Ok(())
 }
@@ -220,17 +227,21 @@ fn resolve_parent<'builder>(
         Some((object_kind, _)) => {
             Err(Error::AlterActionUnsupportedOnRelation {
                 object_kind,
-                relation_name: parent_name.to_string(),
+                relation_name: builder.dialect().stored_object_name_last(parent_name),
                 operation: AlterTableOperation::Inherit { parent: parent_name.clone() }.to_string(),
             })
         }
-        None => Err(absent_parent(child_name, parent_name)),
+        None => Err(absent_parent(builder, child_name, parent_name)),
     }
 }
 
-fn absent_parent(child_name: &ObjectName, parent_name: &ObjectName) -> Error {
+fn absent_parent(
+    builder: &ParserDBBuilder,
+    child_name: &ObjectName,
+    parent_name: &ObjectName,
+) -> Error {
     Error::ParentTableNotFound {
-        parent_table: parent_name.to_string(),
-        child_table: child_name.to_string(),
+        parent_table: builder.dialect().stored_object_name(parent_name),
+        child_table: builder.dialect().stored_object_name_last(child_name),
     }
 }

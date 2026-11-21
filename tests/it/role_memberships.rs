@@ -638,7 +638,7 @@ fn grant_options_are_read_as_postgres_reads_them() {
          GRANT parent TO child WITH FOO TRUE;",
     )
     .expect_err("FOO is no role option");
-    assert!(matches!(error, Error::UnrecognizedRoleOption { option } if option == "FOO"));
+    assert!(matches!(error, Error::UnrecognizedRoleOption { option } if option == "foo"));
 
     let database = parse(
         "CREATE ROLE parent;
@@ -856,7 +856,7 @@ fn revoke_refuses_what_a_grant_refuses() {
          REVOKE FOO OPTION FOR parent FROM child;",
     )
     .expect_err("FOO is no role option");
-    assert!(matches!(error, Error::UnrecognizedRoleOption { option } if option == "FOO"));
+    assert!(matches!(error, Error::UnrecognizedRoleOption { option } if option == "foo"));
 
     for (revoke, absent) in [
         ("REVOKE nobody FROM child", "nobody"),

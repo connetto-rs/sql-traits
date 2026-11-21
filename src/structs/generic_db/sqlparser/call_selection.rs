@@ -19,13 +19,7 @@
 //! the operators selected then, to read what the deparse pins, and once more
 //! honouring those pins.
 
-use alloc::{
-    collections::BTreeMap,
-    format,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{collections::BTreeMap, format, string::String, sync::Arc, vec::Vec};
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{
@@ -585,7 +579,11 @@ impl Nodes<'_, '_, '_> {
         };
         let refused = match refusal {
             CallRefusal::Unresolved((reason, argument_types)) => {
-                Error::UnresolvedCall { function_name: called.to_string(), argument_types, reason }
+                Error::UnresolvedCall {
+                    function_name: stored_name(&called),
+                    argument_types,
+                    reason,
+                }
             }
             CallRefusal::Misapplied(rule) => {
                 Error::MisappliedCall { function_name: stored_name(&called), rule }
@@ -609,7 +607,7 @@ impl Nodes<'_, '_, '_> {
             } else if let Some((name, (reason, operand_types))) = application.into_refusal() {
                 self.selections.refused_operators.entry(address(expression)).or_insert_with(|| {
                     Error::UnresolvedOperator {
-                        operator_name: name.name().into(),
+                        operator_name: stored_name(&name).into_boxed_str(),
                         operand_types,
                         reason,
                     }

@@ -16,7 +16,7 @@
 //! PostgreSQL runs a top-level `SELECT … INTO t` as `CREATE TABLE t AS` over
 //! the same query, so that statement takes this path as well.
 
-use alloc::{borrow::ToOwned, boxed::Box, string::ToString, sync::Arc, vec, vec::Vec};
+use alloc::{borrow::ToOwned, boxed::Box, sync::Arc, vec, vec::Vec};
 
 use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, DataType, Expr, Ident, ObjectName, Query, Select,
@@ -145,12 +145,15 @@ pub(super) fn query_columns(
 pub(super) fn apply_query(
     create_table: &mut CreateTable,
     query: Option<QueryColumns>,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<Vec<(Ident, ColumnCreation)>, Error> {
     let Some(QueryColumns { mut columns, computed, creating }) = query else {
         return Ok(Vec::new());
     };
     if create_table.columns.len() > columns.len() {
-        return Err(Error::TableColumnListTooLong { table_name: create_table.name.to_string() });
+        return Err(Error::TableColumnListTooLong {
+            table_name: dialect.stored_object_name_last(&create_table.name),
+        });
     }
     for (column, declared) in columns.iter_mut().zip(core::mem::take(&mut create_table.columns)) {
         column.name = declared.name;

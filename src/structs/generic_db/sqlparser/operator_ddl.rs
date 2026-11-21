@@ -222,13 +222,18 @@ pub(super) fn alter(
     match operation {
         AlterOperatorOperation::OwnerTo(owner) => {
             if closed_world {
-                validate_owner_role(builder, &owner, binder.symbol)?;
+                validate_owner_role(builder, &owner, || binder.symbol.to_string())?;
             }
             Ok(())
         }
         AlterOperatorOperation::SetSchema { schema_name } => {
             let schema = object_name_last_part(&schema_name).unwrap_or(("", false));
-            validate_relation_schema(builder, Some(schema), ObjectKind::Operator, binder.symbol)?;
+            validate_relation_schema(
+                builder,
+                Some(schema),
+                ObjectKind::Operator,
+                (binder.symbol, false),
+            )?;
             let operator = &catalog.operators_slice()[position];
             let moved = CatalogName::new(
                 schema,
@@ -522,7 +527,7 @@ impl<'b> Binder<'b> {
         let not_found = || {
             Error::OperatorFunctionNotFound {
                 operator_name: self.symbol.into(),
-                function_name: name.to_string().into(),
+                function_name: self.builder.dialect().stored_object_name(name).into(),
             }
         };
         let (written, quoted) = object_name_last_part(name).ok_or_else(not_found)?;
@@ -578,9 +583,11 @@ impl<'b> Binder<'b> {
             Some(creator) => {
                 Err(Error::OperatorFunctionNotExecutable {
                     operator_name: self.symbol.into(),
-                    function_name: object_name_last_part(&function.name)
-                        .map_or("", |(name, _)| name)
-                        .into(),
+                    function_name: self
+                        .builder
+                        .dialect()
+                        .stored_object_name_last(&function.name)
+                        .into_boxed_str(),
                     role_name: creator.into(),
                 })
             }
@@ -720,11 +727,15 @@ fn place(
     symbol: &str,
 ) -> Result<CatalogName, Error> {
     if let Some(schema) = qualifier_of(name).named() {
-        validate_relation_schema(builder, Some(schema), ObjectKind::Operator, symbol)?;
+        validate_relation_schema(builder, Some(schema), ObjectKind::Operator, (symbol, false))?;
         return Ok(CatalogName::new(schema, (symbol, false)));
     }
-    let qualifier =
-        search_path_qualifier(builder, ObjectKind::Operator, symbol, session.creating_role())?;
+    let qualifier = search_path_qualifier(
+        builder,
+        ObjectKind::Operator,
+        (symbol, false),
+        session.creating_role(),
+    )?;
     Ok(match qualifier {
         Some(schema) => {
             CatalogName::new((&schema.value, schema.quote_style.is_some()), (symbol, false))
@@ -762,6 +773,12 @@ fn operand(
     mut data_type: DataType,
 ) -> Result<CatalogName, Error> {
     domains::bind_type(builder, &mut data_type, arrays)?;
-    type_identity(arrays, &data_type)
-        .ok_or_else(|| Error::TypeNotFound { type_name: data_type.to_string() })
+    type_identity(arrays, &data_type).ok_or_else(|| {
+        Error::TypeNotFound {
+            type_name: domains::custom_name(&data_type).map_or_else(
+                || data_type.to_string(),
+                |name| builder.dialect().stored_object_name(name),
+            ),
+        }
+    })
 }

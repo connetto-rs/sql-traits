@@ -11,6 +11,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::Error,
+    impls::SqlparserDialect,
     structs::IdentifierCase,
     traits::{PartitionStrategy, TableLike},
     utils::walk::walk,
@@ -143,11 +144,12 @@ fn identifiers(expr: &Expr) -> Vec<Ident> {
 pub(super) fn validate_partitioned_table(
     table: &CreateTable,
     case: IdentifierCase,
+    dialect: SqlparserDialect,
 ) -> Result<(), Error> {
     let Some((strategy, items)) = partition_key(table) else {
         return Ok(());
     };
-    let table_name = || table.table_name().to_string();
+    let table_name = || dialect.stored_object_name_last(&table.name);
     if strategy == PartitionStrategy::List && items.len() > 1 {
         return Err(Error::ListPartitionKeyHasManyColumns { table_name: table_name() });
     }
@@ -160,19 +162,19 @@ pub(super) fn validate_partitioned_table(
             let Some(column) = column_named(table, &ident, case) else {
                 return Err(Error::PartitionKeyColumnNotFound {
                     table_name: table_name(),
-                    column_name: ident.value,
+                    column_name: dialect.stored_name(&ident),
                 });
             };
             if is_generated(column) {
                 return Err(Error::GeneratedColumnInPartitionKey {
                     table_name: table_name(),
-                    column_name: column.name.value.clone(),
+                    column_name: dialect.stored_name(&column.name),
                 });
             }
         }
     }
     for covered in unique_constraints(table) {
-        covers_key(table, &items, &covered, case)?;
+        covers_key(table, &items, &covered, case, dialect)?;
     }
     Ok(())
 }
@@ -183,6 +185,7 @@ pub(super) fn validate_unique_index(
     index: &CreateIndex,
     table: &CreateTable,
     case: IdentifierCase,
+    dialect: SqlparserDialect,
 ) -> Result<(), Error> {
     if !index.unique {
         return Ok(());
@@ -190,7 +193,7 @@ pub(super) fn validate_unique_index(
     let Some((_, items)) = partition_key(table) else {
         return Ok(());
     };
-    covers_key(table, &items, &plain_columns(&index.columns), case)
+    covers_key(table, &items, &plain_columns(&index.columns), case, dialect)
 }
 
 /// The plain columns an index or key lists, leaving out its expressions.
@@ -249,18 +252,19 @@ fn covers_key(
     items: &[KeyItem<'_>],
     covered: &[Ident],
     case: IdentifierCase,
+    dialect: SqlparserDialect,
 ) -> Result<(), Error> {
     for item in items {
         match item {
             KeyItem::Expression(_) => {
                 return Err(Error::UniqueConstraintOverExpressionPartitionKey {
-                    table_name: table.table_name().to_string(),
+                    table_name: dialect.stored_object_name_last(&table.name),
                 });
             }
             KeyItem::Column(key) => {
                 if !covered.iter().any(|column| same_name(column, key, case)) {
                     return Err(Error::UniqueConstraintMissesPartitionKey {
-                        table_name: table.table_name().to_string(),
+                        table_name: dialect.stored_object_name_last(&table.name),
                     });
                 }
             }

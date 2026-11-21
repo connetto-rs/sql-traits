@@ -36,12 +36,12 @@ enum MembershipOption {
 
 impl MembershipOption {
     /// Reads an option name as PostgreSQL does, refusing any other name.
-    fn read(name: &Ident) -> Result<Self, Error> {
+    fn read(name: &Ident, dialect: crate::impls::SqlparserDialect) -> Result<Self, Error> {
         match stored_identifier(&name.value, name.quote_style.is_some()).as_ref() {
             "admin" => Ok(Self::Admin),
             "inherit" => Ok(Self::Inherit),
             "set" => Ok(Self::Set),
-            _ => Err(Error::UnrecognizedRoleOption { option: name.value.clone() }),
+            _ => Err(Error::UnrecognizedRoleOption { option: dialect.stored_name(name) }),
         }
     }
 }
@@ -60,10 +60,13 @@ impl WrittenOptions {
 
     /// Reads the `WITH` list of `GRANT role TO role`, a later option of a
     /// kind replacing an earlier one as it does in PostgreSQL.
-    fn read(options: &[RoleGrantOption]) -> Result<Self, Error> {
+    fn read(
+        options: &[RoleGrantOption],
+        dialect: crate::impls::SqlparserDialect,
+    ) -> Result<Self, Error> {
         let mut written = Self::default();
         for option in options {
-            let slot = match MembershipOption::read(&option.name)? {
+            let slot = match MembershipOption::read(&option.name, dialect)? {
                 MembershipOption::Admin => &mut written.admin,
                 MembershipOption::Inherit => &mut written.inherit,
                 MembershipOption::Set => &mut written.set,
@@ -160,7 +163,7 @@ pub(super) fn grant_role(
     access_resolution: AccessResolution,
     role_alterations: &[UndeclaredRoleAlteration],
 ) -> Result<(), Error> {
-    let written = WrittenOptions::read(&grant.options)?;
+    let written = WrittenOptions::read(&grant.options, *builder.dialect())?;
     let members = named_members(&grant.roles, &grant.grantees, builder, access_resolution)?;
     for role in &grant.roles {
         for member in &members {
@@ -184,7 +187,11 @@ pub(super) fn revoke_role(
     revoke: &RevokeRole,
     access_resolution: AccessResolution,
 ) -> Result<(), Error> {
-    let option = revoke.option_for.as_ref().map(MembershipOption::read).transpose()?;
+    let option = revoke
+        .option_for
+        .as_ref()
+        .map(|name| MembershipOption::read(name, *builder.dialect()))
+        .transpose()?;
     let members = named_members(&revoke.roles, &revoke.grantees, builder, access_resolution)?;
     let cascade = revoke.cascade == Some(CascadeOption::Cascade);
     for role in &revoke.roles {
@@ -195,6 +202,7 @@ pub(super) fn revoke_role(
             revoke.granted_by.as_ref(),
             option,
             cascade,
+            *builder.dialect(),
         )?;
         apply_revoke(builder, &rows);
     }
@@ -227,6 +235,7 @@ fn plan_revoke(
     grantor: Option<&Ident>,
     option: Option<MembershipOption>,
     cascade: bool,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<Vec<PlannedGrant>, Error> {
     let mut rows: Vec<PlannedGrant> = memberships
         .iter()
@@ -250,9 +259,19 @@ fn plan_revoke(
                 rows[index].change = Some(Change::Clear(cleared));
             }
             Some(MembershipOption::Admin) => {
-                plan_recursive_revoke(memberships, &mut rows, index, true, cascade, role)?;
+                plan_recursive_revoke(memberships, &mut rows, index, true, cascade, role, dialect)?;
             }
-            None => plan_recursive_revoke(memberships, &mut rows, index, false, cascade, role)?,
+            None => {
+                plan_recursive_revoke(
+                    memberships,
+                    &mut rows,
+                    index,
+                    false,
+                    cascade,
+                    role,
+                    dialect,
+                )?;
+            }
         }
     }
     Ok(rows)
@@ -268,6 +287,7 @@ fn plan_recursive_revoke(
     admin_only: bool,
     cascade: bool,
     role: &Ident,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<(), Error> {
     // A deletion is final, even where a later member's visit asks for less.
     if rows[index].change == Some(Change::Delete) {
@@ -305,11 +325,11 @@ fn plan_recursive_revoke(
         }
         if !cascade {
             return Err(Error::DependentRoleMemberships {
-                role_name: role.value.clone(),
-                member_name: member.value.clone(),
+                role_name: dialect.stored_name(role),
+                member_name: dialect.stored_name(member),
             });
         }
-        plan_recursive_revoke(memberships, rows, dependent, false, cascade, role)?;
+        plan_recursive_revoke(memberships, rows, dependent, false, cascade, role, dialect)?;
     }
     Ok(())
 }
@@ -443,7 +463,7 @@ fn grantee_member(grantee: &Grantee) -> Result<Option<&Ident>, Error> {
 /// exist` whichever side of a membership it stands on.
 fn refuse_public(role: &Ident) -> Result<(), Error> {
     if is_public_pseudo_role(&role.value, role.quote_style.is_some()) {
-        return Err(Error::RoleNotFoundForMembership { role_name: role.value.clone() });
+        return Err(Error::RoleNotFoundForMembership { role_name: "public".to_string() });
     }
     Ok(())
 }
@@ -457,7 +477,9 @@ fn require_role(
     if access_resolution == AccessResolution::ClosedWorld
         && !builder.roles().iter().any(|(declared, ())| role_matches_lookup_ident(declared, role))
     {
-        return Err(Error::RoleNotFoundForMembership { role_name: role.value.clone() });
+        return Err(Error::RoleNotFoundForMembership {
+            role_name: builder.dialect().stored_name(role),
+        });
     }
     Ok(())
 }
@@ -471,8 +493,8 @@ fn refuse_cycle(builder: &ParserDBBuilder, role: &Ident, member: &Ident) -> Resu
     while let Some(current) = pending.pop() {
         if idents_match(current, member) {
             return Err(Error::CircularRoleMembership {
-                role_name: role.value.clone(),
-                member_name: member.value.clone(),
+                role_name: builder.dialect().stored_name(role),
+                member_name: builder.dialect().stored_name(member),
             });
         }
         if visited.iter().any(|seen| idents_match(seen, current)) {

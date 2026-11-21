@@ -64,10 +64,9 @@ use crate::{
         ColumnIdentity, Sequence, SequenceParameters, SequenceType, StoredSequenceOwner,
         TableAttribute, TargetName,
     },
-    traits::{ColumnLike, DatabaseLike, SequenceLike, SequenceOrigin, TableLike},
+    traits::{ColumnLike, DatabaseLike, SequenceLike, SequenceOrigin},
     utils::{
         identifier_resolution::{MAX_NAME_BYTES, clipped, identifiers_match, stored_identifier},
-        last_str,
         object_name::{
             object_name_identifiers, qualifier_of, require_static_object_name,
             resolve_sequence_on_search_path_in_iter, stored_sequence_key, target_name_of_idents,
@@ -112,7 +111,10 @@ pub(super) fn create_sequence(
     // PostgreSQL reads the options before it creates the relation, so their
     // refusal comes ahead of a name another relation holds.
     let parameters = SequenceParameters::from_options(&options).map_err(|reason| {
-        Error::InvalidSequenceParameters { sequence_name: name_ident.value.clone(), reason }
+        Error::InvalidSequenceParameters {
+            sequence_name: builder.dialect().stored_name(name_ident),
+            reason,
+        }
     })?;
     // PostgreSQL refuses a sequence a name of the type pool, `IF NOT EXISTS` or
     // not.
@@ -122,7 +124,7 @@ pub(super) fn create_sequence(
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Sequence,
             conflicting_kind,
-            object_name: name_ident.value.clone(),
+            object_name: builder.dialect().stored_name(name_ident),
         });
     }
 
@@ -179,7 +181,7 @@ fn resolve_owner(
     sequence_schema: SchemaQualifier<'_>,
 ) -> Result<StoredSequenceOwner, Error> {
     require_static_object_name(owner)?;
-    let sequence_name = || sequence.value.clone();
+    let sequence_name = || builder.dialect().stored_name(sequence);
     // A static name ends in an identifier, so this refuses only a name with
     // no relation before the column.
     let Some((ObjectNamePart::Identifier(column), relation_parts)) =
@@ -187,16 +189,16 @@ fn resolve_owner(
     else {
         return Err(Error::InvalidSequenceOwner {
             sequence_name: sequence_name(),
-            owner: owner.to_string(),
+            owner: builder.dialect().stored_object_name(owner),
         });
     };
     let mut relation = ObjectName(relation_parts.to_vec());
     require_named_in_catalog(&mut relation, ObjectKind::Table, builder.catalog_name())?;
-    let relation_name = || last_str(&relation).to_string();
+    let relation_name = || builder.dialect().stored_object_name_last(&relation);
 
     let Some((kind, relation_schema)) = builder.relation_reached(&relation) else {
         return Err(Error::RelationNotFoundForSequenceOwner {
-            relation_name: relation_name(),
+            relation_name: builder.dialect().stored_object_name(&relation),
             sequence_name: sequence_name(),
         });
     };
@@ -217,7 +219,7 @@ fn resolve_owner(
     }
     let column_not_found = || {
         Error::ColumnNotFoundForSequenceOwner {
-            column_name: column.value.clone(),
+            column_name: builder.dialect().stored_name(column),
             relation_name: relation_name(),
             sequence_name: sequence_name(),
         }
@@ -260,7 +262,7 @@ fn resolve_owner(
         None => {
             Err(Error::UnsupportedSequenceOwner {
                 sequence_name: sequence_name(),
-                owner: owner.to_string(),
+                owner: builder.dialect().stored_object_name(owner),
             })
         }
     }
@@ -275,6 +277,7 @@ fn resolve_sequence<'builder>(
     let (schema_ident, name_ident) = object_name_identifiers(name)?;
     let case = builder.identifier_case();
     resolve_sequence_on_search_path_in_iter(
+        *builder.dialect(),
         builder.namespaces(),
         builder.sequences().iter().map(|(sequence, ())| sequence.as_ref()),
         &target_name_of_idents(schema_ident, name_ident),
@@ -396,12 +399,7 @@ pub(super) fn drop_sequences(
                 drop.types.extend(taken.types);
                 drop.functions.extend(taken.functions);
             } else {
-                views::refuse_dependent_views(
-                    &builder,
-                    &key,
-                    ObjectKind::Sequence,
-                    &name.to_string(),
-                )?;
+                views::refuse_dependent_views(&builder, &key, ObjectKind::Sequence, &key)?;
             }
             forget(&mut builder, alloc::vec![doomed]);
             // A view the cascade took may have owned other sequences.
@@ -412,7 +410,7 @@ pub(super) fn drop_sequences(
         match builder.relation_reached(name).map(|(kind, _)| kind) {
             Some(actual_kind) => {
                 return Err(Error::RelationKindMismatch {
-                    object_name: name.to_string(),
+                    object_name: builder.dialect().stored_object_name_last(name),
                     expected_kind: ObjectKind::Sequence,
                     actual_kind,
                 });
@@ -420,7 +418,7 @@ pub(super) fn drop_sequences(
             None if !if_exists => {
                 return Err(Error::RelationNotFound {
                     object_kind: ObjectKind::Sequence,
-                    object_name: name.to_string(),
+                    object_name: builder.dialect().stored_object_name_last(name),
                 });
             }
             None => {}
@@ -498,10 +496,13 @@ fn refuse_dropping_identity_sequence(
         && let Some((column, _, _)) =
             builder.columns().iter().find(|(_, _, held)| *held == identity)
     {
+        let table = TableAttribute::table(column.as_ref());
         return Err(Error::SequenceRequiredByColumn {
-            sequence_name: sequence.sequence_name().to_string(),
-            table_name: TableAttribute::table(column.as_ref()).table_name().to_string(),
-            column_name: column.column_name().to_string(),
+            sequence_name: builder
+                .dialect()
+                .stored_spelling(sequence.sequence_name(), sequence.sequence_name_is_quoted()),
+            table_name: builder.dialect().stored_object_name_last(&table.name),
+            column_name: builder.dialect().stored_name(&column.attribute().name),
         });
     }
     Ok(())
@@ -782,11 +783,13 @@ pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) -> Result<(),
             (!current).then(|| (position, data_type.clone()))
         })
         .collect();
+    let dialect = *builder.dialect();
     for (position, data_type) in changed {
         let sequence = Arc::make_mut(&mut builder.sequences_mut()[position].0);
         sequence.set_data_type(data_type).map_err(|reason| {
             Error::InvalidSequenceParameters {
-                sequence_name: sequence.sequence_name().to_string(),
+                sequence_name: dialect
+                    .stored_spelling(sequence.sequence_name(), sequence.sequence_name_is_quoted()),
                 reason,
             }
         })?;
@@ -968,8 +971,8 @@ fn nextval(sequence: String) -> Expr {
 /// nothing.
 pub(super) fn bind_default(
     builder: &ParserDBBuilder,
-    table_name: &str,
-    column_name: &str,
+    table_name: &StoredTable,
+    column_name: &Ident,
     default: &mut Expr,
 ) -> Result<(), Error> {
     if *builder.dialect() != SqlparserDialect::PostgreSql {
@@ -982,8 +985,10 @@ pub(super) fn bind_default(
         let Some(name) = regclass_name(builder, text) else {
             return ControlFlow::Break(Error::InvalidRelationNameForDefault {
                 relation_name: text.clone(),
-                table_name: table_name.to_string(),
-                column_name: column_name.to_string(),
+                table_name: builder
+                    .dialect()
+                    .stored_spelling(&table_name.name, table_name.name_quoted),
+                column_name: builder.dialect().stored_name(column_name),
             });
         };
         match resolve_sequence(builder, &name) {
@@ -991,9 +996,11 @@ pub(super) fn bind_default(
             Ok(None) if builder.relation_reached(&name).is_some() => {}
             Ok(None) => {
                 return ControlFlow::Break(Error::RelationNotFoundForDefault {
-                    relation_name: text.clone(),
-                    table_name: table_name.to_string(),
-                    column_name: column_name.to_string(),
+                    relation_name: builder.dialect().stored_object_name(&name),
+                    table_name: builder
+                        .dialect()
+                        .stored_spelling(&table_name.name, table_name.name_quoted),
+                    column_name: builder.dialect().stored_name(column_name),
                 });
             }
             Err(error) => return ControlFlow::Break(error),
@@ -1013,13 +1020,13 @@ pub(super) fn bind_default(
 /// Returns the first refusal [`bind_default`] meets.
 pub(super) fn bind_column_defaults<'column>(
     builder: &ParserDBBuilder,
-    table_name: &str,
+    table_name: &StoredTable,
     columns: impl IntoIterator<Item = &'column mut ColumnDef>,
 ) -> Result<(), Error> {
     for ColumnDef { name, options, .. } in columns {
         for option in options {
             if let ColumnOption::Default(default) = &mut option.option {
-                bind_default(builder, table_name, &name.value, default)?;
+                bind_default(builder, table_name, name, default)?;
             }
         }
     }
@@ -1144,9 +1151,11 @@ pub(super) fn settle_dropped_sequences(
         let table = TableAttribute::table(column.as_ref());
         if !cascade {
             return Err(Error::SequenceUsedByDefault {
-                sequence_name: sequence.sequence_name().to_string(),
-                table_name: table.table_name().to_string(),
-                column_name: column.column_name().to_string(),
+                sequence_name: builder
+                    .dialect()
+                    .stored_spelling(sequence.sequence_name(), sequence.sequence_name_is_quoted()),
+                table_name: builder.dialect().stored_object_name_last(&table.name),
+                column_name: builder.dialect().stored_name(&column.attribute().name),
             });
         }
         let name = column.attribute().name.clone();

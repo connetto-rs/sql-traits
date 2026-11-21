@@ -379,7 +379,7 @@ impl TypeArrays {
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: kind,
-                object_name: to_name.to_string(),
+                object_name: builder.dialect().stored_spelling(to_name, to_name_quoted),
             });
         }
         let entry = &self.entries[position];
@@ -408,7 +408,7 @@ impl TypeArrays {
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: kind,
-                object_name: array_name.to_string(),
+                object_name: builder.dialect().stored_spelling(array_name, array_quoted),
             });
         }
         let current = named_in_schema(to, ident_of(array_name, array_quoted));

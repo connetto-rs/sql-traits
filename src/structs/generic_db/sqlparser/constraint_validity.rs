@@ -24,9 +24,11 @@ use super::{
     AlterTableScope, ParserDB, ParserDBBuilder, StoredTable,
     constraint_names::{self, Position},
     inheritance::{self, ParentKind},
-    last_str,
 };
-use crate::errors::{Error, InheritedChange};
+use crate::{
+    errors::{Error, InheritedChange},
+    impls::SqlparserDialect,
+};
 
 /// Whether the kind can be added `NOT VALID` and validated afterwards.
 fn takes_validation(constraint: &TableConstraint) -> bool {
@@ -41,6 +43,7 @@ fn takes_validation(constraint: &TableConstraint) -> bool {
 /// PostgreSQL refuses it while reading the statement, so this runs before the
 /// table is looked up and `IF EXISTS` excuses nothing.
 pub(super) fn refuse_not_valid(
+    dialect: SqlparserDialect,
     table_name: &ObjectName,
     constraint: &TableConstraint,
 ) -> Result<(), Error> {
@@ -48,7 +51,7 @@ pub(super) fn refuse_not_valid(
         return Ok(());
     }
     Err(Error::NotValidRefused {
-        table_name: last_str(table_name).to_string(),
+        table_name: dialect.stored_object_name_last(table_name),
         constraint: constraint.to_string(),
     })
 }
@@ -128,7 +131,7 @@ pub(super) fn merged_copy_validated(
     match held {
         TableConstraint::Check(_) if arriving_validated && !held_validated => {
             Err(Error::NotValidConstraintConflict {
-                table_name: table.name.clone(),
+                table_name: builder.dialect().stored_spelling(&table.name, table.name_quoted),
                 constraint: held.to_string(),
             })
         }
@@ -164,8 +167,8 @@ pub(super) fn validate_constraint(
     let node = ParserDB::stored_node(&builder, &stored)?;
     let not_validatable = || {
         Error::ConstraintNotValidatable {
-            table_name: stored.name.clone(),
-            constraint_name: name.value.clone(),
+            table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+            constraint_name: builder.dialect().stored_name(name),
         }
     };
 
@@ -213,8 +216,8 @@ pub(super) fn validate_constraint(
     }
 
     Err(Error::ValidateConstraintNotFound {
-        table_name: stored.name.clone(),
-        constraint_name: name.value.clone(),
+        table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+        constraint_name: builder.dialect().stored_name(name),
     })
 }
 

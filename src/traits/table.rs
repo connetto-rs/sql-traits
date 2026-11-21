@@ -1,6 +1,8 @@
 //! Submodule providing a trait for describing SQL Table-like entities.
 
-use alloc::{borrow::Cow, string::ToString, vec, vec::Vec};
+#[cfg(test)]
+use alloc::string::ToString;
+use alloc::{borrow::Cow, vec, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use crate::{
@@ -1809,8 +1811,10 @@ pub trait TableLike:
                 remaining_key_columns[unresolved - 1]
             };
             return Err(LookupError::ColumnNotFound {
-                table_name: self.table_name().to_string(),
-                column_name: key_column.column_name().to_string(),
+                table_name: crate::impls::SqlparserDialect::for_error_names(database.dialect())
+                    .stored_spelling(self.table_name(), self.table_name_is_quoted()),
+                column_name: crate::impls::SqlparserDialect::for_error_names(database.dialect())
+                    .stored_spelling(key_column.column_name(), key_column.column_name_is_quoted()),
             });
         }
         Ok(column_ids)
@@ -6994,7 +6998,7 @@ mod tests {
                         conflicting_table,
                         ..
                     }
-                )) if table == "public.t" && conflicting_table == "t"
+                )) if table == "t" && conflicting_table == "t"
             ));
         }
 
@@ -7015,7 +7019,7 @@ mod tests {
                         conflicting_table,
                         ..
                     }
-                )) if table == "\"foo\"" && conflicting_table == "foo"
+                )) if table == "foo" && conflicting_table == "foo"
             ));
         }
 
@@ -7109,7 +7113,7 @@ mod tests {
                         conflicting_table,
                         ..
                     }
-                )) if table == "public.t" && conflicting_table == "t"
+                )) if table == "t" && conflicting_table == "t"
             ));
         }
 
@@ -7130,7 +7134,7 @@ mod tests {
                         conflicting_table,
                         ..
                     }
-                )) if table == "\"foo\"" && conflicting_table == "foo"
+                )) if table == "foo" && conflicting_table == "foo"
             ));
         }
     }

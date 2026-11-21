@@ -68,7 +68,7 @@ fn a_key_constraint_naming_a_column_twice_is_refused() {
 
 #[test]
 fn key_columns_repeat_when_their_stored_names_match() {
-    assert_repeated("CREATE TABLE t (b INT, UNIQUE (b, B));", "t", "B", KeyConstraint::Unique);
+    assert_repeated("CREATE TABLE t (b INT, UNIQUE (b, B));", "t", "b", KeyConstraint::Unique);
     assert_repeated("CREATE TABLE t (b INT, UNIQUE (b, \"b\"));", "t", "b", KeyConstraint::Unique);
     parse("CREATE TABLE t (\"B\" INT, b INT, UNIQUE (b, \"B\"));")
         .expect("`b` and `\"B\"` are two columns");

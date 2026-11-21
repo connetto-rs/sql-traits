@@ -6,14 +6,18 @@
 //! [`FunctionKind::Procedure`], so the two kinds share one store and one
 //! signature space, as they share `pg_proc`.
 
-use alloc::{string::ToString, vec::Vec};
+use alloc::vec::Vec;
 
 use sqlparser::ast::{
     CreateFunction, CreateFunctionBody, CreateProcedureBody, FunctionDesc, Ident, ObjectName,
     OperateFunctionArg, ProcedureParam,
 };
 
-use crate::{errors::Error, impls::SqlparserDialect, structs::FunctionKind, utils::last_str};
+use crate::{
+    errors::Error,
+    impls::SqlparserDialect,
+    structs::{FunctionKind, ParserDBBuilder},
+};
 
 /// Whether `dialect` holds procedures, which the dialects following
 /// PostgreSQL's `pg_proc` do. Another engine's procedures share no signature
@@ -34,6 +38,7 @@ pub(super) fn procedure_function(
     params: Option<Vec<ProcedureParam>>,
     language: Option<Ident>,
     body: CreateProcedureBody,
+    dialect: SqlparserDialect,
 ) -> Result<CreateFunction, Error> {
     let function_body = match body {
         CreateProcedureBody::AsString { body, link_symbol } => {
@@ -42,7 +47,7 @@ pub(super) fn procedure_function(
         CreateProcedureBody::BeginAtomic(block) => CreateFunctionBody::BeginAtomic(block),
         CreateProcedureBody::As(_) => {
             return Err(Error::ProcedureBodyUnsupported {
-                procedure_name: last_str(&name).to_string(),
+                procedure_name: dialect.stored_object_name_last(&name),
             });
         }
     };
@@ -119,14 +124,21 @@ impl RoutineKeyword {
         self,
         signature: &FunctionDesc,
         kind: FunctionKind,
+        builder: &ParserDBBuilder,
     ) -> Result<(), Error> {
         if self.admits(kind) {
             return Ok(());
         }
         match self {
-            Self::Procedure => Err(Error::NotAProcedure { procedure_name: signature.to_string() }),
+            Self::Procedure => {
+                Err(Error::NotAProcedure {
+                    procedure_name: builder.dialect().stored_object_name(&signature.name),
+                })
+            }
             Self::Function | Self::Routine => {
-                Err(Error::NotAFunction { function_name: signature.to_string() })
+                Err(Error::NotAFunction {
+                    function_name: builder.dialect().stored_object_name(&signature.name),
+                })
             }
         }
     }
