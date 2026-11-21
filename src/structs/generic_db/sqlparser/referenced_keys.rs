@@ -282,6 +282,23 @@ fn dependences(builder: &ParserDBBuilder) -> Vec<Dependence> {
     found
 }
 
+/// The stored identity of the constraint key at `slot`.
+pub(super) fn key_identity(
+    builder: &ParserDBBuilder,
+    node: &CreateTable,
+    slot: Slot<'_>,
+) -> Option<KeyIdentity> {
+    let key = constraint_names::keyed_slots(node)
+        .into_iter()
+        .find(|(held, _)| held.position() == slot.position())
+        .map(|(_, key)| key);
+    metadata_of(builder, node)?
+        .key_creations()
+        .iter()
+        .find(|created| Some(&created.slot) == key.as_ref())
+        .map(|created| created.identity)
+}
+
 /// The identity of the key at `slot` of `node`, the stored table `table`,
 /// with those of the copies the partitions below hold of it unless `only`
 /// keeps them.
@@ -296,19 +313,8 @@ pub(super) fn removed_keys(
     only: bool,
 ) -> Result<Vec<KeyIdentity>, Error> {
     let case = builder.identifier_case();
-    let identity_of = |node: &CreateTable, slot: Slot<'_>| {
-        let key = constraint_names::keyed_slots(node)
-            .into_iter()
-            .find(|(held, _)| held.position() == slot.position())
-            .map(|(_, key)| key);
-        metadata_of(builder, node)?
-            .key_creations()
-            .iter()
-            .find(|created| Some(&created.slot) == key.as_ref())
-            .map(|created| created.identity)
-    };
     let node = ParserDB::stored_node(builder, table)?;
-    let mut removed: Vec<KeyIdentity> = identity_of(node, slot).into_iter().collect();
+    let mut removed: Vec<KeyIdentity> = key_identity(builder, node, slot).into_iter().collect();
     if only {
         return Ok(removed);
     }
@@ -322,7 +328,7 @@ pub(super) fn removed_keys(
             else {
                 continue;
             };
-            removed.extend(identity_of(child_node, copy));
+            removed.extend(key_identity(builder, child_node, copy));
             frontier.push((child, copy));
         }
     }

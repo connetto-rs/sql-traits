@@ -88,6 +88,7 @@ pub(super) fn detach_partition(
     {
         metadata.set_inherited_column_names(Vec::new());
         metadata.set_inherited_constraints(Vec::new());
+        metadata.partition_indexes_mut().clear();
     }
     triggers::drop_clones_on_detached(&mut builder, &partition);
     // The identity stays with the root, so it leaves the whole detached tree.

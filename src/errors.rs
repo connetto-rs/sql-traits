@@ -3555,6 +3555,21 @@ pub enum Error {
         /// Name of the table holding the constraint.
         table_name: String,
     },
+    /// PostgreSQL refuses dropping an index required by its partition parent.
+    #[error("cannot drop index {index_name} because index {parent_index_name} requires it")]
+    IndexRequiredByParent {
+        /// Name of the partition's index.
+        index_name: String,
+        /// Name of the immediate parent index.
+        parent_index_name: String,
+    },
+    /// PostgreSQL refuses dropping an index with dependent constraints without
+    /// `CASCADE`.
+    #[error("cannot drop index {index_name} because other objects depend on it")]
+    IndexHasDependentConstraints {
+        /// Name of the index being dropped.
+        index_name: String,
+    },
     #[error("Index `{index_name}` not found for DROP INDEX statement.")]
     /// Error indicating that a DROP INDEX statement references an index
     /// that does not exist.

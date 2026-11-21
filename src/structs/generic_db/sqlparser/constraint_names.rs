@@ -738,7 +738,7 @@ fn new_names(
 }
 
 /// The names the slots of a node the builder holds answer to.
-fn answers<'a>(
+pub(super) fn answers<'a>(
     builder: &'a ParserDBBuilder,
     node: &'a CreateTable,
 ) -> Vec<(Slot<'a>, Option<Cow<'a, str>>)> {
@@ -1149,7 +1149,8 @@ fn rename_constraint_of(
             constraint_name: new.value.clone(),
         });
     }
-    if backed_by_index(slot)
+    let index_backed = backed_by_index(slot);
+    if index_backed
         && let Some(conflicting_kind) =
             super::relation_name_holder(&builder, new, table_schema_qualifier(node))
     {
@@ -1163,6 +1164,9 @@ fn rename_constraint_of(
     let below = if scope.only { Vec::new() } else { inheritance::descendants(&builder, &stored) };
     let mut builder = builder;
     for table in core::iter::once(stored).chain(below) {
+        if index_backed {
+            super::partition_indexes::rename(&mut builder, &table, old, new);
+        }
         builder = rename_on(builder, &table, old, new)?;
     }
     Ok(builder)

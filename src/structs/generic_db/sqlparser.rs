@@ -113,6 +113,8 @@ mod operator_ddl;
 mod parse_options;
 mod parsed_source;
 mod partition_bounds;
+mod partition_index_families;
+mod partition_indexes;
 mod partition_keys;
 mod policy_literals;
 mod postgres_18_collations;
@@ -6903,6 +6905,8 @@ impl ParserDB {
             builder = builder.add_index(index, metadata);
         }
 
+        let attached_indexes =
+            (!metadata.partition_indexes().is_empty()).then(|| StoredTable::of(&replacement));
         builder = Self::ingest_table_node_with_collations(
             builder,
             replacement,
@@ -6912,6 +6916,9 @@ impl ParserDB {
             &preserved_collations,
             TableOrigin::Replacement(identity, Box::new(carried)),
         )?;
+        if let Some(current) = attached_indexes {
+            partition_indexes::prune(&mut builder, &current)?;
+        }
         builder.tables_mut().sort_by(|(a, _, _), (b, _, _)| {
             (a.table_schema(), a.table_name()).cmp(&(b.table_schema(), b.table_name()))
         });
@@ -6951,6 +6958,8 @@ impl ParserDB {
         // has to survive the rebuild the way the other unspelled settings do.
         metadata.set_inherited_column_names(previous_metadata.inherited_column_names().to_vec());
         metadata.set_inherited_not_null(previous_metadata.inherited_not_null().to_vec());
+        *metadata.partition_indexes_mut() =
+            core::mem::take(previous_metadata.partition_indexes_mut());
         metadata.set_inherited_constraints(inheritance::follow_constraint_rewrite(
             previous_metadata.inherited_constraints(),
             &previous_node.constraints,
@@ -8266,6 +8275,7 @@ impl ParserDB {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
+        partition_indexes::refuse_drop(&builder, &stored, name)?;
 
         let node = Self::stored_node(&builder, &stored)?;
         let key = constraint_names::locate(
@@ -8361,36 +8371,20 @@ impl ParserDB {
         if let Some(index_name) = object_name_last_identifier(name)
             && let Some((stored, _)) = constraint_names::key_index_owner(&builder, name, index_name)
         {
+            partition_indexes::refuse_drop(&builder, &stored, index_name)?;
             return Err(crate::errors::Error::IndexRequiredByConstraint {
                 index_name: index_name.value.clone(),
                 table_name: stored.name,
             });
         }
-        let stored_name = |name: &ObjectName| {
-            object_name_last_identifier(name)
-                .map(|ident| stored_ident_name(ident).into_owned())
-                .unwrap_or_default()
-        };
-        let (removed, table_name) = match builder.index_position(name)? {
-            Some(IndexSlot::Table(at)) => {
-                let (index, metadata) = &builder.indices()[at];
-                let table_name = stored_name(&index.attribute().table_name);
-                (metadata.key_identity().into_iter().collect::<Vec<_>>(), table_name)
+        match builder.index_position(name)? {
+            Some(IndexSlot::Table(position)) => {
+                partition_indexes::drop_index(builder, position, cascade)
             }
-            Some(IndexSlot::MaterializedView(_)) | None => (Vec::new(), String::new()),
-        };
-        if removed.is_empty() {
-            return Self::drop_named_index(builder, name, if_exists);
+            Some(IndexSlot::MaterializedView(_)) | None => {
+                Self::drop_named_index(builder, name, if_exists)
+            }
         }
-        let index_name = stored_name(name);
-        let on_dependents = if cascade {
-            referenced_keys::OnDependents::Cascade
-        } else {
-            referenced_keys::OnDependents::Refuse { key_name: &index_name, table_name: &table_name }
-        };
-        Self::drop_keys(builder, &removed, on_dependents, |builder| {
-            Self::drop_named_index(builder, name, if_exists)
-        })
     }
 
     /// Removes the index `name` reaches.
@@ -11057,6 +11051,21 @@ impl ParserDB {
                     match slot {
                         IndexSlot::Table(position) => {
                             let (stored, metadata) = builder.indices()[position].clone();
+                            if let (Some(old), Some(new)) = (
+                                stored
+                                    .attribute()
+                                    .name
+                                    .as_ref()
+                                    .and_then(object_name_last_identifier),
+                                object_name_last_identifier(&new_name),
+                            ) {
+                                partition_indexes::rename(
+                                    &mut builder,
+                                    &StoredTable::of(stored.table()),
+                                    old,
+                                    new,
+                                );
+                            }
                             let mut renamed = (*stored).clone();
                             renamed.attribute_mut().name = Some(new_name);
                             let renamed = Arc::new(renamed);
@@ -11472,7 +11481,8 @@ impl ParserDB {
                         entry.1.add_index(index.clone());
                     }
                     let metadata = metadata.with_key_identity(Some(builder.draw_key_identity()));
-                    builder = builder.add_index(index, metadata);
+                    builder = builder.add_index(Arc::clone(&index), metadata);
+                    builder = partition_indexes::propagate(builder, index.attribute())?;
                 }
                 Statement::AlterView(alter_view) => {
                     builder = views::apply_alter_view(
@@ -12350,6 +12360,7 @@ impl ParserDB {
                     );
                     if let Some(root) = &partition_root {
                         triggers::clone_onto_partition(&mut builder, root, &stored)?;
+                        builder = partition_indexes::receive_all(builder, root, &stored)?;
                     }
                     Arc::make_mut(&mut type_arrays).create(&builder, &name);
                     sequences::own_column_sequences(&mut builder, &stored, column_sequences);
