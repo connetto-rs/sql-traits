@@ -202,6 +202,7 @@ mod sequences;
 mod set_returning_functions;
 mod simple_index_entries;
 mod sql_text_calls;
+mod sqlite_autoindex_names;
 mod sqlite_databases;
 mod sqlite_foreign_key_targets;
 mod sqlite_primary_key_nullability;

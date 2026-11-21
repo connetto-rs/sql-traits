@@ -12,6 +12,7 @@ use super::index_clauses::{
 };
 use crate::{
     errors::{LookupError, ObjectKind},
+    impls::SqlparserDialect,
     structs::{
         ConstraintObject, IndexKey, ParserDB, TableAttribute, WrittenCall,
         metadata::UniqueIndexMetadata,
@@ -104,6 +105,22 @@ impl IndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         Ok(super::create_table::position_among(&held, self).and_then(|position| {
             database.constraint_object_name(table, ConstraintObject::UniqueKey, position)
         }))
+    }
+
+    fn backing_index_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        self.metadata(database)?;
+        match database.dialect() {
+            SqlparserDialect::SQLite => {
+                Ok(super::create_table::table_metadata(self.table(), database)?
+                    .sqlite_autoindex_name(self)
+                    .map(Cow::Borrowed))
+            }
+            SqlparserDialect::PostgreSql => self.constraint_name(database),
+            _ => Ok(self.name().map(Cow::Borrowed)),
+        }
     }
 
     #[inline]

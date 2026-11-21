@@ -138,6 +138,7 @@ mod rules;
 mod schema_usage;
 mod sequences;
 mod signature_types;
+mod sqlite_autoindex;
 mod sqlite_databases;
 mod stored_expressions;
 mod table_as;
@@ -7788,6 +7789,7 @@ impl ParserDB {
         }
         builder = Self::process_foreign_keys(&create_table, &mut table_metadata, builder)?;
         Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
+        sqlite_autoindex::record_autoindex_names(&builder, &create_table, &mut table_metadata);
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
         referenced_keys::settle_key_creations(&mut builder, &create_table, &mut table_metadata);

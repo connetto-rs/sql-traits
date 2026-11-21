@@ -131,6 +131,56 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
         database: &'db Self::DB,
     ) -> Result<Option<Cow<'db, str>>, LookupError>;
 
+    /// Returns the name of the index itself, which the catalog lists among
+    /// the indexes of its relation.
+    ///
+    /// A primary key or unique constraint on SQLite is backed by an index
+    /// SQLite names `sqlite_autoindex_<table>_<n>` whatever the constraint is
+    /// called, and the constraints whose keys it treats as one share it. The
+    /// rowid alias is the primary key SQLite keys without an index, and
+    /// answers [`None`]. On PostgreSQL the index takes the constraint's name,
+    /// so the answer is [`Self::constraint_name`]. Under SQLite and
+    /// PostgreSQL, [`None`] therefore means no index backs the constraint.
+    ///
+    /// Every other index, and every constraint under any other dialect,
+    /// answers [`Self::name`], so there [`None`] means the name is not
+    /// modelled, a backing index being possible all the same.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this index.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::{errors::LookupError, prelude::*};
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT CONSTRAINT uq UNIQUE, UNIQUE (email DESC));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("users", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let names = table
+    ///     .unique_indices(&db)?
+    ///     .map(|key| key.backing_index_name(&db))
+    ///     .collect::<Result<Vec<_>, LookupError>>()?;
+    /// let shared = "sqlite_autoindex_users_1";
+    /// assert_eq!(names.iter().map(Option::as_deref).collect::<Vec<_>>(), [None, Some(shared), Some(shared)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn backing_index_name<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<Cow<'db, str>>, LookupError> {
+        self.relation(database)?;
+        Ok(self.name().map(Cow::Borrowed))
+    }
+
     /// Returns the expression of the index as an SQL AST node.
     ///
     /// # Errors
