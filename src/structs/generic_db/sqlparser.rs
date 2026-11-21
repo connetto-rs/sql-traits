@@ -107,6 +107,7 @@ mod function_bodies;
 mod function_cascade;
 mod function_dependents;
 mod function_moves;
+mod generated_expressions;
 mod generated_names;
 mod grantors;
 mod index_access_methods;
@@ -157,6 +158,8 @@ mod type_facts;
 mod user_defined_types;
 mod view_rewrites;
 mod views;
+mod virtual_generated_constraints;
+mod virtual_generated_types;
 mod virtual_tables;
 
 use column_texts::ColumnTexts;
@@ -424,7 +427,8 @@ pub struct ParserDBIngestor {
 /// for it.
 struct AddedColumnContext<'a> {
     created: &'a [CreatedCollationMetadata],
-    catalog: &'a PostgresCatalog,
+    catalog: &'a Arc<PostgresCatalog>,
+    type_arrays: &'a Arc<TypeArrays>,
     defaults: &'a DefaultPrivileges,
     declared_type_text: Option<String>,
 }
@@ -7194,6 +7198,7 @@ impl ParserDB {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
         }
         stored_expressions::refuse_in_index(builder, &create_index)?;
+        virtual_generated_constraints::index(builder, table, &create_index)?;
         builder.refuse_table_kinds(
             table,
             &create_index.table_name,
@@ -7823,14 +7828,7 @@ impl ParserDB {
                     if !transformed
                         && matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
                 {
-                    columns_in_expression::validate_columns_in_expression(
-                        &expression,
-                        builder.catalog_name(),
-                        &target_name_of_object_name(&create_table.name),
-                        create_table.columns.iter().map(|column| &column.name),
-                        builder.identifier_case(),
-                        *builder.dialect(),
-                    )?;
+                    generated_expressions::references(&builder, create_table, &expression)?;
                 }
                 _ => {}
             }
@@ -7980,50 +7978,50 @@ impl ParserDB {
             }
         }
 
-        let generated_action_refusal = if matches!(
-            fk.on_update,
-            Some(
-                ReferentialAction::Cascade
-                    | ReferentialAction::SetNull
-                    | ReferentialAction::SetDefault
-            )
-        ) {
-            Some(crate::errors::Error::InvalidForeignKeyUpdateActionForGeneratedColumn)
-        } else if matches!(
-            fk.on_delete,
-            Some(ReferentialAction::SetNull | ReferentialAction::SetDefault)
-        ) {
-            Some(crate::errors::Error::InvalidForeignKeyDeleteActionForGeneratedColumn)
-        } else {
-            None
-        };
-        if let Some(refusal) = generated_action_refusal
-            && matches!(builder.dialect(), SqlparserDialect::PostgreSql)
-            && create_table.columns.iter().any(|column| {
-                column.options.iter().any(|option| {
-                    matches!(
-                        option.option,
-                        ColumnOption::Generated { generation_expr: Some(_), .. }
-                    )
-                }) && fk.columns.iter().any(|referencing| {
-                    case.identifiers_match(
-                        &column.name.value,
-                        column.name.quote_style.is_some(),
-                        &referencing.value,
-                        referencing.quote_style.is_some(),
-                    )
-                })
-            })
-        {
-            return Err(refusal);
-        }
-
         let fk_arc = Arc::new(TableAttribute::new(create_table.clone(), fk.clone()));
         if builder.dialect().binds_foreign_keys_on_use() {
             refuse_unequal_written_lists(create_table, fk)?;
         } else {
             let (target, referenced_columns) =
                 Self::refuse_unreachable_target(&builder, create_table, fk)?;
+            let generated_action_refusal = if matches!(
+                fk.on_update,
+                Some(
+                    ReferentialAction::Cascade
+                        | ReferentialAction::SetNull
+                        | ReferentialAction::SetDefault
+                )
+            ) {
+                Some(crate::errors::Error::InvalidForeignKeyUpdateActionForGeneratedColumn)
+            } else if matches!(
+                fk.on_delete,
+                Some(ReferentialAction::SetNull | ReferentialAction::SetDefault)
+            ) {
+                Some(crate::errors::Error::InvalidForeignKeyDeleteActionForGeneratedColumn)
+            } else {
+                None
+            };
+            if let Some(refusal) = generated_action_refusal
+                && matches!(builder.dialect(), SqlparserDialect::PostgreSql)
+                && create_table.columns.iter().any(|column| {
+                    column.options.iter().any(|option| {
+                        matches!(
+                            option.option,
+                            ColumnOption::Generated { generation_expr: Some(_), .. }
+                        )
+                    }) && fk.columns.iter().any(|referencing| {
+                        case.identifiers_match(
+                            &column.name.value,
+                            column.name.quote_style.is_some(),
+                            &referencing.value,
+                            referencing.quote_style.is_some(),
+                        )
+                    })
+                })
+            {
+                return Err(refusal);
+            }
+            virtual_generated_constraints::foreign_key(&builder, create_table, fk)?;
             if postgres {
                 table_metadata.add_pending_foreign_key(ResolvedForeignKey {
                     binding: foreign_key_types::BoundForeignKey {
@@ -8529,6 +8527,7 @@ impl ParserDB {
         {
             builder.ensure_table_lookup_invariants(&create_table)?;
         }
+        virtual_generated_constraints::table_keys(&builder, &create_table)?;
         builder = Self::process_foreign_keys(&create_table, &mut table_metadata, builder)?;
         Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
         sqlite_autoindex::record_autoindexes(&builder, &create_table, &mut table_metadata);
@@ -8868,6 +8867,7 @@ impl ParserDB {
         Self::refuse_unaddable_constraint(&builder, &stored, scope, &constraint)?;
         let case = builder.identifier_case();
         let node = Self::stored_node(&builder, &stored)?;
+        virtual_generated_constraints::constraint(&builder, node, &constraint)?;
         if let TableConstraint::NotNull(not_null) = &constraint
             && requires_value(node, &not_null.column, case)
         {
@@ -10775,6 +10775,7 @@ impl ParserDB {
                         AddedColumnContext {
                             created: collation_metadata,
                             catalog: active_postgres_catalog,
+                            type_arrays,
                             defaults: default_privileges,
                             declared_type_text,
                         },
@@ -11184,6 +11185,14 @@ impl ParserDB {
         }
         let change = InheritedChange::AddColumn;
         Self::refuse_only_with_children(&builder, &stored, scope, change, None)?;
+        if matches!(builder.dialect(), SqlparserDialect::PostgreSql) {
+            generated_expressions::defaults(
+                *builder.dialect(),
+                &Self::stored_node(&builder, &stored)?.name,
+                &column_def,
+            )?;
+            virtual_generated_types::column(&builder, &column_def, &column_def.data_type)?;
+        }
 
         let deferred = Self::refuse_unaddable_column_options(&builder, &stored, &mut column_def)?;
         // Named against the schema as it stands, before the column lands.
@@ -11219,6 +11228,9 @@ impl ParserDB {
         )?;
 
         let case = builder.identifier_case();
+        let expression_database = (matches!(builder.dialect(), SqlparserDialect::PostgreSql)
+            && crate::impls::generation_storage(&column_def, *builder.dialect()).is_some())
+        .then(|| generated_expressions::database(&builder, context.catalog, context.type_arrays));
         let mut builder = Self::replace_table_node_with_collations(
             builder,
             &stored,
@@ -11228,6 +11240,9 @@ impl ParserDB {
             |_, node| {
                 let at = column_insert_position(node, position, case);
                 node.columns.insert(at, column_def);
+                if let Some(database) = &expression_database {
+                    generated_expressions::column(database, node, &node.columns[at])?;
+                }
                 Ok(())
             },
         )?;
@@ -11236,26 +11251,47 @@ impl ParserDB {
             &stored,
             &bound_to_primary_key,
         );
+        builder = Self::propagate_added_column(
+            builder,
+            &stored,
+            &inheritors,
+            &added,
+            (&inherited_def, &inherited_metadata),
+            &context,
+            expression_database.as_ref(),
+        )?;
         Self::record_declared_type_text(&mut builder, &stored, &added, context.declared_type_text)?;
 
-        for child in &inheritors {
-            // A child already declaring the name keeps its own, the way
-            // PostgreSQL merges the two rather than adding a second.
+        sequences::own_column_sequences(&mut builder, &stored, column_sequences);
+        Ok((builder, deferred))
+    }
+
+    /// Adds or merges a parent's column in its descendants.
+    fn propagate_added_column(
+        mut builder: ParserDBBuilder,
+        parent: &StoredTable,
+        children: &[StoredTable],
+        added: &NamedColumn,
+        (declaration, metadata): (&ColumnDef, &ColumnMetadata),
+        context: &AddedColumnContext<'_>,
+        database: Option<&ParserDB>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        for child in children {
             if added.declared_by(Self::stored_node(&builder, child)?) {
                 if let Some(error) = existing_child_column_conflict(
                     &builder,
-                    &stored,
+                    parent,
                     child,
-                    &added,
-                    &inherited_def,
-                    &inherited_metadata,
+                    added,
+                    declaration,
+                    metadata,
                 ) {
                     return Err(error);
                 }
                 continue;
             }
-            let inherited_def = inherited_def.clone();
-            let required = states_not_null(&inherited_def);
+            let inherited = declaration.clone();
+            let required = states_not_null(&inherited);
             builder = Self::replace_table_node_with_collations(
                 builder,
                 child,
@@ -11263,16 +11299,19 @@ impl ParserDB {
                 Some(context.catalog),
                 |_| {},
                 |_, node| {
-                    node.columns.push(inherited_def);
+                    node.columns.push(inherited);
+                    if let Some(database) = database
+                        && let Some(column) = node.columns.last()
+                    {
+                        generated_expressions::column(database, node, column)?;
+                    }
                     Ok(())
                 },
             )?;
             inheritance::mark_inherited(&mut builder, child, &added.name);
             inheritance::mark_inherited_not_null(&mut builder, child, &added.name, required);
         }
-
-        sequences::own_column_sequences(&mut builder, &stored, column_sequences);
-        Ok((builder, deferred))
+        Ok(builder)
     }
 
     /// The views, materialized views, bound function bodies and rules naming
@@ -12093,6 +12132,37 @@ impl ParserDB {
         }
     }
 
+    /// Refuses a default on a generated column, a `USING` conversion of one,
+    /// and a user-defined type for a virtual one, under PostgreSQL.
+    fn refuse_generated_column_change(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        column: &NamedColumn,
+        declared: &ColumnDef,
+        operation: &AlterColumnOperation,
+    ) -> Result<(), crate::errors::Error> {
+        if !matches!(builder.dialect(), SqlparserDialect::PostgreSql)
+            || crate::impls::generation_storage(declared, *builder.dialect()).is_none()
+        {
+            return Ok(());
+        }
+        match operation {
+            AlterColumnOperation::SetDefault { .. } => {
+                Err(crate::errors::Error::GeneratedColumnDefault {
+                    table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                    column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
+                })
+            }
+            AlterColumnOperation::SetDataType { using: Some(_), .. } => {
+                Err(crate::errors::Error::GeneratedColumnTypeUsing)
+            }
+            AlterColumnOperation::SetDataType { data_type, .. } => {
+                virtual_generated_types::column(builder, declared, data_type)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Refuses an `ALTER COLUMN` operation PostgreSQL will not perform.
     ///
     /// Removing the requirement to hold a value is refused where a key covers
@@ -12109,6 +12179,9 @@ impl ParserDB {
         operation: &AlterColumnOperation,
     ) -> Result<(), crate::errors::Error> {
         let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
+        if let Some(declared) = declared {
+            Self::refuse_generated_column_change(builder, stored, column, declared, operation)?;
+        }
 
         match operation {
             AlterColumnOperation::DropExpression { if_exists }
@@ -13582,11 +13655,26 @@ impl ParserDB {
                             RelationNamePhase::Table,
                         )?;
                         builder.ensure_table_lookup_invariants(&create_table)?;
+                        let expression_database = create_table
+                            .columns
+                            .iter()
+                            .any(|column| {
+                                crate::impls::generation_storage(column, dialect).is_some()
+                            })
+                            .then(|| {
+                                generated_expressions::database(
+                                    &builder,
+                                    &active_postgres_catalog,
+                                    &type_arrays,
+                                )
+                            });
                         create_table_transform::expressions(
                             &builder,
+                            expression_database.as_ref(),
                             &mut create_table,
                             &written_defaults,
                         )?;
+                        virtual_generated_constraints::table_keys(&builder, &create_table)?;
                         inherited.column_metadata.append(&mut transformed_columns);
                     }
                     // The bound is checked against the partitions the root

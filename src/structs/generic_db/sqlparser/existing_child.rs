@@ -63,17 +63,19 @@ fn refuse_column(
     if parent_requires && !super::requires_value(child_node, &column.name, case) {
         return Err(ChildMismatch::ColumnNullable { column_name });
     }
-    match (is_stored_generated(parent_column), is_stored_generated(column)) {
-        (true, false) => Err(ChildMismatch::MustBeGenerated { column_name }),
-        (false, true) => Err(ChildMismatch::MustNotBeGenerated { column_name }),
+    match (
+        crate::impls::generation_storage(parent_column, *builder.dialect()),
+        crate::impls::generation_storage(column, *builder.dialect()),
+    ) {
+        (Some(_), None) => Err(ChildMismatch::MustBeGenerated { column_name }),
+        (None, Some(_)) => Err(ChildMismatch::MustNotBeGenerated { column_name }),
+        (Some(inherited_storage), Some(declared_storage))
+            if inherited_storage != declared_storage =>
+        {
+            Err(ChildMismatch::GeneratedKind { column_name })
+        }
         _ => Ok(()),
     }
-}
-
-fn is_stored_generated(column: &ColumnDef) -> bool {
-    column.options.iter().any(|option| {
-        matches!(option.option, ColumnOption::Generated { generation_expr: Some(_), .. })
-    })
 }
 
 /// A check a table holds, written on a column or on its own.

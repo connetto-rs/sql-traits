@@ -8,18 +8,14 @@ use super::{
     CreatedCollationMetadata, NotNullRequirement, ParserDB, ParserDBBuilder, PostgresCatalog,
     PreservedColumnMetadata, RelationNamePhase, StoredTable, TableDeclaration, TypeArrays,
     case_idents_match, column_collation_name, column_metadata_for_collations, domains,
-    index_access_methods, index_opclasses, inheritance, partition_keys,
+    generated_expressions, index_access_methods, index_opclasses, inheritance, partition_keys,
     refuse_no_inherit_constraints_on_partitioned, sequences, stored_expressions,
-    validate_relation_names,
+    validate_relation_names, virtual_generated_types,
 };
 use crate::{
     errors::{Error, LookupError, ObjectKind},
     structs::IdentifierCase,
     traits::TableLike,
-    utils::{
-        columns_in_expression::validate_columns_in_expression,
-        object_name::target_name_of_object_name,
-    },
 };
 
 /// Binds column types and collations in declaration order.
@@ -39,7 +35,9 @@ pub(super) fn columns(
         }
     }
     for column in &mut table.columns {
+        generated_expressions::defaults(*builder.dialect(), &table.name, column)?;
         domains::bind_type(builder, &mut column.data_type, arrays)?;
+        virtual_generated_types::column(builder, column, &column.data_type)?;
         let column_metadata =
             if table.partition_of.is_some() && matches!(column.data_type, DataType::Unspecified) {
                 None
@@ -145,24 +143,18 @@ fn key(
 /// Binds defaults and generated expressions in column order.
 pub(super) fn expressions(
     builder: &ParserDBBuilder,
+    database: Option<&ParserDB>,
     table: &mut CreateTable,
     written_defaults: &[Ident],
 ) -> Result<(), Error> {
     let table_name = StoredTable::of(table);
     for column_index in 0..table.columns.len() {
+        if let Some(database) = database {
+            generated_expressions::column(database, table, &table.columns[column_index])?;
+        }
         for option_index in 0..table.columns[column_index].options.len() {
             let option = &table.columns[column_index].options[option_index].option;
             stored_expressions::refuse_column_value(option)?;
-            if let ColumnOption::Generated { generation_expr: Some(expression), .. } = option {
-                validate_columns_in_expression(
-                    expression,
-                    builder.catalog_name(),
-                    &target_name_of_object_name(&table.name),
-                    table.columns.iter().map(|column| &column.name),
-                    builder.identifier_case(),
-                    *builder.dialect(),
-                )?;
-            }
             let column = &mut table.columns[column_index];
             if written_defaults
                 .iter()

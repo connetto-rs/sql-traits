@@ -6,6 +6,7 @@ use sql_traits::prelude::*;
 use sqlparser::dialect::{Dialect, PostgreSqlDialect};
 
 mod alterations_transactions;
+mod generated_columns;
 mod inheritance_operators;
 mod keys_triggers_grants;
 mod lookup_columns;

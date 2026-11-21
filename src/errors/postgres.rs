@@ -213,6 +213,131 @@ impl Error {
                     "invalid ON DELETE action for foreign key constraint containing generated column",
                 ))
             }
+            Self::GeneratedColumnReference { column } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    format!(
+                        "cannot use generated column {} in column generation expression",
+                        quoted(column)
+                    ),
+                ))
+            }
+            Self::GeneratedSystemColumnReference { column } => {
+                Some(PostgresError::new(
+                    pg::INVALID_COLUMN_REFERENCE,
+                    format!(
+                        "cannot use system column {} in column generation expression",
+                        quoted(column)
+                    ),
+                ))
+            }
+            Self::GenerationExpressionNotImmutable => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    "generation expression is not immutable",
+                ))
+            }
+            Self::GenerationExpressionUserDefinedType => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "generation expression uses user-defined type",
+                ))
+            }
+            Self::GenerationExpressionUserDefinedFunction => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "generation expression uses user-defined function",
+                ))
+            }
+            Self::DefaultAndGeneration { table, column } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!(
+                        "both default and generation expression specified for column {} of table {}",
+                        quoted(column),
+                        quoted(table)
+                    ),
+                ))
+            }
+            Self::VirtualGeneratedIndex => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "indexes on virtual generated columns are not supported",
+                ))
+            }
+            Self::VirtualGeneratedUnique => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "unique constraints on virtual generated columns are not supported",
+                ))
+            }
+            Self::VirtualGeneratedPrimaryKey => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "primary keys on virtual generated columns are not supported",
+                ))
+            }
+            Self::VirtualGeneratedForeignKey => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "foreign key constraints on virtual generated columns are not supported",
+                ))
+            }
+            Self::VirtualGeneratedDomainType { column_name } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "virtual generated column {} cannot have a domain type",
+                        quoted(column_name)
+                    ),
+                ))
+            }
+            Self::VirtualGeneratedUserDefinedType { column_name } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "virtual generated column {} cannot have a user-defined type",
+                        quoted(column_name)
+                    ),
+                ))
+            }
+            Self::GeneratedColumnDefault { table_name, column_name } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!(
+                        "column {} of relation {} is a generated column",
+                        quoted(column_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::GeneratedColumnTypeUsing => {
+                Some(PostgresError::new(
+                    pg::INVALID_COLUMN_DEFINITION,
+                    "cannot specify USING when altering type of generated column",
+                ))
+            }
+            Self::InheritedGeneratedKindConflict { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_COLUMN_DEFINITION,
+                    format!(
+                        "column {} inherits from generated column of different kind",
+                        quoted(column_name)
+                    ),
+                ))
+            }
+            Self::BeforeTriggerGeneratedColumn { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_OBJECT_DEFINITION,
+                    "BEFORE trigger's WHEN condition cannot reference NEW generated columns",
+                ))
+            }
+            Self::BeforeTriggerSystemColumn { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "BEFORE trigger's WHEN condition cannot reference NEW system columns",
+                ))
+            }
             Self::DeferrablePrimaryKeyForForeignKey { referenced_table, .. } => {
                 Some(PostgresError::new(
                     pg::OBJECT_NOT_IN_PREREQUISITE_STATE,

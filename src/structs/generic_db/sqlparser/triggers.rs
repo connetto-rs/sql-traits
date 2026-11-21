@@ -17,9 +17,10 @@
 //! the view, follows its renames and outlives its replacement.
 
 use alloc::{string::ToString, sync::Arc, vec::Vec};
+use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CreateTable, CreateTrigger, DropTrigger, Ident, ObjectName, TriggerEvent, TriggerObject,
+    CreateTable, CreateTrigger, DropTrigger, Expr, Ident, ObjectName, TriggerEvent, TriggerObject,
     TriggerObjectKind, TriggerPeriod,
 };
 
@@ -35,6 +36,7 @@ use crate::{
     errors::{Error, ObjectKind, TriggerFiringRefusal},
     impls::SqlparserDialect,
     structs::{TriggerEnablement, metadata::TriggerMetadata},
+    utils::walk::walk_expressions,
 };
 
 /// Records a `CREATE TRIGGER` on the table or plain view its target reaches,
@@ -69,7 +71,8 @@ pub(super) fn create_trigger(
         )?;
         let table = StoredTable::of(table);
         refuse_firing(&builder, &create_trigger, false)?;
-        let mut create_trigger = bind_parts(&builder, create_trigger)?;
+        stored_expressions::refuse_in_trigger_condition(&builder, &create_trigger.condition)?;
+        let mut create_trigger = create_trigger;
         builder.bind_table_reference(&mut create_trigger.table_name);
         column_references::refuse_in_expressions(
             &builder,
@@ -77,12 +80,19 @@ pub(super) fn create_trigger(
             &[Some("new"), Some("old")],
             &create_trigger.condition,
         )?;
+        refuse_before_generated(
+            &builder,
+            &create_trigger,
+            ParserDB::stored_node(&builder, &table)?,
+        )?;
+        let create_trigger = bind_parts(&builder, create_trigger)?;
         return create_on_table(builder, create_trigger, &table);
     }
     if let Some(view) = builder.resolve_view_object_name(&create_trigger.table_name)? {
         let host = ViewHost::of_view(view);
         let qualifier = stored_view_qualifier(view);
         refuse_firing(&builder, &create_trigger, true)?;
+        stored_expressions::refuse_in_trigger_condition(&builder, &create_trigger.condition)?;
         let mut create_trigger = bind_parts(&builder, create_trigger)?;
         bind_reference(&mut create_trigger.table_name, qualifier);
         return create_on_view(builder, create_trigger, &host);
@@ -104,6 +114,73 @@ pub(super) fn create_trigger(
         relation_name: builder.dialect().stored_object_name(&create_trigger.table_name),
         trigger_name: builder.dialect().stored_object_name_last(&create_trigger.name),
     })
+}
+
+/// Refuses generated values and `tableoid` in `NEW` before the row is formed.
+fn refuse_before_generated(
+    builder: &ParserDBBuilder,
+    trigger: &CreateTrigger,
+    table: &CreateTable,
+) -> Result<(), Error> {
+    if !matches!(builder.dialect(), SqlparserDialect::PostgreSql)
+        || trigger.period != Some(TriggerPeriod::Before)
+    {
+        return Ok(());
+    }
+    let names_new = |name: &Ident| {
+        builder.identifier_case().identifiers_match(
+            &name.value,
+            name.quote_style.is_some(),
+            "new",
+            false,
+        )
+    };
+    let generated = |column: &sqlparser::ast::ColumnDef| {
+        crate::impls::generation_storage(column, *builder.dialect()).is_some()
+    };
+    let result = walk_expressions(&trigger.condition, |expression| {
+        let column = match expression {
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 && names_new(&parts[0]) => {
+                Some(&parts[1])
+            }
+            Expr::Identifier(name) if names_new(name) => None,
+            Expr::QualifiedWildcard(name, _)
+                if name.0.len() == 1 && name.0[0].as_ident().is_some_and(names_new) =>
+            {
+                None
+            }
+            _ => return ControlFlow::Continue(()),
+        };
+        if let Some(column) = column {
+            if builder.identifier_case().identifiers_match(
+                &column.value,
+                column.quote_style.is_some(),
+                "tableoid",
+                false,
+            ) {
+                return ControlFlow::Break(Error::BeforeTriggerSystemColumn {
+                    table_name: builder.dialect().stored_object_name_last(&table.name),
+                    column_name: builder.dialect().stored_name(column),
+                });
+            }
+            if !table.columns.iter().any(|declared| {
+                super::case_idents_match(&declared.name, column, builder.identifier_case())
+                    && generated(declared)
+            }) {
+                return ControlFlow::Continue(());
+            }
+        } else if !table.columns.iter().any(generated) {
+            return ControlFlow::Continue(());
+        }
+        ControlFlow::Break(Error::BeforeTriggerGeneratedColumn {
+            table_name: builder.dialect().stored_object_name_last(&table.name),
+            column_name: column.map(|column| builder.dialect().stored_name(column)),
+        })
+    });
+    match result {
+        ControlFlow::Break(error) => Err(error),
+        ControlFlow::Continue(()) => Ok(()),
+    }
 }
 
 /// Refuses `trigger` on its table, or on its view when `on_view` is set, when
@@ -173,20 +250,16 @@ fn sqlite_firing_refusal(trigger: &CreateTrigger, on_view: bool) -> Option<Trigg
     }
 }
 
-/// `trigger` with its `WHEN` condition checked and the function it runs and
-/// the table its `FROM` names bound, which a trigger on a table and one on a
-/// view take alike.
+/// Binds the trigger function and its referenced table.
 ///
 /// # Errors
 ///
-/// Returns the refusal of a subquery in the condition and
-/// [`Error::FunctionNotFoundForTrigger`] for a function the trigger cannot
-/// run.
+/// Returns [`Error::FunctionNotFoundForTrigger`] for a function the trigger
+/// cannot run.
 fn bind_parts(
     builder: &ParserDBBuilder,
     mut create_trigger: CreateTrigger,
 ) -> Result<CreateTrigger, Error> {
-    stored_expressions::refuse_in_trigger_condition(builder, &create_trigger.condition)?;
     if let Some(exec_body) = &mut create_trigger.exec_body {
         let Some(function) = builder.trigger_function(&exec_body.func_desc.name) else {
             if let Some(schema_name) =

@@ -4,9 +4,9 @@ use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
 use core::{ops::ControlFlow, sync::atomic::Ordering};
 
 use sqlparser::ast::{
-    ArgMode, BinaryOperator, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Ident, InTarget, ObjectNamePart,
-    Query, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
+    ArgMode, BinaryOperator, CastKind, ColumnDef, DataType, DuplicateTreatment, Expr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Ident, InTarget,
+    ObjectNamePart, Query, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 
 use crate::{
@@ -107,6 +107,7 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     /// The PL/pgSQL variables the expression reaches, and the path its body
     /// runs it under.
     variables: Option<&'query PlPgSqlScope<'query, 'db, DB>>,
+    declared_columns: Option<&'query [ColumnDef]>,
 }
 
 /// An application of an operator, by the address of the node applying it
@@ -468,6 +469,20 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         Self::for_root(ScopedRoot::Expression(expression), scope, database, case)
     }
 
+    /// Types a bound generation expression against columns awaiting catalog
+    /// insertion.
+    pub(crate) fn for_declared_columns(
+        expression: &'query Expr,
+        columns: &'query [ColumnDef],
+        database: &'db DB,
+        case: IdentifierCase,
+    ) -> Result<Self, LookupError> {
+        let mut context =
+            Self::for_expression(expression, &ExpressionScope::Empty, database, case)?;
+        context.declared_columns = Some(columns);
+        Ok(context)
+    }
+
     /// Builds the context of `statement`, a query or an `INSERT`, `UPDATE`,
     /// `DELETE` or `MERGE` written outside a query, over `database`, its
     /// column references reaching its own relations first and then what
@@ -570,7 +585,18 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         });
         nodes.sort_unstable();
         sites.sort_unstable_by_key(|(address, _)| *address);
-        Self { database, scope, nodes, sites, case, parameters, value, pins: None, variables: None }
+        Self {
+            database,
+            scope,
+            nodes,
+            sites,
+            case,
+            parameters,
+            value,
+            pins: None,
+            variables: None,
+            declared_columns: None,
+        }
     }
 
     /// The context typing as `pins` has PostgreSQL's deparsed text pin it.
@@ -1142,6 +1168,33 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         self.check(expression)?;
         Ok(match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                if let Some(columns) = self.declared_columns {
+                    let name = match expression {
+                        Expr::Identifier(name) => Some(name),
+                        Expr::CompoundIdentifier(names) => names.last(),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        if let Some(column) = columns.iter().find(|column| {
+                            self.case.identifiers_match(
+                                &column.name.value,
+                                column.name.quote_style.is_some(),
+                                &name.value,
+                                name.quote_style.is_some(),
+                            )
+                        }) {
+                            return Ok(declared_type(self.database, &column.data_type));
+                        }
+                        if self.case.identifiers_match(
+                            "tableoid",
+                            false,
+                            &name.value,
+                            name.quote_style.is_some(),
+                        ) {
+                            return Ok(catalog("oid"));
+                        }
+                    }
+                }
                 match self.reference(expression)? {
                     Some((ColumnDefinition::VariableField(variable), _)) => {
                         self.field_type(&variable, expression)?
@@ -1158,6 +1211,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 }
             }
             Expr::TypedString(typed) => declared_type(self.database, &typed.data_type),
+            Expr::Interval(_) => catalog("interval"),
             Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, data_type, .. } => {
                 declared_type(self.database, data_type)
             }

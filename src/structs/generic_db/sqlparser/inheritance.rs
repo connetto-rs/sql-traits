@@ -1151,6 +1151,7 @@ fn merge_local_columns(
             {
                 return Err(error);
             }
+            refuse_generation_kind(context, &columns[position], column)?;
             refuse_default_on_generated(context, &columns[position], column)?;
             columns[position] = merge_declarations(&columns[position], column);
         } else if let Some((_, root)) =
@@ -1173,9 +1174,8 @@ fn merge_local_columns(
     Ok(())
 }
 
-/// Refuses a `DEFAULT` written on a column the table receives as a stored
-/// generated column, unless the table gives it a generation expression of its
-/// own instead.
+/// Refuses a `DEFAULT` on an inherited generated column without a local
+/// generation expression.
 fn refuse_default_on_generated(
     context: &ParentApplication<'_>,
     received: &ColumnDef,
@@ -1194,6 +1194,27 @@ fn refuse_default_on_generated(
                 .builder
                 .dialect()
                 .stored_object_name_last(context.child_object_name),
+            column_name: context.builder.dialect().stored_name(&written.name),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses incompatible generated storage kinds in a child's declaration.
+fn refuse_generation_kind(
+    context: &ParentApplication<'_>,
+    received: &ColumnDef,
+    written: &ColumnDef,
+) -> Result<(), Error> {
+    if matches!(context.builder.dialect(), crate::impls::SqlparserDialect::PostgreSql)
+        && let Some(parent_mode) =
+            crate::impls::generation_storage(received, *context.builder.dialect())
+        && let Some(child_mode) =
+            crate::impls::generation_storage(written, *context.builder.dialect())
+        && parent_mode != child_mode
+    {
+        return Err(Error::InheritedGeneratedKindConflict {
+            table_name: context.child_name.to_string(),
             column_name: context.builder.dialect().stored_name(&written.name),
         });
     }
@@ -1430,6 +1451,11 @@ pub(super) fn apply_parents(
         let parent = resolve_parent(builder, parent_name, &child_name)?;
 
         for column in &parent.columns {
+            if let Some(held) =
+                columns.iter().find(|held| super::case_idents_match(&held.name, &column.name, case))
+            {
+                refuse_generation_kind(&context, held, column)?;
+            }
             // A second parent declaring the same column merges into the one
             // already taken, keeping the position the first parent gave it.
             if !columns.iter().any(|held| super::case_idents_match(&held.name, &column.name, case))
