@@ -52,7 +52,8 @@ use crate::{
         },
     },
     traits::{
-        ColumnLike, DatabaseLike, FunctionLike, IndexLike, SequenceLike, TableLike, ViewLike,
+        ColumnLike, DatabaseLike, DialectLike, FunctionLike, IndexLike, SequenceLike, TableLike,
+        ViewLike,
     },
     utils::{
         columns_in_expression,
@@ -86,10 +87,12 @@ mod index_opclasses;
 use calls_in_expression::CarriedCalls;
 mod column_copy;
 mod column_references;
+mod column_texts;
 mod comment_on;
 mod constraint_names;
 mod constraint_using_index;
 mod constraint_validity;
+mod declared_types;
 mod default_privileges;
 mod detach_partition;
 mod domains;
@@ -151,13 +154,14 @@ mod view_rewrites;
 mod views;
 mod virtual_tables;
 
+use column_texts::ColumnTexts;
 use default_privileges::{
     Creator, DefaultPrivileges, SessionChange, SessionRoles, tracks_session_roles,
 };
 pub(crate) use key_nullability::key_excludes_null;
 use leading_comments::TableDocumentation;
 pub use parse_options::{AccessResolution, ParseOptions};
-use parsed_source::{ParsedSource, StatementSource};
+use parsed_source::{ParsedSource, SourceText, StatementSource};
 use postgres_catalog::CatalogName;
 mod postgres_cast;
 mod postgres_operator;
@@ -307,12 +311,30 @@ impl UndeclaredRoleAlteration {
 }
 
 enum TableOrigin {
-    /// A `CREATE TABLE` statement, with the comments written above it and the
-    /// query output each column without a declared type was created from.
-    Declaration(TableDocumentation, Vec<(Ident, ColumnCreation)>),
+    /// A `CREATE TABLE` statement, with the comments written above it, the
+    /// query output each column without a declared type was created from and
+    /// the declared type text SQLite reports for each column it knows.
+    Declaration(TableDocumentation, Vec<(Ident, ColumnCreation)>, ColumnTexts),
     /// A rebuild of a stored table, keeping its identity and the bindings
     /// and operator selections its expressions held.
     Replacement(RelationIdentity, Box<CarriedCalls>),
+}
+
+impl TableOrigin {
+    /// Gives `metadata` what the statement declaring the column `name` wrote
+    /// for it.
+    fn declared_column(&mut self, name: &Ident, metadata: ColumnMetadata) -> ColumnMetadata {
+        let TableOrigin::Declaration(documentation, creations, declared_types) = self else {
+            return metadata;
+        };
+        let metadata = metadata
+            .with_documentation(documentation.columns.take(name))
+            .with_declared_type_text(declared_types.take(name));
+        match creations.iter().position(|(created, _)| created == name) {
+            Some(position) => metadata.with_creation(creations.swap_remove(position).1),
+            None => metadata,
+        }
+    }
 }
 
 /// The continuation state the parser carries inside every built database so
@@ -377,13 +399,14 @@ pub struct ParserDBIngestor {
     transaction: Option<transactions::Transaction>,
 }
 
-/// The collations a column added to a stored table may name, and the defaults
-/// the sequence it brings takes.
-#[derive(Clone, Copy)]
+/// The collations a column added to a stored table may name, the defaults
+/// the sequence it brings takes, and the declared type text SQLite reports
+/// for it.
 struct AddedColumnContext<'a> {
     created: &'a [CreatedCollationMetadata],
     catalog: &'a PostgresCatalog,
     defaults: &'a DefaultPrivileges,
+    declared_type_text: Option<String>,
 }
 
 enum CollationResolution<'a> {
@@ -5856,14 +5879,57 @@ impl ParserDBIngestor {
         Ok(Self { catalog, access_resolution, transaction })
     }
 
-    fn apply_parsed(self, source: ParsedSource) -> Result<Self, crate::errors::Error> {
-        let ParsedSource { statements, comments } = source;
+    fn apply_parsed(self, sql: &str, source: ParsedSource) -> Result<Self, crate::errors::Error> {
+        let ParsedSource { statements, comments, line_starts } = source;
+        let text = SourceText { sql, line_starts: &line_starts };
         self.apply_statements(statements.into_iter().map(|(statement, start)| {
-            (statement, Some(StatementSource { comments: &comments, start }))
+            (statement, Some(StatementSource { comments: &comments, start, text }))
         }))
     }
 
+    /// Parses `sql` under the ingestor's dialect and applies its statements
+    /// in turn, keeping the text each was written as.
+    ///
+    /// The text gives what the statements alone do not: the comments
+    /// documenting a table and its columns, and the declared type text
+    /// [`ColumnLike::declared_type_text`] answers under SQLite.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SqlParserError`] when `sql` does not parse, and
+    /// otherwise the errors [`Self::apply_statement`] returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let database = ParseOptions::default()
+    ///     .with_identifier_case(IdentifierCase::Folded)
+    ///     .ingestor::<SQLiteDialect>("main".to_owned())
+    ///     .apply_sql("CREATE TABLE sample(value VARCHAR( 10 ))")?
+    ///     .finish();
+    /// let table = database
+    ///     .table_by_target(TargetName::new("sample", false), IdentifierCase::Folded)?
+    ///     .expect("sample is stored");
+    /// let column = table.column("value", &database, IdentifierCase::Folded)?.expect("declared");
+    /// assert_eq!(column.declared_type_text(&database)?, Some("VARCHAR( 10 )"));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    ///
+    /// [`ColumnLike::declared_type_text`]: crate::traits::ColumnLike::declared_type_text
+    /// [`Error::SqlParserError`]: crate::errors::Error::SqlParserError
+    pub fn apply_sql(self, sql: &str) -> Result<Self, crate::errors::Error> {
+        let source = ParsedSource::parse(sql, self.catalog.builder.dialect().sqlparser_dialect())?;
+        self.apply_parsed(sql, source)
+    }
+
     /// Applies one statement to the current schema.
+    ///
+    /// The statement carries no text, so the comments above it document
+    /// nothing and its columns have no declared type text. [`Self::apply_sql`]
+    /// keeps both.
     ///
     /// # Errors
     ///
@@ -7715,7 +7781,7 @@ impl ParserDB {
         index_opclasses::table(&create_table, &builder)?;
 
         let (identity, documentation, mut carried) = match &mut origin {
-            TableOrigin::Declaration(documentation, _) => {
+            TableOrigin::Declaration(documentation, ..) => {
                 (
                     builder.draw_relation_identity(),
                     documentation.table.take(),
@@ -7756,17 +7822,7 @@ impl ParserDB {
                 validate_missing,
             )?
             .with_calls(calls);
-            let metadata = match &mut origin {
-                TableOrigin::Declaration(documentation, creations) => {
-                    let name = &column.attribute().name;
-                    let metadata = metadata.with_documentation(documentation.take_column(name));
-                    match creations.iter().position(|(created, _)| created == name) {
-                        Some(position) => metadata.with_creation(creations.swap_remove(position).1),
-                        None => metadata,
-                    }
-                }
-                TableOrigin::Replacement(..) => metadata,
-            };
+            let metadata = origin.declared_column(&column.attribute().name, metadata);
             let column_identity =
                 preserved_identity.unwrap_or_else(|| builder.draw_column_identity());
             builder = builder.add_column_with_identity(column.clone(), metadata, column_identity);
@@ -9646,6 +9702,29 @@ impl ParserDB {
         Ok(())
     }
 
+    /// Gives the column `added` of `stored` the declared type text the
+    /// statement adding it wrote, when it is known.
+    fn record_declared_type_text(
+        builder: &mut ParserDBBuilder,
+        stored: &StoredTable,
+        added: &NamedColumn,
+        declared_type_text: Option<String>,
+    ) -> Result<(), crate::errors::Error> {
+        let Some(declared_type_text) = declared_type_text else {
+            return Ok(());
+        };
+        let node: *const CreateTable = Self::stored_node(builder, stored)?;
+        for (candidate, metadata, _) in builder.columns_mut() {
+            if core::ptr::eq(TableAttribute::table(candidate.as_ref()), node)
+                && added.matches(&candidate.attribute().name)
+            {
+                metadata.set_declared_type_text(Some(declared_type_text));
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Adds a column to a table.
     fn alter_table_add_column(
         builder: ParserDBBuilder,
@@ -9729,6 +9808,7 @@ impl ParserDB {
             &stored,
             &bound_to_primary_key,
         );
+        Self::record_declared_type_text(&mut builder, &stored, &added, context.declared_type_text)?;
 
         for child in &inheritors {
             // A child already declaring the name keeps its own, the way
@@ -11850,6 +11930,11 @@ impl ParserDB {
                                         )?;
                                     }
                                 }
+                                let declared_type_text = source
+                                    .filter(|_| dialect.is_sqlite())
+                                    .and_then(|source| {
+                                        declared_types::declared_type(&column_def, source.text)
+                                    });
                                 builder = Self::alter_table_add_column(
                                     builder,
                                     &alter_table.name,
@@ -11861,6 +11946,7 @@ impl ParserDB {
                                         created: &collation_metadata,
                                         catalog: &active_postgres_catalog,
                                         defaults: &default_privileges,
+                                        declared_type_text,
                                     },
                                 )?;
                             }
@@ -12305,6 +12391,12 @@ impl ParserDB {
                     let documentation = source.map_or_else(TableDocumentation::default, |source| {
                         TableDocumentation::from_source(&create_table, source)
                     });
+                    let mut declared_types = match source {
+                        Some(source) if dialect.is_sqlite() => {
+                            declared_types::read(&create_table.columns, source.text)
+                        }
+                        _ => ColumnTexts::default(),
+                    };
                     require_named_in_catalog(
                         &mut create_table.name,
                         crate::errors::ObjectKind::Table,
@@ -12352,12 +12444,16 @@ impl ParserDB {
                         Some(source) => {
                             validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
                             builder.ensure_table_lookup_invariants(&create_table)?;
-                            virtual_tables::declare_columns(
+                            let mut declaration = virtual_tables::declare_columns(
                                 &builder,
                                 &mut create_table,
                                 source,
                                 declared_virtual_table.take(),
-                            )?
+                            )?;
+                            if dialect.is_sqlite() {
+                                declared_types = core::mem::take(&mut declaration.declared_types);
+                            }
+                            declaration
                         }
                         None => virtual_tables::ModuleDeclaration::default(),
                     };
@@ -12531,7 +12627,7 @@ impl ParserDB {
                         &collation_metadata,
                         &active_postgres_catalog,
                         &inherited.column_metadata,
-                        TableOrigin::Declaration(documentation, creations),
+                        TableOrigin::Declaration(documentation, creations, declared_types),
                     )?;
                     referenced_keys::record_primary_key_references(
                         &mut builder,
@@ -13615,7 +13711,7 @@ impl ParserDB {
             SqlparserDialect::of::<D>(),
             options,
         );
-        Ok(ingestor.apply_parsed(source)?.finish())
+        Ok(ingestor.apply_parsed(sql, source)?.finish())
     }
 
     /// Constructs a `ParserDB` from a git URL.
@@ -13736,7 +13832,7 @@ impl ParserDB {
                 let source = ParsedSource::parse(&sql_content, &dialect).map_err(|error| {
                     crate::errors::Error::SqlParserError { error, file: Some(sql_path.clone()) }
                 })?;
-                files.push(source);
+                files.push((sql_content, source));
             }
         }
 
@@ -13745,8 +13841,8 @@ impl ParserDB {
             SqlparserDialect::of::<D>(),
             options,
         );
-        for source in files {
-            ingestor = ingestor.apply_parsed(source)?;
+        for (sql, source) in files {
+            ingestor = ingestor.apply_parsed(&sql, source)?;
         }
         Ok(ingestor.finish())
     }
