@@ -202,8 +202,8 @@ fn the_public_pseudo_role_needs_no_declaration() {
 #[test]
 fn an_exclusion_constraint_include_list_follows_its_column() {
     let renamed = parse(
-        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT,
-             CONSTRAINT x EXCLUDE USING gist (a WITH =) INCLUDE (b));
+        "CREATE TABLE t (id INT PRIMARY KEY, a int4range, b INT,
+             CONSTRAINT x EXCLUDE USING gist (a WITH &&) INCLUDE (b));
          ALTER TABLE t RENAME COLUMN b TO renamed;",
     )
     .expect("b is declared");
@@ -221,8 +221,8 @@ fn an_exclusion_constraint_include_list_follows_its_column() {
     );
 
     let dropped = parse(
-        "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT,
-             CONSTRAINT x EXCLUDE USING gist (a WITH =) INCLUDE (b));
+        "CREATE TABLE t (id INT PRIMARY KEY, a int4range, b INT,
+             CONSTRAINT x EXCLUDE USING gist (a WITH &&) INCLUDE (b));
          ALTER TABLE t DROP COLUMN b;",
     )
     .expect("the constraint goes with the column it includes");

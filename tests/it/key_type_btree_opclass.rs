@@ -35,7 +35,7 @@ fn parse(sql: &str) -> Result<ParserDB, Error> {
 fn refused(sql: &str, expected_type: &str) {
     let outcome = parse(sql);
     assert!(
-        matches!(&outcome, Err(Error::MissingDefaultBtreeOperatorClass { type_name }) if type_name == expected_type),
+        matches!(&outcome, Err(Error::MissingDefaultOperatorClass { type_name, access_method: "btree" }) if type_name == expected_type),
         "expected missing default class for {expected_type}, got {outcome:?} for {sql}"
     );
     assert_eq!(
