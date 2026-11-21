@@ -95,6 +95,7 @@ mod domains;
 mod duplicate_keys;
 mod existing_child;
 mod extensions;
+mod foreign_key_types;
 mod foreign_options;
 mod function_bodies;
 mod function_cascade;

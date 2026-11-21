@@ -64,6 +64,7 @@ mod folded_catalog_reads;
 mod folded_catalog_rewrites;
 mod foreign_key_column_case;
 mod foreign_key_deferral;
+mod foreign_key_type_equality;
 mod foreign_tables;
 mod function_body_binding;
 mod function_call_casts;
