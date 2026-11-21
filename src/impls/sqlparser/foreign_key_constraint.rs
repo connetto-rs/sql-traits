@@ -158,12 +158,10 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
 
         let columns = resolve_columns(referenced_table, database, &foreign_key.referred_columns)?;
         if database.dialect().binds_foreign_keys_on_use() {
-            // SQLite takes a unique index only when it covers every row and
-            // names plain columns.
             let unique_indexes = referenced_table
                 .indices(database)?
                 .map(TableAttribute::attribute)
-                .filter(|index| index.unique && index.predicate.is_none());
+                .filter(|index| index.unique);
             let referred: Vec<&Ident> = foreign_key.referred_columns.iter().collect();
             if !is_candidate_key(
                 referenced_table,
