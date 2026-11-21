@@ -4,6 +4,7 @@
 
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::{
+    ast::Ident,
     dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect},
     parser::Parser,
 };
@@ -60,9 +61,19 @@ fn ingestor() -> ParserDBIngestor {
 
 /// The name and declared type text of each column of `table`.
 fn declared_types(db: &ParserDB, table: &str) -> Vec<(String, Option<String>)> {
-    db.table_by_target(TargetName::new(table, false), IdentifierCase::Folded)
+    let stored = db
+        .table_by_target(TargetName::new(table, false), IdentifierCase::Folded)
         .expect("unambiguous lookup")
-        .unwrap_or_else(|| panic!("table {table} exists"))
+        .unwrap_or_else(|| panic!("table {table} exists"));
+    column_types(db, stored)
+}
+
+/// The name and declared type text of each column of the stored `table`.
+fn column_types(
+    db: &ParserDB,
+    table: &<ParserDB as DatabaseLike>::Table,
+) -> Vec<(String, Option<String>)> {
+    table
         .columns(db)
         .expect("the table is held")
         .map(|column| {
@@ -70,6 +81,19 @@ fn declared_types(db: &ParserDB, table: &str) -> Vec<(String, Option<String>)> {
             (column.column_name().to_string(), declared.map(str::to_string))
         })
         .collect()
+}
+
+/// The table stored as `name` in the database `schema`, without any search.
+fn stored<'db>(
+    db: &'db ParserDB,
+    schema: &str,
+    name: &str,
+) -> Option<&'db <ParserDB as DatabaseLike>::Table> {
+    db.table_by_target(
+        TargetName::new(name, false).with_schema(schema, false),
+        IdentifierCase::Folded,
+    )
+    .expect("unambiguous lookup")
 }
 
 fn typed(columns: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
@@ -198,6 +222,70 @@ fn a_declaration_without_its_text_has_no_declared_type_text() {
         .remove(0);
     let db = ingestor().apply_statement(statement).expect("SQLite stores t").finish();
     assert_eq!(declared_types(&db, "t"), [("a".to_string(), None)]);
+}
+
+/// An ingestor holding `aux` attached beside `main` and `temp`.
+fn ingestor_with_aux() -> ParserDBIngestor {
+    ingestor().apply_sql("ATTACH ':memory:' AS aux;").expect("SQLite attaches aux")
+}
+
+#[test]
+fn stored_text_of_temp_and_attached_databases_keeps_its_declared_types() {
+    let db = ingestor_with_aux()
+        .apply_sql_in(&Ident::new("temp"), "CREATE TABLE tt(a varchar( 10 ))")
+        .expect("SQLite stores tt in temp")
+        .apply_sql_in(&Ident::new("aux"), "CREATE TABLE x(b int)")
+        .expect("SQLite stores x in aux")
+        .apply_sql_in(&Ident::new("aux"), "CREATE INDEX x_b ON x(b)")
+        .expect("SQLite stores x_b in aux")
+        .finish();
+    let tt = stored(&db, "temp", "tt").expect("tt is in temp");
+    assert_eq!(column_types(&db, tt), typed(&[("a", "varchar( 10 )")]));
+    let x = stored(&db, "aux", "x").expect("x is in aux");
+    assert_eq!(column_types(&db, x), typed(&[("b", "INT")]));
+    let indices: Vec<_> = x.indices(&db).expect("x is held").map(IndexLike::name).collect();
+    assert_eq!(indices, [Some("x_b")]);
+    for (schema, name) in [("main", "tt"), ("main", "x"), ("temp", "x"), ("aux", "tt")] {
+        assert!(stored(&db, schema, name).is_none(), "{schema}.{name} is not stored");
+    }
+}
+
+#[test]
+fn a_name_the_stored_text_qualifies_keeps_its_database() {
+    let db = ingestor_with_aux()
+        .apply_sql_in(&Ident::new("aux"), "CREATE TABLE main.m(c numeric( 5 ))")
+        .expect("SQLite stores m in main")
+        .finish();
+    let m = stored(&db, "main", "m").expect("m is in main");
+    assert_eq!(column_types(&db, m), typed(&[("c", "numeric( 5 )")]));
+    assert!(stored(&db, "aux", "m").is_none());
+}
+
+#[test]
+fn stored_text_of_main_applies_as_sql_does() {
+    for database in [Ident::new("main"), Ident::new("MAIN"), Ident::with_quote('"', "main")] {
+        let db = ingestor()
+            .apply_sql_in(&database, "CREATE TABLE t(a VARCHAR( 10 ))")
+            .expect("SQLite stores t in main")
+            .finish();
+        let table = stored(&db, "main", "t").expect("t is in main");
+        assert_eq!(table.table_schema(), None, "under {database}");
+        assert_eq!(column_types(&db, table), typed(&[("a", "VARCHAR( 10 )")]));
+    }
+}
+
+#[test]
+fn stored_text_of_a_database_nothing_attached_is_refused() {
+    assert!(ingestor().apply_sql_in(&Ident::new("aux"), "CREATE TABLE x(b int)").is_err());
+}
+
+#[test]
+fn stored_text_of_a_database_is_refused_outside_sqlite() {
+    let postgres = ParserDBIngestor::new::<PostgreSqlDialect>("catalog".to_owned());
+    assert!(matches!(
+        postgres.apply_sql_in(&Ident::new("public"), "CREATE TABLE t(a int)"),
+        Err(Error::DatabaseOutsideSqlite { database_name }) if database_name == "public"
+    ));
 }
 
 #[test]

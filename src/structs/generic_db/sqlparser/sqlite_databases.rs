@@ -14,7 +14,7 @@ use alloc::{
 };
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Ident, ObjectName, Statement};
+use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Statement};
 
 use super::{ParserDBBuilder, declared_schema, object_name_last_identifier, relation_name_holder};
 use crate::{
@@ -50,6 +50,26 @@ pub(super) fn attach(builder: ParserDBBuilder, name: &Ident) -> Result<ParserDBB
     Ok(builder
         .add_schema(Arc::new(Schema::with_quoted(name.value.clone(), quoted)), ())
         .with_search_path(search_path))
+}
+
+/// Names the table, index, view, trigger or virtual table `statement`
+/// creates under `database` when it names that object without a database, as
+/// SQLite stores the definition of an object in its database.
+pub(super) fn place_created_object(statement: &mut Statement, database: &Ident) {
+    let name = match statement {
+        Statement::CreateTable(create_table) => &mut create_table.name,
+        Statement::CreateIndex(create_index) => {
+            let Some(name) = &mut create_index.name else { return };
+            name
+        }
+        Statement::CreateView(create_view) => &mut create_view.name,
+        Statement::CreateTrigger(create_trigger) => &mut create_trigger.name,
+        Statement::CreateVirtualTable { name, .. } => name,
+        _ => return,
+    };
+    if name.0.len() == 1 {
+        name.0.insert(0, ObjectNamePart::Identifier(database.clone()));
+    }
 }
 
 /// The one database the unqualified names of `statement` resolve in, or
