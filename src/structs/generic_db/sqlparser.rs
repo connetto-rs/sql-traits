@@ -10148,7 +10148,6 @@ impl ParserDB {
         scope: AlterTableScope,
         column: &NamedColumn,
         column_name: &Ident,
-        operation: &AlterColumnOperation,
     ) -> Result<(), crate::errors::Error> {
         if inheritance::is_inherited_column(builder, node, column_name) {
             return Err(crate::errors::Error::GenerationExpressionNotDroppable {
@@ -10162,19 +10161,7 @@ impl ParserDB {
             stored,
             scope,
             crate::errors::InheritedChange::DropExpression,
-        )?;
-        if !scope.only {
-            for child in inheritance::descendants(builder, stored) {
-                Self::refuse_alter_column(
-                    builder,
-                    &child,
-                    Self::stored_node(builder, &child)?,
-                    column,
-                    operation,
-                )?;
-            }
-        }
-        Ok(())
+        )
     }
 
     /// Applies an `ALTER COLUMN` operation, refusing the ones PostgreSQL will
@@ -10211,7 +10198,6 @@ impl ParserDB {
                         scope,
                         &column,
                         column_name,
-                        &operation,
                     )?;
                 }
                 Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;

@@ -43,8 +43,12 @@ fn column_kind_matrix() {
             assert_eq!(result.is_ok(), accepted, "{kind} / {suffix}: {result:?}");
             match result {
                 Ok(database) => assert_shape(&database, "probe", default, identity),
-                Err(Error::GenerationExpressionNotDroppable { reason, .. }) => {
+                Err(error @ Error::GenerationExpressionNotDroppable { reason, .. }) => {
                     assert_eq!(reason, GenerationExpressionRefusal::NotGenerated);
+                    assert_eq!(
+                        error.to_string(),
+                        "Cannot drop generation expression of `probe.value` because the column is not generated."
+                    );
                 }
                 Err(error) => assert!(accepted, "unexpected refusal {error}"),
             }
@@ -71,13 +75,21 @@ fn inherited_and_partitioned_matrix() {
                         assert_shape(&database, "parent", None, false);
                         assert_shape(&database, "child", None, false);
                     }
-                    Err(Error::OnlyRefusedWithChildren { change, .. }) => {
+                    Err(error @ Error::OnlyRefusedWithChildren { change, .. }) => {
                         assert_eq!(target, "ONLY parent");
                         assert_eq!(change, InheritedChange::DropExpression);
+                        assert_eq!(
+                            error.to_string(),
+                            "`ONLY` cannot be used to drop a generation expression of table `parent`, because other tables inherit from it."
+                        );
                     }
-                    Err(Error::GenerationExpressionNotDroppable { reason, .. }) => {
+                    Err(error @ Error::GenerationExpressionNotDroppable { reason, .. }) => {
                         assert!(target.ends_with("child"));
                         assert_eq!(reason, GenerationExpressionRefusal::Inherited);
+                        assert_eq!(
+                            error.to_string(),
+                            "Cannot drop generation expression of `child.value` because the column is inherited."
+                        );
                     }
                     Err(error) => assert_eq!(target, "parent", "unexpected refusal {error}"),
                 }
@@ -165,17 +177,23 @@ fn virtual_generation_is_not_droppable() {
                 ),
             )
             .unwrap();
+            let error = ParserDB::from_statements_with_dialect(
+                statements,
+                "postgres".to_owned(),
+                SqlparserDialect::PostgreSql,
+            )
+            .unwrap_err();
             assert!(matches!(
-                ParserDB::from_statements_with_dialect(
-                    statements,
-                    "postgres".to_owned(),
-                    SqlparserDialect::PostgreSql,
-                ),
-                Err(Error::GenerationExpressionNotDroppable {
+                error,
+                Error::GenerationExpressionNotDroppable {
                     reason: GenerationExpressionRefusal::Virtual,
                     ..
-                })
+                }
             ));
+            assert_eq!(
+                error.to_string(),
+                "Cannot drop generation expression of `probe.value` because the column is virtual."
+            );
         }
     }
 }
