@@ -1,0 +1,7 @@
+CREATE ROLE app_reader NOLOGIN;
+CREATE ROLE app_admin NOLOGIN;
+CREATE TABLE docs (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, body TEXT);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, UPDATE ON docs TO app_reader;
+CREATE POLICY sel ON docs FOR SELECT USING (true);
+CREATE POLICY upd ON docs FOR UPDATE USING (true) WITH CHECK (owner = current_setting('app.user_id', true));

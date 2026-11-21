@@ -1,0 +1,47 @@
+[[answer]]
+caller = "alice"
+row = "tdocs:1"
+statement = 'SELECT "id" FROM "tdocs"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "tdocs:2"
+statement = 'SELECT "id" FROM "tdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "tdocs:1"
+statement = 'SELECT "id" FROM "tdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "tdocs:2"
+statement = 'SELECT "id" FROM "tdocs"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "members:alice"
+statement = 'SELECT "team", "user_id" FROM "members"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "members:bob"
+statement = 'SELECT "team", "user_id" FROM "members"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "members:alice"
+statement = 'SELECT "team", "user_id" FROM "members"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "members:bob"
+statement = 'SELECT "team", "user_id" FROM "members"'
+postgres = "visible"

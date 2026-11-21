@@ -1,0 +1,43 @@
+[[answer]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"
+
+[[answer]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"
+
+[[answer]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"
+
+[[answer]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"
+
+[[answer]]
+caller = "alice"
+row = "docs:3"
+statement = """INSERT INTO "docs" ("body", "id", "owner") VALUES ('c', 3, 'alice')"""
+postgres = "changed"
+
+[[answer]]
+caller = "bob"
+row = "docs:3"
+statement = """INSERT INTO "docs" ("body", "id", "owner") VALUES ('c', 3, 'alice')"""
+postgres = "changed"

@@ -1,0 +1,9 @@
+[[tables]]
+name = "docs"
+key = ["id"]
+columns = ["id"]
+
+[[callers]]
+name = "holder"
+role = "app_reader"
+settings = { "app.user_id" = "carol", "app.subjects" = "alice,bob" }

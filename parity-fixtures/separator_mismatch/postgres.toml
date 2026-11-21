@@ -1,0 +1,11 @@
+[[answer]]
+caller = "holder"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "holder"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "hidden"

@@ -1,0 +1,31 @@
+[[answer]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = 'infinite recursion detected in policy for relation "docs"'
+
+[[answer]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = 'infinite recursion detected in policy for relation "docs"'
+
+[[answer]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = 'infinite recursion detected in policy for relation "docs"'
+
+[[answer]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+
+[answer.postgres]
+error = 'infinite recursion detected in policy for relation "docs"'

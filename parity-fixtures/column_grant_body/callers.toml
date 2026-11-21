@@ -1,0 +1,14 @@
+[[tables]]
+name = "docs"
+key = ["id"]
+columns = ["id", "body"]
+
+[[callers]]
+name = "alice"
+role = "app_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "" }
+
+[[callers]]
+name = "bob"
+role = "app_reader"
+settings = { "app.user_id" = "bob", "app.subjects" = "" }

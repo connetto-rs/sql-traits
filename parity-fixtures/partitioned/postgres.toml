@@ -1,0 +1,23 @@
+[[answer]]
+caller = "alice"
+row = "p:1"
+statement = 'SELECT "id" FROM "p"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "p:2"
+statement = 'SELECT "id" FROM "p"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "p:1"
+statement = 'SELECT "id" FROM "p"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "p:2"
+statement = 'SELECT "id" FROM "p"'
+postgres = "visible"

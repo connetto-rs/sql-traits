@@ -1,0 +1,31 @@
+[[answer]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id", "body" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"
+
+[[answer]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id", "body" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"
+
+[[answer]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id", "body" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"
+
+[[answer]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id", "body" FROM "docs"'
+
+[answer.postgres]
+error = "permission denied for table docs"

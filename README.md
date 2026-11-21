@@ -16,6 +16,7 @@ This library provides a set of traits to abstract over SQL database schemas, all
 - **Parser integration**. `ParserDB` builds schema models from `SQL` declarations and tracks PostgreSQL generated-array ownership through renames, drops, and transactions.
 - **Metadata Support**: Comprehensive support for table attributes, indices, and constraints.
 - **Canonical expressions**. The optional `canonicalize` feature implements [sqlparser-canonicalize](https://github.com/connetto-rs/sqlparser-canonicalize)'s `SemanticContext` through `SemanticProofs`, so a `CHECK` as written and as PostgreSQL deparses it read as one canonical text.
+- **RLS parity fixtures**. The optional `parity-fixtures` feature ships [rls-parity](https://github.com/connetto-rs/rls-parity)'s recorded row-level security cases with PostgreSQL 18's answers, so a translator's CI can judge its engine's answers against them.
 
 ## Usage
 

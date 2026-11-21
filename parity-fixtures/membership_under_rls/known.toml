@@ -1,0 +1,2 @@
+[openfga]
+refusal = "8, rls2fga refuses a membership table under its own row level security, which the replica translates"

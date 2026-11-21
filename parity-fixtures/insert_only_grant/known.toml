@@ -1,0 +1,41 @@
+[[sqlite.row]]
+caller = "alice"
+row = "docs:3"
+statement = """INSERT INTO "docs" ("body", "id", "owner") VALUES ('c', 3, 'alice')"""
+direction = "narrower"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[sqlite.row]]
+caller = "bob"
+row = "docs:3"
+statement = """INSERT INTO "docs" ("body", "id", "owner") VALUES ('c', 3, 'alice')"""
+direction = "narrower"
+finding = "5, the replica leaves off a table the role cannot read, and every write to it"
+
+[[openfga.row]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
+
+[[openfga.row]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
+
+[[openfga.row]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"
+
+[[openfga.row]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "5, missing `SELECT` privilege is hidden while PostgreSQL raises a privilege error"

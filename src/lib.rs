@@ -21,6 +21,8 @@ extern crate alloc;
 
 pub mod errors;
 mod impls;
+#[cfg(feature = "parity-fixtures")]
+pub mod parity;
 pub mod structs;
 pub mod traits;
 pub mod upstream_pending;

@@ -1,0 +1,14 @@
+[[tables]]
+name = "udocs"
+key = ["id"]
+columns = ["id"]
+
+[[callers]]
+name = "a"
+role = "app_reader"
+settings = { "app.user_id" = "00000000-0000-0000-0000-00000000000a", "app.subjects" = "" }
+
+[[callers]]
+name = "b"
+role = "app_reader"
+settings = { "app.user_id" = "00000000-0000-0000-0000-00000000000b", "app.subjects" = "" }

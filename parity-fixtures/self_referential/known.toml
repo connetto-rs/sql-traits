@@ -1,0 +1,61 @@
+[sqlite]
+refusal = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[sqlite.row]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[sqlite.row]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[sqlite.row]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[sqlite.row]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+direction = "refused"
+finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
+
+[openfga]
+refusal = "8, rls2fga refuses a recursive policy that PostgreSQL rejects during the read"
+
+[[openfga.row]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"
+
+[[openfga.row]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"
+
+[[openfga.row]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"
+
+[[openfga.row]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+direction = "error"
+finding = "8, recursive policy reads are hidden while PostgreSQL raises a recursion error"

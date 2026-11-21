@@ -1,0 +1,30 @@
+[sqlite]
+refusal = "8, SQLite translation refuses partitioned tables, which rls2fga accepts"
+
+[[sqlite.row]]
+caller = "alice"
+row = "p:1"
+statement = 'SELECT "id" FROM "p"'
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"
+
+[[sqlite.row]]
+caller = "alice"
+row = "p:2"
+statement = 'SELECT "id" FROM "p"'
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"
+
+[[sqlite.row]]
+caller = "bob"
+row = "p:1"
+statement = 'SELECT "id" FROM "p"'
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"
+
+[[sqlite.row]]
+caller = "bob"
+row = "p:2"
+statement = 'SELECT "id" FROM "p"'
+direction = "refused"
+finding = "8, SQLite translation refuses partitioned tables"

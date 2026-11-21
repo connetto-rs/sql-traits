@@ -1,0 +1,27 @@
+[[openfga.row]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id", "body" FROM "docs"'
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
+
+[[openfga.row]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id", "body" FROM "docs"'
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
+
+[[openfga.row]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id", "body" FROM "docs"'
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"
+
+[[openfga.row]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id", "body" FROM "docs"'
+direction = "error"
+finding = "5, denied column access is hidden while PostgreSQL raises a privilege error"

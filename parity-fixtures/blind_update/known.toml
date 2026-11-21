@@ -1,0 +1,13 @@
+[[sqlite.row]]
+caller = "alice"
+row = "docs:2"
+statement = """UPDATE "docs" SET "body" = 'edited'"""
+direction = "narrower"
+finding = "9, a blind `UPDATE` on the replica reaches only the rows the caller reads"
+
+[[sqlite.row]]
+caller = "bob"
+row = "docs:1"
+statement = """UPDATE "docs" SET "body" = 'edited'"""
+direction = "narrower"
+finding = "9, a blind `UPDATE` on the replica reaches only the rows the caller reads"

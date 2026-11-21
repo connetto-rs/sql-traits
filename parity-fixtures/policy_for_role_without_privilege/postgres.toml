@@ -1,0 +1,39 @@
+[[answer]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "carol"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "carol"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "docs:3"
+statement = """INSERT INTO "docs" ("body", "id", "owner") VALUES ('c', 3, 'alice')"""
+
+[answer.postgres]
+rejected = "42501"
+
+[[answer]]
+caller = "carol"
+row = "docs:3"
+statement = """INSERT INTO "docs" ("body", "id", "owner") VALUES ('c', 3, 'alice')"""
+
+[answer.postgres]
+rejected = "42501"

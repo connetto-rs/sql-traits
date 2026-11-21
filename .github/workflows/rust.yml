@@ -32,7 +32,7 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Run tests
-      run: cargo test --all-targets --features git,serde,canonicalize
+      run: cargo test --all-targets --features git,serde,canonicalize,parity-fixtures
 
   msrv:
     name: MSRV
@@ -57,6 +57,7 @@ jobs:
         cargo check --locked -p sql-traits --lib
         cargo check --locked -p sql-traits --lib --features serde
         cargo check --locked -p sql-traits --lib --features git
+        cargo check --locked -p sql-traits --lib --features parity-fixtures
         cargo check --locked -p sql-traits --lib --no-default-features
         cargo check --locked -p sql-traits --lib --no-default-features --features serde
         cargo check --locked -p sql-traits --lib --no-default-features --features canonicalize
@@ -113,7 +114,7 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Run clippy
-      run: cargo clippy --all-targets --features git,serde,canonicalize -- -D warnings
+      run: cargo clippy --all-targets --features git,serde,canonicalize,parity-fixtures -- -D warnings
     - name: Clippy under no_std
       run: |
         cargo clippy --lib --no-default-features -- -D warnings
@@ -130,7 +131,7 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
     - name: Check documentation
-      run: cargo doc --no-deps --document-private-items --features git,serde,canonicalize
+      run: cargo doc --no-deps --document-private-items --features git,serde,canonicalize,parity-fixtures
       env:
         RUSTDOCFLAGS: -D warnings
 
@@ -152,10 +153,10 @@ jobs:
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
     - name: Measure all targets
-      run: cargo llvm-cov --workspace --all-targets --features git,serde,canonicalize --no-report
+      run: cargo llvm-cov --workspace --all-targets --features git,serde,canonicalize,parity-fixtures --no-report
     # Coverage reads only the `__llvm_cov*` and `__llvm_prf_*` sections, which survive stripping the symbol table of each persisted doctest binary.
     - name: Measure doctests and write the report
-      run: cargo llvm-cov --workspace --doc --features git,serde,canonicalize --no-clean --lcov --output-path target/coverage.lcov
+      run: cargo llvm-cov --workspace --doc --features git,serde,canonicalize,parity-fixtures --no-clean --lcov --output-path target/coverage.lcov
       env:
         RUSTDOCFLAGS: -C strip=symbols
     - name: Upload coverage to Codecov

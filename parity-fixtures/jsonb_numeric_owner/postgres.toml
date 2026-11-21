@@ -1,0 +1,53 @@
+[[answer]]
+caller = "seven"
+row = "jdocs:1"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "visible"
+
+[[answer]]
+caller = "seven"
+row = "jdocs:2"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "seven"
+row = "jdocs:3"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "eight"
+row = "jdocs:1"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "eight"
+row = "jdocs:2"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "visible"
+
+[[answer]]
+caller = "eight"
+row = "jdocs:3"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "true"
+row = "jdocs:1"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "true"
+row = "jdocs:2"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "true"
+row = "jdocs:3"
+statement = 'SELECT "id" FROM "jdocs"'
+postgres = "visible"
