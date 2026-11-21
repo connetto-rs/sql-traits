@@ -157,6 +157,7 @@ fn a_foreign_key_naming_an_undeclared_column_does_not_abort() {
         Some(LookupError::ColumnNotFound {
             table_name: "parent".to_string(),
             column_name: "id".to_string(),
+            site: sql_traits::errors::ColumnLookupSite::ForeignKey,
         })
     );
 }

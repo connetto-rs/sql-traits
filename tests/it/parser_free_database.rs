@@ -2852,6 +2852,7 @@ fn an_unresolvable_key_column_stops_the_ordinals() -> Result<(), LookupError> {
         Err(LookupError::ColumnNotFound {
             table_name: String::from("docs"),
             column_name: String::from("dropped_id"),
+            site: sql_traits::errors::ColumnLookupSite::Key,
         })
     );
 
@@ -2881,6 +2882,7 @@ fn a_wholly_unresolvable_key_names_its_first_column() {
         Err(LookupError::ColumnNotFound {
             table_name: String::from("docs"),
             column_name: String::from("dropped_id"),
+            site: sql_traits::errors::ColumnLookupSite::Key,
         })
     );
 }

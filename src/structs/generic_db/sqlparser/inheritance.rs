@@ -1158,6 +1158,7 @@ fn merge_local_columns(
                     &resolve_parent(context.builder, root, context.child_name)?.name,
                 ),
                 column_name: context.builder.dialect().stored_name(&column.name),
+                site: crate::errors::ColumnLookupSite::Column,
             }
             .into());
         } else {

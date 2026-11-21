@@ -1815,6 +1815,7 @@ pub trait TableLike:
                     .stored_spelling(self.table_name(), self.table_name_is_quoted()),
                 column_name: crate::impls::SqlparserDialect::for_error_names(database.dialect())
                     .stored_spelling(key_column.column_name(), key_column.column_name_is_quoted()),
+                site: crate::errors::ColumnLookupSite::Key,
             });
         }
         Ok(column_ids)
