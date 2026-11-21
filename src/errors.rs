@@ -2176,6 +2176,36 @@ pub enum Error {
         host_table: String,
     },
     #[error(
+        "Cannot use the deferrable primary key of table `{referenced_table}` for the foreign key in table `{host_table}`."
+    )]
+    /// Error indicating that a foreign key naming no referenced columns
+    /// reaches a table whose primary key is deferrable.
+    ///
+    /// A deferrable key may hold duplicates until the transaction commits, so
+    /// PostgreSQL refuses it with `cannot use a deferrable primary key for
+    /// referenced table`, even when a unique key covers the same columns.
+    DeferrablePrimaryKeyForForeignKey {
+        /// Name of the referenced table.
+        referenced_table: String,
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+    },
+    #[error(
+        "Cannot use a deferrable unique constraint of table `{referenced_table}` for the foreign key in table `{host_table}`."
+    )]
+    /// Error indicating that only deferrable keys cover the columns a foreign
+    /// key references.
+    ///
+    /// PostgreSQL passes over a deferrable key when it looks for the one a
+    /// foreign key reads, and refuses with `cannot use a deferrable unique
+    /// constraint for referenced table` when no other key covers the columns.
+    DeferrableUniqueKeyForForeignKey {
+        /// Name of the referenced table.
+        referenced_table: String,
+        /// Name of the host table containing the foreign key.
+        host_table: String,
+    },
+    #[error(
         "Foreign key in table `{host_table}` names {host_columns} column(s), but its target in table `{referenced_table}` has {referenced_columns}."
     )]
     /// Error indicating that a foreign key names a different number of host

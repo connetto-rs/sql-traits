@@ -1,6 +1,8 @@
 //! When PostgreSQL checks a constraint, as `pg_constraint.condeferrable` and
 //! `pg_constraint.condeferred` record it.
 
+use sqlparser::ast::{ConstraintCharacteristics, DeferrableInitial};
+
 /// When a constraint is checked within a transaction, mirroring
 /// `pg_constraint.condeferrable` and `pg_constraint.condeferred`.
 ///
@@ -42,6 +44,22 @@ pub enum ConstraintDeferral {
 }
 
 impl ConstraintDeferral {
+    /// Reads the deferral a constraint's written characteristics declare.
+    ///
+    /// `NOT DEFERRABLE` outweighs `INITIALLY DEFERRED`, which is how SQLite
+    /// checks a key declaring both and a combination every other dialect
+    /// refuses at ingestion. Otherwise `INITIALLY DEFERRED` implies
+    /// `DEFERRABLE`, as in PostgreSQL.
+    pub(crate) fn of(characteristics: Option<ConstraintCharacteristics>) -> Self {
+        let characteristics = characteristics.unwrap_or_default();
+        match (characteristics.deferrable, characteristics.initially) {
+            (Some(false), _) => Self::NotDeferrable,
+            (_, Some(DeferrableInitial::Deferred)) => Self::InitiallyDeferred,
+            (Some(true), _) => Self::InitiallyImmediate,
+            (None, _) => Self::NotDeferrable,
+        }
+    }
+
     /// Returns whether `SET CONSTRAINTS` can move the check of the
     /// constraint, matching `pg_constraint.condeferrable`.
     #[must_use]

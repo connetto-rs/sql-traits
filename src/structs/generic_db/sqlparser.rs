@@ -41,7 +41,7 @@ use crate::{
     errors::{KeyConstraint, LookupError, ObjectKind},
     impls::{PrivilegeKind, SqlparserDialect},
     structs::{
-        ColumnIdentity, ColumnMetadata, DeclaredVirtualTable, DefaultPrivilege,
+        ColumnIdentity, ColumnMetadata, ConstraintDeferral, DeclaredVirtualTable, DefaultPrivilege,
         DefaultPrivilegeKind, ForeignTableSource, FunctionKind, GenericDB, IdentifierCase,
         MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership, Schema,
         SchemaProfile, Sequence, TableAttribute, TableMetadata, TriggerEnablement, UserDefinedType,
@@ -3666,31 +3666,49 @@ fn key_columns_match(left: &[&Ident], right: &[&Ident], case: IdentifierCase) ->
         && left.iter().all(|wanted| right.iter().any(|have| case_idents_match(wanted, have, case)))
 }
 
+/// A set of columns on a table that a foreign key may point at.
+struct DeclaredKey<'table> {
+    /// The key's columns, as written.
+    columns: Vec<&'table Ident>,
+    /// Whether `SET CONSTRAINTS` may defer the key's check, which leaves it
+    /// unusable to a foreign key.
+    deferrable: bool,
+}
+
 /// Collects every set of columns on `table` that a foreign key may point at:
 /// its primary key and each of its unique constraints, in both the inline and
 /// the table-constraint spelling.
 ///
 /// A `CREATE UNIQUE INDEX` counts too, and lives outside the node, so
 /// [`is_candidate_key`] takes those separately.
-fn declared_candidate_keys(table: &CreateTable) -> Vec<Vec<&Ident>> {
-    let mut keys: Vec<Vec<&Ident>> = Vec::new();
+fn declared_candidate_keys(table: &CreateTable) -> Vec<DeclaredKey<'_>> {
+    let mut keys: Vec<DeclaredKey<'_>> = Vec::new();
 
     for column in &table.columns {
-        if column.options.iter().any(|option| {
-            matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
-        }) {
-            keys.push(vec![&column.name]);
+        for option in &column.options {
+            let characteristics = match &option.option {
+                ColumnOption::PrimaryKey(primary_key) => primary_key.characteristics,
+                ColumnOption::Unique(unique) => unique.characteristics,
+                _ => continue,
+            };
+            keys.push(DeclaredKey {
+                columns: vec![&column.name],
+                deferrable: ConstraintDeferral::of(characteristics).is_deferrable(),
+            });
         }
     }
 
     for constraint in &table.constraints {
-        let columns = match constraint {
-            TableConstraint::PrimaryKey(pk) => &pk.columns,
-            TableConstraint::Unique(unique) => &unique.columns,
+        let (columns, characteristics) = match constraint {
+            TableConstraint::PrimaryKey(pk) => (&pk.columns, pk.characteristics),
+            TableConstraint::Unique(unique) => (&unique.columns, unique.characteristics),
             _ => continue,
         };
-        if let Some(key) = plain_key_columns(columns) {
-            keys.push(key);
+        if let Some(columns) = plain_key_columns(columns) {
+            keys.push(DeclaredKey {
+                columns,
+                deferrable: ConstraintDeferral::of(characteristics).is_deferrable(),
+            });
         }
     }
 
@@ -3700,18 +3718,50 @@ fn declared_candidate_keys(table: &CreateTable) -> Vec<Vec<&Ident>> {
 /// Whether `referred` names, in any order, the columns of the primary key of
 /// `table`, of one of its unique constraints, or of one of `unique_indexes`,
 /// the unique indexes built on it by `CREATE UNIQUE INDEX`, which are the
-/// keys a foreign key may reference.
+/// keys a foreign key may reference. A deferrable key does not count, since
+/// it may hold duplicates until the transaction commits.
 pub(crate) fn is_candidate_key<'index>(
     table: &CreateTable,
     unique_indexes: impl IntoIterator<Item = &'index CreateIndex>,
     referred: &[&Ident],
     case: IdentifierCase,
 ) -> bool {
-    declared_candidate_keys(table).iter().any(|key| key_columns_match(referred, key, case))
+    declared_candidate_keys(table)
+        .iter()
+        .any(|key| !key.deferrable && key_columns_match(referred, &key.columns, case))
         || unique_indexes
             .into_iter()
             .filter_map(|index| plain_key_columns(&index.columns))
             .any(|key| key_columns_match(referred, &key, case))
+}
+
+/// Whether a deferrable key of `table` names, in any order, the columns
+/// `referred` lists.
+fn is_deferrable_key(table: &CreateTable, referred: &[&Ident], case: IdentifierCase) -> bool {
+    declared_candidate_keys(table)
+        .iter()
+        .any(|key| key.deferrable && key_columns_match(referred, &key.columns, case))
+}
+
+/// Whether the primary key of `table` is deferrable.
+fn has_deferrable_primary_key(table: &CreateTable) -> bool {
+    let column_key = table.columns.iter().flat_map(|column| &column.options).find_map(|option| {
+        match &option.option {
+            ColumnOption::PrimaryKey(primary_key) => Some(primary_key.characteristics),
+            _ => None,
+        }
+    });
+    let table_key = || {
+        table.constraints.iter().find_map(|constraint| {
+            match constraint {
+                TableConstraint::PrimaryKey(primary_key) => Some(primary_key.characteristics),
+                _ => None,
+            }
+        })
+    };
+    column_key
+        .or_else(table_key)
+        .is_some_and(|characteristics| ConstraintDeferral::of(characteristics).is_deferrable())
 }
 
 /// Refuses a foreign key whose written column lists differ in length, the one
@@ -4388,7 +4438,8 @@ struct BoundRelation {
 struct ForeignKeyBinding {
     /// Qualifier that table is stored under.
     qualifier: Option<Ident>,
-    /// The table's primary key columns, read only for a key naming none.
+    /// The table's primary key columns, read only for a key naming none and
+    /// left unread when that key is deferrable, which no foreign key reads.
     referred_columns: Option<Vec<Ident>>,
 }
 
@@ -4398,7 +4449,9 @@ impl ForeignKeyBinding {
     fn of(target: &CreateTable, foreign_key: &ForeignKeyConstraint, case: IdentifierCase) -> Self {
         Self {
             qualifier: stored_qualifier(&target.name),
-            referred_columns: if foreign_key.referred_columns.is_empty() {
+            referred_columns: if foreign_key.referred_columns.is_empty()
+                && !has_deferrable_primary_key(target)
+            {
                 primary_key_columns(target, case)
             } else {
                 None
@@ -7011,8 +7064,14 @@ impl ParserDB {
 
         // A `CREATE UNIQUE INDEX` counts and lives in the builder, not the
         // node. A key still naming no columns was bound to a target holding no
-        // primary key.
+        // primary key it may read, which a deferrable one is not.
         let referred: Vec<&Ident> = fk.referred_columns.iter().collect();
+        if referred.is_empty() && has_deferrable_primary_key(referenced_table) {
+            return Err(crate::errors::Error::DeferrablePrimaryKeyForForeignKey {
+                referenced_table: referenced_table_name,
+                host_table: create_table.name.to_string(),
+            });
+        }
         let unique_indexes =
             builder.indices().iter().map(|(index, _)| index.attribute()).filter(|index| {
                 index.unique
@@ -7025,6 +7084,12 @@ impl ParserDB {
         if referred.is_empty()
             || !is_candidate_key(referenced_table, unique_indexes, &referred, case)
         {
+            if is_deferrable_key(referenced_table, &referred, case) {
+                return Err(crate::errors::Error::DeferrableUniqueKeyForForeignKey {
+                    referenced_table: referenced_table_name,
+                    host_table: create_table.name.to_string(),
+                });
+            }
             return Err(crate::errors::Error::ReferencedColumnsNotUniqueForForeignKey {
                 referenced_columns: referred
                     .iter()
