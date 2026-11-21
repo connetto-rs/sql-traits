@@ -10043,12 +10043,12 @@ impl ParserDB {
             let mut operation = match action {
                 alter_passes::Work::Operation(operation) => operation,
                 alter_passes::Work::ColumnConstraint { column, position, option } => {
-                    let position = work.option_position(&column, position);
+                    let (column, position) = work.option_position(column, position);
                     builder = alter_passes::install_column_constraint(
                         builder,
                         &alter_table.name,
                         scope,
-                        &column,
+                        column,
                         position,
                         option,
                         persistence_before_change,
@@ -10541,7 +10541,7 @@ impl ParserDB {
             });
         }
         let deferred = if matches!(builder.dialect(), SqlparserDialect::PostgreSql) {
-            alter_passes::DeferredColumn::extract(column_def)
+            alter_passes::DeferredColumn::extract(column_def, stored)
         } else {
             None
         };

@@ -8,8 +8,8 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AlterTableScope, NamedColumn, ParserDB, ParserDBBuilder, TypeArrays, constraint_validity,
-    inheritance, referenced_keys,
+    AlterTableScope, NamedColumn, ParserDB, ParserDBBuilder, StoredTable, TypeArrays,
+    constraint_validity, inheritance, referenced_keys,
 };
 use crate::errors::{Error, LookupError};
 
@@ -43,8 +43,9 @@ impl Pass {
 }
 
 /// Original positions of options already installed on an added column.
-struct ColumnPositions {
+pub(super) struct ColumnPositions {
     column: Ident,
+    stored: StoredTable,
     present: Vec<usize>,
     default: Option<usize>,
 }
@@ -57,7 +58,7 @@ pub(super) struct DeferredColumn {
 
 impl DeferredColumn {
     /// Removes constraints while retaining the column's immediate requirements.
-    pub(super) fn extract(column: &mut ColumnDef) -> Option<Self> {
+    pub(super) fn extract(column: &mut ColumnDef, stored: &StoredTable) -> Option<Self> {
         if !column.options.iter().any(|option| is_deferred_option(&option.option)) {
             return None;
         }
@@ -85,7 +86,12 @@ impl DeferredColumn {
             .map(|option| (position.get() - 1, option))
             .collect();
         Some(Self {
-            positions: ColumnPositions { column: column.name.clone(), present, default },
+            positions: ColumnPositions {
+                column: column.name.clone(),
+                stored: stored.clone(),
+                present,
+                default,
+            },
             constraints,
         })
     }
@@ -109,7 +115,7 @@ fn is_deferred_option(option: &ColumnOption) -> bool {
 )]
 pub(super) enum Work {
     Operation(AlterTableOperation),
-    ColumnConstraint { column: Ident, position: usize, option: ColumnOptionDef },
+    ColumnConstraint { column: usize, position: usize, option: ColumnOptionDef },
 }
 
 /// Stable queues for catalog passes and their generated work.
@@ -156,25 +162,22 @@ impl Queue {
         for (position, option) in deferred.constraints {
             self.push(
                 column_constraint_pass(&option.option),
-                Work::ColumnConstraint {
-                    column: deferred.positions.column.clone(),
-                    position,
-                    option,
-                },
+                Work::ColumnConstraint { column: self.columns.len(), position, option },
             );
         }
         self.columns.push(deferred.positions);
     }
 
     /// Restores an option among the original options already present.
-    pub(super) fn option_position(&mut self, column: &Ident, original: usize) -> usize {
-        let Some(positions) = self.columns.iter_mut().find(|positions| positions.column == *column)
-        else {
-            return original;
-        };
+    pub(super) fn option_position(
+        &mut self,
+        column: usize,
+        original: usize,
+    ) -> (&ColumnPositions, usize) {
+        let positions = &mut self.columns[column];
         let position = positions.present.partition_point(|present| *present < original);
         positions.present.insert(position, original);
-        position
+        (positions, position)
     }
 
     /// Removes the original default's position when a command replaces it.
@@ -279,7 +282,15 @@ pub(super) fn transform_constraint(
     constraint: &TableConstraint,
 ) -> Result<Pass, Error> {
     if let Some(stored) = ParserDB::alter_table_target(builder, table_name, scope)? {
-        super::constraint_using_index::validate_adoption(builder, &stored, constraint)?;
+        if let TableConstraint::PrimaryKeyUsingIndex(adoption)
+        | TableConstraint::UniqueUsingIndex(adoption) = constraint
+        {
+            super::constraint_using_index::validate_adoption(
+                builder,
+                &stored,
+                &adoption.index_name,
+            )?;
+        }
         ParserDB::refuse_repeated_added_key_column(builder, &stored, constraint)?;
     }
     Ok(constraint_pass(constraint))
@@ -424,15 +435,13 @@ pub(super) fn install_column_constraint(
     mut builder: ParserDBBuilder,
     table_name: &ObjectName,
     scope: AlterTableScope,
-    column: &Ident,
+    column: &ColumnPositions,
     position: usize,
     mut option: ColumnOptionDef,
     persistence: Option<bool>,
 ) -> Result<ParserDBBuilder, Error> {
-    let Some(stored) = ParserDB::alter_table_target(&builder, table_name, scope)? else {
-        return Ok(builder);
-    };
-    ParserDB::refuse_unaddable_column_option(&builder, &stored, &option)?;
+    let stored = &column.stored;
+    ParserDB::refuse_unaddable_column_option(&builder, stored, &option)?;
     ParserDB::refuse_column_reference_from_permanent_start(
         &builder,
         table_name,
@@ -444,7 +453,7 @@ pub(super) fn install_column_constraint(
         referenced_keys::option_foreign_keys,
         |option| {
             if let ColumnOption::ForeignKey(key) = &mut option.option {
-                builder.bind_foreign_key(&stored, key)?;
+                builder.bind_foreign_key(stored, key)?;
             }
             Ok(())
         },
@@ -453,13 +462,13 @@ pub(super) fn install_column_constraint(
         builder,
         table_name,
         scope,
-        column,
+        &column.column,
         &option.option,
         false,
         |declared| {
             declared.options.insert(position.min(declared.options.len()), option.clone());
         },
     )?;
-    referenced_keys::record_primary_key_references(&mut builder, &stored, &bound_to_primary);
+    referenced_keys::record_primary_key_references(&mut builder, stored, &bound_to_primary);
     Ok(builder)
 }

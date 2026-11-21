@@ -1458,3 +1458,115 @@ fn generic_expression_drop_accepts_only_parent() {
     );
     assert!(result.is_ok(), "{result:?}");
 }
+
+#[test]
+fn generic_missing_table_metadata_refusals() {
+    for operation in [
+        "ENABLE ROW LEVEL SECURITY",
+        "DISABLE ROW LEVEL SECURITY",
+        "FORCE ROW LEVEL SECURITY",
+        "NO FORCE ROW LEVEL SECURITY",
+        "OWNER TO CURRENT_USER",
+        "REPLICA IDENTITY FULL",
+    ] {
+        let result = ParserDB::parse::<sqlparser::dialect::GenericDialect>(&format!(
+            "ALTER TABLE absent {operation};"
+        ));
+        assert_eq!(
+            result.err().map(|error| format!("{error:?}")),
+            Some("AlterTableNotFound { table_name: \"absent\" }".to_owned()),
+            "{operation}"
+        );
+    }
+}
+
+#[test]
+fn generic_missing_table_skips_unsupported_actions() {
+    for operation in
+        ["DROP PRIMARY KEY", "DROP FOREIGN KEY absent", "DROP INDEX absent", "SWAP WITH other"]
+    {
+        let result = ParserDB::parse::<sqlparser::dialect::GenericDialect>(&format!(
+            "ALTER TABLE IF EXISTS absent {operation};"
+        ));
+        assert!(result.is_ok(), "{operation} {result:?}");
+    }
+}
+
+#[test]
+fn mysql_redeclaration_refuses_missing_check_column() {
+    for operation in
+        ["CHANGE COLUMN x y int CHECK(absent>0)", "MODIFY COLUMN x int CHECK(absent>0)"]
+    {
+        let result = ParserDB::parse::<sqlparser::dialect::MySqlDialect>(&format!(
+            "CREATE TABLE probe(z int PRIMARY KEY, x int); ALTER TABLE probe {operation};"
+        ));
+        assert_eq!(
+            result.err().map(|error| format!("{error:?}")),
+            Some("UnknownColumn { reference: \"absent\" }".to_owned()),
+            "{operation}"
+        );
+    }
+}
+
+#[test]
+fn alteration_refuses_shell_column_type() {
+    let sql = "CREATE TYPE shell; CREATE TABLE probe(x int); ALTER TABLE probe ALTER COLUMN x TYPE shell;";
+    for result in [
+        ParserDB::parse::<PostgreSqlDialect>(sql),
+        ParserDB::parse::<sqlparser::dialect::GenericDialect>(sql),
+    ] {
+        assert_eq!(
+            result.err().map(|error| format!("{error:?}")),
+            Some("TypeIsOnlyShell { type_name: \"shell\" }".to_owned())
+        );
+    }
+}
+
+#[test]
+fn deferred_foreign_key_refuses_missing_referenced_column() {
+    let result = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE target(id int PRIMARY KEY); CREATE TABLE probe(z int);
+         ALTER TABLE probe ADD COLUMN x int REFERENCES target(absent);",
+    );
+    assert_eq!(
+        result.err().map(|error| format!("{error:?}")),
+        Some("ReferencedColumnNotFoundForForeignKey { referenced_column: \"absent\", referenced_table: \"target\", host_table: \"probe\" }".to_owned())
+    );
+}
+
+#[test]
+fn replaced_default_follows_deferred_constraints() -> Result<(), sql_traits::errors::Error> {
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE target(id int PRIMARY KEY); CREATE TABLE probe(z int);
+         ALTER TABLE probe ADD COLUMN x int UNIQUE DEFAULT 1 REFERENCES target(id),
+         ALTER COLUMN x SET DEFAULT 2;",
+    )?;
+    let options = database
+        .tables()
+        .filter(|table| table.name.to_string() == "probe")
+        .flat_map(|table| table.columns.iter().filter(|column| column.name.value == "x"))
+        .flat_map(|column| column.options.iter().map(|option| option.option.to_string()))
+        .collect::<Vec<_>>();
+    assert_eq!(options, ["UNIQUE", "REFERENCES target (id)", "DEFAULT 2"]);
+    Ok(())
+}
+
+#[test]
+fn generic_replica_identity_keeps_last_setting() -> Result<(), sql_traits::errors::Error> {
+    use sql_traits::prelude::TableLike;
+    for (operations, expected) in [
+        ("REPLICA IDENTITY FULL", "Full"),
+        ("REPLICA IDENTITY FULL, REPLICA IDENTITY NOTHING", "Nothing"),
+        ("REPLICA IDENTITY NOTHING, REPLICA IDENTITY DEFAULT", "Default"),
+    ] {
+        let database = ParserDB::parse::<sqlparser::dialect::GenericDialect>(&format!(
+            "CREATE TABLE probe(z int); ALTER TABLE probe {operations};"
+        ))?;
+        let identities = database
+            .tables()
+            .map(|table| table.replica_identity(&database).map(|identity| format!("{identity:?}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(identities, [expected]);
+    }
+    Ok(())
+}
