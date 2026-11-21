@@ -2570,6 +2570,20 @@ pub enum Error {
         /// Reason why the index is invalid.
         reason: String,
     },
+    #[error("access method \"{access_method}\" does not support unique indexes")]
+    /// PostgreSQL refuses unique indexes whose access method lacks uniqueness
+    /// support.
+    AccessMethodWithoutUniqueSupport {
+        /// The resolved access method name.
+        access_method: String,
+    },
+    #[error("access method \"{access_method}\" does not support exclusion constraints")]
+    /// PostgreSQL refuses exclusion constraints whose access method lacks
+    /// exclusion support.
+    AccessMethodWithoutExclusionSupport {
+        /// The resolved access method name.
+        access_method: String,
+    },
     #[error("cannot use subquery in {place}")]
     /// Error indicating that an expression PostgreSQL stores and evaluates
     /// without running a query holds a subquery.

@@ -95,6 +95,7 @@ mod identifier_bytes;
 mod implicit_sequences;
 mod implied_referenced_columns;
 mod incremental_schema_ingestion;
+mod index_access_method_support;
 mod index_key_options;
 mod index_schema;
 mod indexed_lookup_equivalence;
