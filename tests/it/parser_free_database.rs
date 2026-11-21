@@ -1402,6 +1402,10 @@ impl TriggerLike for MemoryTrigger {
         Ok(TriggerEnablement::Origin)
     }
 
+    fn deferral(&self) -> Option<ConstraintDeferral> {
+        None
+    }
+
     fn function<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db MemoryFunction>
     where
         Self: 'db,
