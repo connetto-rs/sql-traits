@@ -407,6 +407,7 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
         .chain(joins)
         .chain(grant.caps().iter().map(|cap| render_cap(cap, grant.joined_rows())))
         .chain(anti_joins)
+        .chain(grant.exclusions().iter().map(render_exclusion))
         .collect();
     let filter = if conditions.is_empty() {
         String::new()
@@ -415,6 +416,18 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
     };
     let returned = render_returned(grant.returned(), |column| column.column_name().to_string());
     format!("{}.{returned}{filter}", grant.table().table_name())
+}
+
+/// An exclusion as `<column> NOT IN <helper>(<arguments>) {<its set>}`.
+fn render_exclusion(exclusion: &SetExclusion<'_, ParserDB>) -> String {
+    let arguments: Vec<String> = exclusion.arguments().iter().map(ToString::to_string).collect();
+    format!(
+        "{} NOT IN {}({}) {{{}}}",
+        exclusion.column().column_name(),
+        exclusion.function().target_name(),
+        arguments.join(", "),
+        render(exclusion.set()),
+    )
 }
 
 /// The columns an arm returns, one bare and several in parentheses, each
@@ -725,6 +738,11 @@ fn grant_rows(
                 .then(|| cap_rows(cap, request, fixture))
         })
         .collect();
+    let excluded: Vec<_> = grant
+        .exclusions()
+        .iter()
+        .map(|exclusion| evaluate(exclusion.set(), request, fixture))
+        .collect();
     for row in rows(fixture, grant.table().table_name()) {
         let restricted = grant.restrictions().iter().all(|restriction| restricts(restriction, row))
             && grant.joined_rows().iter().all(|joined| joins(row, joined, fixture));
@@ -741,7 +759,12 @@ fn grant_rows(
             GrantedTo::Anyone => true,
         };
         let unblocked = grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
-        if granted && restricted && unblocked && capped(grant, &caps, row, fixture) {
+        // `NULL` compared with a set holding any value answers `NULL`.
+        let unexcluded = grant.exclusions().iter().zip(&excluded).all(|(exclusion, excluded)| {
+            nullable(row, exclusion.column().column_name())
+                .map_or(excluded.is_empty(), |value| !excluded.contains(value))
+        });
+        if granted && restricted && unblocked && unexcluded && capped(grant, &caps, row, fixture) {
             let columns: Vec<Vec<&'static str>> = grant
                 .returned()
                 .iter()
@@ -5371,6 +5394,153 @@ fn an_anti_join_of_any_other_shape_refuses_the_answer() {
             Err(HelperSetError::MissingSelect { table, .. }) if table == "memberships"
         ),
         "`*` reads every column, as PostgreSQL 16.15 refuses it"
+    );
+}
+
+const EXCLUSIONS: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE TABLE organizations (id TEXT PRIMARY KEY);
+CREATE TABLE organization_blocks (
+  organization_id TEXT NOT NULL REFERENCES organizations (id),
+  principal_id TEXT NOT NULL,
+  PRIMARY KEY (organization_id, principal_id)
+);
+CREATE TABLE resources (
+  id TEXT PRIMARY KEY,
+  organization_id TEXT REFERENCES organizations (id),
+  owner_id TEXT NOT NULL
+);
+CREATE FUNCTION blocking_organizations() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT block.organization_id FROM public.organization_blocks block
+  WHERE block.principal_id = current_setting('app.user_id', true)
+$$;
+CREATE FUNCTION resources_with() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id FROM public.resources resource
+  WHERE resource.owner_id = current_setting('app.user_id', true)
+    AND NOT (resource.organization_id = ANY (ARRAY(SELECT public.blocking_organizations())))
+$$;
+ALTER FUNCTION blocking_organizations() OWNER TO authz_owner;
+ALTER FUNCTION resources_with() OWNER TO authz_owner;
+GRANT SELECT ON organizations, organization_blocks, resources TO authz_owner;
+";
+
+const EXCLUSION_ROWS: Rows = &[
+    ("organizations", &[("id", "o1")]),
+    ("organizations", &[("id", "o2")]),
+    ("organizations", &[("id", "o3")]),
+    ("organization_blocks", &[("organization_id", "o1"), ("principal_id", "alice")]),
+    ("organization_blocks", &[("organization_id", "o2"), ("principal_id", "carol")]),
+    ("resources", &[("id", "r1"), ("organization_id", "o1"), ("owner_id", "alice")]),
+    ("resources", &[("id", "r2"), ("organization_id", "o2"), ("owner_id", "alice")]),
+    ("resources", &[("id", "r3"), ("owner_id", "alice")]),
+    ("resources", &[("id", "r4"), ("organization_id", "o1"), ("owner_id", "bob")]),
+    ("resources", &[("id", "r5"), ("owner_id", "bob")]),
+    ("resources", &[("id", "r6"), ("organization_id", "o2"), ("owner_id", "carol")]),
+    ("resources", &[("id", "r7"), ("organization_id", "o3"), ("owner_id", "carol")]),
+];
+
+/// What PostgreSQL 17.11 returns for `resources_with()` of [`EXCLUSIONS`],
+/// called by each caller over [`EXCLUSION_ROWS`], and as much for the body
+/// written with `NOT IN`.
+const EXCLUSIONS_MEASURED: &[(&str, &[&str])] =
+    &[("alice", &["r2"]), ("bob", &["r4", "r5"]), ("carol", &["r7"]), ("zed", &[])];
+
+/// What `resources_with()` of [`EXCLUSIONS`] answers, rendered, with
+/// `excluding` in place of its exclusion, `after` following the helpers.
+fn excluding(excluding: &str, after: &str) -> Result<String, HelperSetError> {
+    let written =
+        "NOT (resource.organization_id = ANY (ARRAY(SELECT public.blocking_organizations())))";
+    let sql = format!("{}{after}", EXCLUSIONS.replace(written, excluding));
+    assert!(sql.contains(excluding), "the exclusion is replaced");
+    let database = postgres(&sql);
+    let deployment = deployment();
+    answer(&database, &deployment, "public", "resources_with", &[]).map(|set| render(&set))
+}
+
+#[test]
+fn an_exclusion_keeps_a_grant_only_where_its_column_stays_out_of_the_set() {
+    let arm = "resources.id WHERE owner_id = app.user_id AND organization_id NOT IN \
+               blocking_organizations() \
+               {organization_blocks.organization_id WHERE principal_id = app.user_id}";
+    let database = postgres(EXCLUSIONS);
+    let deployment = deployment();
+    let resources =
+        answer(&database, &deployment, "public", "resources_with", &[]).expect("answered");
+    assert_eq!(render(&resources), arm);
+    for &(caller, measured) in EXCLUSIONS_MEASURED {
+        let returned: Vec<_> =
+            evaluate(&resources, Request::of(caller), EXCLUSION_ROWS).into_iter().collect();
+        assert_eq!(returned, measured, "{caller:?} calling resources_with()");
+    }
+    for spelling in [
+        "resource.organization_id NOT IN (SELECT public.blocking_organizations())",
+        "NOT (resource.organization_id IN (SELECT * FROM public.blocking_organizations()))",
+        "NOT (organization_id = ANY (ARRAY(SELECT * FROM public.blocking_organizations() b)))",
+    ] {
+        assert_eq!(excluding(spelling, "").expect("answered"), arm, "{spelling}");
+    }
+    let unblocked = EXCLUSIONS.replace(
+        "WHERE block.principal_id = current_setting('app.user_id', true)",
+        "WHERE block.principal_id = current_setting('app.user_id', true) AND false",
+    );
+    assert_ne!(unblocked, EXCLUSIONS, "the blocking helper is replaced");
+    assert_eq!(
+        render(
+            &answer(&postgres(&unblocked), &deployment, "public", "resources_with", &[])
+                .expect("answered")
+        ),
+        "resources.id WHERE owner_id = app.user_id",
+        "an exclusion of a set holding nothing takes no row away"
+    );
+}
+
+#[test]
+fn an_exclusion_of_any_other_shape_refuses_the_answer() {
+    for spelling in [
+        "NOT (lower(resource.organization_id) = ANY (ARRAY(SELECT public.blocking_organizations())))",
+        "NOT (resource.organization_id <> ANY (ARRAY(SELECT public.blocking_organizations())))",
+        "resource.organization_id NOT IN (SELECT public.blocking_organizations() LIMIT 1)",
+        "resource.organization_id NOT IN (SELECT public.blocking_organizations() UNION SELECT 'o3')",
+        "resource.organization_id = ANY (ARRAY(SELECT public.blocking_organizations()))",
+        "'o1' NOT IN (SELECT public.blocking_organizations())",
+    ] {
+        assert!(
+            matches!(excluding(spelling, ""), Err(HelperSetError::Irreducible { .. })),
+            "{spelling}"
+        );
+    }
+    assert!(
+        matches!(
+            excluding("resource.organization_id NOT IN (SELECT public.unblocked())", ""),
+            Err(HelperSetError::UnresolvedCall { call, .. }) if call == "public.unblocked"
+        ),
+        "the excluded set is another helper's"
+    );
+    assert!(
+        matches!(
+            excluding(
+                "resource.organization_id NOT IN (SELECT public.blocking_organizations())",
+                "CREATE ROLE blocker NOLOGIN;
+                ALTER FUNCTION blocking_organizations() OWNER TO blocker;
+                REVOKE EXECUTE ON FUNCTION blocking_organizations() FROM PUBLIC;"
+            ),
+            Err(HelperSetError::MissingExecute { called, .. }) if called == "blocking_organizations"
+        ),
+        "the owner calls the helper"
+    );
+    let blocking = EXCLUSIONS.replace(
+        "RETURNS SETOF TEXT\nLANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$\n  SELECT block.organization_id",
+        "RETURNS TABLE (organization_id TEXT, principal_id TEXT)\nLANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$\n  SELECT block.organization_id, block.principal_id",
+    );
+    assert_ne!(blocking, EXCLUSIONS, "the blocking helper is replaced");
+    assert!(
+        matches!(
+            answer(&postgres(&blocking), &deployment(), "public", "resources_with", &[]),
+            Err(HelperSetError::ArmShape { .. })
+        ),
+        "a column stays out of a set of one column"
     );
 }
 

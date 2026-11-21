@@ -112,7 +112,8 @@ pub enum Returned<S> {
 /// <conditions>]`, the rows the conditions keep for the grantee they name,
 /// the caller gate they write, the restrictions and bounds the rest of them
 /// reduce to, the caps they write, the rows of other tables each row has to
-/// name, and the rows of other tables whose existence takes a row away.
+/// name, the rows of other tables whose existence takes a row away, and the
+/// sets of other helpers a row's column has to stay out of.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
@@ -126,6 +127,8 @@ pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) caps: Arc<[RowCap<'db, DB>]>,
     /// Shared as [`caps`](Self::caps) is.
     pub(crate) anti_joins: Arc<[AntiJoin<'db, DB>]>,
+    /// Shared as [`caps`](Self::caps) is.
+    pub(crate) exclusions: Arc<[SetExclusion<'db, DB>]>,
     /// Shared as [`caps`](Self::caps) is.
     pub(crate) joined_rows: Arc<[JoinedRow<'db, DB>]>,
 }
@@ -187,6 +190,15 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     #[must_use]
     pub fn anti_joins(&self) -> &[AntiJoin<'db, DB>] {
         &self.anti_joins
+    }
+
+    /// The sets of other helpers a row's column has to stay out of, every
+    /// one of them, in the order the condition writes them. An exclusion of
+    /// a helper answering no arm for its arguments takes no row away and is
+    /// left out.
+    #[must_use]
+    pub fn exclusions(&self) -> &[SetExclusion<'db, DB>] {
+        &self.exclusions
     }
 
     /// The rows the arm joins, in the order the body joins them, each of
@@ -778,6 +790,52 @@ impl<'db, DB: DatabaseLike> Correlation<'db, DB> {
     #[must_use]
     pub fn arm_column(&self) -> &'db DB::Column {
         self.arm_column
+    }
+}
+
+/// `NOT (<column> = ANY (ARRAY(SELECT <function>(<arguments>))))`, or
+/// `<column> NOT IN (SELECT <function>(<arguments>))`, a conjunct of a grant
+/// arm's condition keeping a row of the arm only where its column holds no
+/// value the helper returns. The subquery may also be written `(SELECT *
+/// FROM <function>(<arguments>))`, and `NOT IN` as `NOT (... IN ...)`.
+///
+/// The column is one of the arm's table. A row holding `NULL` in it is kept
+/// only where the helper returns no row, and a helper returning `NULL`
+/// keeps no row, as PostgreSQL answers `NULL` for the comparison in both
+/// cases.
+#[derive(Debug)]
+pub struct SetExclusion<'db, DB: DatabaseLike> {
+    pub(crate) column: &'db DB::Column,
+    pub(crate) function: &'db DB::Function,
+    pub(crate) arguments: Vec<Value>,
+    pub(crate) set: Box<HelperSet<'db, DB>>,
+}
+
+impl<'db, DB: DatabaseLike> SetExclusion<'db, DB> {
+    /// The column of the arm's table compared with the set.
+    #[must_use]
+    pub fn column(&self) -> &'db DB::Column {
+        self.column
+    }
+
+    /// The helper returning the values excluded.
+    #[must_use]
+    pub fn function(&self) -> &'db DB::Function {
+        self.function
+    }
+
+    /// The arguments the exclusion passes to [`function`](Self::function),
+    /// the helper's own arguments substituted.
+    #[must_use]
+    pub fn arguments(&self) -> &[Value] {
+        &self.arguments
+    }
+
+    /// What [`function`](Self::function) returns for
+    /// [`arguments`](Self::arguments).
+    #[must_use]
+    pub fn set(&self) -> &HelperSet<'db, DB> {
+        &self.set
     }
 }
 

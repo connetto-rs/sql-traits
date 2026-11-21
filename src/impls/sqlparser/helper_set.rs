@@ -29,8 +29,9 @@ use crate::{
         AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, Deployment,
         FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase,
         JoinedRow, LiteralSet, ParentArm, RequestNormalization, Restriction, Returned, RowCap,
-        RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent,
-        SettingValue, TargetName, TimeBound, TimeComparison, WalkArm, WalkDirection,
+        RowSecurity, RowStatement, SessionSetting, SetExclusion, SetPacking, SettingComparison,
+        SettingContent, SettingValue, TargetName, TimeBound, TimeComparison, WalkArm,
+        WalkDirection,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, EnumerationKind, EnumerationMember, ForeignKeyLike,
@@ -1989,13 +1990,16 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         }
         let mut anti_joins = Vec::new();
+        let mut exclusions = Vec::new();
         let mut filters = Vec::new();
         for condition in conditions {
-            match not_exists(condition) {
-                Some(blocking) => {
-                    anti_joins.extend(self.anti_join(scope, table, condition, blocking)?);
-                }
-                None => filters.push(condition),
+            if let Some(blocking) = not_exists(condition) {
+                anti_joins.extend(self.anti_join(scope, table, condition, blocking)?);
+            } else if let Some((compared, subquery)) = excluded_set(condition) {
+                exclusions
+                    .extend(self.exclusion(scope, select, rows, condition, compared, subquery)?);
+            } else {
+                filters.push(condition);
             }
         }
         let (kept, time_bounds) = self.filter(scope, table, filters)?;
@@ -2005,6 +2009,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
         let caps: Arc<[RowCap<'db, DB>]> = caps.into();
         let anti_joins: Arc<[AntiJoin<'db, DB>]> = anti_joins.into();
+        let exclusions: Arc<[SetExclusion<'db, DB>]> = exclusions.into();
         let joined_rows: Arc<[JoinedRow<'db, DB>]> = joined_rows.into();
         let grant = |(granted_to, own): Grantee<'db, DB>,
                      kept: Kept<'db, DB>,
@@ -2020,6 +2025,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 time_bounds,
                 caps: Arc::clone(&caps),
                 anti_joins: Arc::clone(&anti_joins),
+                exclusions: Arc::clone(&exclusions),
                 joined_rows: Arc::clone(&joined_rows),
             }))
         };
@@ -2239,6 +2245,36 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             restrictions,
             time_bounds,
         }))
+    }
+
+    /// Reads `condition`, `compared` kept out of the set `subquery` returns
+    /// in a grant arm reading `rows`, its table and then each table it
+    /// joins, `None` where the helper it calls answers no arm for the
+    /// arguments.
+    fn exclusion(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        rows: &[ArmTable<'_, 'db, DB>],
+        condition: &Expr,
+        compared: &Expr,
+        subquery: &Query,
+    ) -> Result<Option<SetExclusion<'db, DB>>, HelperSetError> {
+        let irreducible = || scope.irreducible(condition);
+        let column =
+            rows.first().and_then(|table| table.column(compared)).ok_or_else(irreducible)?;
+        // The elements of a set the request carries are no helper's.
+        if self.set_elements(scope, subquery)?.is_some() {
+            return Err(irreducible());
+        }
+        let call =
+            projected_call(subquery).or_else(|| selected_call(subquery)).ok_or_else(irreducible)?;
+        let Called { function, arguments, set } = self.called_set(scope, select, rows, &call, 1)?;
+        // `NOT (<column> = ANY ('{}'))` holds for every row, `NULL` included.
+        if set.arms.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(SetExclusion { column, function, arguments, set: Box::new(set) }))
     }
 
     /// `<column> IN (<values>)` listing at least one read of a setting
@@ -2698,17 +2734,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             expression => (expression, None),
         };
         let Expr::Function(call) = expression else { return Ok(None) };
-        if let FunctionArguments::Subquery(query) = &call.args {
-            // `ARRAY(SELECT ...)` is a constructor, which no function shadows.
-            let [ObjectNamePart::Identifier(name)] = call.name.0.as_slice() else {
-                return Ok(None);
-            };
-            if cast.is_some()
-                || name.quote_style.is_some()
-                || !name.value.eq_ignore_ascii_case("array")
-            {
-                return Ok(None);
-            }
+        if let FunctionArguments::Subquery(_) = &call.args {
+            let (Some(query), None) = (array_subquery(call), &cast) else { return Ok(None) };
             return self.set_elements(scope, query);
         }
         // A third argument names a string read as `NULL`, which changes the
@@ -3853,6 +3880,36 @@ fn not_exists(condition: &Expr) -> Option<&Query> {
         Expr::UnaryOp { op: UnaryOperator::Not, expr } => {
             let Expr::Exists { subquery, negated: false } = unnest(expr) else { return None };
             Some(subquery)
+        }
+        _ => None,
+    }
+}
+
+/// The query of `ARRAY(<query>)`, a constructor which no function shadows.
+fn array_subquery(call: &Function) -> Option<&Query> {
+    let FunctionArguments::Subquery(query) = &call.args else { return None };
+    let [ObjectNamePart::Identifier(name)] = call.name.0.as_slice() else { return None };
+    (name.quote_style.is_none() && name.value.eq_ignore_ascii_case("array")).then_some(query)
+}
+
+/// The column and the subquery of `NOT (<column> = ANY (ARRAY(<subquery>)))`,
+/// `<column> NOT IN (<subquery>)` or `NOT (<column> IN (<subquery>))`.
+fn excluded_set(condition: &Expr) -> Option<(&Expr, &Query)> {
+    match unnest(condition) {
+        Expr::In { expr, target: InTarget::Subquery(subquery), negated: true, .. } => {
+            Some((expr, subquery))
+        }
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => {
+            match unnest(expr) {
+                Expr::In { expr, target: InTarget::Subquery(subquery), negated: false, .. } => {
+                    Some((expr, subquery))
+                }
+                Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
+                    let Expr::Function(array) = unnest(right) else { return None };
+                    Some((left, array_subquery(array)?))
+                }
+                _ => None,
+            }
         }
         _ => None,
     }

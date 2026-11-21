@@ -93,8 +93,8 @@ pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{
     AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, GrantArm, GrantedTo,
     GranteeSet, HelperArm, HelperSet, JoinedRow, LiteralSet, ParentArm, RequestNormalization,
-    Restriction, Returned, RowCap, SettingComparison, TimeBound, TimeComparison, WalkArm,
-    WalkDirection,
+    Restriction, Returned, RowCap, SetExclusion, SettingComparison, TimeBound, TimeComparison,
+    WalkArm, WalkDirection,
 };
 pub use identifier_case::IdentifierCase;
 pub use identity::{ColumnIdentity, RelationIdentity};

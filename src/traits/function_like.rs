@@ -2182,10 +2182,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   (SELECT 1 FROM <table> WHERE <conditions>)` whose conditions equal
     ///   columns of `<table>` with columns of the arm's table and otherwise
     ///   read `<table>` alone, and the arm answers it as an
-    ///   [`AntiJoin`](crate::structs::AntiJoin). The rest, the arguments
-    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to what
-    ///   columns have to hold, literal values, a `boolean` column alone holding
-    ///   `TRUE`, `<column> IS NULL` or `<column> IS NOT NULL` (see
+    ///   [`AntiJoin`](crate::structs::AntiJoin). An exclusion is a conjunct
+    ///   `NOT (<column> = ANY (ARRAY(SELECT <helper>(<arguments>))))` or
+    ///   `<column> NOT IN (SELECT <helper>(<arguments>))`, the helper answered
+    ///   in turn, and the arm answers it as a
+    ///   [`SetExclusion`](crate::structs::SetExclusion). The rest, the
+    ///   arguments substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to
+    ///   what columns have to hold, literal values, a `boolean` column alone
+    ///   holding `TRUE`, `<column> IS NULL` or `<column> IS NOT NULL` (see
     ///   [`Restriction`](crate::structs::Restriction)). A column of an enum
     ///   type compared with a label by `<`, `<=`, `>` or `>=`, either way
     ///   round, holds the labels on the kept side of it in the order the type
