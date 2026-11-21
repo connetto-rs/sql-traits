@@ -7906,7 +7906,9 @@ impl ParserDB {
     /// A table that declared an equivalent constraint itself keeps its own, and
     /// so does one still receiving it from another parent. `ONLY` stops the
     /// walk at the named table and leaves the copies behind as their
-    /// holders' own, which is what PostgreSQL leaves.
+    /// holders' own, which is what PostgreSQL leaves. A key, an exclusion or a
+    /// foreign key reaches only partitions, and no partition keeps one without
+    /// its parent's, so `ONLY` drops those copies at every level too.
     fn drop_table_constraint(
         builder: ParserDBBuilder,
         stored: &StoredTable,
@@ -7933,7 +7935,7 @@ impl ParserDB {
                 Ok(())
             })?;
 
-        if scope.only {
+        if scope.only && inheritance::passes_down(inheritance::ParentKind::Inherits, &dropped) {
             // The tables below keep their copies, and each becomes the holder's
             // own now that nothing passes it down. A grandchild is untouched,
             // because its own parent still holds one.
@@ -8202,7 +8204,12 @@ impl ParserDB {
                 Ok(())
             })?;
 
-        if scope.only {
+        // `ONLY` stops the walk for a check or a `NOT NULL`, whose copies stay
+        // with their holders. A key or a foreign key reaches only partitions,
+        // which never keep a copy without the parent's.
+        if scope.only
+            && inheritance::option_passes_down(inheritance::ParentKind::Inherits, &option.option)
+        {
             return Ok(builder);
         }
 
