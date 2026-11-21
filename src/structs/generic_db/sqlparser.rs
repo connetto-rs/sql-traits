@@ -87,6 +87,7 @@ mod constraint_validity;
 mod default_privileges;
 mod detach_partition;
 mod domains;
+mod duplicate_keys;
 mod existing_child;
 mod extensions;
 mod foreign_options;
@@ -11077,6 +11078,13 @@ impl ParserDB {
                                 column_position,
                                 ..
                             } => {
+                                if matches!(dialect, SqlparserDialect::PostgreSql) {
+                                    duplicate_keys::merge(
+                                        core::slice::from_mut(&mut column_def),
+                                        &mut Vec::new(),
+                                        builder.identifier_case(),
+                                    );
+                                }
                                 domains::bind_type(&builder, &mut column_def.data_type, &type_arrays)?;
                                 for option in &column_def.options {
                                     if let ColumnOption::ForeignKey(foreign_key) = &option.option {
@@ -11638,6 +11646,13 @@ impl ParserDB {
                     // A `LIKE` copy becomes the table's own columns, so it
                     // runs before the parents contribute theirs.
                     creations.extend(like::apply_like(&builder, &mut create_table)?);
+                    if matches!(dialect, SqlparserDialect::PostgreSql) {
+                        duplicate_keys::merge(
+                            &mut create_table.columns,
+                            &mut create_table.constraints,
+                            builder.identifier_case(),
+                        );
+                    }
 
                     // A foreign partition is refused under a unique index
                     // before it takes the keys a partition receives.
