@@ -1,0 +1,19 @@
+[[tables]]
+name = "docs"
+key = ["id"]
+columns = ["id"]
+
+[[callers]]
+name = "alice"
+role = "app_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "" }
+
+[[callers]]
+name = "carol"
+role = "app_writer"
+settings = { "app.user_id" = "carol", "app.subjects" = "" }
+
+[[writes]]
+table = "docs"
+shape = "insert"
+row = { id = 3, owner = "alice", body = "c" }

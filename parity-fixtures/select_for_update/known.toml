@@ -1,0 +1,13 @@
+[[sqlite.row]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs" FOR UPDATE'
+direction = "wider"
+finding = "9, the replica drops `FOR UPDATE` and skips the `UPDATE` policies a locking read applies"
+
+[[sqlite.row]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs" FOR UPDATE'
+direction = "wider"
+finding = "9, the replica drops `FOR UPDATE` and skips the `UPDATE` policies a locking read applies"

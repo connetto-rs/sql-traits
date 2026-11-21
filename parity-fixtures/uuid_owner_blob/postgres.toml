@@ -1,0 +1,23 @@
+[[answer]]
+caller = "a"
+row = "udocs:1"
+statement = 'SELECT "id" FROM "udocs"'
+postgres = "visible"
+
+[[answer]]
+caller = "a"
+row = "udocs:2"
+statement = 'SELECT "id" FROM "udocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "b"
+row = "udocs:1"
+statement = 'SELECT "id" FROM "udocs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "b"
+row = "udocs:2"
+statement = 'SELECT "id" FROM "udocs"'
+postgres = "visible"

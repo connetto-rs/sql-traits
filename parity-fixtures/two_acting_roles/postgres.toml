@@ -1,0 +1,79 @@
+[[answer]]
+caller = "alice"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "hidden"
+
+[[answer]]
+caller = "bob"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "carol"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "carol"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+postgres = "visible"
+
+[[answer]]
+caller = "alice"
+row = "docs:1"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 1"""
+
+[answer.postgres]
+rejected = "42501"
+
+[[answer]]
+caller = "alice"
+row = "docs:2"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 2"""
+
+[answer.postgres]
+rejected = "42501"
+
+[[answer]]
+caller = "bob"
+row = "docs:1"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 1"""
+
+[answer.postgres]
+rejected = "42501"
+
+[[answer]]
+caller = "bob"
+row = "docs:2"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 2"""
+
+[answer.postgres]
+rejected = "42501"
+
+[[answer]]
+caller = "carol"
+row = "docs:1"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 1"""
+postgres = "changed"
+
+[[answer]]
+caller = "carol"
+row = "docs:2"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 2"""
+postgres = "changed"

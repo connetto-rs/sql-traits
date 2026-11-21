@@ -1,0 +1,13 @@
+[[sqlite.row]]
+caller = "alice"
+row = "docs:2"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 2"""
+direction = "different_denial"
+finding = "5, the replica skips a row the caller cannot read before raising the missing `UPDATE` privilege"
+
+[[sqlite.row]]
+caller = "bob"
+row = "docs:1"
+statement = """UPDATE "docs" SET "body" = 'edited' WHERE "id" = 1"""
+direction = "different_denial"
+finding = "5, the replica skips a row the caller cannot read before raising the missing `UPDATE` privilege"

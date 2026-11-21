@@ -1,0 +1,28 @@
+[[tables]]
+name = "lines"
+key = ["order_id", "line_no"]
+columns = ["order_id", "line_no", "owner"]
+
+[[callers]]
+name = "alice"
+role = "app_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "" }
+
+[[callers]]
+name = "bob"
+role = "app_reader"
+settings = { "app.user_id" = "bob", "app.subjects" = "" }
+
+[[writes]]
+table = "lines"
+shape = "update"
+set = { quantity = 2 }
+
+[[writes]]
+table = "lines"
+shape = "delete"
+
+[[writes]]
+table = "lines"
+shape = "insert"
+row = { order_id = 1, line_no = 3, owner = "alice", quantity = 1 }

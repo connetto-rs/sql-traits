@@ -1,0 +1,19 @@
+[[tables]]
+name = "jdocs"
+key = ["id"]
+columns = ["id"]
+
+[[callers]]
+name = "seven"
+role = "app_reader"
+settings = { "app.user_id" = "7", "app.subjects" = "" }
+
+[[callers]]
+name = "eight"
+role = "app_reader"
+settings = { "app.user_id" = "8", "app.subjects" = "" }
+
+[[callers]]
+name = "true"
+role = "app_reader"
+settings = { "app.user_id" = "true", "app.subjects" = "" }

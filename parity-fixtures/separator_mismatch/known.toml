@@ -1,0 +1,19 @@
+[sqlite]
+refusal = "3, the declared set separator differs from the policy separator"
+
+[[sqlite.row]]
+caller = "holder"
+row = "docs:1"
+statement = 'SELECT "id" FROM "docs"'
+direction = "refused"
+finding = "3, the declared set separator differs from the policy separator"
+
+[[sqlite.row]]
+caller = "holder"
+row = "docs:2"
+statement = 'SELECT "id" FROM "docs"'
+direction = "refused"
+finding = "3, the declared set separator differs from the policy separator"
+
+[openfga]
+refusal = "3, the declared set separator differs from the policy separator"

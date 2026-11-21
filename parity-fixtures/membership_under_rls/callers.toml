@@ -1,0 +1,19 @@
+[[tables]]
+name = "tdocs"
+key = ["id"]
+columns = ["id"]
+
+[[tables]]
+name = "members"
+key = ["user_id"]
+columns = ["team", "user_id"]
+
+[[callers]]
+name = "alice"
+role = "app_reader"
+settings = { "app.user_id" = "alice", "app.subjects" = "" }
+
+[[callers]]
+name = "bob"
+role = "app_reader"
+settings = { "app.user_id" = "bob", "app.subjects" = "" }

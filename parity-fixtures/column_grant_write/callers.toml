@@ -1,0 +1,24 @@
+[[tables]]
+name = "docs"
+key = ["id"]
+columns = ["id"]
+
+[[callers]]
+name = "alice"
+role = "app_owner_editor"
+settings = { "app.user_id" = "alice", "app.subjects" = "" }
+
+[[callers]]
+name = "bob"
+role = "app_body_writer"
+settings = { "app.user_id" = "bob", "app.subjects" = "" }
+
+[[writes]]
+table = "docs"
+shape = "update"
+set = { body = "x" }
+
+[[writes]]
+table = "docs"
+shape = "update"
+set = { owner = "x" }

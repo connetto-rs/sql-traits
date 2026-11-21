@@ -1,0 +1,6 @@
+CREATE ROLE app_reader NOLOGIN;
+CREATE ROLE app_admin NOLOGIN;
+CREATE TABLE docs (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, body TEXT);
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+GRANT SELECT (id, owner) ON docs TO app_reader;
+CREATE POLICY open ON docs USING (true);
