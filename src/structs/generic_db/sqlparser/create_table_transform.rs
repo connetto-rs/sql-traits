@@ -45,12 +45,12 @@ pub(super) fn columns(
                 None
             } else {
                 Some(column_metadata_for_collations(
+                    builder,
                     column,
                     collations,
                     catalog,
                     &search_path,
                     &[],
-                    true,
                 )?)
             };
         for option in &column.options {

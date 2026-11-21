@@ -93,6 +93,7 @@ pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> 
                     return Err(Error::FunctionBodyStatementUnsupported {
                         statement: statement.to_string(),
                         function_name: function_name.clone(),
+                        command_tag: utility_command_tag(statement),
                     });
                 }
                 super::view_rewrites::shape_of_block_statement(statement, &function_name)?;
@@ -120,6 +121,110 @@ pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> 
         }
         _ => Ok(()),
     }
+}
+
+/// PostgreSQL's command tag for a utility statement in a SQL function body.
+fn utility_command_tag(statement: &Statement) -> Option<alloc::string::String> {
+    let tag = match statement {
+        Statement::Set(_) => "SET",
+        Statement::Reset(_) => "RESET",
+        Statement::Analyze(_) => "ANALYZE",
+        Statement::Vacuum(_) => "VACUUM",
+        Statement::Truncate(_) => "TRUNCATE TABLE",
+        Statement::Call(_) => "CALL",
+        Statement::Copy { .. } => "COPY",
+        Statement::Close { cursor: sqlparser::ast::CloseCursor::All } => "CLOSE CURSOR ALL",
+        Statement::Close { .. } => "CLOSE CURSOR",
+        Statement::CreateTextSearch(search) => {
+            return Some(format!("CREATE TEXT SEARCH {}", search.object_type));
+        }
+        Statement::AlterTextSearch(search) => {
+            return Some(format!("ALTER TEXT SEARCH {}", search.object_type));
+        }
+        Statement::CreateView(view) if view.materialized => "CREATE MATERIALIZED VIEW",
+        Statement::CreateView(_) => "CREATE VIEW",
+        Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::CreateIndex(_) => "CREATE INDEX",
+        Statement::CreateRole(_) => "CREATE ROLE",
+        Statement::CreateServer(_) => "CREATE SERVER",
+        Statement::CreateForeignTable(_) => "CREATE FOREIGN TABLE",
+        Statement::CreateForeignDataWrapper(_) => "CREATE FOREIGN DATA WRAPPER",
+        Statement::CreateUserMapping(_) => "CREATE USER MAPPING",
+        Statement::CreatePolicy(_) => "CREATE POLICY",
+        Statement::CreateRule(_) => "CREATE RULE",
+        Statement::CreateOperator(_) => "CREATE OPERATOR",
+        Statement::CreateOperatorFamily(_) => "CREATE OPERATOR FAMILY",
+        Statement::CreateOperatorClass(_) => "CREATE OPERATOR CLASS",
+        Statement::CreateAggregate(_) => "CREATE AGGREGATE",
+        Statement::AlterTable(_) => "ALTER TABLE",
+        Statement::AlterSchema(_) => "ALTER SCHEMA",
+        Statement::AlterIndex { .. } => "ALTER INDEX",
+        Statement::AlterView(view) if view.materialized => "ALTER MATERIALIZED VIEW",
+        Statement::AlterView(_) => "ALTER VIEW",
+        Statement::AlterFunction(_) => "ALTER FUNCTION",
+        Statement::AlterType(_) => "ALTER TYPE",
+        Statement::AlterCollation(_) => "ALTER COLLATION",
+        Statement::AlterExtension(_) => "ALTER EXTENSION",
+        Statement::AlterOperator(_) => "ALTER OPERATOR",
+        Statement::AlterOperatorFamily(_) => "ALTER OPERATOR FAMILY",
+        Statement::AlterOperatorClass(_) => "ALTER OPERATOR CLASS",
+        Statement::AlterRole { .. } => "ALTER ROLE",
+        Statement::AlterPolicy(_) => "ALTER POLICY",
+        Statement::AlterTrigger(_) => "ALTER TRIGGER",
+        Statement::Drop { object_type, .. } => return Some(format!("DROP {object_type}")),
+        Statement::DropFunction(_) => "DROP FUNCTION",
+        Statement::DropDomain(_) => "DROP DOMAIN",
+        Statement::DropProcedure { .. } => "DROP PROCEDURE",
+        Statement::DropPolicy(_) => "DROP POLICY",
+        Statement::DropRule(_) => "DROP RULE",
+        Statement::Declare { .. } => "DECLARE CURSOR",
+        Statement::CreateExtension(_) => "CREATE EXTENSION",
+        Statement::CreateCollation(_) => "CREATE COLLATION",
+        Statement::DropExtension(_) => "DROP EXTENSION",
+        Statement::DropOperator(_) => "DROP OPERATOR",
+        Statement::DropOperatorFamily(_) => "DROP OPERATOR FAMILY",
+        Statement::DropOperatorClass(_) => "DROP OPERATOR CLASS",
+        Statement::Fetch { .. } => "FETCH",
+        Statement::Discard { object_type } => return Some(format!("DISCARD {object_type}")),
+        Statement::ShowVariable { .. } => "SHOW",
+        Statement::StartTransaction { begin: false, .. } => "START TRANSACTION",
+        Statement::Comment { .. } => "COMMENT",
+        Statement::Commit { .. } => "COMMIT",
+        Statement::Rollback { .. } => "ROLLBACK",
+        Statement::CreateSchema { .. } => "CREATE SCHEMA",
+        Statement::CreateDatabase { .. } => "CREATE DATABASE",
+        Statement::CreateFunction(_) => "CREATE FUNCTION",
+        Statement::CreateTrigger(_) => "CREATE TRIGGER",
+        Statement::DropTrigger(_) => "DROP TRIGGER",
+        Statement::CreateProcedure { .. } => "CREATE PROCEDURE",
+        Statement::Grant(_) => "GRANT",
+        Statement::GrantRole(_) => "GRANT ROLE",
+        Statement::Revoke(_) => "REVOKE",
+        Statement::RevokeRole(_) => "REVOKE ROLE",
+        Statement::AlterDefaultPrivileges(_) => "ALTER DEFAULT PRIVILEGES",
+        Statement::Deallocate { name, .. }
+            if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("ALL") =>
+        {
+            "DEALLOCATE ALL"
+        }
+        Statement::Deallocate { .. } => "DEALLOCATE",
+        Statement::Execute { .. } => "EXECUTE",
+        Statement::Prepare { .. } => "PREPARE",
+        Statement::Explain { .. } => "EXPLAIN",
+        Statement::Savepoint { .. } => "SAVEPOINT",
+        Statement::ReleaseSavepoint { .. } => "RELEASE",
+        Statement::CreateSequence { .. } => "CREATE SEQUENCE",
+        Statement::CreateDomain(_) => "CREATE DOMAIN",
+        Statement::CreateType { .. } => "CREATE TYPE",
+        Statement::Lock(_) => "LOCK TABLE",
+        Statement::LISTEN { .. } => "LISTEN",
+        Statement::UNLISTEN { .. } => "UNLISTEN",
+        Statement::Do(_) => "DO",
+        Statement::NOTIFY { .. } => "NOTIFY",
+        Statement::RefreshMaterializedView(_) => "REFRESH MATERIALIZED VIEW",
+        _ => return None,
+    };
+    Some(tag.to_string())
 }
 
 /// Whether the function declares a result, which is any `RETURNS` other

@@ -380,6 +380,7 @@ impl TypeArrays {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: kind,
                 object_name: builder.dialect().stored_spelling(to_name, to_name_quoted),
+                type_collision: true,
             });
         }
         let entry = &self.entries[position];
@@ -409,6 +410,7 @@ impl TypeArrays {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: kind,
                 object_name: builder.dialect().stored_spelling(array_name, array_quoted),
+                type_collision: true,
             });
         }
         let current = named_in_schema(to, ident_of(array_name, array_quoted));

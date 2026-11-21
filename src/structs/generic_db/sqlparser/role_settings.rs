@@ -300,7 +300,12 @@ pub(super) fn alter_role(
                 }
                 SetConfigValue::Value(value) => {
                     let Some(value) = literal(value, hex_strings_may_be_integers) else {
-                        return Err(Error::NonLiteralSetting { statement: statement.to_string() });
+                        return Err(Error::NonLiteralSetting {
+                            statement: statement.to_string(),
+                            written_token: crate::utils::setting_syntax::setting_syntax_token(
+                                value,
+                            ),
+                        });
                     };
                     Some(valued(&name, value)?)
                 }

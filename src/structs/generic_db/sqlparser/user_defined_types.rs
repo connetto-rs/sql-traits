@@ -73,6 +73,27 @@ fn schema_ident(name: &str, quoted: bool) -> Ident {
     if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
 }
 
+/// PostgreSQL's diagnostic type spelling in the builder's search path.
+fn diagnostic_type(builder: &ParserDBBuilder, name: &ObjectName) -> String {
+    let Ok((schema, ident)) = object_name_identifiers(name) else {
+        return builder.dialect().stored_object_name(name);
+    };
+    let target = crate::structs::TargetName::new(&ident.value, ident.quote_style.is_some());
+    let target = match schema {
+        Some(schema) => target.with_schema(&schema.value, schema.quote_style.is_some()),
+        None => target,
+    };
+    diagnostic_target(builder, &target)
+}
+
+/// PostgreSQL's diagnostic spelling of an array's element or a named type.
+fn diagnostic_target(builder: &ParserDBBuilder, target: &crate::structs::TargetName<'_>) -> String {
+    super::domains::format_type_for_builder(
+        builder,
+        &crate::utils::postgres_types::PgType::from_target(target),
+    )
+}
+
 /// A stored object a `DROP TYPE` or `DROP DOMAIN` statement dooms.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Doomed {
@@ -366,6 +387,10 @@ pub(super) fn create_user_defined_type(
                 object_kind: ObjectKind::Type,
                 conflicting_kind,
                 object_name: builder.dialect().stored_name(name_ident),
+                type_collision: !matches!(
+                    conflicting_kind,
+                    ObjectKind::Sequence | ObjectKind::Index | ObjectKind::UniqueIndex
+                ),
             });
         }
     }
@@ -382,6 +407,7 @@ pub(super) fn create_user_defined_type(
                 object_kind: ObjectKind::Type,
                 conflicting_kind: ObjectKind::Type,
                 object_name: builder.dialect().stored_name(name_ident),
+                type_collision: true,
             });
         }
         Some(CreationTarget::Domain) => {
@@ -389,6 +415,7 @@ pub(super) fn create_user_defined_type(
                 object_kind: ObjectKind::Type,
                 conflicting_kind: ObjectKind::Domain,
                 object_name: builder.dialect().stored_name(name_ident),
+                type_collision: true,
             });
         }
         Some(CreationTarget::RowType(conflicting_kind)) => {
@@ -396,6 +423,7 @@ pub(super) fn create_user_defined_type(
                 object_kind: ObjectKind::Type,
                 conflicting_kind,
                 object_name: builder.dialect().stored_name(name_ident),
+                type_collision: true,
             });
         }
         None => None,
@@ -552,6 +580,7 @@ fn bind_representation(
             }) else {
                 return Err(Error::RangeSubtypeRequired {
                     type_name: builder.dialect().stored_name(name_ident),
+                    empty_attributes: options.is_empty(),
                 });
             };
             bind_type(builder, subtype, arrays)?;
@@ -573,6 +602,7 @@ fn bind_representation(
                         object_kind: ObjectKind::Type,
                         conflicting_kind: kind,
                         object_name: builder.dialect().stored_name(multirange_ident),
+                        type_collision: true,
                     });
                 }
                 Some(Reached::Domain(_)) => {
@@ -580,6 +610,7 @@ fn bind_representation(
                         object_kind: ObjectKind::Type,
                         conflicting_kind: ObjectKind::Domain,
                         object_name: builder.dialect().stored_name(multirange_ident),
+                        type_collision: true,
                     });
                 }
                 Some(Reached::UserType(_, _)) => {
@@ -587,6 +618,7 @@ fn bind_representation(
                         object_kind: ObjectKind::Type,
                         conflicting_kind: ObjectKind::Type,
                         object_name: builder.dialect().stored_name(multirange_ident),
+                        type_collision: true,
                     });
                 }
                 Some(Reached::Catalog) | None => {}
@@ -627,12 +659,29 @@ fn dependents_error(
     dependent_name: String,
 ) -> Error {
     let name = doomed_type_name(builder, used);
+    let type_display = diagnostic_type(
+        builder,
+        match used {
+            Doomed::Domain(position) => &builder.domains()[*position].0.name,
+            Doomed::UserType(position) => &builder.user_defined_types()[*position].0.name,
+        },
+    );
     match used {
         Doomed::Domain(_) => {
-            Error::DomainHasDependents { domain_name: name, dependent_kind, dependent_name }
+            Error::DomainHasDependents {
+                domain_name: name,
+                type_display,
+                dependent_kind,
+                dependent_name,
+            }
         }
         Doomed::UserType(_) => {
-            Error::TypeHasDependents { type_name: name, dependent_kind, dependent_name }
+            Error::TypeHasDependents {
+                type_name: name,
+                type_display,
+                dependent_kind,
+                dependent_name,
+            }
         }
     }
 }
@@ -754,86 +803,59 @@ pub(super) fn drop_types(
         if spelling == DropSpelling::Type
             && let Some(base) = arrays.element(&builder, name)
         {
+            let requiring_display = diagnostic_target(&builder, &base);
             return Err(Error::TypeDropRequiredBy {
                 type_name: format!("{}[]", base.name()),
+                type_display: format!("{requiring_display}[]"),
                 requiring_kind: ObjectKind::Type,
                 requiring_name: base.name().to_string(),
+                requiring_display,
             });
         }
-        let reached = match schema_parts {
-            Some(schema) => reach_in_schema(&builder, ident, schema),
-            None => reach_type(&builder, ident),
+        let grammar_alias = if schema_parts.is_none() && ident.quote_style.is_none() {
+            match crate::utils::postgres_types::PgType::parse(&name.to_string()) {
+                Some(crate::utils::postgres_types::PgType::Catalog(catalog_name))
+                    if catalog_name != builder.dialect().stored_name(ident) =>
+                {
+                    Some(catalog_name)
+                }
+                _ => None,
+            }
+        } else {
+            None
         };
+        let reached = if grammar_alias.is_some() {
+            Some(Reached::Catalog)
+        } else {
+            match schema_parts {
+                Some(schema) => reach_in_schema(&builder, ident, schema),
+                None => reach_type(&builder, ident),
+            }
+        };
+        if reached.is_none()
+            && !if_exists
+            && let Some(schema_name) = super::missing_schema::missing_schema_name(&builder, name)
+        {
+            return Err(Error::SchemaNotFound { schema_name });
+        }
         let skipped = if_exists && reached.is_none();
-        let held = match (reached, spelling) {
-            (Some(Reached::Domain(position)), _) => {
-                if !doomed_domain(&doomed, position) {
-                    doomed.push(Doomed::Domain(position));
-                }
-                Some(Doomed::Domain(position))
-            }
-            (Some(Reached::UserType(_position, _is_multirange)), DropSpelling::Domain) => {
-                return Err(Error::RelationKindMismatch {
-                    object_name: builder.dialect().stored_object_name(name),
-                    expected_kind: ObjectKind::Domain,
-                    actual_kind: ObjectKind::Type,
-                });
-            }
-            (Some(Reached::UserType(position, false)), DropSpelling::Type) => {
-                if !doomed_user_type(&doomed, position) {
-                    doomed.push(Doomed::UserType(position));
-                }
-                Some(Doomed::UserType(position))
-            }
-            // A multirange goes only with its range.
-            (Some(Reached::UserType(position, true)), DropSpelling::Type) => {
-                let range_name = builder
-                    .dialect()
-                    .stored_object_name(&builder.user_defined_types()[position].0.name);
-                return Err(Error::TypeDropRequiredBy {
-                    type_name: builder.dialect().stored_object_name(name),
-                    requiring_kind: ObjectKind::Type,
-                    requiring_name: range_name,
-                });
-            }
-            (Some(Reached::RowType(kind)), DropSpelling::Domain) => {
-                return Err(Error::RelationKindMismatch {
-                    object_name: builder.dialect().stored_object_name(name),
-                    expected_kind: ObjectKind::Domain,
-                    actual_kind: kind,
-                });
-            }
-            // A row type goes only with its relation.
-            (Some(Reached::RowType(kind)), DropSpelling::Type) => {
-                return Err(Error::TypeDropRequiredBy {
-                    type_name: builder.dialect().stored_object_name(name),
-                    requiring_kind: kind,
-                    requiring_name: builder.dialect().stored_object_name(name),
-                });
-            }
-            (Some(Reached::Catalog), DropSpelling::Type) => {
-                return Err(Error::TypeRequiredBySystem {
-                    type_name: builder.dialect().stored_object_name(name),
-                });
-            }
-            (Some(Reached::Catalog) | None, DropSpelling::Domain) if !skipped => {
-                return Err(Error::DropDomainNotFound {
-                    domain_name: builder.dialect().stored_object_name(name),
-                });
-            }
-            (None, DropSpelling::Type) if !skipped => {
-                return Err(Error::TypeNotFound {
-                    type_name: builder.dialect().stored_object_name(name),
-                });
-            }
-            _ => None,
-        };
+        let held = drop_type_target(
+            &builder,
+            name,
+            reached,
+            spelling,
+            skipped,
+            grammar_alias,
+            &mut doomed,
+        )?;
         if !cascade {
             for candidate in held_type_identities(&builder, arrays, held) {
                 if let Some(dependent) = dependent_holding(&candidate) {
                     return Err(Error::TypeDropRequiredBy {
                         type_name: builder.dialect().stored_object_name(name),
+                        type_display: diagnostic_type(&builder, name),
                         requiring_kind: dependent.kind,
+                        requiring_display: dependent.name.clone(),
                         requiring_name: dependent.name,
                     });
                 }
@@ -841,6 +863,112 @@ pub(super) fn drop_types(
         }
     }
     drop_positions(builder, &doomed, cascade, arrays)
+}
+
+/// Records a dropped type or answers why the named object cannot be dropped.
+fn drop_type_target(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+    reached: Option<Reached>,
+    spelling: DropSpelling,
+    skipped: bool,
+    grammar_alias: Option<&'static str>,
+    doomed: &mut Vec<Doomed>,
+) -> Result<Option<Doomed>, Error> {
+    let held = match (reached, spelling) {
+        (Some(Reached::Domain(position)), _) => {
+            if !doomed_domain(doomed, position) {
+                doomed.push(Doomed::Domain(position));
+            }
+            Some(Doomed::Domain(position))
+        }
+        (Some(Reached::UserType(_position, _is_multirange)), DropSpelling::Domain) => {
+            return Err(Error::RelationKindMismatch {
+                object_name: builder.dialect().stored_object_name(name),
+                expected_kind: ObjectKind::Domain,
+                actual_kind: ObjectKind::Type,
+                context: crate::errors::RelationKindContext::Statement,
+            });
+        }
+        (Some(Reached::UserType(position, false)), DropSpelling::Type) => {
+            if !doomed_user_type(doomed, position) {
+                doomed.push(Doomed::UserType(position));
+            }
+            Some(Doomed::UserType(position))
+        }
+        // A multirange goes only with its range.
+        (Some(Reached::UserType(position, true)), DropSpelling::Type) => {
+            let range_name = builder
+                .dialect()
+                .stored_object_name(&builder.user_defined_types()[position].0.name);
+            return Err(Error::TypeDropRequiredBy {
+                type_name: builder.dialect().stored_object_name(name),
+                type_display: diagnostic_type(builder, name),
+                requiring_kind: ObjectKind::Type,
+                requiring_name: range_name,
+                requiring_display: diagnostic_type(
+                    builder,
+                    &builder.user_defined_types()[position].0.name,
+                ),
+            });
+        }
+        (Some(Reached::RowType(kind)), DropSpelling::Domain) => {
+            return Err(Error::RelationKindMismatch {
+                object_name: builder.dialect().stored_object_name(name),
+                expected_kind: ObjectKind::Domain,
+                actual_kind: kind,
+                context: crate::errors::RelationKindContext::Statement,
+            });
+        }
+        // A row type goes only with its relation.
+        (Some(Reached::RowType(kind)), DropSpelling::Type) => {
+            return Err(Error::TypeDropRequiredBy {
+                type_name: builder.dialect().stored_object_name(name),
+                type_display: diagnostic_type(builder, name),
+                requiring_kind: kind,
+                requiring_name: builder.dialect().stored_object_name(name),
+                requiring_display: diagnostic_type(builder, name),
+            });
+        }
+        (Some(Reached::Catalog), DropSpelling::Type) => {
+            return Err(Error::TypeRequiredBySystem {
+                type_name: builder.dialect().stored_object_name(name),
+                type_display: grammar_alias.map_or_else(
+                    || diagnostic_type(builder, name),
+                    |catalog_name| {
+                        super::domains::format_type_for_builder(
+                            builder,
+                            &crate::utils::postgres_types::PgType::Catalog(catalog_name),
+                        )
+                    },
+                ),
+            });
+        }
+        (Some(Reached::Catalog), DropSpelling::Domain) => {
+            return Err(Error::RelationKindMismatch {
+                object_name: grammar_alias.map_or_else(
+                    || builder.dialect().stored_object_name(name),
+                    |catalog_name| format!("pg_catalog.{catalog_name}"),
+                ),
+                expected_kind: ObjectKind::Domain,
+                actual_kind: ObjectKind::Type,
+                context: crate::errors::RelationKindContext::Statement,
+            });
+        }
+        (None, DropSpelling::Domain) if !skipped => {
+            return Err(Error::DropDomainNotFound {
+                domain_name: builder.dialect().stored_object_name(name),
+            });
+        }
+        (None, DropSpelling::Type) if !skipped => {
+            return Err(Error::TypeNotFound {
+                type_name: builder.dialect().stored_object_name(name),
+            });
+        }
+        _ => None,
+    };
+
+    Ok(held)
 }
 
 /// Drops the domain or user-defined type `doomed` with everything a
@@ -1374,6 +1502,11 @@ fn resolve_named_type(
         Some(schema) => reach_in_schema(builder, ident, ident_parts(schema)),
         None => reach_type(builder, ident),
     };
+    if reached.is_none()
+        && let Some(schema_name) = super::missing_schema::missing_schema_name(builder, name)
+    {
+        return Err(Error::SchemaNotFound { schema_name });
+    }
     match reached {
         Some(Reached::Domain(position)) => Ok((Doomed::Domain(position), false)),
         Some(Reached::UserType(position, is_multirange)) => {
@@ -1389,6 +1522,7 @@ fn resolve_named_type(
         Some(Reached::RowType(kind)) => {
             Err(Error::TypeIsRowType {
                 type_name: builder.dialect().stored_object_name(name),
+                type_display: diagnostic_type(builder, name),
                 relation_kind: kind,
             })
         }
@@ -1413,7 +1547,10 @@ fn alter_type_rename(
 ) -> Result<ParserDBBuilder, Error> {
     // The array type of a stored type is altered only through its type.
     if let Some(base) = arrays.element(&builder, name) {
-        return Err(Error::CannotAlterArrayType { array_name: format!("{}[]", base.name()) });
+        return Err(Error::CannotAlterArrayType {
+            array_name: format!("{}[]", base.name()),
+            type_display: format!("{}[]", diagnostic_target(&builder, &base)),
+        });
     }
     let (target, is_multirange) = resolve_named_type(&builder, name)?;
     let old_name = match target {
@@ -1430,29 +1567,6 @@ fn alter_type_rename(
         }
     };
     let schema = qualifier_of(&old_name).named().unwrap_or((DEFAULT_SCHEMA, false));
-    match reach_in_schema(&builder, new_name, schema) {
-        Some(Reached::RowType(kind)) => {
-            return Err(Error::TypeIsRowType {
-                type_name: builder.dialect().stored_name(new_name),
-                relation_kind: kind,
-            });
-        }
-        Some(Reached::UserType(_, _)) => {
-            return Err(Error::RelationNameAlreadyTaken {
-                object_kind: ObjectKind::Type,
-                conflicting_kind: ObjectKind::Type,
-                object_name: builder.dialect().stored_name(new_name),
-            });
-        }
-        Some(Reached::Domain(_)) => {
-            return Err(Error::RelationNameAlreadyTaken {
-                object_kind: ObjectKind::Type,
-                conflicting_kind: ObjectKind::Domain,
-                object_name: builder.dialect().stored_name(new_name),
-            });
-        }
-        Some(Reached::Catalog) | None => {}
-    }
     // A composite takes a relation name, which the other kinds do not.
     let is_composite = match target {
         Doomed::UserType(position) => {
@@ -1467,7 +1581,35 @@ fn alter_type_rename(
             object_kind: ObjectKind::Type,
             conflicting_kind,
             object_name: builder.dialect().stored_name(new_name),
+            type_collision: false,
         });
+    }
+    match reach_in_schema(&builder, new_name, schema) {
+        Some(Reached::RowType(kind)) => {
+            return Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Type,
+                conflicting_kind: kind,
+                object_name: builder.dialect().stored_name(new_name),
+                type_collision: true,
+            });
+        }
+        Some(Reached::UserType(_, _)) => {
+            return Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Type,
+                conflicting_kind: ObjectKind::Type,
+                object_name: builder.dialect().stored_name(new_name),
+                type_collision: true,
+            });
+        }
+        Some(Reached::Domain(_)) => {
+            return Err(Error::RelationNameAlreadyTaken {
+                object_kind: ObjectKind::Type,
+                conflicting_kind: ObjectKind::Domain,
+                object_name: builder.dialect().stored_name(new_name),
+                type_collision: true,
+            });
+        }
+        Some(Reached::Catalog) | None => {}
     }
     let mut destination = old_name.clone();
     rewrite_last_ident(&mut destination, new_name);
@@ -1545,14 +1687,17 @@ fn alter_type_add_value(
         Doomed::Domain(_) => (0, false),
     };
     if !is_user_type {
-        return Err(Error::NotAnEnum { type_name: builder.dialect().stored_object_name(name) });
+        return Err(Error::NotAnEnum {
+            type_name: builder.dialect().stored_object_name(name),
+            type_display: diagnostic_type(&builder, name),
+        });
     }
     let case = builder.identifier_case();
     let type_name = builder.dialect().stored_object_name(name);
     let (type_, _) = &mut builder.user_defined_types_mut()[position];
     let type_ = Arc::make_mut(type_);
     let Some(UserDefinedTypeRepresentation::Enum { labels }) = type_.representation.as_mut() else {
-        return Err(Error::NotAnEnum { type_name });
+        return Err(Error::NotAnEnum { type_name, type_display: diagnostic_type(&builder, name) });
     };
     // A held label is refused, or skipped with IF NOT EXISTS, before its
     // position is checked.
@@ -1592,14 +1737,17 @@ fn alter_type_rename_value(
         Doomed::Domain(_) => (0, false),
     };
     if !is_user_type {
-        return Err(Error::NotAnEnum { type_name: builder.dialect().stored_object_name(name) });
+        return Err(Error::NotAnEnum {
+            type_name: builder.dialect().stored_object_name(name),
+            type_display: diagnostic_type(&builder, name),
+        });
     }
     let case = builder.identifier_case();
     let type_name = builder.dialect().stored_object_name(name);
     let (type_, _) = &mut builder.user_defined_types_mut()[position];
     let type_ = Arc::make_mut(type_);
     let Some(UserDefinedTypeRepresentation::Enum { labels }) = type_.representation.as_mut() else {
-        return Err(Error::NotAnEnum { type_name });
+        return Err(Error::NotAnEnum { type_name, type_display: diagnostic_type(&builder, name) });
     };
     let Some(index) = label_position(labels, &renamed.from, case) else {
         return Err(Error::EnumLabelNotFound { type_name, label: renamed.from.value.clone() });

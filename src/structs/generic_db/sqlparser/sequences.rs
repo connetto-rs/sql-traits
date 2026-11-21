@@ -125,6 +125,7 @@ pub(super) fn create_sequence(
             object_kind: ObjectKind::Sequence,
             conflicting_kind,
             object_name: builder.dialect().stored_name(name_ident),
+            type_collision: relation.is_none(),
         });
     }
 
@@ -197,6 +198,9 @@ fn resolve_owner(
     let relation_name = || builder.dialect().stored_object_name_last(&relation);
 
     let Some((kind, relation_schema)) = builder.relation_reached(&relation) else {
+        if let Some(schema_name) = super::missing_schema::missing_schema_name(builder, &relation) {
+            return Err(Error::SchemaNotFound { schema_name });
+        }
         return Err(Error::RelationNotFoundForSequenceOwner {
             relation_name: builder.dialect().stored_object_name(&relation),
             sequence_name: sequence_name(),
@@ -413,12 +417,19 @@ pub(super) fn drop_sequences(
                     object_name: builder.dialect().stored_object_name_last(name),
                     expected_kind: ObjectKind::Sequence,
                     actual_kind,
+                    context: crate::errors::RelationKindContext::Statement,
                 });
             }
             None if !if_exists => {
+                if let Some(schema_name) =
+                    super::missing_schema::missing_schema_name(&builder, name)
+                {
+                    return Err(Error::SchemaNotFound { schema_name });
+                }
                 return Err(Error::RelationNotFound {
                     object_kind: ObjectKind::Sequence,
                     object_name: builder.dialect().stored_object_name_last(name),
+                    drop_statement: true,
                 });
             }
             None => {}
@@ -670,6 +681,13 @@ pub(super) fn create_column_sequences(
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Sequence,
                 conflicting_kind,
+                type_collision: super::relation_name_holder(
+                    &builder,
+                    &Ident::with_quote('"', name.as_str()),
+                    qualifier,
+                    None,
+                )
+                .is_none(),
                 object_name: name,
             });
         }

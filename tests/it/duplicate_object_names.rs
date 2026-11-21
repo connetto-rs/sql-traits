@@ -191,7 +191,7 @@ fn an_index_name_used_twice_is_refused() {
          CREATE INDEX i ON docs (id);",
     );
     assert!(
-        matches!(&refused, Err(Error::RelationNameAlreadyTaken { object_kind, conflicting_kind, object_name })
+        matches!(&refused, Err(Error::RelationNameAlreadyTaken { object_kind, conflicting_kind, object_name, .. })
             if *object_kind == ObjectKind::Index
                 && *conflicting_kind == ObjectKind::Index
                 && object_name == "i"),
@@ -731,7 +731,7 @@ fn dropping_a_trigger_leaves_the_same_name_on_another_table_alone() {
          DROP TRIGGER t ON b;"
     ));
     assert!(
-        matches!(&missing, Err(Error::DropTriggerNotFound { trigger_name }) if trigger_name == "t"),
+        matches!(&missing, Err(Error::DropTriggerNotFound { trigger_name, .. }) if trigger_name == "t"),
         "got {missing:?}"
     );
 }

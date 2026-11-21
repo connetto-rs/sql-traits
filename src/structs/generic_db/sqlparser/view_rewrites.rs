@@ -1879,6 +1879,7 @@ pub(super) fn shape_of_block_statement(
         return Err(Error::FunctionBodyStatementUnsupported {
             statement: statement.to_string(),
             function_name: function_name.to_string(),
+            command_tag: None,
         });
     }
     Ok(())

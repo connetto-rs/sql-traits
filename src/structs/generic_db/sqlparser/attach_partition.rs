@@ -82,6 +82,7 @@ pub(super) fn attach_partition(
                 for_values: for_values.clone(),
             }
             .to_string(),
+            action: Some(crate::errors::RelationAlterAction::Command("ATTACH PARTITION")),
         }
     };
 
@@ -98,9 +99,15 @@ pub(super) fn attach_partition(
         if let Some(object_kind) = views::holds_view(&builder, partition_name) {
             return Err(unsupported(object_kind, partition_name));
         }
+        if let Some(schema_name) =
+            super::missing_schema::missing_schema_name(&builder, partition_name)
+        {
+            return Err(Error::SchemaNotFound { schema_name });
+        }
         return Err(Error::RelationNotFound {
             object_kind: ObjectKind::Table,
             object_name: builder.dialect().stored_object_name(partition_name),
+            drop_statement: false,
         });
     };
     let partition = StoredTable::of(partition_node);

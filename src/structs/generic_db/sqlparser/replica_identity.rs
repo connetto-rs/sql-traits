@@ -136,6 +136,7 @@ fn usable_index(
                         object_name: wanted,
                         expected_kind: ObjectKind::Index,
                         actual_kind,
+                        context: crate::errors::RelationKindContext::Statement,
                     })
                 }
                 None => Err(Error::ReplicaIdentityIndexNotFound { table_name, index_name: wanted }),

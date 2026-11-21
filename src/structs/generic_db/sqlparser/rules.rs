@@ -70,15 +70,33 @@ pub(super) fn create_rule(
     } else if super::sequences::holds_sequence(&builder, &rule.table_name) {
         return unsupported(rule, ObjectKind::Sequence);
     } else {
+        if let Some(schema_name) =
+            super::missing_schema::missing_schema_name(&builder, &rule.table_name)
+        {
+            return Err(Error::SchemaNotFound { schema_name });
+        }
         return Err(Error::RelationNotFoundForRule {
             relation_name: builder.dialect().stored_object_name(&rule.table_name),
             rule_name: builder.dialect().stored_name(&rule.name),
         });
     };
     if rule.event == CreateRuleEvent::Select {
+        let on_view = builder.resolve_view_object_name(&rule.table_name)?.is_some();
+        let instead_select = rule.do_kind == Some(sqlparser::ast::CreateRuleDoKind::Instead)
+            && matches!(action_statements(&rule.action), [Statement::Query(_)]);
+        let refusal = if !on_view {
+            Some(crate::errors::SelectRuleRefusal::Table)
+        } else if !instead_select {
+            Some(crate::errors::SelectRuleRefusal::InvalidViewAction)
+        } else if rule.or_replace && builder.dialect().stored_name(&rule.name) == "_RETURN" {
+            None
+        } else {
+            Some(crate::errors::SelectRuleRefusal::ExistingView)
+        };
         return Err(Error::SelectRuleUnsupported {
             relation_name: builder.dialect().stored_object_name_last(&rule.table_name),
             rule_name: builder.dialect().stored_name(&rule.name),
+            refusal,
         });
     }
     bind_reference(&mut rule.table_name, qualifier);
