@@ -203,16 +203,10 @@ fn single_column(column: &Ident, columns: &[IndexColumn], case: IdentifierCase) 
     let [held] = columns else {
         return false;
     };
-    if held.operator_class.is_some()
-        || held.column.options != OrderByOptions::default()
-        || held.column.with_fill.is_some()
-    {
-        return false;
-    }
-    match &held.column.expr {
-        Expr::Identifier(name) => same_identifier(column, name, case),
-        _ => false,
-    }
+    held.operator_class.is_none()
+        && held.column.options == OrderByOptions::default()
+        && held.column.with_fill.is_none()
+        && matches!(&held.column.expr, Expr::Identifier(name) if same_identifier(column, name, case))
 }
 
 /// Merges the equal keys declared by one `CREATE TABLE` or `ADD COLUMN`.
@@ -253,10 +247,15 @@ pub(super) fn merge(
             surviving.push(current);
         }
     }
-    for (destination, source) in renamed {
-        let name = name_mut(columns, constraints, source).and_then(Option::take);
-        if let Some(destination) = name_mut(columns, constraints, destination) {
-            *destination = name;
+    let mut names = Vec::with_capacity(renamed.len());
+    for (position, slot) in name_slots(columns, constraints) {
+        if let Some((destination, _)) = renamed.iter().find(|(_, source)| *source == position) {
+            names.push((*destination, slot.take()));
+        }
+    }
+    for (position, slot) in name_slots(columns, constraints) {
+        if let Some(index) = names.iter().position(|(destination, _)| *destination == position) {
+            *slot = names.swap_remove(index).1;
         }
     }
     for (column, definition) in columns.iter_mut().enumerate() {
@@ -275,32 +274,30 @@ pub(super) fn merge(
     });
 }
 
-/// The written name field of an index-backed constraint.
-fn name_mut<'node>(
+/// The written name fields of every index-backed constraint, with their slots.
+fn name_slots<'node>(
     columns: &'node mut [ColumnDef],
     constraints: &'node mut [TableConstraint],
-    position: Position,
-) -> Option<&'node mut Option<Ident>> {
-    match position {
-        Position::Column(column, option) => {
-            let option = &mut columns[column].options[option];
-            if option.name.is_some() {
-                Some(&mut option.name)
-            } else {
-                match &mut option.option {
-                    ColumnOption::PrimaryKey(key) => Some(&mut key.name),
-                    ColumnOption::Unique(key) => Some(&mut key.name),
-                    _ => None,
-                }
-            }
-        }
-        Position::Table(position) => {
-            match &mut constraints[position] {
-                TableConstraint::PrimaryKey(key) => Some(&mut key.name),
-                TableConstraint::Unique(key) => Some(&mut key.name),
-                TableConstraint::Exclude(key) => Some(&mut key.name),
-                _ => None,
-            }
-        }
-    }
+) -> impl Iterator<Item = (Position, &'node mut Option<Ident>)> {
+    let column_slots = columns.iter_mut().enumerate().flat_map(|(column, definition)| {
+        definition.options.iter_mut().enumerate().filter_map(move |(option, declared)| {
+            let key_name = match &mut declared.option {
+                ColumnOption::PrimaryKey(key) => &mut key.name,
+                ColumnOption::Unique(key) => &mut key.name,
+                _ => return None,
+            };
+            let slot = if declared.name.is_some() { &mut declared.name } else { key_name };
+            Some((Position::Column(column, option), slot))
+        })
+    });
+    let table_slots = constraints.iter_mut().enumerate().filter_map(|(position, constraint)| {
+        let slot = match constraint {
+            TableConstraint::PrimaryKey(key) => &mut key.name,
+            TableConstraint::Unique(key) => &mut key.name,
+            TableConstraint::Exclude(key) => &mut key.name,
+            _ => return None,
+        };
+        Some((Position::Table(position), slot))
+    });
+    column_slots.chain(table_slots)
 }
