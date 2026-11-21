@@ -2078,6 +2078,23 @@ fn a_block_body_refuses_a_bare_reference_its_own_factors_expose_twice() {
     );
 }
 
+#[test]
+fn a_block_body_refuses_a_bare_reference_a_derived_table_also_exposes() {
+    let refused = parse(
+        "CREATE TABLE m1 (a INT, b INT);
+         CREATE TABLE m2 (a INT);
+         CREATE FUNCTION f() RETURNS VOID LANGUAGE sql BEGIN ATOMIC
+             UPDATE m1 SET b = 1 FROM (SELECT a FROM m2) AS d WHERE a > 0;
+         END;",
+    )
+    .expect_err("the table and the derived table both expose the reference");
+    assert!(
+        matches!(&refused, Error::FunctionBodyReferenceAmbiguous { column_name, function_name }
+            if column_name == "a" && function_name == "f"),
+        "got {refused:?}"
+    );
+}
+
 /// A `RETURNING` wildcard writes the qualified columns it reaches, the way
 /// PostgreSQL stores it, the target's for an `INSERT`, the target's and its
 /// clause factors' for an `UPDATE` or a `DELETE`, and the source's and the

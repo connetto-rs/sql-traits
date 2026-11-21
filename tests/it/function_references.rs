@@ -124,14 +124,19 @@ fn a_trigger_reports_the_function_it_runs() {
     assert_eq!(function.target_name().schema(), None);
     assert_eq!(function.argument_type_names(&db).count(), 0);
 
+    // An overload with an input argument is never the trigger's, even where
+    // the catalog lists it first.
     let spelled_public = parse(
-        "CREATE FUNCTION public.f() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+        "CREATE FUNCTION f(x INT) RETURNS INT AS 'SELECT 1';
+         CREATE FUNCTION public.f() RETURNS TRIGGER LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
          CREATE TABLE t (id INT);
          CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();",
     )
     .expect("schema parses");
     let trigger = spelled_public.triggers().next().expect("the trigger exists");
-    assert!(trigger.function(&spelled_public).is_some(), "public.f is the f a bare name reaches");
+    let function =
+        trigger.function(&spelled_public).expect("public.f is the f a bare name reaches");
+    assert_eq!(function.argument_type_names(&spelled_public).count(), 0);
 }
 
 #[test]

@@ -153,6 +153,15 @@ fn a_rename_another_relation_would_capture_is_qualified() {
         "v",
         "SELECT t.b AS a FROM t, x",
     );
+    // The qualifier the outer relation is reached by names an inner one too,
+    // so the rename is shielded rather than qualified.
+    assert_definition(
+        "CREATE TABLE t (a INT); CREATE TABLE x (b INT);
+         CREATE VIEW v AS SELECT a FROM t AS s WHERE EXISTS (SELECT 1 FROM x AS s WHERE s.b = a);
+         ALTER TABLE t RENAME COLUMN a TO b;",
+        "v",
+        "SELECT a FROM t AS s (a) WHERE EXISTS (SELECT 1 FROM x AS s WHERE s.b = a)",
+    );
 }
 
 #[test]
