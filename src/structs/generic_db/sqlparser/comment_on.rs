@@ -144,6 +144,7 @@ fn comment_on_column(
             LookupError::ColumnNotFound {
                 table_name: builder.dialect().stored_object_name(&relation),
                 column_name: builder.dialect().stored_name(&column),
+                site: crate::errors::ColumnLookupSite::Relation,
             }
         })?;
     builder.columns_mut()[position].1.set_documentation(documentation);

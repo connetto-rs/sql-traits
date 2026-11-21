@@ -49,7 +49,7 @@ fn an_index_naming_an_absent_column_is_refused() {
     );
     assert!(
         matches!(&error, Error::IdentifierLookupError(LookupError::ColumnNotFound {
-            table_name, column_name }) if table_name == "t" && column_name == "missing"),
+            table_name, column_name, .. }) if table_name == "t" && column_name == "missing"),
         "got {error:?}"
     );
 }
@@ -78,7 +78,7 @@ fn a_key_constraint_including_an_absent_column_is_refused() {
             .expect_err("missing is not declared");
         assert!(
             matches!(&error, Error::IdentifierLookupError(LookupError::ColumnNotFound {
-                table_name, column_name }) if table_name == "t" && column_name == "missing"),
+                table_name, column_name, .. }) if table_name == "t" && column_name == "missing"),
             "{constraint}: got {error:?}"
         );
     }

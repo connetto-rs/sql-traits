@@ -1188,6 +1188,7 @@ fn missing_copied_types_keep_their_errors() {
                 Some(LookupError::ColumnNotFound {
                     table_name: "t".to_owned(),
                     column_name: "absent".to_owned(),
+                    site: sql_traits::errors::ColumnLookupSite::Relation,
                 })
             ),
             (

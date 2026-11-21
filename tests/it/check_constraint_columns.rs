@@ -28,6 +28,6 @@ fn an_unknown_column_inside_an_any_form_is_refused() {
     );
     assert!(matches!(
         parsed,
-        Err(Error::UnknownColumn { reference }) if reference == "missing"
+        Err(Error::UnknownColumn { reference }) if reference.to_string() == "missing"
     ));
 }

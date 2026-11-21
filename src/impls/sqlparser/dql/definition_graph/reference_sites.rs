@@ -1,10 +1,7 @@
 //! The column references of a query, each with what it reaches, and how its
 //! wildcards and `NATURAL` joins would be spelled out.
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -28,7 +25,7 @@ use crate::{
     errors::LookupError,
     impls::dql::scoped_roots::ScopedRoot,
     structs::IdentifierCase,
-    traits::DatabaseLike,
+    traits::{DatabaseLike, TableLike},
     utils::{
         columns_in_expression::Labels,
         identifier_resolution::{identifiers_match, name_parts},
@@ -263,7 +260,7 @@ pub(crate) fn first_unknown_column<DB: DatabaseLike>(
     database: &DB,
     case: IdentifierCase,
     names_routine: &dyn Fn(&Ident) -> bool,
-) -> Option<String> {
+) -> Option<crate::errors::ColumnReference> {
     let (graph, _) = build_definition_graph(query, database, case).ok()?;
     let mut unknown = None;
     let mut sink = |expression: &Expr, rule: Option<SiteRule>| {
@@ -273,7 +270,7 @@ pub(crate) fn first_unknown_column<DB: DatabaseLike>(
             && matches!(graph.resolve_site(rule, expression), Ok(None))
             && !graph.reads_otherwise(rule, parts, database.catalog_name(), names_routine)
         {
-            unknown = Some(expression.to_string());
+            unknown = Some(graph.unknown_column(rule, parts, database.catalog_name()));
         }
     };
     Walk {
@@ -287,6 +284,54 @@ pub(crate) fn first_unknown_column<DB: DatabaseLike>(
 }
 
 impl<DB: DatabaseLike> DefinitionGraph<'_, '_, DB> {
+    /// Records the missing column or inaccessible relation in its lexical
+    /// scope.
+    fn unknown_column(
+        &self,
+        rule: SiteRule,
+        parts: &[Ident],
+        catalog: &str,
+    ) -> crate::errors::ColumnReference {
+        let cursor = match rule {
+            SiteRule::Scope(cursor)
+            | SiteRule::OutputFirst(cursor)
+            | SiteRule::InputFirst(cursor) => Some(cursor),
+            SiteRule::OrderBy(query) => self.order_by_cursor(query),
+        };
+        let qualifier = &parts[..parts.len().saturating_sub(1)];
+        let relation_found = cursor.is_some_and(|cursor| {
+            without_catalog(qualifier, catalog).is_some_and(|qualifier| {
+                self.resolve_relation(cursor, &ObjectName::from(qualifier.to_vec())).is_some()
+            })
+        }) || (parts.len() == 4
+            && cursor.is_some_and(|cursor| {
+                self.resolve_relation(cursor, &ObjectName::from(parts[1..3].to_vec())).is_some()
+            }));
+        let mut inaccessible = false;
+        let mut scope = cursor;
+        while let Some(cursor) = scope {
+            let current = &self.scopes[cursor.scope.0];
+            if let Some(name) = qualifier.last() {
+                inaccessible |= current.data.bases.iter().any(|base| {
+                    identifiers_match(
+                        base.table.table_name(),
+                        base.table.table_name_is_quoted(),
+                        &name.value,
+                        name.quote_style.is_some(),
+                    )
+                });
+            }
+            scope = current.parent;
+        }
+        crate::errors::ColumnReference::unresolved(
+            self.dialect,
+            parts,
+            catalog,
+            relation_found,
+            inaccessible,
+        )
+    }
+
     /// Whether the reference written as `parts`, which `rule` resolves to no
     /// column, reads a whole row, a system column, a field of a column, or a
     /// function or cast applied to a row, as [`first_unknown_column`]

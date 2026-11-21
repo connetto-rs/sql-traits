@@ -910,6 +910,90 @@ impl ObjectKind {
     }
 }
 
+/// The context in which a declared column was required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnLookupSite {
+    /// An index entry or a column rename.
+    Column,
+    /// A primary or unique key.
+    Key,
+    /// An alteration or comment naming a relation's column.
+    Relation,
+    /// A foreign key's referenced columns.
+    ForeignKey,
+}
+
+/// A refused column reference with stored identifier parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnReference {
+    /// A column absent from the relations in scope.
+    Column {
+        /// Stored column name.
+        column_name: String,
+        /// Stored relation qualifier, when present.
+        relation_name: Option<String>,
+    },
+    /// A qualifier that reaches no visible relation.
+    Relation {
+        /// Stored relation name.
+        relation_name: String,
+        /// Whether a matching relation is hidden by its alias or scope.
+        inaccessible: bool,
+    },
+    /// A reference naming another database.
+    CrossDatabase {
+        /// Stored identifier parts joined with dots.
+        reference: String,
+    },
+    /// A reference with more than four identifier parts.
+    Improper {
+        /// Stored identifier parts joined with dots.
+        reference: String,
+    },
+}
+
+impl ColumnReference {
+    /// Records the stored parts and scope of a refused column reference.
+    pub(crate) fn unresolved(
+        dialect: crate::impls::SqlparserDialect,
+        parts: &[sqlparser::ast::Ident],
+        catalog: &str,
+        relation_found: bool,
+        inaccessible: bool,
+    ) -> Self {
+        let joined =
+            || parts.iter().map(|part| dialect.stored_name(part)).collect::<Vec<_>>().join(".");
+        if parts.len() > 4 {
+            return Self::Improper { reference: joined() };
+        }
+        if parts.len() == 4 && dialect.stored_name(&parts[0]) != catalog {
+            return Self::CrossDatabase { reference: joined() };
+        }
+        let column_name = parts.last().map(|part| dialect.stored_name(part)).unwrap_or_default();
+        let relation_name =
+            parts.len().checked_sub(2).map(|position| dialect.stored_name(&parts[position]));
+        if !relation_found && let Some(relation_name) = relation_name {
+            return Self::Relation { relation_name, inaccessible };
+        }
+        Self::Column { column_name, relation_name }
+    }
+}
+
+impl core::fmt::Display for ColumnReference {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Column { column_name, relation_name: Some(relation_name) } => {
+                write!(formatter, "{relation_name}.{column_name}")
+            }
+            Self::Column { column_name, relation_name: None } => formatter.write_str(column_name),
+            Self::Relation { relation_name, .. } => formatter.write_str(relation_name),
+            Self::CrossDatabase { reference } | Self::Improper { reference } => {
+                formatter.write_str(reference)
+            }
+        }
+    }
+}
+
 /// Errors produced by identifier-aware lookup and resolution APIs.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum LookupError {
@@ -985,6 +1069,8 @@ pub enum LookupError {
         table_name: String,
         /// Stored name of the column that was not found.
         column_name: String,
+        /// The statement context requiring this column.
+        site: ColumnLookupSite,
     },
     /// A foreign key naming no referenced columns targets a table holding no
     /// primary key. SQLite stores such a key and reports a foreign key
@@ -1705,9 +1791,8 @@ pub enum Error {
     /// predicate, a trigger's `WHEN` condition, a policy, or the query of a
     /// view or of `CREATE TABLE … AS`.
     UnknownColumn {
-        /// The reference as written, such as `nosuch`, `"nosuch"` or
-        /// `new.nosuch`.
-        reference: String,
+        /// Stored identifier parts and their resolution.
+        reference: ColumnReference,
     },
     #[error(
         "Column reference `{reference}` in table `{table_name}` names something other than that \
@@ -1716,8 +1801,8 @@ pub enum Error {
     /// A check constraint or an index expression qualified a column with a
     /// table, schema or catalog other than the one the expression belongs to.
     ForeignColumnReference {
-        /// The reference as written.
-        reference: String,
+        /// Stored identifier parts and their resolution.
+        reference: ColumnReference,
         /// Stored name of the table the expression is declared on.
         table_name: String,
     },

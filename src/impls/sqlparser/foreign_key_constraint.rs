@@ -279,6 +279,7 @@ fn resolve_columns<'db>(
                         .dialect()
                         .stored_spelling(table.table_name(), table.table_name_is_quoted()),
                     column_name: database.dialect().stored_name(column_name),
+                    site: crate::errors::ColumnLookupSite::ForeignKey,
                 }
             })?;
         columns.push(column);

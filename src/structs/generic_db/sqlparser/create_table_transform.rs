@@ -200,6 +200,7 @@ pub(super) fn key_column(
     Err(LookupError::ColumnNotFound {
         table_name: builder.dialect().stored_object_name_last(&table.name),
         column_name: builder.dialect().stored_name(name),
+        site: crate::errors::ColumnLookupSite::Key,
     }
     .into())
 }

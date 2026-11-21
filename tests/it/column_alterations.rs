@@ -146,7 +146,7 @@ fn dropping_a_column_that_is_absent_is_refused_unless_tolerated() {
     .expect_err("nope is not declared");
     assert!(
         matches!(&error, Error::IdentifierLookupError(LookupError::ColumnNotFound {
-            table_name, column_name }) if table_name == "t" && column_name == "nope"),
+            table_name, column_name, .. }) if table_name == "t" && column_name == "nope"),
         "got {error:?}"
     );
 
