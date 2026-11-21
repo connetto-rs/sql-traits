@@ -836,7 +836,9 @@ pub(super) fn receives_constraint(
     held: &TableConstraint,
 ) -> bool {
     if matches!(held, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_)) {
-        return receives_partition_key(builder, child, held);
+        // A key the partition added itself stays its own beside an alike one.
+        return records_inherited_constraint(builder, &StoredTable::of(child), held)
+            && receives_partition_key(builder, child, held);
     }
     parents_with_kind(child).any(|(kind, name)| {
         builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {

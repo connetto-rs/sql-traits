@@ -346,6 +346,26 @@ fn a_table_may_drop_a_constraint_of_its_own() {
     assert_eq!(constraint_names(&database, "chi"), Vec::<String>::new());
 }
 
+/// A key a partition adds itself stays its own beside an alike key its
+/// parent added `ONLY`, since nothing passed one down or attached it.
+#[test]
+fn a_partition_key_of_its_own_is_not_received() {
+    let alike = "CREATE TABLE k (id INT NOT NULL) PARTITION BY RANGE (id);
+         CREATE TABLE k0 PARTITION OF k FOR VALUES FROM (0) TO (10);
+         ALTER TABLE ONLY k ADD CONSTRAINT k_parent PRIMARY KEY (id);
+         ALTER TABLE ONLY k0 ADD CONSTRAINT k_child PRIMARY KEY (id);";
+    let has = |database: &ParserDB, table_name: &str, name: &str| {
+        constraint_names(database, table_name).iter().any(|held| held == name)
+    };
+
+    let dropped_below = database(&format!("{alike} ALTER TABLE k0 DROP CONSTRAINT k_child;"));
+    assert!(!has(&dropped_below, "k0", "k_child"));
+    assert!(has(&dropped_below, "k", "k_parent"));
+
+    let dropped_above = database(&format!("{alike} ALTER TABLE k DROP CONSTRAINT k_parent;"));
+    assert!(has(&dropped_above, "k0", "k_child"));
+}
+
 #[test]
 fn only_refuses_to_add_a_constraint_when_tables_inherit() {
     assert!(matches!(
