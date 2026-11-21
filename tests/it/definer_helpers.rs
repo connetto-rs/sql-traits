@@ -5480,6 +5480,7 @@ fn a_negated_comparison_with_no_helper_is_no_exclusion() {
         "NOT (project.id = ANY (string_to_array(current_setting('app.blocked', true), ',')))",
         "'p1' NOT IN (SELECT public.blocked_projects())",
         "project.id <> ANY (ARRAY(SELECT public.blocked_projects()))",
+        "project.id <> ALL ('{p9}'::TEXT[])",
         "NOT (lower(project.id) = ANY (ARRAY(SELECT public.blocked_projects())))",
         "project.id NOT IN (SELECT public.blocked_projects() LIMIT 1)",
         "project.id NOT IN (SELECT public.blocked_projects() UNION SELECT 'p9')",
