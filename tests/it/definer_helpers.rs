@@ -5480,6 +5480,9 @@ fn a_negated_comparison_with_no_helper_is_no_exclusion() {
         "NOT (project.id = ANY (string_to_array(current_setting('app.blocked', true), ',')))",
         "'p1' NOT IN (SELECT public.blocked_projects())",
         "project.id <> ANY (ARRAY(SELECT public.blocked_projects()))",
+        "NOT (lower(project.id) = ANY (ARRAY(SELECT public.blocked_projects())))",
+        "project.id NOT IN (SELECT public.blocked_projects() LIMIT 1)",
+        "project.id NOT IN (SELECT public.blocked_projects() UNION SELECT 'p9')",
     ] {
         for reads_exclusions in [false, true] {
             let answered = excluded_as(condition, reads_exclusions);
@@ -5489,6 +5492,44 @@ fn a_negated_comparison_with_no_helper_is_no_exclusion() {
             );
         }
     }
+}
+
+#[test]
+fn an_exclusion_calls_one_helper_returning_one_column() {
+    let unresolved = excluded_as("project.id NOT IN (SELECT public.unblocked())", true);
+    assert!(
+        matches!(
+            &unresolved,
+            Err(HelperSetError::UnresolvedCall { function, call })
+                if function == "visible_projects" && call == "public.unblocked"
+        ),
+        "{unresolved:?}"
+    );
+    let pairs = EXCLUSIONS.replace(
+        "CREATE FUNCTION blocked_projects() RETURNS SETOF TEXT\nLANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$\n  SELECT block.project_id FROM",
+        "CREATE FUNCTION blocked_projects() RETURNS TABLE (project_id TEXT, principal_id TEXT)\nLANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$\n  SELECT block.project_id, block.principal_id FROM",
+    );
+    assert_ne!(pairs, EXCLUSIONS, "the excluded helper returns two columns");
+    let database = postgres(&pairs);
+    let deployment = deployment();
+    let refused = excluding(&database, &deployment, "visible_projects");
+    assert!(matches!(refused, Err(HelperSetError::ArmShape { .. })), "{refused:?}");
+}
+
+#[test]
+fn an_exclusion_of_a_set_holding_nothing_takes_no_row_away() {
+    let condition = "block.principal_id = current_setting('app.user_id', true)\n$$;\nCREATE FUNCTION blocked_teams";
+    let empty = EXCLUSIONS.replace(
+        condition,
+        "block.principal_id = current_setting('app.user_id', true) AND false\n$$;\nCREATE FUNCTION blocked_teams",
+    );
+    assert_ne!(empty, EXCLUSIONS, "the excluded helper keeps no row");
+    let database = postgres(&empty);
+    let deployment = deployment();
+    assert_eq!(
+        excluding(&database, &deployment, "visible_projects").map(|set| render(&set)).as_deref(),
+        Ok("projects.id WHERE owner_id = app.user_id")
+    );
 }
 
 /// PostgreSQL runs the excluded helper as the owner of the helper excluding

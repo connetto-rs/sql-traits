@@ -193,7 +193,8 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     }
 
     /// The sets of other helpers a row's column has to stay outside, every
-    /// one of them, in the order the condition writes them. Empty in every
+    /// one of them, in the order the condition writes them. An exclusion of
+    /// a set holding no arm takes no row away and is left out. Empty in every
     /// answer of [`FunctionLike::helper_set`], which refuses an arm writing
     /// one (see [`FunctionLike::helper_set_with_exclusions`]).
     ///

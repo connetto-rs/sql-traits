@@ -1960,7 +1960,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 continue;
             }
             if let Some(exclusion) = self.exclusion(scope, select, table, conjunct)? {
-                exclusions.push(exclusion);
+                // `NOT IN` an empty set holds for every row, `NULL` too.
+                if !exclusion.set.arms.is_empty() {
+                    exclusions.push(exclusion);
+                }
                 continue;
             }
             let named = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
