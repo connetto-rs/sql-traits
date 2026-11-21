@@ -871,6 +871,7 @@ fn assign_name(
                     object_kind: ObjectKind::UniqueIndex,
                     conflicting_kind: ObjectKind::UniqueIndex,
                     object_name: name,
+                    type_collision: false,
                 }
             } else {
                 Error::ConstraintAlreadyExists {
@@ -1217,6 +1218,7 @@ pub(super) fn key_index_table(
                 object_kind: ObjectKind::UniqueIndex,
                 conflicting_kind,
                 object_name: builder.dialect().stored_name(new),
+                type_collision: false,
             })
         }
         None => Ok(Some(stored)),
@@ -1325,6 +1327,7 @@ fn rename_constraint_of(
             object_kind: ObjectKind::UniqueIndex,
             conflicting_kind,
             object_name: builder.dialect().stored_name(new),
+            type_collision: false,
         });
     }
 

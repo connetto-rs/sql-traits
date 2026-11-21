@@ -293,7 +293,7 @@ fn a_select_rule_is_refused() {
     assert!(
         matches!(
             &error,
-            Error::SelectRuleUnsupported { rule_name, relation_name }
+            Error::SelectRuleUnsupported { rule_name, relation_name, refusal: Some(sql_traits::errors::SelectRuleRefusal::Table) }
                 if rule_name == "_RETURN" && relation_name == "orders"
         ),
         "got {error:?}"

@@ -469,7 +469,10 @@ ALTER TYPE c RENAME TO t;
 ",
     )
     .expect_err("the row type is held");
-    assert!(matches!(error, Error::TypeIsRowType { .. }), "{error:?}");
+    assert!(
+        matches!(error, Error::RelationNameAlreadyTaken { type_collision: false, .. }),
+        "{error:?}"
+    );
 }
 
 #[test]
@@ -728,6 +731,7 @@ DROP TYPE _ccomp;
                 ref type_name,
                 requiring_kind: ObjectKind::Type,
                 ref requiring_name,
+                ..
             } if type_name.as_str() == "ccomp[]" && requiring_name.as_str() == "ccomp"
         ),
         "{error:?}"
@@ -761,7 +765,7 @@ ALTER TYPE _ccomp RENAME TO x;
     assert!(
         matches!(
             error,
-            Error::CannotAlterArrayType { ref array_name } if array_name.as_str() == "ccomp[]"
+            Error::CannotAlterArrayType { ref array_name, .. } if array_name.as_str() == "ccomp[]"
         ),
         "{error:?}"
     );
@@ -916,7 +920,7 @@ ALTER TYPE mr2 ADD VALUE 'x';
     )
     .expect_err("a multirange is no enum");
     assert!(
-        matches!(error, Error::NotAnEnum { ref type_name } if type_name.as_str() == "mr2"),
+        matches!(error, Error::NotAnEnum { ref type_name, .. } if type_name.as_str() == "mr2"),
         "{error:?}"
     );
 }

@@ -51,6 +51,7 @@ pub(super) fn detach_partition(
                 mode,
             }
             .to_string(),
+            action: Some(crate::errors::RelationAlterAction::Command("DETACH PARTITION")),
         });
     }
     let partition = partition_of(&builder, &root, root_name, partition_name)?;
@@ -129,9 +130,15 @@ fn partition_of(
         if builder.relation_reached(partition_name).is_some() {
             return Err(not_a_partition());
         }
+        if let Some(schema_name) =
+            super::missing_schema::missing_schema_name(builder, partition_name)
+        {
+            return Err(Error::SchemaNotFound { schema_name });
+        }
         return Err(Error::RelationNotFound {
             object_kind: ObjectKind::Table,
             object_name: builder.dialect().stored_object_name(partition_name),
+            drop_statement: false,
         });
     };
     let case = builder.identifier_case();

@@ -1037,12 +1037,12 @@ fn local_collation_conflict(
 ) -> Result<Option<Error>, Error> {
     let local_collation = super::stored_column_collation_name(column);
     let local_metadata = super::column_metadata_for_collations(
+        context.builder,
         column,
         context.collations,
         context.catalog,
         context.search_path,
         &[],
-        super::should_validate_missing_collations(*context.builder.dialect()),
     )?;
     if inherited_metadata.metadata.postgres_collation_matches(&local_metadata) != Some(false) {
         return Ok(None);
@@ -1536,6 +1536,10 @@ pub(super) fn resolve_unbound_parent<'builder>(
     child_name: &ObjectName,
 ) -> Result<&'builder CreateTable, Error> {
     builder.resolve_table_object_name(parent_name)?.ok_or_else(|| {
+        if let Some(schema_name) = super::missing_schema::missing_schema_name(builder, parent_name)
+        {
+            return Error::SchemaNotFound { schema_name };
+        }
         match builder.relation_reached(parent_name) {
             Some((object_kind, _)) => {
                 Error::InheritsFromNonTable {
@@ -1631,6 +1635,10 @@ fn resolve_parent<'builder>(
     child_name: &str,
 ) -> Result<&'builder CreateTable, Error> {
     builder.resolve_bound_table_name(parent_name)?.ok_or_else(|| {
+        if let Some(schema_name) = super::missing_schema::missing_schema_name(builder, parent_name)
+        {
+            return Error::SchemaNotFound { schema_name };
+        }
         Error::ParentTableNotFound {
             parent_table: builder.dialect().stored_object_name(parent_name),
             child_table: child_name.to_string(),

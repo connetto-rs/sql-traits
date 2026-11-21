@@ -1200,7 +1200,7 @@ fn a_statement_needing_a_table_names_the_view_it_found_instead() {
     for sql in cases {
         let refused = parse(&sql).expect_err("a view cannot stand in for a table here");
         assert!(
-            matches!(&refused, Error::RelationKindMismatch { expected_kind, actual_kind, object_name }
+            matches!(&refused, Error::RelationKindMismatch { expected_kind, actual_kind, object_name, .. }
                 if *expected_kind == ObjectKind::Table
                     && *actual_kind == ObjectKind::View
                     && object_name == "v"),

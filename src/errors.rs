@@ -13,6 +13,43 @@ mod postgres;
 
 pub use postgres::{PostgresError, SqlState};
 
+/// The session identity and operation that prevent a role change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRoleRefusal {
+    /// Dropping the current user.
+    DropCurrent,
+    /// Dropping the session user while another role is active.
+    DropSession,
+    /// Renaming the current user.
+    RenameCurrent,
+    /// Renaming the session user.
+    RenameSession,
+}
+
+/// The operation that requires a different relation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKindContext {
+    /// A statement naming the expected object kind.
+    Statement,
+    /// A foreign key's referenced relation.
+    ForeignKey,
+    /// Creation of an index.
+    Index,
+    /// Creation of a trigger.
+    Trigger,
+}
+
+/// The PostgreSQL refusal associated with an unsupported relation alteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationAlterAction {
+    /// An `ALTER` action named by PostgreSQL's command tag.
+    Command(&'static str),
+    /// Renaming a column on a relation kind without renameable columns.
+    RenameColumns,
+    /// A constraint kind forbidden on foreign tables.
+    ForeignConstraint(KeyConstraint),
+}
+
 /// Kind of database object a metadata lookup was made for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
@@ -548,6 +585,17 @@ pub enum TriggerFiringRefusal {
     /// A trigger on a view with a `REFERENCING` transition table, which
     /// PostgreSQL refuses.
     TransitionTablesOnView,
+}
+
+/// Why PostgreSQL refuses an `ON SELECT` rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SelectRuleRefusal {
+    /// The target is a table.
+    Table,
+    /// The view already has its query rule.
+    ExistingView,
+    /// The action is not an `INSTEAD SELECT`.
+    InvalidViewAction,
 }
 
 impl core::fmt::Display for TriggerFiringRefusal {
@@ -2618,6 +2666,8 @@ pub enum Error {
         rule_name: String,
         /// Name of the relation, as stored.
         relation_name: String,
+        /// The PostgreSQL refusal, absent for a supported view replacement.
+        refusal: Option<SelectRuleRefusal>,
     },
     #[error("Relation `{relation_name}` not found for rule `{rule_name}`.")]
     /// Error indicating that a rule's action or condition names a relation
@@ -3823,6 +3873,10 @@ pub enum Error {
     DropTriggerNotFound {
         /// Name of the trigger that was not found.
         trigger_name: String,
+        /// Stored name of the target relation, if the statement names one.
+        table_name: Option<String>,
+        /// Whether the target relation exists.
+        table_exists: bool,
     },
     #[error("Policy `{policy_name}` not found for DROP POLICY statement.")]
     /// Error indicating that a DROP POLICY statement references a policy
@@ -3830,6 +3884,10 @@ pub enum Error {
     DropPolicyNotFound {
         /// Name of the policy that was not found.
         policy_name: String,
+        /// Stored name of the target relation.
+        table_name: String,
+        /// Whether the target relation exists.
+        table_exists: bool,
     },
     #[error("Role `{role_name}` not found for DROP ROLE statement.")]
     /// Error indicating that a DROP ROLE statement references a role
@@ -3854,6 +3912,8 @@ pub enum Error {
     RoleInUseBySession {
         /// Stored name of the role.
         role_name: String,
+        /// The operation and session identity PostgreSQL refuses.
+        refusal: SessionRoleRefusal,
     },
     #[error("Role `{role_name}` not found for the session to run as.")]
     /// Error indicating that `SET ROLE` or `SET SESSION AUTHORIZATION` names a
@@ -3866,12 +3926,21 @@ pub enum Error {
         role_name: String,
     },
     #[error("`{statement}` names no single role for the session to run as.")]
-    /// Error indicating that `SET role` or `SET session_authorization` takes
-    /// more than one value, or a value that is no name, string, number or
-    /// boolean, which PostgreSQL refuses.
+    /// A session role setting contains an expression PostgreSQL's grammar
+    /// refuses.
     InvalidSessionRole {
         /// The statement, rendered by sqlparser.
         statement: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
+    },
+    #[error("`{statement}` gives `{setting}` more than one role.")]
+    /// A session role setting has more than one value.
+    MultipleSessionRoles {
+        /// The statement, rendered by sqlparser.
+        statement: String,
+        /// The PostgreSQL setting name.
+        setting: String,
     },
     #[error(
         "`{statement}` sets a value that is no name, string, number or boolean, which PostgreSQL \
@@ -3883,6 +3952,8 @@ pub enum Error {
     NonLiteralSetting {
         /// The statement, rendered by sqlparser.
         statement: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
     },
     #[error(
         "`{statement}` stores the session's current `{setting}`, which the input leaves unknown."
@@ -3923,6 +3994,14 @@ pub enum Error {
     /// `public` is exempt, since every database holds it.
     SchemaNotFoundForDefaultPrivileges {
         /// The stored name of the schema.
+        schema_name: String,
+    },
+    #[error("Schema `{schema_name}` of ALTER DEFAULT PRIVILEGES is qualified.")]
+    /// Error indicating that `ALTER DEFAULT PRIVILEGES ... IN SCHEMA` names a
+    /// schema with a qualifier, which PostgreSQL's grammar refuses since a
+    /// schema name has a single part.
+    QualifiedDefaultPrivilegesSchema {
+        /// The stored parts of the name joined with dots.
         schema_name: String,
     },
     #[error("ALTER DEFAULT PRIVILEGES cannot use IN SCHEMA with ON {object_type}.")]
@@ -3967,6 +4046,8 @@ pub enum Error {
         conflicting_kind: ObjectKind,
         /// The contested stored name.
         object_name: String,
+        /// Whether the collision is in PostgreSQL's type namespace.
+        type_collision: bool,
     },
     #[error("{object_kind} `{object_name}` not found.")]
     /// Error indicating that a statement names a relation the input never
@@ -3976,6 +4057,8 @@ pub enum Error {
         object_kind: ObjectKind,
         /// The stored relation name.
         object_name: String,
+        /// Whether the statement drops the relation.
+        drop_statement: bool,
     },
     #[error("Domain `{domain_name}` not found for DROP DOMAIN statement.")]
     /// Error indicating that a `DROP DOMAIN` statement without `IF EXISTS`
@@ -3996,6 +4079,8 @@ pub enum Error {
     DomainHasDependents {
         /// The stored name of the domain the statement drops.
         domain_name: String,
+        /// PostgreSQL's diagnostic spelling of the domain type.
+        type_display: String,
         /// [`ObjectKind::Column`], [`ObjectKind::Domain`] or
         /// [`ObjectKind::Function`].
         dependent_kind: ObjectKind,
@@ -4018,6 +4103,8 @@ pub enum Error {
         expected_kind: ObjectKind,
         /// Kind the name actually holds.
         actual_kind: ObjectKind,
+        /// The operation requiring this relation kind.
+        context: RelationKindContext,
     },
     #[error("Type `{type_name}` not found.")]
     /// Error indicating that a `DROP TYPE` statement without `IF EXISTS`, or
@@ -4034,6 +4121,8 @@ pub enum Error {
     TypeRequiredBySystem {
         /// The stored type name.
         type_name: String,
+        /// PostgreSQL's diagnostic spelling of the type.
+        type_display: String,
     },
     #[error("Type `{type_name}` is only a shell.")]
     /// Error indicating that a statement declares a value or a definition
@@ -4056,6 +4145,8 @@ pub enum Error {
     TypeHasDependents {
         /// The stored name of the type the statement drops.
         type_name: String,
+        /// PostgreSQL's diagnostic spelling of the type.
+        type_display: String,
         /// [`ObjectKind::Column`], [`ObjectKind::Domain`],
         /// [`ObjectKind::Type`], [`ObjectKind::Table`] or
         /// [`ObjectKind::Function`].
@@ -4073,11 +4164,15 @@ pub enum Error {
     TypeDropRequiredBy {
         /// The stored type name.
         type_name: String,
+        /// PostgreSQL's diagnostic spelling of the type.
+        type_display: String,
         /// [`ObjectKind::Type`] for a range or a base type, or the kind of
         /// relation whose row type the name holds.
         requiring_kind: ObjectKind,
         /// The stored name of the object requiring the dropped type.
         requiring_name: String,
+        /// PostgreSQL's diagnostic spelling of the requiring object.
+        requiring_display: String,
     },
     #[error("Type `{type_name}` is a {relation_kind}'s row type.")]
     /// Error indicating that an `ALTER TYPE` statement names the row type of
@@ -4085,6 +4180,8 @@ pub enum Error {
     TypeIsRowType {
         /// The stored type name.
         type_name: String,
+        /// PostgreSQL's diagnostic spelling of the row type.
+        type_display: String,
         /// Kind of relation that owns the row type.
         relation_kind: ObjectKind,
     },
@@ -4095,6 +4192,8 @@ pub enum Error {
     CannotAlterArrayType {
         /// The type whose array type the statement names, spelled as `name[]`.
         array_name: String,
+        /// PostgreSQL's diagnostic spelling of the array type.
+        type_display: String,
     },
     #[error("Enum label `{label}` of type `{type_name}` already exists.")]
     /// Error indicating that an `ALTER TYPE ... ADD VALUE` or `RENAME VALUE`
@@ -4120,6 +4219,8 @@ pub enum Error {
     NotAnEnum {
         /// The stored type name.
         type_name: String,
+        /// PostgreSQL's diagnostic spelling of the type.
+        type_display: String,
     },
     #[error("The type attribute `subtype` is required for type `{type_name}`.")]
     /// Error indicating that a `CREATE TYPE ... AS RANGE` statement names no
@@ -4127,6 +4228,8 @@ pub enum Error {
     RangeSubtypeRequired {
         /// The stored type name.
         type_name: String,
+        /// Whether the range declaration has no attributes.
+        empty_attributes: bool,
     },
     #[error("Enum label `{label}` of type `{type_name}` is written more than once.")]
     /// Error indicating that a `CREATE TYPE ... AS ENUM` statement writes the
@@ -4444,6 +4547,8 @@ pub enum Error {
         relation_name: String,
         /// The action, rendered by the parser.
         operation: String,
+        /// The PostgreSQL action tag, or `None` for a dialect-specific action.
+        action: Option<RelationAlterAction>,
     },
     #[error(
         "Constraint `{constraint_name}` not found on table `{table_name}` for ALTER TABLE RENAME CONSTRAINT statement."
@@ -4663,6 +4768,9 @@ pub enum Error {
         statement: String,
         /// Stored name of the function the statement declares.
         function_name: String,
+        /// The PostgreSQL utility command tag, or `None` for another dialect's
+        /// statement.
+        command_tag: Option<String>,
     },
     #[error(
         "Column `{column_name}` of `{relation_name}` cannot be renamed while function `{function_name}` writes to the relation in a statement that cannot follow the rename."
@@ -4888,6 +4996,8 @@ pub enum Error {
         table_name: String,
         /// The constraint as the statement wrote it.
         constraint: String,
+        /// Kind of constraint whose validation cannot be deferred.
+        kind: Option<KeyConstraint>,
     },
     #[error(
         "Constraint `{constraint}` arriving at table `{table_name}` from a parent conflicts with the `NOT VALID` copy the table holds."
@@ -5021,6 +5131,13 @@ pub enum Error {
     StatementAfterDefinition {
         /// The statement as written.
         statement: String,
+    },
+    #[error("Schema `{schema_name}` does not exist.")]
+    /// A statement qualifies a name with a schema the database does not hold,
+    /// which PostgreSQL refuses before it looks for the object itself.
+    SchemaNotFound {
+        /// Name of the schema, as stored.
+        schema_name: String,
     },
 }
 

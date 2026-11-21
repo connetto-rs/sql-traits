@@ -423,7 +423,7 @@ fn an_absent_root_is_excused_by_if_exists_and_an_absent_partition_never() {
             "CREATE TABLE p (id INT) PARTITION BY LIST (id);
              ALTER TABLE IF EXISTS p ATTACH PARTITION c FOR VALUES IN (1);"
         ),
-        Err(Error::RelationNotFound { object_kind: ObjectKind::Table, object_name })
+        Err(Error::RelationNotFound { object_kind: ObjectKind::Table, object_name, .. })
             if object_name == "c"
     ));
 }

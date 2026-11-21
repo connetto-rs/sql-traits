@@ -65,6 +65,7 @@ pub(super) fn create_trigger(
             table,
             &create_trigger.table_name,
             &[ObjectKind::VirtualTable],
+            crate::errors::RelationKindContext::Trigger,
         )?;
         let table = StoredTable::of(table);
         refuse_firing(&builder, &create_trigger, false)?;
@@ -91,7 +92,13 @@ pub(super) fn create_trigger(
             object_name: builder.dialect().stored_object_name_last(&create_trigger.table_name),
             expected_kind: ObjectKind::Table,
             actual_kind,
+            context: crate::errors::RelationKindContext::Trigger,
         });
+    }
+    if let Some(schema_name) =
+        super::missing_schema::missing_schema_name(&builder, &create_trigger.table_name)
+    {
+        return Err(Error::SchemaNotFound { schema_name });
     }
     Err(Error::RelationNotFoundForTrigger {
         relation_name: builder.dialect().stored_object_name(&create_trigger.table_name),
@@ -182,6 +189,11 @@ fn bind_parts(
     stored_expressions::refuse_in_trigger_condition(builder, &create_trigger.condition)?;
     if let Some(exec_body) = &mut create_trigger.exec_body {
         let Some(function) = builder.trigger_function(&exec_body.func_desc.name) else {
+            if let Some(schema_name) =
+                super::missing_schema::missing_schema_name(builder, &exec_body.func_desc.name)
+            {
+                return Err(Error::SchemaNotFound { schema_name });
+            }
             return Err(Error::FunctionNotFoundForTrigger {
                 function_name: builder.dialect().stored_object_name(&exec_body.func_desc.name),
                 trigger_name: builder.dialect().stored_object_name_last(&create_trigger.name),
@@ -279,8 +291,26 @@ pub(super) fn drop_trigger(
         if drop_trigger.if_exists {
             return Ok(builder);
         }
+        if let Some(schema_name) = drop_trigger
+            .table_name
+            .as_ref()
+            .and_then(|name| super::missing_schema::missing_schema_name(&builder, name))
+        {
+            return Err(Error::SchemaNotFound { schema_name });
+        }
         return Err(Error::DropTriggerNotFound {
             trigger_name: builder.dialect().stored_object_name_last(&drop_trigger.trigger_name),
+            table_name: drop_trigger.table_name.as_ref().map(|name| {
+                if builder.relation_reached(name).is_some() {
+                    builder.dialect().stored_object_name_last(name)
+                } else {
+                    builder.dialect().stored_object_name(name)
+                }
+            }),
+            table_exists: drop_trigger
+                .table_name
+                .as_ref()
+                .is_some_and(|name| builder.relation_reached(name).is_some()),
         });
     };
 
