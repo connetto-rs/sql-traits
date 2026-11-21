@@ -50,6 +50,7 @@ mod dropped_column_readers;
 mod dropped_policies;
 mod duplicate_keys;
 mod duplicate_object_names;
+mod duplicate_referenced_columns;
 mod enumerated_types;
 mod exhaustive_alter_table;
 mod explicit_revokes;
