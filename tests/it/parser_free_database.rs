@@ -1195,6 +1195,10 @@ impl FunctionLike for MemoryFunction {
         false
     }
 
+    fn estimated_rows(&self) -> Option<f32> {
+        None
+    }
+
     fn argument_modes(&self) -> impl Iterator<Item = ArgMode> {
         self.argument_types.iter().map(|_| ArgMode::In)
     }

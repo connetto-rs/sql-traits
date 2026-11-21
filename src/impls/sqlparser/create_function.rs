@@ -19,6 +19,7 @@ use crate::{
     utils::{
         identifier_resolution::SearchPath,
         last_str, normalize_sqlparser_type,
+        numeric_literal::float4_option,
         object_name::{
             is_search_path_parameter, object_name_last_part, search_path_entry,
             target_name_of_object_name,
@@ -43,6 +44,10 @@ fn function_metadata<'db>(
         .function_metadata(function)
         .ok_or_else(|| ObjectKind::Function.not_in_database(&function.name.to_string()))
 }
+
+/// The estimate PostgreSQL stores for a set-returning function declared
+/// without `ROWS`.
+const UNDECLARED_SET_ROWS: f32 = 1000.0;
 
 impl FunctionLike for CreateFunction {
     type DB = ParserDB;
@@ -123,6 +128,12 @@ impl FunctionLike for CreateFunction {
             }
             None => false,
         }
+    }
+
+    #[inline]
+    fn estimated_rows(&self) -> Option<f32> {
+        self.returns_set()
+            .then(|| self.rows.as_ref().and_then(float4_option).unwrap_or(UNDECLARED_SET_ROWS))
     }
 
     #[inline]

@@ -4129,6 +4129,26 @@ pub enum Error {
         /// The kind of the function the statement would replace.
         kind: FunctionKind,
     },
+    #[error("Function `{function_name}` declares `ROWS {rows}`, which is not a positive estimate.")]
+    /// Error indicating that a `CREATE FUNCTION` or `ALTER FUNCTION` statement
+    /// gives a `ROWS` estimate PostgreSQL refuses as not positive.
+    ///
+    /// PostgreSQL stores the estimate as a `float4`, so a positive literal
+    /// too small to keep its value is refused as zero.
+    FunctionRowsNotPositive {
+        /// Name of the function the statement declares or alters.
+        function_name: String,
+        /// The estimate as the statement spelled it.
+        rows: String,
+    },
+    #[error("Function `{function_name}` declares `ROWS` but returns no set.")]
+    /// Error indicating that a `CREATE FUNCTION` or `ALTER FUNCTION` statement
+    /// gives a `ROWS` estimate to a function that returns no set, which
+    /// PostgreSQL refuses.
+    FunctionRowsWithoutSet {
+        /// Name of the function the statement declares or alters.
+        function_name: String,
+    },
     #[error("Relation `{relation_name}` not found for function `{function_name}`.")]
     /// Error indicating that a function body names a table or view the
     /// database does not hold.

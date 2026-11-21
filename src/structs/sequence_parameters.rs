@@ -3,11 +3,12 @@
 use alloc::string::ToString;
 use core::fmt;
 
-use sqlparser::ast::{
-    DataType, Expr, ObjectNamePart, SequenceOptions, UnaryOperator, Value, ValueWithSpan,
-};
+use sqlparser::ast::{DataType, Expr, ObjectNamePart, SequenceOptions};
 
-use crate::errors::SequenceParameterError;
+use crate::{
+    errors::SequenceParameterError,
+    utils::numeric_literal::{parse_integer, signed_number},
+};
 
 /// The integer type a sequence counts in, which bounds its values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -282,48 +283,8 @@ impl SequenceParameters {
 /// numeric literal with an optional sign.
 fn bigint(option: &'static str, value: &Expr) -> Result<i64, SequenceParameterError> {
     let refused = || SequenceParameterError::NotABigint { option, value: value.to_string() };
-    let (negative, literal) = match value {
-        Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (true, expr.as_ref()),
-        Expr::UnaryOp { op: UnaryOperator::Plus, expr } => (false, expr.as_ref()),
-        literal => (false, literal),
-    };
-    let Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) = literal else {
-        return Err(refused());
-    };
+    let (negative, digits) = signed_number(value).ok_or_else(refused)?;
     parse_integer(digits, negative).ok_or_else(refused)
-}
-
-/// Reads `digits` the way PostgreSQL's `bigint` input does: decimal, or
-/// hexadecimal, octal or binary behind `0x`, `0o` or `0b`, with single
-/// underscores between digits or after the prefix.
-fn parse_integer(digits: &str, negative: bool) -> Option<i64> {
-    let (radix, body) = match digits.as_bytes() {
-        [b'0', b'x' | b'X', ..] => (16, &digits[2..]),
-        [b'0', b'o' | b'O', ..] => (8, &digits[2..]),
-        [b'0', b'b' | b'B', ..] => (2, &digits[2..]),
-        _ => (10, digits),
-    };
-    let mut magnitude: i128 = 0;
-    let mut ends_in_digit = false;
-    let mut underscore_allowed = radix != 10;
-    for character in body.chars() {
-        if character == '_' {
-            if !underscore_allowed {
-                return None;
-            }
-            underscore_allowed = false;
-            ends_in_digit = false;
-            continue;
-        }
-        let digit = character.to_digit(radix)?;
-        magnitude = magnitude.checked_mul(i128::from(radix))?.checked_add(i128::from(digit))?;
-        underscore_allowed = true;
-        ends_in_digit = true;
-    }
-    if !ends_in_digit {
-        return None;
-    }
-    i64::try_from(if negative { -magnitude } else { magnitude }).ok()
 }
 
 /// Whether `part` is the identifier `name`, which an unquoted spelling matches

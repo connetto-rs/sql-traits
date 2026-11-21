@@ -563,6 +563,10 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn estimated_rows(&self) -> Option<f32> {
+        self.unreach()
+    }
+
     fn argument_modes(&self) -> impl Iterator<Item = ArgMode> {
         self.unreach::<core::iter::Empty<ArgMode>>()
     }
