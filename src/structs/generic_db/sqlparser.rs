@@ -11614,6 +11614,21 @@ impl ParserDB {
                     if alter_table.table_type == Some(AlterTableType::Foreign) {
                         refuse_alter_foreign_table_of_other_kind(&builder, &alter_table)?;
                     }
+                    if matches!(dialect, SqlparserDialect::PostgreSql)
+                        && alter_table.operations.len() > 1
+                        && alter_table.operations.iter().any(|operation| {
+                            matches!(
+                                operation,
+                                AlterTableOperation::RenameColumn { .. }
+                                    | AlterTableOperation::RenameConstraint { .. }
+                                    | AlterTableOperation::RenameTable { .. }
+                            )
+                        })
+                    {
+                        return Err(crate::errors::Error::RenameCommandNotAlone {
+                            relation_name: alter_table.name.to_string(),
+                        });
+                    }
                     // PostgreSQL's grammar takes a partition command only as
                     // the whole of its statement.
                     if alter_table.operations.len() > 1
