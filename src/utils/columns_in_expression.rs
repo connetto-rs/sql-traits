@@ -17,13 +17,8 @@ use crate::{
 };
 
 /// Whether a written reference names a stored column under `case`.
-fn column_named_by<C: ColumnLike>(column: &C, written: &Ident, case: IdentifierCase) -> bool {
-    case.identifiers_match(
-        column.column_name(),
-        column.column_name_is_quoted(),
-        written.value.as_str(),
-        written.quote_style.is_some(),
-    )
+fn column_named_by(name: &str, quoted: bool, written: &Ident, case: IdentifierCase) -> bool {
+    case.identifiers_match(name, quoted, written.value.as_str(), written.quote_style.is_some())
 }
 
 /// Returns whether a column reference's qualifier chain names the table the
@@ -124,15 +119,13 @@ impl Labels {
     }
 }
 
-/// Collects the columns of one table an expression reads, in the order it
-/// first reads them.
-struct ColumnsRead<'a, 't, C> {
+/// Resolves the column references visited in an expression.
+struct ColumnsRead<'a, 't, Resolve> {
     catalog_name: &'a str,
     table: &'a TargetName<'t>,
-    columns: &'a [C],
+    resolve: Resolve,
     /// The comparison every written name is read under.
     case: IdentifierCase,
-    read: Vec<C>,
     /// How many subqueries enclose the visited expression, which read the
     /// tables of their own `FROM` rather than this one.
     subqueries: usize,
@@ -143,7 +136,7 @@ struct ColumnsRead<'a, 't, C> {
     parameters: Vec<Ident>,
 }
 
-impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
+impl<Resolve: FnMut(&Ident) -> bool> ColumnsRead<'_, '_, Resolve> {
     fn is_parameter(&self, ident: &Ident) -> bool {
         self.parameters.iter().any(|parameter| {
             self.case.identifiers_match(
@@ -158,13 +151,8 @@ impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
     /// Records the column `ident` names, `reference` being the whole
     /// reference as written.
     fn column(&mut self, ident: &Ident, reference: &Expr) -> Result<(), crate::errors::Error> {
-        let Some(column) =
-            self.columns.iter().find(|column| column_named_by(*column, ident, self.case))
-        else {
+        if !(self.resolve)(ident) {
             return Err(crate::errors::Error::UnknownColumn { reference: reference.to_string() });
-        };
-        if !self.read.contains(column) {
-            self.read.push(column.clone());
         }
         Ok(())
     }
@@ -192,7 +180,7 @@ impl<C: ColumnLike + Clone> ColumnsRead<'_, '_, C> {
     }
 }
 
-impl<C: ColumnLike + Clone> Visitor for ColumnsRead<'_, '_, C> {
+impl<Resolve: FnMut(&Ident) -> bool> Visitor for ColumnsRead<'_, '_, Resolve> {
     type Break = crate::errors::Error;
 
     fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
@@ -266,18 +254,58 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
     columns: &[C],
     case: IdentifierCase,
 ) -> Result<Vec<C>, crate::errors::Error> {
+    let mut read = Vec::new();
+    visit_columns(expr, catalog_name, table, case, |ident| {
+        let Some(column) = columns.iter().find(|column| {
+            column_named_by(column.column_name(), column.column_name_is_quoted(), ident, case)
+        }) else {
+            return false;
+        };
+        if !read.contains(column) {
+            read.push(column.clone());
+        }
+        true
+    })?;
+    Ok(read)
+}
+
+/// Validates references against borrowed column names without collecting
+/// columns.
+#[expect(clippy::needless_pass_by_value, reason = "Callers pass lightweight cloneable iterators.")]
+pub(crate) fn validate_columns_in_expression<'column>(
+    expr: &Expr,
+    catalog_name: &str,
+    table: &TargetName<'_>,
+    columns: impl Iterator<Item = &'column Ident> + Clone,
+    case: IdentifierCase,
+) -> Result<(), crate::errors::Error> {
+    visit_columns(expr, catalog_name, table, case, |ident| {
+        columns
+            .clone()
+            .any(|column| column_named_by(&column.value, column.quote_style.is_some(), ident, case))
+    })
+}
+
+/// Walks references once, delegating column lookup and collection to the
+/// caller.
+fn visit_columns(
+    expr: &Expr,
+    catalog_name: &str,
+    table: &TargetName<'_>,
+    case: IdentifierCase,
+    resolve: impl FnMut(&Ident) -> bool,
+) -> Result<(), crate::errors::Error> {
     let mut visitor = ColumnsRead {
         catalog_name,
         table,
-        columns,
+        resolve,
         case,
-        read: Vec::new(),
         subqueries: 0,
         labels: Labels::default(),
         parameters: Vec::new(),
     };
     match walk(expr, &mut visitor) {
-        ControlFlow::Continue(()) => Ok(visitor.read),
+        ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
     }
 }

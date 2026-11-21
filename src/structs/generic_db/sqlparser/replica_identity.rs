@@ -132,7 +132,7 @@ fn usable_index(
             })
         }
         None => {
-            match relation_name_holder(builder, index, schema) {
+            match relation_name_holder(builder, index, schema, None) {
                 // An index on a materialized view.
                 Some(ObjectKind::Index | ObjectKind::UniqueIndex) => Err(other_table(wanted)),
                 Some(actual_kind) => {

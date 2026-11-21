@@ -1209,7 +1209,7 @@ pub(super) fn key_index_table(
     let Some((stored, schema)) = key_index_owner(builder, name, old) else {
         return Ok(None);
     };
-    match super::relation_name_holder(builder, new, Some(schema)) {
+    match super::relation_name_holder(builder, new, Some(schema), None) {
         Some(conflicting_kind) => {
             Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::UniqueIndex,
@@ -1317,7 +1317,7 @@ fn rename_constraint_of(
     let index_backed = backed_by_index(slot);
     if index_backed
         && let Some(conflicting_kind) =
-            super::relation_name_holder(&builder, new, table_schema_qualifier(node))
+            super::relation_name_holder(&builder, new, table_schema_qualifier(node), None)
     {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::UniqueIndex,

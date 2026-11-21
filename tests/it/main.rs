@@ -38,6 +38,7 @@ mod constraint_using_index;
 mod constraint_validation;
 mod create_index_error_order;
 mod create_index_on_only;
+mod create_table_error_order;
 mod creation_identifier_case;
 mod data_statement_analysis;
 mod declared_type_names;

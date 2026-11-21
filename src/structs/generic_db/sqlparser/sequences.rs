@@ -105,7 +105,7 @@ pub(super) fn create_sequence(
     // A sequence takes a shell of its name over, filling the type name.
     super::user_defined_types::take_over_shell(&mut builder, name_ident, schema);
 
-    let relation = relation_name_holder(&builder, name_ident, schema);
+    let relation = relation_name_holder(&builder, name_ident, schema, None);
     if relation.is_some() && if_not_exists {
         return Ok(builder);
     }
@@ -594,6 +594,7 @@ pub(super) fn plan_column_sequences<'column>(
                         builder,
                         &Ident::with_quote('"', candidate.as_str()),
                         schema,
+                        None,
                     )
                     .is_none()
                 })?;

@@ -137,7 +137,9 @@ pub(super) fn index_name_on(
         } else {
             spelled(object_name(&relation_name, columns, Some(&format!("{label}{pass}"))))
         };
-        if relation_name_holder(builder, &candidate, schema).is_none() && !also_taken(&candidate) {
+        if relation_name_holder(builder, &candidate, schema, None).is_none()
+            && !also_taken(&candidate)
+        {
             return candidate;
         }
         pass += 1;

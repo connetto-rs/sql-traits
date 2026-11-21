@@ -181,8 +181,9 @@ fn table_database(builder: &ParserDBBuilder, table: &ObjectName) -> (&'static st
     let in_temp = match qualifier_of(table).named() {
         Some(database) => namespaces.is_temporary(database, builder.identifier_case()),
         None => {
-            object_name_last_identifier(table)
-                .is_some_and(|name| relation_name_holder(builder, name, Some(temporary)).is_some())
+            object_name_last_identifier(table).is_some_and(|name| {
+                relation_name_holder(builder, name, Some(temporary), None).is_some()
+            })
         }
     };
     if in_temp { temporary } else { (namespaces.default_schema(), false) }

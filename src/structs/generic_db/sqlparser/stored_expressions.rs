@@ -64,16 +64,36 @@ fn refuse<N: Visit + ?Sized>(node: &N, place: ExpressionPlace) -> Result<(), Err
 /// `column`, and a column reference in its default.
 fn column_options(column: &ColumnDef) -> Result<(), Error> {
     for option in &column.options {
-        match &option.option {
-            ColumnOption::Default(default) => refuse(default, ExpressionPlace::Default)?,
-            ColumnOption::Generated { generation_expr: Some(generation), .. } => {
-                refuse(generation, ExpressionPlace::Generation)?;
-            }
-            ColumnOption::Check(check) => refuse(&check.expr, ExpressionPlace::CheckConstraint)?,
-            _ => {}
+        refuse_column_value(&option.option)?;
+        if let ColumnOption::Check(check) = &option.option {
+            refuse(&check.expr, ExpressionPlace::CheckConstraint)?;
         }
     }
     Ok(())
+}
+
+/// Refuses subqueries and forbidden references in a column's value expression.
+pub(super) fn refuse_column_value(option: &ColumnOption) -> Result<(), Error> {
+    match option {
+        ColumnOption::Default(default) => refuse(default, ExpressionPlace::Default),
+        ColumnOption::Generated { generation_expr: Some(generation), .. } => {
+            refuse(generation, ExpressionPlace::Generation)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Refuses subqueries in the checks and partition key of a new table.
+pub(super) fn refuse_table_checks(create_table: &CreateTable) -> Result<(), Error> {
+    for column in &create_table.columns {
+        for option in &column.options {
+            if let ColumnOption::Check(check) = &option.option {
+                refuse(&check.expr, ExpressionPlace::CheckConstraint)?;
+            }
+        }
+    }
+    create_table.constraints.iter().try_for_each(constraint)?;
+    refuse(&create_table.partition_by, ExpressionPlace::PartitionKey)
 }
 
 /// Refuses a subquery in `constraint`, a check or an exclusion constraint.
@@ -103,23 +123,6 @@ fn bound(bound: &ForValues) -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-/// Refuses a subquery in an expression `create_table` stores: a column's
-/// default, generation expression or check, a table constraint, the
-/// partition key or the partition bound, and a column reference in a
-/// column's default.
-pub(super) fn refuse_in_table(
-    builder: &ParserDBBuilder,
-    create_table: &CreateTable,
-) -> Result<(), Error> {
-    if !postgres(builder) {
-        return Ok(());
-    }
-    create_table.columns.iter().try_for_each(column_options)?;
-    create_table.constraints.iter().try_for_each(constraint)?;
-    refuse(&create_table.partition_by, ExpressionPlace::PartitionKey)?;
-    create_table.for_values.as_ref().map_or(Ok(()), bound)
 }
 
 /// Refuses a subquery in the default, generation expression or checks of
