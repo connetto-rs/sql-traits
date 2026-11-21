@@ -348,7 +348,7 @@ fn uuid_ossp_functions_go_with_the_extension() {
 
     assert!(matches!(
         parse("CREATE EXTENSION \"uuid-ossp\"; DROP FUNCTION uuid_generate_v4();"),
-        Err(Error::FunctionRequiredByExtension { function_name, extension_name })
+        Err(Error::FunctionRequiredByExtension { function_name, extension_name, .. })
             if function_name == "uuid_generate_v4" && extension_name == "uuid-ossp"
     ));
     assert!(matches!(

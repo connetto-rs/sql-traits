@@ -58,7 +58,7 @@ fn a_reader_naming_the_column_refuses_the_drop() {
         let sql = format!("{TABLE} {reader} ALTER TABLE t DROP COLUMN a;");
         let error = parse(&sql).expect_err(reader);
         assert!(
-            matches!(&error, Error::ColumnReferenced { table_name, column_name }
+            matches!(&error, Error::ColumnReferenced { table_name, column_name, .. }
                 if table_name == "t" && column_name == "a"),
             "{reader}: {error:?}"
         );

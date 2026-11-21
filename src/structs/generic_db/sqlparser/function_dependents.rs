@@ -500,10 +500,15 @@ impl ParserDBBuilder {
 pub(super) fn referenced(
     builder: &ParserDBBuilder,
     function: &CreateFunction,
+    procedure: bool,
+    dropping_object: Option<crate::errors::FunctionOwner>,
     (kind, name): Dependent,
 ) -> Error {
     Error::FunctionReferenced {
         function_name: builder.dialect().stored_object_name_last(&function.name),
+        signature: super::procedures::diagnostic_definition(builder, function),
+        procedure,
+        dropping_object,
         dependent_kind: kind,
         dependent_name: name,
     }

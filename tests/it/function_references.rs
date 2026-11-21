@@ -243,7 +243,7 @@ fn every_bound_call_holds_its_function() {
         assert!(
             matches!(
                 &result,
-                Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+                Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                     if function_name == "f" && *dependent_kind == kind && dependent_name == name
             ),
             "{dependent} got {result:?}"
@@ -267,6 +267,7 @@ fn a_refusal_names_the_function_held_and_what_holds_it() {
                 function_name,
                 dependent_kind: ObjectKind::Trigger,
                 dependent_name,
+                ..
             }) if function_name == "trg" && dependent_name == "tr"
         ),
         "got {result:?}"
@@ -285,6 +286,7 @@ fn a_refusal_names_the_function_held_and_what_holds_it() {
                 function_name,
                 dependent_kind: ObjectKind::CheckConstraint,
                 dependent_name,
+                ..
             }) if function_name == "g" && dependent_name == "t.t_a_check"
         ),
         "got {result:?}"

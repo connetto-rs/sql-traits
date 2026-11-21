@@ -7,9 +7,13 @@ pub use sqlstate::SqlState;
 use sqlstate::pg;
 
 use super::{Error, LookupError};
+use crate::utils::quote_identifier::quote_identifier;
 
+mod keys_triggers_grants;
 mod lookup_columns;
+mod roles_functions_schemas;
 mod types_settings;
+mod views_constraints_functions;
 
 /// An error as PostgreSQL 18 reports it, its SQLSTATE beside its primary
 /// message, without the detail, hint or position it may add.
@@ -46,6 +50,16 @@ fn quoted(name: &str) -> String {
     format!("\"{name}\"")
 }
 
+/// A stored relation name, qualified by its schema when PostgreSQL needs the
+/// schema to tell it apart from what the search path reaches.
+fn relation_name(name: &str, schema: Option<&str>) -> String {
+    let name = quote_identifier(name);
+    match schema {
+        Some(schema) => format!("{}.{name}", quote_identifier(schema)),
+        None => name,
+    }
+}
+
 impl Error {
     /// The SQLSTATE and the message PostgreSQL 18 refuses the statement with,
     /// or `None` for an error PostgreSQL has no counterpart of.
@@ -68,108 +82,337 @@ impl Error {
     pub fn postgres_error(&self) -> Option<PostgresError> {
         match self {
             Self::IdentifierLookupError(error) => error.postgres_error(),
+            Self::UnresolvedOperator { operator_name, operand_types, reason } => {
+                Some(keys_triggers_grants::unresolved(operator_name, operand_types, *reason, true))
+            }
+            Self::UnresolvedCall { function_name, argument_types, reason } => {
+                Some(keys_triggers_grants::unresolved(
+                    function_name,
+                    argument_types,
+                    *reason,
+                    false,
+                ))
+            }
+            Self::MisappliedCall { function_name, rule, procedure_argument_types } => {
+                if *rule == super::Misapplied::ProcedureCalled {
+                    Some(PostgresError::new(
+                        pg::WRONG_OBJECT_TYPE,
+                        format!(
+                            "{function_name}({}) is a procedure",
+                            procedure_argument_types.join(", ")
+                        ),
+                    ))
+                } else {
+                    Some(keys_triggers_grants::call_rule(function_name, *rule))
+                }
+            }
+            Self::InvalidCollationOption {
+                option_name,
+                option_value,
+                qualified,
+                nondeterministic_provider,
+            } => {
+                Some(keys_triggers_grants::collation_option(
+                    option_name,
+                    option_value,
+                    *qualified,
+                    *nondeterministic_provider,
+                ))
+            }
+            Self::RepeatedCollationOption { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "conflicting or redundant options"))
+            }
+            Self::RepeatedColumnCollation { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "multiple COLLATE clauses not allowed"))
+            }
+            Self::NonCollatableColumnType { type_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DATATYPE_MISMATCH,
+                    format!("collations are not supported by type {type_name}"),
+                ))
+            }
+            Self::DropTableInheritedFrom { parent_table, schema_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop table {} because other objects depend on it",
+                        relation_name(parent_table, schema_name.as_deref())
+                    ),
+                ))
+            }
+            Self::ReferencedColumnNotFoundForForeignKey { referenced_column, .. }
+            | Self::HostColumnNotFoundForForeignKey { host_column: referenced_column, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_COLUMN,
+                    format!(
+                        "column {} referenced in foreign key constraint does not exist",
+                        quoted(referenced_column)
+                    ),
+                ))
+            }
+            Self::ReferencedColumnsNotUniqueForForeignKey {
+                referenced_table,
+                referenced_columns,
+                ..
+            } => {
+                if referenced_columns.is_empty() {
+                    Some(PostgresError::new(
+                        pg::UNDEFINED_OBJECT,
+                        format!(
+                            "there is no primary key for referenced table {}",
+                            quoted(referenced_table)
+                        ),
+                    ))
+                } else {
+                    Some(PostgresError::new(
+                        pg::INVALID_FOREIGN_KEY,
+                        format!(
+                            "there is no unique constraint matching given keys for referenced table {}",
+                            quoted(referenced_table)
+                        ),
+                    ))
+                }
+            }
+            Self::ForeignKeyColumnCountMismatch { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FOREIGN_KEY,
+                    "number of referencing and referenced columns for foreign key disagree",
+                ))
+            }
+            Self::DuplicateReferencedColumnsForForeignKey => {
+                Some(PostgresError::new(
+                    pg::INVALID_FOREIGN_KEY,
+                    "foreign key referenced-columns list must not contain duplicates",
+                ))
+            }
+            Self::InvalidForeignKeyUpdateActionForGeneratedColumn => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    "invalid ON UPDATE action for foreign key constraint containing generated column",
+                ))
+            }
+            Self::InvalidForeignKeyDeleteActionForGeneratedColumn => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    "invalid ON DELETE action for foreign key constraint containing generated column",
+                ))
+            }
+            Self::DeferrablePrimaryKeyForForeignKey { referenced_table, .. } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!(
+                        "cannot use a deferrable primary key for referenced table {}",
+                        quoted(referenced_table)
+                    ),
+                ))
+            }
+            Self::DeferrableUniqueKeyForForeignKey { referenced_table, .. } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!(
+                        "cannot use a deferrable unique constraint for referenced table {}",
+                        quoted(referenced_table)
+                    ),
+                ))
+            }
+            Self::AccessMethodWithoutUniqueSupport { access_method } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "access method {} does not support unique indexes",
+                        quoted(access_method)
+                    ),
+                ))
+            }
+            Self::AccessMethodWithoutExclusionSupport { access_method } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "access method {} does not support exclusion constraints",
+                        quoted(access_method)
+                    ),
+                ))
+            }
+            Self::MultiplePrimaryKeys { table_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!(
+                        "multiple primary keys for table {} are not allowed",
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::FunctionRowsNotPositive { .. } => {
+                Some(PostgresError::new(pg::INVALID_PARAMETER_VALUE, "ROWS must be positive"))
+            }
+            Self::FunctionRowsWithoutSet { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    "ROWS is not applicable when function does not return a set",
+                ))
+            }
+            Self::InitiallyDeferredNotDeferrable { .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    "constraint declared INITIALLY DEFERRED must be DEFERRABLE",
+                ))
+            }
+            Self::RelationNotFoundForTrigger { relation_name, .. }
+            | Self::TableNotFoundForPolicy { table_name: relation_name, .. }
+            | Self::RelationNotFoundForRule { relation_name, .. }
+            | Self::RelationNotFoundForRuleAction { relation_name, .. }
+            | Self::TableNotFoundForIndex { table_name: relation_name, .. }
+            | Self::RelationNotFoundForSequenceOwner { relation_name, .. }
+            | Self::RelationNotFoundForDefault { relation_name, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!("relation {} does not exist", quoted(relation_name)),
+                ))
+            }
+            Self::TriggerFiringRefused { relation_name, reason, .. } => {
+                keys_triggers_grants::trigger_firing(relation_name, *reason)
+            }
+            Self::RuleOnUnsupportedRelation { relation_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("relation {} cannot have rules", quoted(relation_name)),
+                ))
+            }
+            Self::SelectRuleUnsupported { relation_name, refusal: Some(refusal), .. } => {
+                Some(match refusal {
+                    super::SelectRuleRefusal::Table => {
+                        PostgresError::new(
+                            pg::WRONG_OBJECT_TYPE,
+                            format!(
+                                "relation {} cannot have ON SELECT rules",
+                                quoted(relation_name)
+                            ),
+                        )
+                    }
+                    super::SelectRuleRefusal::ExistingView => {
+                        PostgresError::new(
+                            pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            format!("{} is already a view", quoted(relation_name)),
+                        )
+                    }
+                    super::SelectRuleRefusal::InvalidViewAction => {
+                        PostgresError::new(
+                            pg::FEATURE_NOT_SUPPORTED,
+                            "rules on SELECT must have action INSTEAD SELECT",
+                        )
+                    }
+                })
+            }
+            Self::RuleActionReferenceAmbiguous { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::AMBIGUOUS_COLUMN,
+                    format!("column reference {} is ambiguous", quoted(column_name)),
+                ))
+            }
+            Self::RuleActionInsertTooWide { .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    "INSERT has more expressions than target columns",
+                ))
+            }
+            Self::RoleNotFoundForOwner { role_name, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("role {} does not exist", quoted(role_name)),
+                ))
+            }
+            Self::ColumnNotFoundForGrant { column_name, table_name }
+            | Self::ColumnNotFoundForSequenceOwner {
+                column_name, relation_name: table_name, ..
+            } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_COLUMN,
+                    format!(
+                        "column {} of relation {} does not exist",
+                        quoted(column_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::IndexInAnotherSchema { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "syntax error at or near \".\""))
+            }
+            Self::InvalidSequenceOwner { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "invalid OWNED BY option"))
+            }
+            Self::UnqualifiedCommentColumn { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "column name must be qualified"))
+            }
+            Self::SequenceOwnerInAnotherSchema { .. } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "sequence must be in same schema as table it is linked to",
+                ))
+            }
+            Self::SequenceOwnerKindUnsupported { relation_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("sequence cannot be owned by relation {}", quoted(relation_name)),
+                ))
+            }
+            Self::SequenceRequiredByColumn {
+                sequence_name,
+                sequence_schema,
+                table_name,
+                table_schema,
+                column_name,
+            } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop sequence {} because column {column_name} of table {} requires it",
+                        relation_name(sequence_name, sequence_schema.as_deref()),
+                        relation_name(table_name, table_schema.as_deref())
+                    ),
+                ))
+            }
+            Self::SequenceUsedByDefault { sequence_name, sequence_schema, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop sequence {} because other objects depend on it",
+                        relation_name(sequence_name, sequence_schema.as_deref())
+                    ),
+                ))
+            }
+            Self::InvalidSequenceParameters { reason, identity, .. } => {
+                Some(keys_triggers_grants::sequence_parameters(reason, *identity))
+            }
+            Self::InvalidRelationNameForDefault { name_parts, .. } => {
+                Some(keys_triggers_grants::relation_name(name_parts))
+            }
+            Self::InvalidIndex { written_token, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!("syntax error at or near {}", quoted(written_token)),
+                ))
+            }
+            Self::SubqueryInExpression { place } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!("cannot use subquery in {place}"),
+                ))
+            }
+            Self::ColumnReferenceInDefault { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "cannot use column reference in DEFAULT expression",
+                ))
+            }
+            Self::FunctionNotFoundForTrigger { function_name, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_FUNCTION,
+                    format!("function {function_name}() does not exist"),
+                ))
+            }
             Self::ColumnTypeCollatabilityNotInCatalog { .. }
-            | Self::UnresolvedOperator { .. }
-            | Self::UnresolvedCall { .. }
-            | Self::MisappliedCall { .. }
-            | Self::InvalidCollationOption { .. }
-            | Self::RepeatedCollationOption { .. }
-            | Self::RepeatedColumnCollation { .. }
-            | Self::NonCollatableColumnType { .. }
-            | Self::DropTableInheritedFrom { .. }
-            | Self::ReferencedColumnNotFoundForForeignKey { .. }
-            | Self::HostColumnNotFoundForForeignKey { .. }
-            | Self::ReferencedColumnsNotUniqueForForeignKey { .. }
-            | Self::ForeignKeyColumnCountMismatch { .. }
-            | Self::InitiallyDeferredNotDeferrable { .. }
-            | Self::RelationNotFoundForTrigger { .. }
-            | Self::TableNotFoundForPolicy { .. }
-            | Self::RelationNotFoundForRule { .. }
-            | Self::RelationNotFoundForRuleAction { .. }
-            | Self::TableNotFoundForIndex { .. }
-            | Self::RelationNotFoundForSequenceOwner { .. }
-            | Self::RelationNotFoundForDefault { .. }
-            | Self::TriggerFiringRefused { .. }
-            | Self::RuleOnUnsupportedRelation { .. }
-            | Self::RuleActionReferenceAmbiguous { .. }
-            | Self::RuleActionInsertTooWide { .. }
-            | Self::RoleNotFoundForOwner { .. }
-            | Self::ColumnNotFoundForGrant { .. }
-            | Self::ColumnNotFoundForSequenceOwner { .. }
-            | Self::IndexInAnotherSchema { .. }
-            | Self::InvalidSequenceOwner { .. }
-            | Self::UnqualifiedCommentColumn { .. }
-            | Self::SequenceOwnerInAnotherSchema { .. }
-            | Self::SequenceOwnerKindUnsupported { .. }
-            | Self::SequenceRequiredByColumn { .. }
-            | Self::SequenceUsedByDefault { .. }
-            | Self::InvalidSequenceParameters { .. }
-            | Self::InvalidRelationNameForDefault { .. }
-            | Self::InvalidIndex { .. }
-            | Self::SubqueryInExpression { .. }
-            | Self::ColumnReferenceInDefault { .. }
-            | Self::FunctionNotFoundForTrigger { .. }
-            | Self::RoleNotFoundForGrant { .. }
-            | Self::RoleNotFoundForMembership { .. }
-            | Self::CircularRoleMembership { .. }
-            | Self::UnrecognizedRoleOption { .. }
-            | Self::DependentRoleMemberships { .. }
-            | Self::TableNotFoundForGrant { .. }
-            | Self::FunctionNotFoundForGrant { .. }
-            | Self::AmbiguousFunctionForGrant { .. }
-            | Self::InvalidFunctionPrivilege { .. }
-            | Self::DropFunctionNotFound { .. }
-            | Self::DropProcedureNotFound { .. }
-            | Self::NotAFunction { .. }
-            | Self::NotAProcedure { .. }
-            | Self::ProcedureBodyUnsupported { .. }
-            | Self::FunctionReferenced { .. }
-            | Self::FunctionRequiredByExtension { .. }
-            | Self::FunctionRequiredByType { .. }
-            | Self::DropTableNotFound { .. }
-            | Self::TableReferenced { .. }
-            | Self::ColumnReferenced { .. }
-            | Self::ColumnTypeChangeBlocked { .. }
-            | Self::ColumnAlreadyExists { .. }
-            | Self::SchemaNotFoundForRelation { .. }
-            | Self::SchemaNotFoundForCollation { .. }
-            | Self::SchemaNotFoundForExtension { .. }
-            | Self::NoSchemaSelectedForExtension { .. }
-            | Self::NoSchemaSelectedForRelation { .. }
-            | Self::SystemSchemaRelationRefused { .. }
-            | Self::ForeignOptionNotFound { .. }
-            | Self::UniqueIndexOverForeignPartition { .. }
-            | Self::ViewColumnRenamedByReplace { .. }
-            | Self::ViewColumnsDroppedByReplace { .. }
-            | Self::MaterializedViewCannotBeReplaced { .. }
-            | Self::ViewIfNotExistsUnsupported { .. }
-            | Self::ViewColumnListTooLong { .. }
-            | Self::TableColumnListTooLong { .. }
-            | Self::UnrecognizedViewOption { .. }
-            | Self::InvalidViewOptionValue { .. }
-            | Self::RepeatedViewOption { .. }
-            | Self::RelationHasDependents { .. }
-            | Self::RenameConstraintNotFound { .. }
-            | Self::InheritedConstraintNotRenamable { .. }
-            | Self::ConstraintAlreadyExists { .. }
-            | Self::PolicyAlreadyExists { .. }
-            | Self::TriggerAlreadyExists { .. }
-            | Self::ClonedTriggerDropped { .. }
-            | Self::ClonedTriggerReplaced { .. }
-            | Self::ConstraintTriggerOnForeignTable { .. }
-            | Self::AlterTableTriggerNotFound { .. }
-            | Self::RuleAlreadyExists { .. }
-            | Self::ExtensionAlreadyExists { .. }
-            | Self::RoleAlreadyExists { .. }
-            | Self::FunctionAlreadyExists { .. }
-            | Self::FunctionNotExecutableByCreator { .. }
-            | Self::FunctionKindChange { .. }
-            | Self::RelationNotFoundForFunctionBody { .. }
-            | Self::FunctionBodyResultMissing { .. }
-            | Self::FunctionBodyReferenceAmbiguous { .. }
-            | Self::FunctionBodyInsertTooWide { .. }
             | Self::QualifiedForeignKeyTarget { .. }
-            | Self::SelectRuleUnsupported { .. }
+            | Self::SelectRuleUnsupported { refusal: None, .. }
             | Self::UnsupportedSequenceOwner { .. }
             | Self::DatabaseAlreadyInUse { .. }
             | Self::CrossDatabaseReference { .. }
@@ -199,7 +442,7 @@ impl Error {
             | Self::UnsupportedRevoke { .. }
             | Self::UnsupportedAlterTableOperation { .. }
             | Self::FunctionBodyBlocksColumnRename { .. }
-            | Self::FunctionBodyStatementUnsupported { .. }
+            | Self::FunctionBodyStatementUnsupported { command_tag: None, .. }
             | Self::AmbiguousDropFunction { .. }
             | Self::AmbiguousAlterFunction { .. }
             | Self::AmbiguousDropProcedure { .. }
@@ -295,8 +538,7 @@ impl Error {
             | Self::PartitionBoundInvalid { .. }
             | Self::PartitionBoundOverlaps { .. }
             | Self::PartitionNotAttachable { .. }
-            | Self::AlterActionUnsupportedOnRelation { .. }
-            | Self::ForeignKeyCannotBeImplemented { .. }
+            | Self::AlterActionUnsupportedOnRelation { action: None, .. }
             | Self::GenerationExpressionNotDroppable { .. }
             | Self::DatabaseOutsideSqlite { .. }
             | Self::RenameCommandNotAlone { .. }
@@ -304,13 +546,6 @@ impl Error {
             | Self::ReplicaIdentityIndexNotFound { .. }
             | Self::ReplicaIdentityIndexOfOtherTable { .. }
             | Self::ReplicaIdentityIndexRefused { .. }
-            | Self::DuplicateReferencedColumnsForForeignKey
-            | Self::InvalidForeignKeyUpdateActionForGeneratedColumn
-            | Self::InvalidForeignKeyDeleteActionForGeneratedColumn
-            | Self::DeferrablePrimaryKeyForForeignKey { .. }
-            | Self::DeferrableUniqueKeyForForeignKey { .. }
-            | Self::AccessMethodWithoutUniqueSupport { .. }
-            | Self::AccessMethodWithoutExclusionSupport { .. }
             | Self::KeyReferenced { .. }
             | Self::AdoptedIndexNotUnique { .. }
             | Self::AdoptedIndexPartial { .. }
@@ -323,11 +558,8 @@ impl Error {
             | Self::IndexRequiredByConstraint { .. }
             | Self::IndexRequiredByParent { .. }
             | Self::IndexHasDependentConstraints { .. }
-            | Self::MultiplePrimaryKeys { .. }
             | Self::AttachIndexNotSupported { .. }
-            | Self::AttachIndexRefused { .. }
-            | Self::FunctionRowsNotPositive { .. }
-            | Self::FunctionRowsWithoutSet { .. } => None,
+            | Self::AttachIndexRefused { .. } => None,
             Self::StorageParameterNotNamed { option, .. } => {
                 Some(types_settings::storage_option_not_named(option))
             }
@@ -362,6 +594,15 @@ impl Error {
                 Some(PostgresError::new(
                     pg::INVALID_PARAMETER_VALUE,
                     format!("value {value} out of bounds for option {}", quoted(parameter_name)),
+                ))
+            }
+            Self::ForeignKeyCannotBeImplemented { constraint_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DATATYPE_MISMATCH,
+                    format!(
+                        "foreign key constraint {} cannot be implemented",
+                        quoted(constraint_name)
+                    ),
                 ))
             }
             Self::MissingDefaultOperatorClass { type_name, access_method } => {
@@ -633,6 +874,505 @@ impl Error {
                 Some(PostgresError::new(
                     pg::INVALID_SCHEMA_NAME,
                     format!("schema {} does not exist", quoted(schema_name)),
+                ))
+            }
+            Self::RoleNotFoundForGrant { role_name }
+            | Self::RoleNotFoundForMembership { role_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("role {} does not exist", quoted(role_name)),
+                ))
+            }
+            Self::CircularRoleMembership { role_name, member_name } => {
+                Some(PostgresError::new(
+                    pg::INVALID_GRANT_OPERATION,
+                    format!(
+                        "role {} is a member of role {}",
+                        quoted(role_name),
+                        quoted(member_name)
+                    ),
+                ))
+            }
+            Self::UnrecognizedRoleOption { option } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!("unrecognized role option {}", quoted(option)),
+                ))
+            }
+            Self::DependentRoleMemberships { .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    "dependent privileges exist",
+                ))
+            }
+            Self::TableNotFoundForGrant { table_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!("relation {} does not exist", quoted(table_name)),
+                ))
+            }
+            Self::GrantOnIndex { index_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{} is an index", quoted(index_name)),
+                ))
+            }
+            Self::GrantOnCompositeType { type_name } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{} is a composite type", quoted(type_name)),
+                ))
+            }
+            Self::FunctionNotFoundForGrant { function_name, signature, procedure } => {
+                Some(roles_functions_schemas::missing_routine(
+                    function_name,
+                    signature.as_deref(),
+                    *procedure,
+                ))
+            }
+            Self::AmbiguousFunctionForGrant { function_name, routine } => {
+                Some(PostgresError::new(
+                    pg::AMBIGUOUS_FUNCTION,
+                    format!(
+                        "{} name {} is not unique",
+                        roles_functions_schemas::routine_kind(*routine),
+                        quoted(function_name)
+                    ),
+                ))
+            }
+            Self::InvalidFunctionPrivilege { privilege, routine, columns } => {
+                Some(roles_functions_schemas::invalid_privilege(privilege, *routine, *columns))
+            }
+            Self::DropFunctionNotFound { function_name, signature } => {
+                Some(roles_functions_schemas::missing_routine(
+                    function_name,
+                    signature.as_deref(),
+                    false,
+                ))
+            }
+            Self::DropProcedureNotFound { procedure_name, signature } => {
+                Some(roles_functions_schemas::missing_routine(
+                    procedure_name,
+                    signature.as_deref(),
+                    true,
+                ))
+            }
+            Self::NotAFunction { signature, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{signature} is not a function"),
+                ))
+            }
+            Self::NotAProcedure { signature, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{signature} is not a procedure"),
+                ))
+            }
+            Self::ProcedureBodyUnsupported { written_token, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!("syntax error at or near {}", quoted(written_token)),
+                ))
+            }
+            Self::FunctionReferenced { signature, procedure, dropping_object, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    match dropping_object {
+                        Some(super::FunctionOwner::Extension { extension_name }) => {
+                            format!(
+                                "cannot drop extension {extension_name} because other objects depend on it"
+                            )
+                        }
+                        Some(super::FunctionOwner::Type { type_description }) => {
+                            format!(
+                                "cannot drop type {type_description} because other objects depend on it"
+                            )
+                        }
+                        None => {
+                            let kind = if *procedure { "procedure" } else { "function" };
+                            format!(
+                                "cannot drop {kind} {signature} because other objects depend on it"
+                            )
+                        }
+                    },
+                ))
+            }
+            Self::FunctionRequiredByExtension { signature, extension_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop function {signature} because extension {extension_name} requires it"
+                    ),
+                ))
+            }
+            Self::FunctionRequiredByType { signature, type_description, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop function {signature} because type {type_description} requires it"
+                    ),
+                ))
+            }
+            Self::DropTableNotFound { table_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!("table {} does not exist", quoted(table_name)),
+                ))
+            }
+            Self::TableReferenced { table_name, schema_name } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop table {} because other objects depend on it",
+                        relation_name(table_name, schema_name.as_deref())
+                    ),
+                ))
+            }
+            Self::ColumnReferenced { table_name, column_name, schema_name } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop column {column_name} of table {} because other objects depend on it",
+                        relation_name(table_name, schema_name.as_deref())
+                    ),
+                ))
+            }
+            Self::ColumnTypeChangeBlocked { dependent_kind, .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    match dependent_kind {
+                        super::ObjectKind::Function => {
+                            "cannot alter type of a column used by a function or procedure"
+                        }
+                        super::ObjectKind::Policy => {
+                            "cannot alter type of a column used in a policy definition"
+                        }
+                        super::ObjectKind::Trigger => {
+                            "cannot alter type of a column used in a trigger definition"
+                        }
+                        _ => "cannot alter type of a column used by a view or rule",
+                    },
+                ))
+            }
+            Self::ColumnAlreadyExists { table_name, column_name, declaration } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_COLUMN,
+                    if *declaration {
+                        format!("column {} specified more than once", quoted(column_name))
+                    } else {
+                        format!(
+                            "column {} of relation {} already exists",
+                            quoted(column_name),
+                            quoted(table_name)
+                        )
+                    },
+                ))
+            }
+            Self::SchemaNotFoundForRelation { schema_name, .. }
+            | Self::SchemaNotFoundForCollation { schema_name, .. }
+            | Self::SchemaNotFoundForExtension { schema_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_SCHEMA_NAME,
+                    format!("schema {} does not exist", quoted(schema_name)),
+                ))
+            }
+            Self::NoSchemaSelectedForExtension { .. }
+            | Self::NoSchemaSelectedForRelation { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_SCHEMA_NAME,
+                    "no schema has been selected to create in",
+                ))
+            }
+            Self::SystemSchemaRelationRefused { relation_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INSUFFICIENT_PRIVILEGE,
+                    format!("permission denied to create \"pg_catalog.{relation_name}\""),
+                ))
+            }
+            Self::ForeignOptionNotFound { option_name, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!("option {} not found", quoted(option_name)),
+                ))
+            }
+            Self::UniqueIndexOverForeignPartition { table_name, creating_partition, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!(
+                        "cannot create {} partitioned table {}",
+                        if *creating_partition {
+                            "foreign partition of"
+                        } else {
+                            "unique index on"
+                        },
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::ViewColumnRenamedByReplace { existing_column, new_column, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!(
+                        "cannot change name of view column {} to {}",
+                        quoted(existing_column),
+                        quoted(new_column)
+                    ),
+                ))
+            }
+            Self::ViewColumnsDroppedByReplace { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    "cannot drop columns from view",
+                ))
+            }
+            Self::MaterializedViewCannotBeReplaced { written_token, .. }
+            | Self::ViewIfNotExistsUnsupported { written_token, .. }
+            | Self::FunctionBodySyntaxUnsupported { written_token, .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    format!("syntax error at or near {}", quoted(written_token)),
+                ))
+            }
+            Self::ViewColumnListTooLong { .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    "CREATE VIEW specifies more column names than columns",
+                ))
+            }
+            Self::TableColumnListTooLong { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "too many column names were specified"))
+            }
+            Self::UnrecognizedViewOption { option_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("unrecognized parameter {}", quoted(option_name)),
+                ))
+            }
+            Self::InvalidViewOptionValue { option_name, option_value, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!(
+                        "invalid value for {} option {}: {option_value}",
+                        if option_name == "check_option" { "enum" } else { "boolean" },
+                        quoted(option_name)
+                    ),
+                ))
+            }
+            Self::RepeatedViewOption { option_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("parameter {} specified more than once", quoted(option_name)),
+                ))
+            }
+            Self::RelationHasDependents { object_kind, object_name, schema_name, .. } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop {} {} because other objects depend on it",
+                        views_constraints_functions::object_kind(*object_kind),
+                        relation_name(object_name, schema_name.as_deref())
+                    ),
+                ))
+            }
+            Self::AlterActionUnsupportedOnRelation {
+                relation_name, action: Some(action), ..
+            } => {
+                use super::RelationAlterAction;
+                Some(match action {
+                    RelationAlterAction::Command(action) => {
+                        PostgresError::new(
+                            pg::WRONG_OBJECT_TYPE,
+                            format!(
+                                "ALTER action {action} cannot be performed on relation {}",
+                                quoted(relation_name)
+                            ),
+                        )
+                    }
+                    RelationAlterAction::RenameColumns => {
+                        PostgresError::new(
+                            pg::WRONG_OBJECT_TYPE,
+                            format!("cannot rename columns of relation {}", quoted(relation_name)),
+                        )
+                    }
+                    RelationAlterAction::ForeignConstraint(kind) => {
+                        PostgresError::new(
+                            pg::FEATURE_NOT_SUPPORTED,
+                            format!(
+                                "{} constraints are not supported on foreign tables",
+                                types_settings::constraint(*kind)
+                            ),
+                        )
+                    }
+                })
+            }
+            Self::RenameConstraintNotFound { table_name, constraint_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!(
+                        "constraint {} for table {} does not exist",
+                        quoted(constraint_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::InheritedConstraintNotRenamable { constraint_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_TABLE_DEFINITION,
+                    format!("cannot rename inherited constraint {}", quoted(constraint_name)),
+                ))
+            }
+            Self::ConstraintAlreadyExists { table_name, constraint_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!(
+                        "constraint {} for relation {} already exists",
+                        quoted(constraint_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::PolicyAlreadyExists { policy_name, table_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!(
+                        "policy {} for table {} already exists",
+                        quoted(policy_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::TriggerAlreadyExists { trigger_name, relation_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!(
+                        "trigger {} for relation {} already exists",
+                        quoted(trigger_name),
+                        quoted(relation_name)
+                    ),
+                ))
+            }
+            Self::ClonedTriggerDropped {
+                trigger_name,
+                table_name,
+                parent_table_name,
+                table_schema,
+                parent_table_schema,
+            } => {
+                Some(PostgresError::new(
+                    pg::DEPENDENT_OBJECTS_STILL_EXIST,
+                    format!(
+                        "cannot drop trigger {trigger_name} on table {} because trigger {trigger_name} on table {} requires it",
+                        relation_name(table_name, table_schema.as_deref()),
+                        relation_name(parent_table_name, parent_table_schema.as_deref())
+                    ),
+                ))
+            }
+            Self::ClonedTriggerReplaced { trigger_name, table_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!(
+                        "trigger {} for relation {} is an internal or a child trigger",
+                        quoted(trigger_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::ConstraintTriggerOnForeignTable { table_name, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("{} is a foreign table", quoted(table_name)),
+                ))
+            }
+            Self::AlterTableTriggerNotFound { trigger_name, table_name } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_OBJECT,
+                    format!(
+                        "trigger {} for table {} does not exist",
+                        quoted(trigger_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
+            Self::RuleAlreadyExists { rule_name, relation_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!(
+                        "rule {} for relation {} already exists",
+                        quoted(rule_name),
+                        quoted(relation_name)
+                    ),
+                ))
+            }
+            Self::ExtensionAlreadyExists { extension_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!("extension {} already exists", quoted(extension_name)),
+                ))
+            }
+            Self::RoleAlreadyExists { role_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_OBJECT,
+                    format!("role {} already exists", quoted(role_name)),
+                ))
+            }
+            Self::FunctionAlreadyExists { function_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_FUNCTION,
+                    format!(
+                        "function {} already exists with same argument types",
+                        quoted(function_name)
+                    ),
+                ))
+            }
+            Self::FunctionAlreadyExistsInSchema { function_name, argument_types, schema_name } => {
+                Some(PostgresError::new(
+                    pg::DUPLICATE_FUNCTION,
+                    format!(
+                        "function {}({}) already exists in schema {}",
+                        quote_identifier(function_name),
+                        argument_types.join(", "),
+                        quoted(schema_name)
+                    ),
+                ))
+            }
+            Self::FunctionNotExecutableByCreator { function_name, .. } => {
+                Some(PostgresError::new(
+                    pg::INSUFFICIENT_PRIVILEGE,
+                    format!("permission denied for function {function_name}"),
+                ))
+            }
+            Self::FunctionKindChange { .. } => {
+                Some(PostgresError::new(pg::WRONG_OBJECT_TYPE, "cannot change routine kind"))
+            }
+            Self::RelationNotFoundForFunctionBody { relation_name, .. } => {
+                Some(PostgresError::new(
+                    pg::UNDEFINED_TABLE,
+                    format!("relation {} does not exist", quoted(relation_name)),
+                ))
+            }
+            Self::FunctionBodyStatementUnsupported { command_tag: Some(command_tag), .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!("{command_tag} is not yet supported in unquoted SQL function body"),
+                ))
+            }
+            Self::FunctionBodyResultMissing { return_type, .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_FUNCTION_DEFINITION,
+                    format!("return type mismatch in function declared to return {return_type}"),
+                ))
+            }
+            Self::FunctionBodyReferenceAmbiguous { column_name, .. } => {
+                Some(PostgresError::new(
+                    pg::AMBIGUOUS_COLUMN,
+                    format!("column reference {} is ambiguous", quoted(column_name)),
+                ))
+            }
+            Self::FunctionBodyInsertTooWide { .. } => {
+                Some(PostgresError::new(
+                    pg::SYNTAX_ERROR,
+                    "INSERT has more expressions than target columns",
                 ))
             }
             Self::UnknownColumn { reference } | Self::ForeignColumnReference { reference, .. } => {

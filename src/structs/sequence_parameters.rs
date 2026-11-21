@@ -7,7 +7,7 @@ use sqlparser::ast::{DataType, Expr, ObjectNamePart, SequenceOptions};
 
 use crate::{
     errors::SequenceParameterError,
-    utils::numeric_literal::{parse_integer, signed_number},
+    utils::numeric_literal::{number_digits, parse_integer, sign_and_operand},
 };
 
 /// The integer type a sequence counts in, which bounds its values.
@@ -282,11 +282,26 @@ impl SequenceParameters {
 /// The value `option` writes as a `bigint`, which PostgreSQL reads from a
 /// numeric literal with an optional sign.
 fn bigint(option: &'static str, value: &Expr) -> Result<i64, SequenceParameterError> {
-    let refused = || SequenceParameterError::NotABigint { option, value: value.to_string() };
-    let (negative, digits) = signed_number(value).ok_or_else(refused)?;
-    parse_integer(digits, negative).ok_or_else(refused)
+    let (negative, operand) = sign_and_operand(value);
+    let Some(digits) = number_digits(operand) else {
+        let written_token = match operand {
+            Expr::UnaryOp { op, .. } => op.to_string(),
+            _ => operand.to_string(),
+        };
+        return Err(SequenceParameterError::NotABigint {
+            option,
+            value: value.to_string(),
+            refusal: crate::errors::SequenceIntegerRefusal::UnexpectedToken { written_token },
+        });
+    };
+    parse_integer(digits, negative).map_err(|refusal| {
+        SequenceParameterError::NotABigint {
+            option,
+            value: if negative { format!("-{digits}") } else { digits.to_string() },
+            refusal,
+        }
+    })
 }
-
 /// Whether `part` is the identifier `name`, which an unquoted spelling matches
 /// in any case.
 fn names(part: &ObjectNamePart, name: &str) -> bool {

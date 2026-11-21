@@ -49,7 +49,7 @@ fn serial(database: &ParserDB, table: &str, column: &str) -> bool {
 /// The default a drop was refused for, as `sequence <- table.column`.
 fn refused_by_default(result: Result<ParserDB, Error>) -> String {
     match result {
-        Err(Error::SequenceUsedByDefault { sequence_name, table_name, column_name }) => {
+        Err(Error::SequenceUsedByDefault { sequence_name, table_name, column_name, .. }) => {
             format!("{sequence_name} <- {table_name}.{column_name}")
         }
         other => panic!("expected a default holding the sequence, got {other:?}"),

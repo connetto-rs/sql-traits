@@ -3,25 +3,41 @@
 
 use sqlparser::ast::{Expr, UnaryOperator, Value, ValueWithSpan};
 
-/// Whether a minus sign negates the numeric literal `value`, and the
-/// literal's digits, since PostgreSQL's `NumericOnly` writes an option value
-/// as a literal with an optional sign. [`None`] for any other expression.
-pub(crate) fn signed_number(value: &Expr) -> Option<(bool, &str)> {
-    let (negative, literal) = match value {
+/// Whether a minus sign negates `value`, and the operand under its one
+/// leading sign, since PostgreSQL's `NumericOnly` writes an option value as a
+/// literal with an optional sign.
+pub(crate) fn sign_and_operand(value: &Expr) -> (bool, &Expr) {
+    match value {
         Expr::UnaryOp { op: UnaryOperator::Minus, expr } => (true, expr.as_ref()),
         Expr::UnaryOp { op: UnaryOperator::Plus, expr } => (false, expr.as_ref()),
-        literal => (false, literal),
-    };
-    let Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) = literal else {
+        operand => (false, operand),
+    }
+}
+
+/// The digits of the numeric literal `operand`, [`None`] for any other
+/// expression.
+pub(crate) fn number_digits(operand: &Expr) -> Option<&str> {
+    let Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) = operand else {
         return None;
     };
-    Some((negative, digits))
+    Some(digits)
+}
+
+/// Whether a minus sign negates the numeric literal `value`, and the
+/// literal's digits. [`None`] for any other expression.
+fn signed_number(value: &Expr) -> Option<(bool, &str)> {
+    let (negative, operand) = sign_and_operand(value);
+    Some((negative, number_digits(operand)?))
 }
 
 /// Reads `digits` the way PostgreSQL's `bigint` input does: decimal, or
 /// hexadecimal, octal or binary behind `0x`, `0o` or `0b`, with single
 /// underscores between digits or after the prefix.
-pub(crate) fn parse_integer(digits: &str, negative: bool) -> Option<i64> {
+pub(crate) fn parse_integer(
+    digits: &str,
+    negative: bool,
+) -> Result<i64, crate::errors::SequenceIntegerRefusal> {
+    use crate::errors::SequenceIntegerRefusal::{InvalidInput, OutOfRange};
     let (radix, body) = match digits.as_bytes() {
         [b'0', b'x' | b'X', ..] => (16, &digits[2..]),
         [b'0', b'o' | b'O', ..] => (8, &digits[2..]),
@@ -34,21 +50,24 @@ pub(crate) fn parse_integer(digits: &str, negative: bool) -> Option<i64> {
     for character in body.chars() {
         if character == '_' {
             if !underscore_allowed {
-                return None;
+                return Err(InvalidInput);
             }
             underscore_allowed = false;
             ends_in_digit = false;
             continue;
         }
-        let digit = character.to_digit(radix)?;
-        magnitude = magnitude.checked_mul(i128::from(radix))?.checked_add(i128::from(digit))?;
+        let digit = character.to_digit(radix).ok_or(InvalidInput)?;
+        magnitude = magnitude
+            .checked_mul(i128::from(radix))
+            .and_then(|value| value.checked_add(i128::from(digit)))
+            .ok_or(OutOfRange)?;
         underscore_allowed = true;
         ends_in_digit = true;
     }
     if !ends_in_digit {
-        return None;
+        return Err(InvalidInput);
     }
-    i64::try_from(if negative { -magnitude } else { magnitude }).ok()
+    i64::try_from(if negative { -magnitude } else { magnitude }).map_err(|_| OutOfRange)
 }
 
 /// The value PostgreSQL's `defGetNumeric` reads from the literal `digits`.
@@ -58,10 +77,11 @@ pub(crate) fn parse_integer(digits: &str, negative: bool) -> Option<i64> {
 /// prefix `strtod` accepts, so it stops at the first underscore and at the
 /// `o` or `b` of an octal or binary prefix.
 fn numeric_option(digits: &str, negative: bool) -> f64 {
-    let magnitude = match parse_integer(digits, false).and_then(|value| i32::try_from(value).ok()) {
-        Some(integer) => f64::from(integer),
-        None => strtod_prefix(digits),
-    };
+    let magnitude =
+        match parse_integer(digits, false).ok().and_then(|value| i32::try_from(value).ok()) {
+            Some(integer) => f64::from(integer),
+            None => strtod_prefix(digits),
+        };
     if negative { -magnitude } else { magnitude }
 }
 

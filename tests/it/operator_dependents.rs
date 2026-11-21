@@ -419,7 +419,7 @@ fn a_type_change_keeps_a_converted_argument() {
     assert!(
         matches!(
             &result,
-            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                 if function_name == "f8"
                     && *dependent_kind == ObjectKind::CheckConstraint
                     && dependent_name == "d.ck"
@@ -445,7 +445,7 @@ fn successive_type_changes_keep_a_converted_selection() {
     assert!(
         matches!(
             &result,
-            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                 if function_name == "f8"
                     && *dependent_kind == ObjectKind::CheckConstraint
                     && dependent_name == "d.ck"
@@ -501,7 +501,7 @@ fn successive_type_changes_keep_what_the_deparse_wrote() {
     assert!(
         matches!(
             &called,
-            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                 if function_name == "fx"
                     && *dependent_kind == ObjectKind::CheckConstraint
                     && dependent_name == "d.ck"
@@ -544,7 +544,7 @@ fn a_check_added_beside_a_type_change_reads_the_new_type() {
     assert!(
         matches!(
             &result,
-            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name })
+            Err(Error::FunctionReferenced { function_name, dependent_kind, dependent_name, .. })
                 if function_name == "f"
                     && *dependent_kind == ObjectKind::CheckConstraint
                     && dependent_name == "d.ck"

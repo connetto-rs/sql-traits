@@ -1124,6 +1124,7 @@ fn merge_local_columns(
                     .dialect()
                     .stored_object_name_last(context.child_object_name),
                 column_name: context.builder.dialect().stored_name(&column.name),
+                declaration: true,
             });
         }
         if let Some(position) =
@@ -1131,12 +1132,13 @@ fn merge_local_columns(
         {
             if types_conflict(context.builder, &columns[position].data_type, &column.data_type) {
                 return Err(Error::InheritedColumnTypeConflict {
-                    column_name: context.builder.dialect().stored_name(&column.name),
-                    child_table: context.child_name.to_string(),
-                    child_type: column.data_type.to_string(),
+                    column_name: context.builder.dialect().stored_name(&column.name).into(),
+                    child_table: context.child_name.into(),
+                    child_type: column.data_type.to_string().into(),
                     parent_table: parent_owning(context.builder, context.parents, &column.name)
-                        .unwrap_or_else(|| "a parent".to_string()),
-                    parent_type: columns[position].data_type.to_string(),
+                        .unwrap_or_else(|| "a parent".to_string())
+                        .into(),
+                    parent_type: columns[position].data_type.to_string().into(),
                 });
             }
             if !is_options_only(column)

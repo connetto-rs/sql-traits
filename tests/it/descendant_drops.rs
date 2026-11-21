@@ -90,6 +90,7 @@ fn a_view_reading_a_partition_holds_the_root_back_until_cascade() {
             object_name,
             dependent_kind: ObjectKind::View,
             dependent_name,
+            ..
         }) if object_name == "p" && dependent_name == "v"
     ));
     let database = parse(&format!("{schema} DROP TABLE p CASCADE;")).expect("cascade takes v");
@@ -119,7 +120,7 @@ fn a_foreign_key_to_a_partition_holds_the_root_back_until_cascade() {
 
     assert!(matches!(
         parse(&format!("{schema} DROP TABLE p;")),
-        Err(Error::TableReferenced { table_name }) if table_name == "p"
+        Err(Error::TableReferenced { table_name, .. }) if table_name == "p"
     ));
     let database = parse(&format!("{schema} DROP TABLE p CASCADE;")).expect("cascade cuts the key");
     assert_eq!(table_names(&database), ["x"]);
