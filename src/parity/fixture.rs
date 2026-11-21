@@ -432,7 +432,7 @@ static EMBEDDED: &[Embedded] = &embedded![
     "two_acting_roles" known,
     "update_into_invisibility_apart",
     "update_into_invisibility_mirrored",
-    "uuid_owner_blob" known,
+    "uuid_owner_blob",
 ];
 
 /// Every case of `parity-fixtures/`, in name order, read and validated.
