@@ -2207,7 +2207,9 @@ impl ParserDBBuilder {
         if self.dialect().binds_foreign_keys_on_use() {
             bind_to_host_schema(&host.name, host.qualifier(), foreign_key)?;
         } else if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
-            ForeignKeyBinding::of(table, foreign_key, self.identifier_case()).apply(foreign_key);
+            let primary_key_valid = referenced_keys::primary_key_is_valid(self, table);
+            ForeignKeyBinding::of(table, foreign_key, primary_key_valid, self.identifier_case())
+                .apply(foreign_key);
         }
         Ok(())
     }
@@ -3843,6 +3845,8 @@ struct DeclaredKey<'table> {
     /// Whether `SET CONSTRAINTS` may defer the key's check, which leaves it
     /// unusable to a foreign key.
     deferrable: bool,
+    /// Where the key sits in its table node.
+    position: constraint_names::Position,
 }
 
 /// Collects every set of columns on `table` that a foreign key may point at:
@@ -3854,8 +3858,8 @@ struct DeclaredKey<'table> {
 fn declared_candidate_keys(table: &CreateTable) -> Vec<DeclaredKey<'_>> {
     let mut keys: Vec<DeclaredKey<'_>> = Vec::new();
 
-    for column in &table.columns {
-        for option in &column.options {
+    for (column_position, column) in table.columns.iter().enumerate() {
+        for (option_position, option) in column.options.iter().enumerate() {
             let characteristics = match &option.option {
                 ColumnOption::PrimaryKey(primary_key) => primary_key.characteristics,
                 ColumnOption::Unique(unique) => unique.characteristics,
@@ -3864,11 +3868,12 @@ fn declared_candidate_keys(table: &CreateTable) -> Vec<DeclaredKey<'_>> {
             keys.push(DeclaredKey {
                 columns: vec![&column.name],
                 deferrable: ConstraintDeferral::of(characteristics).is_deferrable(),
+                position: constraint_names::Position::Column(column_position, option_position),
             });
         }
     }
 
-    for constraint in &table.constraints {
+    for (position, constraint) in table.constraints.iter().enumerate() {
         let (columns, characteristics) = match constraint {
             TableConstraint::PrimaryKey(pk) => (&pk.columns, pk.characteristics),
             TableConstraint::Unique(unique) => (&unique.columns, unique.characteristics),
@@ -3878,6 +3883,7 @@ fn declared_candidate_keys(table: &CreateTable) -> Vec<DeclaredKey<'_>> {
             keys.push(DeclaredKey {
                 columns,
                 deferrable: ConstraintDeferral::of(characteristics).is_deferrable(),
+                position: constraint_names::Position::Table(position),
             });
         }
     }
@@ -3898,14 +3904,27 @@ pub(crate) fn is_candidate_key<'index>(
     referred: &[&Ident],
     case: IdentifierCase,
 ) -> bool {
-    declared_candidate_keys(table)
-        .iter()
-        .any(|key| !key.deferrable && key_columns_match(referred, &key.columns, case))
-        || unique_indexes
-            .into_iter()
-            .filter(|index| index.predicate.is_none())
-            .filter_map(|index| plain_key_columns(&index.columns))
-            .any(|key| key_columns_match(referred, &key, case))
+    is_valid_candidate_key(table, &[], unique_indexes, referred, case)
+}
+
+/// Whether `referred` names a key [`is_candidate_key`] accepts, the keys of
+/// `table` at the positions `invalid` lists, whose index is invalid, aside.
+fn is_valid_candidate_key<'index>(
+    table: &CreateTable,
+    invalid: &[constraint_names::Position],
+    unique_indexes: impl IntoIterator<Item = &'index CreateIndex>,
+    referred: &[&Ident],
+    case: IdentifierCase,
+) -> bool {
+    declared_candidate_keys(table).iter().any(|key| {
+        !key.deferrable
+            && !invalid.contains(&key.position)
+            && key_columns_match(referred, &key.columns, case)
+    }) || unique_indexes
+        .into_iter()
+        .filter(|index| index.predicate.is_none())
+        .filter_map(|index| plain_key_columns(&index.columns))
+        .any(|key| key_columns_match(referred, &key, case))
 }
 
 /// Whether a deferrable key of `table` names, in any order, the columns
@@ -4703,10 +4722,16 @@ struct ForeignKeyBinding {
 impl ForeignKeyBinding {
     /// Reads what `foreign_key` keeps of `target`, the table it reaches, with
     /// column names matched under `case`.
-    fn of(target: &CreateTable, foreign_key: &ForeignKeyConstraint, case: IdentifierCase) -> Self {
+    fn of(
+        target: &CreateTable,
+        foreign_key: &ForeignKeyConstraint,
+        primary_key_valid: bool,
+        case: IdentifierCase,
+    ) -> Self {
         Self {
             qualifier: stored_qualifier(&target.name),
             referred_columns: if foreign_key.referred_columns.is_empty()
+                && primary_key_valid
                 && !has_deferrable_primary_key(target)
             {
                 primary_key_columns(target, case)
@@ -4762,7 +4787,10 @@ fn bind_foreign_key_targets(
             )
             .ok()
             .flatten()
-            .map(|table| ForeignKeyBinding::of(table, foreign_key, case))
+            .map(|table| {
+                let primary_key_valid = referenced_keys::primary_key_is_valid(builder, table);
+                ForeignKeyBinding::of(table, foreign_key, primary_key_valid, case)
+            })
         })
         .collect();
     for (foreign_key, binding) in foreign_keys_of_mut(node).zip(bindings) {
@@ -6281,6 +6309,21 @@ impl ParserDB {
             .and_then(|(_, name)| name)
     }
 
+    /// Whether the index of the key at `position` among the primary keys and
+    /// unique constraints of `table` is valid.
+    pub(crate) fn constraint_index_is_valid(&self, table: &CreateTable, position: usize) -> bool {
+        let Some(metadata) = self.table_metadata(table) else {
+            return true;
+        };
+        constraint_names::keyed_slots(table)
+            .into_iter()
+            .filter(|(slot, _)| slot.is_unique_key())
+            .nth(position)
+            .is_none_or(|(_, key)| {
+                metadata.key_creations().iter().all(|created| created.slot != key || created.valid)
+            })
+    }
+
     /// The name of the `NOT NULL` constraint `column` of `table` holds.
     pub(crate) fn not_null_constraint_name<'db>(
         &'db self,
@@ -7709,8 +7752,9 @@ impl ParserDB {
                         &index.table_name,
                     )
             });
+        let invalid = referenced_keys::invalid_keys(builder, referenced_table);
         if referred.is_empty()
-            || !is_candidate_key(referenced_table, unique_indexes, &referred, case)
+            || !is_valid_candidate_key(referenced_table, &invalid, unique_indexes, &referred, case)
         {
             if is_deferrable_key(referenced_table, &referred, case) {
                 return Err(crate::errors::Error::DeferrableUniqueKeyForForeignKey {
@@ -8429,6 +8473,7 @@ impl ParserDB {
         // afterwards still receives its copy at creation, which is also what
         // the server leaves behind.
         if scope.only {
+            partition_indexes::invalidate_key_above_partitions(&mut builder, &stored, &constraint)?;
             return Ok(builder);
         }
 

@@ -193,6 +193,57 @@ fn metadata_of<'builder>(
         .map(|(_, metadata, _)| metadata)
 }
 
+/// The positions of the keys of `node`, a table the builder holds, whose
+/// index is invalid.
+pub(super) fn invalid_keys(builder: &ParserDBBuilder, node: &CreateTable) -> Vec<Position> {
+    let Some(metadata) = metadata_of(builder, node) else {
+        return Vec::new();
+    };
+    constraint_names::keyed_slots(node)
+        .into_iter()
+        .filter(|(_, key)| {
+            metadata.key_creations().iter().any(|created| created.slot == *key && !created.valid)
+        })
+        .map(|(slot, _)| slot.position())
+        .collect()
+}
+
+/// Whether the index of the primary key of `node`, a table the builder
+/// holds, is valid, which it is when the table holds no primary key.
+pub(super) fn primary_key_is_valid(builder: &ParserDBBuilder, node: &CreateTable) -> bool {
+    let invalid = invalid_keys(builder, node);
+    invalid.is_empty()
+        || constraint_names::keyed_slots(node).into_iter().all(|(slot, _)| {
+            !key_columns(slot).is_some_and(|(_, primary)| primary)
+                || !invalid.contains(&slot.position())
+        })
+}
+
+/// Marks the index of the key at `position` of the stored table `table`
+/// valid or invalid.
+pub(super) fn set_key_validity(
+    builder: &mut ParserDBBuilder,
+    table: &StoredTable,
+    position: Position,
+    valid: bool,
+) -> Result<(), Error> {
+    let node = ParserDB::stored_node(builder, table)?;
+    let Some(key) = constraint_names::keyed_slots(node)
+        .into_iter()
+        .find(|(held, _)| held.position() == position)
+        .map(|(_, key)| key)
+    else {
+        return Ok(());
+    };
+    let case = builder.identifier_case();
+    for (_, metadata, _) in
+        builder.tables_mut().iter_mut().filter(|(node, _, _)| table.matches(node, case))
+    {
+        metadata.set_key_validity(&key, valid);
+    }
+    Ok(())
+}
+
 /// Whether the foreign key at `slot` of `node`, keyed `key`, depends on the
 /// primary key of the table it references because it named no columns, or
 /// is the copy of one that does.
@@ -235,7 +286,8 @@ fn bound_key(
             continue;
         };
         if key_columns_match(&referred, &columns, case)
-            && let Some(created) = metadata.key_creations().iter().find(|held| held.slot == key)
+            && let Some(created) =
+                metadata.key_creations().iter().find(|held| held.slot == key && held.valid)
         {
             keys.push((created.identity, primary));
         }
@@ -361,7 +413,7 @@ pub(super) fn settle_key_creations(
         .collect();
     arriving.sort_by_key(|(primary, _)| !primary);
     for (_, slot) in arriving {
-        creations.push(KeyCreation { slot, identity: builder.draw_key_identity() });
+        creations.push(KeyCreation { slot, identity: builder.draw_key_identity(), valid: true });
     }
     metadata.set_key_creations(creations);
 }

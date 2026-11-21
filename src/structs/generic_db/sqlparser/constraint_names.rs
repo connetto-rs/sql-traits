@@ -447,7 +447,7 @@ impl SlotRecord for KeyCreation {
     }
 
     fn moved_to(&self, slot: String, _declared_name: Option<&Ident>) -> Self {
-        Self { slot, identity: self.identity }
+        Self { slot, identity: self.identity, valid: self.valid }
     }
 }
 
