@@ -1146,6 +1146,25 @@ mod tests {
     }
 
     #[test]
+    fn deferral_through_a_reference_answers_the_referenced_trigger() {
+        let db = ParserDB::parse::<GenericDialect>(
+            r"
+            CREATE TABLE parents (id INT);
+            CREATE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql;
+            CREATE CONSTRAINT TRIGGER checked AFTER INSERT ON parents
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION f();
+        ",
+        )
+        .expect("Failed to parse SQL");
+        let trigger = db.triggers().next().expect("No trigger found");
+
+        assert_eq!(
+            <&_ as TriggerLike>::deferral(&trigger),
+            Some(crate::structs::ConstraintDeferral::InitiallyDeferred)
+        );
+    }
+
+    #[test]
     fn test_trigger_function_no_body() {
         // Defines a function with RETURN expression which is not a string
         // literal block. FunctionLike implementation returns None for
