@@ -1322,6 +1322,9 @@ pub(super) fn apply_parents(
 
     for (kind, parent_name) in &parents {
         let parent = resolve_parent(builder, parent_name, &child_name)?;
+        if *kind == ParentKind::PartitionOf {
+            super::refuse_multiple_primary_keys(builder, create_table, Some(parent))?;
+        }
 
         for column in &parent.columns {
             // A second parent declaring the same column merges into the one

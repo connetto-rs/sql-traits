@@ -121,7 +121,7 @@ pub(super) fn attach_partition(
     })?;
 
     let passed = passed_keys(&builder, &root, root_node);
-    let mut received = receive(&builder, root_node, &partition, partition_node, &passed)?;
+    let mut received = receive(&builder, &partition, partition_node, &passed)?;
     received.options.extend(identities_of(root_node, partition_node, builder.identifier_case()));
     received.merged.extend(merged_checks);
     refuse_foreign_under_unique_index(&builder, (&root, root_node), (&partition, partition_node))?;
@@ -149,9 +149,8 @@ pub(super) fn attach_partition(
             .into_iter()
             .filter_map(|(kind, child)| (kind == ParentKind::PartitionOf).then_some(child));
         for child in partitions {
-            let parent_node = ParserDB::stored_node(&builder, &table)?;
             let child_node = ParserDB::stored_node(&builder, &child)?;
-            let next = receive(&builder, parent_node, &child, child_node, &received.passed_on)?;
+            let next = receive(&builder, &child, child_node, &received.passed_on)?;
             frontier.push((child, next));
         }
     }
@@ -464,7 +463,6 @@ fn compared_foreign_key(
 /// which then counts as received.
 fn receive(
     builder: &ParserDBBuilder,
-    parent_node: &CreateTable,
     table: &StoredTable,
     node: &CreateTable,
     passed: &[Passed],
@@ -491,11 +489,7 @@ fn receive(
         if matches!(arriving.constraint, TableConstraint::PrimaryKey(_))
             && held.iter().any(|own| matches!(own.constraint, TableConstraint::PrimaryKey(_)))
         {
-            return Err(Error::PartitionNotAttachable {
-                table_name: StoredTable::of(parent_node).name,
-                partition_name: table.name.clone(),
-                reason: UnattachablePartition::OtherPrimaryKey,
-            });
+            return Err(Error::MultiplePrimaryKeys { table_name: table.name.clone() });
         }
 
         if let Some((column, option)) = &arriving.written_on {
