@@ -684,6 +684,11 @@ pub enum ChildMismatch {
         /// The stored column name.
         column_name: String,
     },
+    /// The generated column uses a different storage kind from its parent.
+    GeneratedKind {
+        /// The column.
+        column_name: String,
+    },
     /// The table lacks a check the parent passes down, named as the parent
     /// names it or, for an unnamed check, written as the check.
     MissingConstraint {
@@ -725,6 +730,9 @@ impl core::fmt::Display for ChildMismatch {
             }
             Self::MustNotBeGenerated { column_name } => {
                 write!(f, "column `{column_name}` must not be a generated column")
+            }
+            Self::GeneratedKind { column_name } => {
+                write!(f, "column \"{column_name}\" has a generation conflict")
             }
             Self::MissingConstraint { constraint_name } => {
                 write!(f, "it lacks check `{constraint_name}`")
@@ -2652,6 +2660,96 @@ pub enum Error {
         referenced_table: String,
         /// Name of the host table, as stored.
         host_table: String,
+    },
+    #[error("cannot use generated column \"{column}\" in column generation expression")]
+    /// A generation expression reads another generated column.
+    GeneratedColumnReference {
+        /// The referenced column.
+        column: String,
+    },
+    #[error("cannot use system column \"{column}\" in column generation expression")]
+    /// A generation expression reads a forbidden system column.
+    GeneratedSystemColumnReference {
+        /// The referenced column.
+        column: String,
+    },
+    #[error("generation expression is not immutable")]
+    /// A generation expression contains a non-immutable operation.
+    GenerationExpressionNotImmutable,
+    #[error("generation expression uses user-defined type")]
+    /// A virtual generation expression contains a user-defined type.
+    GenerationExpressionUserDefinedType,
+    #[error("generation expression uses user-defined function")]
+    /// A virtual generation expression calls a user-defined function.
+    GenerationExpressionUserDefinedFunction,
+    #[error(
+        "both default and generation expression specified for column \"{column}\" of table \"{table}\""
+    )]
+    /// A column declares both a default and a generation expression.
+    DefaultAndGeneration {
+        /// The table.
+        table: String,
+        /// The generated column.
+        column: String,
+    },
+    #[error("indexes on virtual generated columns are not supported")]
+    /// An index reads a virtual generated column.
+    VirtualGeneratedIndex,
+    #[error("unique constraints on virtual generated columns are not supported")]
+    /// A unique or exclusion constraint reads a virtual generated column.
+    VirtualGeneratedUnique,
+    #[error("primary keys on virtual generated columns are not supported")]
+    /// A primary key reads a virtual generated column.
+    VirtualGeneratedPrimaryKey,
+    #[error("foreign key constraints on virtual generated columns are not supported")]
+    /// A foreign key reads a virtual generated source column.
+    VirtualGeneratedForeignKey,
+    #[error("virtual generated column \"{column_name}\" cannot have a domain type")]
+    /// A virtual generated column has a domain type.
+    VirtualGeneratedDomainType {
+        /// The generated column.
+        column_name: String,
+    },
+    #[error("virtual generated column \"{column_name}\" cannot have a user-defined type")]
+    /// A virtual generated column has a user-defined type.
+    VirtualGeneratedUserDefinedType {
+        /// The generated column.
+        column_name: String,
+    },
+    #[error("column \"{column_name}\" of relation \"{table_name}\" is a generated column")]
+    /// A generated column cannot receive a default.
+    GeneratedColumnDefault {
+        /// The table.
+        table_name: String,
+        /// The generated column.
+        column_name: String,
+    },
+    #[error("cannot specify USING when altering type of generated column")]
+    /// A generated column type change specifies a conversion expression.
+    GeneratedColumnTypeUsing,
+    #[error("column \"{column_name}\" inherits from generated column of different kind")]
+    /// A child changes the storage kind of an inherited generated column.
+    InheritedGeneratedKindConflict {
+        /// The child table.
+        table_name: String,
+        /// The generated column.
+        column_name: String,
+    },
+    #[error("BEFORE trigger's WHEN condition cannot reference NEW generated columns")]
+    /// A before trigger condition reads a generated new value.
+    BeforeTriggerGeneratedColumn {
+        /// The trigger table.
+        table_name: String,
+        /// The generated column, or none for a whole-row reference.
+        column_name: Option<String>,
+    },
+    #[error("BEFORE trigger's WHEN condition cannot reference NEW system columns")]
+    /// A before trigger condition reads a system column.
+    BeforeTriggerSystemColumn {
+        /// The trigger table.
+        table_name: String,
+        /// The system column.
+        column_name: String,
     },
     /// PostgreSQL refuses update actions that assign an expression-generated
     /// foreign key column.

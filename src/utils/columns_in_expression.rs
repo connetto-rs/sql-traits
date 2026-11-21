@@ -282,27 +282,9 @@ pub fn columns_in_expression<C: ColumnLike + Clone>(
     Ok(read)
 }
 
-/// Validates references against borrowed column names without collecting
-/// columns.
-#[expect(clippy::needless_pass_by_value, reason = "Callers pass lightweight cloneable iterators.")]
-pub(crate) fn validate_columns_in_expression<'column>(
-    expr: &Expr,
-    catalog_name: &str,
-    table: &TargetName<'_>,
-    columns: impl Iterator<Item = &'column Ident> + Clone,
-    case: IdentifierCase,
-    dialect: crate::impls::SqlparserDialect,
-) -> Result<(), crate::errors::Error> {
-    visit_columns(expr, catalog_name, table, case, dialect, |ident| {
-        columns
-            .clone()
-            .any(|column| column_named_by(&column.value, column.quote_style.is_some(), ident, case))
-    })
-}
-
 /// Walks references once, delegating column lookup and collection to the
 /// caller.
-fn visit_columns(
+pub(crate) fn visit_columns(
     expr: &Expr,
     catalog_name: &str,
     table: &TargetName<'_>,

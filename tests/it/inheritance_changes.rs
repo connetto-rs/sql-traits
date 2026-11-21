@@ -63,6 +63,7 @@ fn mismatch(sql: &str) -> ChildMismatch {
                 | ChildMismatch::ColumnCollation { column_name }
                 | ChildMismatch::ColumnNullable { column_name }
                 | ChildMismatch::MustBeGenerated { column_name }
+                | ChildMismatch::GeneratedKind { column_name }
                 | ChildMismatch::MustNotBeGenerated { column_name } => column_name,
                 ChildMismatch::MissingConstraint { constraint_name }
                 | ChildMismatch::ConstraintDiffers { constraint_name }

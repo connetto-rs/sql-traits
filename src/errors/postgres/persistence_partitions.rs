@@ -85,6 +85,15 @@ pub(super) fn shape(table_name: &str, reason: &ChildMismatch) -> PostgresError {
                 ),
             )
         }
+        ChildMismatch::GeneratedKind { column_name } => {
+            (
+                pg::DATATYPE_MISMATCH,
+                format!(
+                    "column {} inherits from generated column of different kind",
+                    quoted(column_name)
+                ),
+            )
+        }
         ChildMismatch::MissingConstraint { constraint_name } => {
             (
                 pg::DATATYPE_MISMATCH,

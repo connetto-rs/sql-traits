@@ -5,10 +5,7 @@ use sql_traits::{
     errors::{Error, GenerationExpressionRefusal, InheritedChange},
     prelude::*,
 };
-use sqlparser::{
-    dialect::{GenericDialect, PostgreSqlDialect},
-    parser::Parser,
-};
+use sqlparser::dialect::PostgreSqlDialect;
 
 fn parse(sql: &str) -> Result<ParserDB, sql_traits::errors::Error> {
     ParserDB::parse::<PostgreSqlDialect>(sql)
@@ -169,19 +166,10 @@ fn plain_inherited_columns_still_require_parent_recursion() {
 fn virtual_generation_is_not_droppable() {
     for storage in ["VIRTUAL", ""] {
         for suffix in ["", " IF EXISTS"] {
-            let statements = Parser::parse_sql(
-                &GenericDialect {},
-                &format!(
-                    "CREATE TABLE probe(base int, value int GENERATED ALWAYS AS (base+1) {storage}); \
-                     ALTER TABLE probe ALTER COLUMN value DROP EXPRESSION{suffix};"
-                ),
-            )
-            .unwrap();
-            let error = ParserDB::from_statements_with_dialect(
-                statements,
-                "postgres".to_owned(),
-                SqlparserDialect::PostgreSql,
-            )
+            let error = parse(&format!(
+                "CREATE TABLE probe(base int, value int GENERATED ALWAYS AS (base+1) {storage}); \
+                 ALTER TABLE probe ALTER COLUMN value DROP EXPRESSION{suffix};"
+            ))
             .unwrap_err();
             assert!(matches!(
                 error,
