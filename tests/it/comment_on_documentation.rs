@@ -233,7 +233,7 @@ fn a_relation_of_another_kind_is_refused() {
         assert!(
             matches!(
                 &refused,
-                Error::RelationKindMismatch { object_name, expected_kind, actual_kind }
+                Error::RelationKindMismatch { object_name, expected_kind, actual_kind, .. }
                     if object_name == relation && *expected_kind == expected && *actual_kind == actual
             ),
             "{statement}: {refused:?}",
@@ -256,7 +256,7 @@ fn a_missing_relation_or_column_is_refused() {
         assert!(
             matches!(
                 &refused,
-                Error::RelationNotFound { object_kind, object_name }
+                Error::RelationNotFound { object_kind, object_name, .. }
                     if *object_kind == kind && object_name == "missing"
             ),
             "{statement}: {refused:?}",

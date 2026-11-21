@@ -9,7 +9,7 @@ use sqlparser::ast::{
 
 use super::{
     AlterTableScope, NamedColumn, ParserDB, ParserDBBuilder, StoredTable, TypeArrays,
-    constraint_validity, inheritance, referenced_keys,
+    constraint_validity, inheritance, referenced_keys, views,
 };
 use crate::errors::{Error, LookupError};
 
@@ -362,6 +362,7 @@ pub(super) fn prepare(
             object_kind,
             relation_name: builder.dialect().stored_object_name_last(table_name),
             operation: operation.to_string(),
+            action: views::alter_action(operation, object_kind),
         });
     }
     match operation {

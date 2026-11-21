@@ -26,7 +26,7 @@ use super::{
     inheritance::{self, ParentKind},
 };
 use crate::{
-    errors::{Error, InheritedChange},
+    errors::{Error, InheritedChange, KeyConstraint},
     impls::SqlparserDialect,
 };
 
@@ -53,6 +53,12 @@ pub(super) fn refuse_not_valid(
     Err(Error::NotValidRefused {
         table_name: dialect.stored_object_name_last(table_name),
         constraint: constraint.to_string(),
+        kind: match constraint {
+            TableConstraint::PrimaryKey(_) => Some(KeyConstraint::PrimaryKey),
+            TableConstraint::Unique(_) => Some(KeyConstraint::Unique),
+            TableConstraint::Exclude(_) => Some(KeyConstraint::Exclusion),
+            _ => None,
+        },
     })
 }
 

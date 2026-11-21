@@ -119,7 +119,7 @@ fn only_checks_and_foreign_keys_can_be_added_not_valid() {
         assert!(
             matches!(
                 parse(&sql),
-                Err(Error::NotValidRefused { ref table_name, ref constraint })
+                Err(Error::NotValidRefused { ref table_name, ref constraint, .. })
                     if table_name == "t" && constraint.starts_with("CONSTRAINT ")
             ),
             "should have been refused:\n{sql}"

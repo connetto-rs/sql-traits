@@ -162,7 +162,12 @@ fn a_sequence_is_refused_where_a_table_would_be() {
 fn a_sequence_shares_the_relation_name_pool() {
     let taken = |sql: &str| {
         match parse(sql) {
-            Err(Error::RelationNameAlreadyTaken { object_kind, conflicting_kind, object_name }) => {
+            Err(Error::RelationNameAlreadyTaken {
+                object_kind,
+                conflicting_kind,
+                object_name,
+                ..
+            }) => {
                 assert_eq!(object_name, "s");
                 Some((object_kind, conflicting_kind))
             }
@@ -294,7 +299,9 @@ fn drop_sequence_reaches_the_temporary_sequence_first() {
 fn each_drop_spelling_refuses_the_other_kind() {
     let mismatch = |sql: &str| {
         match parse(sql) {
-            Err(Error::RelationKindMismatch { expected_kind, actual_kind, object_name }) => {
+            Err(Error::RelationKindMismatch {
+                expected_kind, actual_kind, object_name, ..
+            }) => {
                 assert_eq!(object_name, "s");
                 (expected_kind, actual_kind)
             }
@@ -320,7 +327,7 @@ fn each_drop_spelling_refuses_the_other_kind() {
     );
     assert!(matches!(
         parse("DROP SEQUENCE s;"),
-        Err(Error::RelationNotFound { object_kind: ObjectKind::Sequence, object_name })
+        Err(Error::RelationNotFound { object_kind: ObjectKind::Sequence, object_name, .. })
             if object_name == "s"
     ));
 }

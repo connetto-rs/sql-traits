@@ -26,7 +26,11 @@
 //! does, and passes over a name reaching anything else, since the other kinds
 //! of type are not modelled.
 
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 use sqlparser::ast::{ArrayElemTypeDef, CreateDomain, DataType, Ident, ObjectName};
 
@@ -45,7 +49,8 @@ use crate::{
         object_name::{
             PG_CATALOG, Qualifier, TEMPORARY_SCHEMA, object_name_identifiers, qualifier_of,
         },
-        postgres_types::names_catalog_type,
+        postgres_format_type::format_with_visibility,
+        postgres_types::{PgType, names_catalog_type},
     },
 };
 
@@ -105,6 +110,7 @@ pub(super) fn create_domain(
             object_kind: ObjectKind::Domain,
             conflicting_kind,
             object_name: builder.dialect().stored_name(name),
+            type_collision: true,
         });
     }
     if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &domain.name) {
@@ -252,6 +258,17 @@ fn reach_type_in<'builder>(
         .chain(builder.search_path())
         .filter(|(schema, _)| !schema.is_empty())
         .find_map(|schema| reach_in_schema(builder, name, schema).map(|reached| (reached, schema)))
+}
+
+/// The spelling of `data_type` PostgreSQL's `format_type` prints while the
+/// search path of `builder` is in force, which qualifies a user type only
+/// when its bare name reaches another type or none.
+pub(crate) fn format_type_for_builder(builder: &ParserDBBuilder, data_type: &PgType) -> String {
+    format_with_visibility(data_type, &|name| {
+        let Some(schema) = name.schema() else { return true };
+        reach_type_in(builder, &Ident::with_quote('"', name.name()))
+            .is_some_and(|(_, (found, quoted))| identifiers_match(found, quoted, schema, true))
+    })
 }
 
 /// What a type name reaches in one schema, if the schema holds a type of that
@@ -558,4 +575,39 @@ pub(super) fn follow_schema_rename(
         })?;
     }
     Ok(builder)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::boxed::Box;
+
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    use super::*;
+
+    /// A user type prints bare when its name alone reaches it along the
+    /// search path, and qualified when it lies off the path or another type
+    /// of its name comes first, as PostgreSQL 18's `format_type` answers.
+    #[test]
+    fn builder_spells_user_types_by_their_visibility() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE SCHEMA s; CREATE DOMAIN s.d AS int; CREATE DOMAIN d2 AS int; \
+             CREATE DOMAIN x AS int; CREATE DOMAIN s.x AS int; CREATE DOMAIN \"D\" AS int;",
+        )
+        .expect("the domains parse");
+        let (builder, _) = ParserDBBuilder::from_database(database);
+        let named = |schema, name| {
+            PgType::Named(TargetName::new(name, true).with_schema(schema, true).into_owned())
+        };
+        for (data_type, spelling) in [
+            (named("s", "d"), "s.d"),
+            (named("public", "d2"), "d2"),
+            (named("s", "x"), "s.x"),
+            (named("public", "x"), "x"),
+            (named("public", "D"), "\"D\""),
+            (PgType::Array(Box::new(named("s", "d"))), "s.d[]"),
+        ] {
+            assert_eq!(format_type_for_builder(&builder, &data_type), spelling);
+        }
+    }
 }
