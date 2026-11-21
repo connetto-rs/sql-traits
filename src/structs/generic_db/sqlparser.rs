@@ -8622,8 +8622,6 @@ impl ParserDB {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
-        partition_indexes::refuse_drop(&builder, &stored, name)?;
-
         let node = Self::stored_node(&builder, &stored)?;
         let key = constraint_names::locate(
             node,
@@ -8636,6 +8634,21 @@ impl ParserDB {
                 .into_iter()
                 .find(|slot| slot.position() == position && slot.is_unique_key())
         });
+        // A key received from the parent's key is refused as inherited, which
+        // the drop below reports, before its attachment is.
+        let received = key.is_some_and(|slot| {
+            match slot {
+                constraint_names::Slot::Column { def, held, .. } => {
+                    inheritance::receives_column_constraint(&builder, node, &def.name, held)
+                }
+                constraint_names::Slot::Table(_, constraint) => {
+                    inheritance::receives_constraint(&builder, node, constraint)
+                }
+            }
+        });
+        if !received {
+            partition_indexes::refuse_drop(&builder, &stored, name)?;
+        }
         let Some(key) = key else {
             return Self::drop_named_constraint(builder, &stored, scope, name, if_exists);
         };
@@ -8795,7 +8808,8 @@ impl ParserDB {
             })?;
 
         if matches!(dropped, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_)) {
-            return Self::drop_partition_key_copies(builder, stored, dropped);
+            let name = stored_ident_name(name).into_owned();
+            return Self::drop_partition_key_copies(builder, stored, dropped, name);
         }
 
         if scope.only && inheritance::passes_down(inheritance::ParentKind::Inherits, &dropped) {
@@ -9091,7 +9105,8 @@ impl ParserDB {
         if let Some(key) = attach_partition::table_form(written_on, option).filter(|key| {
             matches!(key, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_))
         }) {
-            return Self::drop_partition_key_copies(builder, stored, key);
+            let name = stored_ident_name(name).into_owned();
+            return Self::drop_partition_key_copies(builder, stored, key, name);
         }
 
         // `ONLY` stops the walk for a check or a `NOT NULL`, whose copies stay
@@ -9155,27 +9170,22 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Removes an inherited primary or unique key from every partition below
-    /// its owner, leaving a key a partition added itself.
+    /// Removes from every partition below its owner the keys received from or
+    /// attached to the primary or unique key `dropped`, named `name`.
     fn drop_partition_key_copies(
         mut builder: ParserDBBuilder,
         stored: &StoredTable,
         dropped: TableConstraint,
+        name: String,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        let mut frontier = alloc::vec![(stored.clone(), dropped)];
-        while let Some((parent, passed)) = frontier.pop() {
+        let mut frontier = alloc::vec![(stored.clone(), dropped, name)];
+        while let Some((parent, passed, passed_name)) = frontier.pop() {
             for (kind, child) in inheritance::direct_children(&builder, &parent) {
                 if kind != inheritance::ParentKind::PartitionOf {
                     continue;
                 }
-                let node = Self::stored_node(&builder, &child)?;
-                let Some((position, held)) =
-                    inheritance::partition_keys(node).find_map(|(position, key)| {
-                        let received = matches!(position, constraint_names::Position::Column(..))
-                            || inheritance::records_inherited_constraint(&builder, &child, &key);
-                        (received && attach_partition::same_key(&builder, &key, &passed))
-                            .then(|| (position, key.into_owned()))
-                    })
+                let Some((position, held, held_name)) =
+                    partition_indexes::linked_key(&builder, &child, &passed, &passed_name)?
                 else {
                     continue;
                 };
@@ -9191,7 +9201,7 @@ impl ParserDB {
                         }
                         Ok(())
                     })?;
-                frontier.push((child, held));
+                frontier.push((child, held, held_name));
             }
         }
         Ok(builder)
@@ -11452,6 +11462,12 @@ impl ParserDB {
                     for name in names {
                         builder = Self::drop_index(builder, &name, if_exists, cascade)?;
                     }
+                }
+                Statement::AlterIndex {
+                    name,
+                    operation: AlterIndexOperation::AttachPartition { index_name },
+                } => {
+                    builder = partition_indexes::attach(builder, &name, &index_name)?;
                 }
                 Statement::AlterIndex {
                     name,
