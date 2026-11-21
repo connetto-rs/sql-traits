@@ -79,9 +79,9 @@ use crate::{
 
 mod alter_inheritance;
 mod attach_partition;
-mod btree_opclasses;
 mod call_selection;
 mod calls_in_expression;
+mod index_opclasses;
 use calls_in_expression::CarriedCalls;
 mod column_copy;
 mod column_references;
@@ -6532,7 +6532,7 @@ impl ParserDB {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
         }
         validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
-        btree_opclasses::index(&create_index, Some(table), builder)?;
+        index_opclasses::index(&create_index, Some(table), builder)?;
         partition_keys::validate_unique_index(&create_index, table, builder.identifier_case())?;
 
         let index_arc = Arc::new(TableAttribute::new(Arc::new(table.clone()), create_index));
@@ -6893,7 +6893,7 @@ impl ParserDB {
             if renamed {
                 index.table_name = replacement.name.clone();
             }
-            btree_opclasses::index(&index, Some(&replacement), &builder)?;
+            index_opclasses::index(&index, Some(&replacement), &builder)?;
             // The expression follows the column list, which a column rename
             // rewrites, so it is recomputed rather than carried over.
             let expression = Self::create_index_expression(&index.columns).unwrap_or(expression);
@@ -7641,7 +7641,7 @@ impl ParserDB {
         }
         refuse_unholdable_foreign_options(&create_table, table_metadata.foreign_source())?;
         partition_keys::validate_partitioned_table(&create_table, builder.identifier_case())?;
-        btree_opclasses::table(&create_table, &builder)?;
+        index_opclasses::table(&create_table, &builder)?;
 
         let (identity, documentation, mut carried) = match &mut origin {
             TableOrigin::Declaration(documentation, _) => {

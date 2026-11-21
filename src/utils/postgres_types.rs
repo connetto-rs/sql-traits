@@ -229,7 +229,9 @@ impl PgType {
 
     /// The type a parsed declaration denotes.
     pub(crate) fn of(data_type: &DataType) -> Self {
-        let catalog = |name: &'static str| Self::Catalog(name);
+        if let Some(name) = builtin_data_type_name(data_type) {
+            return Self::Catalog(name);
+        }
         match data_type {
             DataType::Array(
                 ArrayElemTypeDef::AngleBracket(element)
@@ -238,61 +240,6 @@ impl PgType {
                 | ArrayElemTypeDef::ParenthesisNotNull(element)
                 | ArrayElemTypeDef::Qualified(element, _),
             ) => Self::of(element).array(),
-            DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => catalog("int4"),
-            DataType::SmallInt(_) | DataType::Int2(_) => catalog("int2"),
-            DataType::BigInt(_) | DataType::Int8(_) => catalog("int8"),
-            DataType::Real | DataType::Float4 => catalog("float4"),
-            DataType::Float(ExactNumberInfo::Precision(precision)) if *precision <= 24 => {
-                catalog("float4")
-            }
-            DataType::DoublePrecision | DataType::Float8 | DataType::Float(_) => catalog("float8"),
-            DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => catalog("numeric"),
-            DataType::Bool | DataType::Boolean => catalog("bool"),
-            DataType::Text => catalog("text"),
-            DataType::Varchar(_)
-            | DataType::CharacterVarying(_)
-            | DataType::CharVarying(_)
-            | DataType::NationalCharacterVarying(_)
-            | DataType::NationalCharVarying(_)
-            | DataType::NcharVarying(_) => catalog("varchar"),
-            DataType::Char(_)
-            | DataType::Character(_)
-            | DataType::NationalCharacter(_)
-            | DataType::NationalChar(_)
-            | DataType::Nchar(_) => catalog("bpchar"),
-            DataType::Bytea => catalog("bytea"),
-            DataType::Uuid => catalog("uuid"),
-            DataType::Date => catalog("date"),
-            DataType::Time(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
-                catalog("time")
-            }
-            DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => catalog("timetz"),
-            DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
-                catalog("timestamp")
-            }
-            DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
-                catalog("timestamptz")
-            }
-            DataType::Interval { .. } => catalog("interval"),
-            DataType::JSON => catalog("json"),
-            DataType::JSONB => catalog("jsonb"),
-            DataType::Bit(_) => catalog("bit"),
-            DataType::BitVarying(_) | DataType::VarBit(_) => catalog("varbit"),
-            DataType::Regclass => catalog("regclass"),
-            DataType::TsVector => catalog("tsvector"),
-            DataType::TsQuery => catalog("tsquery"),
-            DataType::Trigger => catalog("trigger"),
-            DataType::GeometricType(kind) => {
-                Self::Catalog(match kind {
-                    sqlparser::ast::GeometricTypeKind::Point => "point",
-                    sqlparser::ast::GeometricTypeKind::Line => "line",
-                    sqlparser::ast::GeometricTypeKind::LineSegment => "lseg",
-                    sqlparser::ast::GeometricTypeKind::GeometricBox => "box",
-                    sqlparser::ast::GeometricTypeKind::GeometricPath => "path",
-                    sqlparser::ast::GeometricTypeKind::Polygon => "polygon",
-                    sqlparser::ast::GeometricTypeKind::Circle => "circle",
-                })
-            }
             DataType::Custom(name, _) => Self::named(name),
             other => Self::Other(crate::utils::normalize_sqlparser_type(other).into_owned()),
         }
@@ -432,6 +379,67 @@ impl PgType {
 
 /// The element of `record[]`.
 static RECORD: PgType = PgType::RECORD;
+
+/// The borrowed catalog name of a native scalar declaration.
+pub(crate) fn builtin_data_type_name(data_type: &DataType) -> Option<&'static str> {
+    let catalog = Some;
+    match data_type {
+        DataType::Int(_) | DataType::Integer(_) | DataType::Int4(_) => catalog("int4"),
+        DataType::SmallInt(_) | DataType::Int2(_) => catalog("int2"),
+        DataType::BigInt(_) | DataType::Int8(_) => catalog("int8"),
+        DataType::Real | DataType::Float4 => catalog("float4"),
+        DataType::Float(ExactNumberInfo::Precision(precision)) if *precision <= 24 => {
+            catalog("float4")
+        }
+        DataType::DoublePrecision | DataType::Float8 | DataType::Float(_) => catalog("float8"),
+        DataType::Numeric(_) | DataType::Decimal(_) | DataType::Dec(_) => catalog("numeric"),
+        DataType::Bool | DataType::Boolean => catalog("bool"),
+        DataType::Text => catalog("text"),
+        DataType::Varchar(_)
+        | DataType::CharacterVarying(_)
+        | DataType::CharVarying(_)
+        | DataType::NationalCharacterVarying(_)
+        | DataType::NationalCharVarying(_)
+        | DataType::NcharVarying(_) => catalog("varchar"),
+        DataType::Char(_)
+        | DataType::Character(_)
+        | DataType::NationalCharacter(_)
+        | DataType::NationalChar(_)
+        | DataType::Nchar(_) => catalog("bpchar"),
+        DataType::Bytea => catalog("bytea"),
+        DataType::Uuid => catalog("uuid"),
+        DataType::Date => catalog("date"),
+        DataType::Time(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => catalog("time"),
+        DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => catalog("timetz"),
+        DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone) => {
+            catalog("timestamp")
+        }
+        DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            catalog("timestamptz")
+        }
+        DataType::Interval { .. } => catalog("interval"),
+        DataType::JSON => catalog("json"),
+        DataType::JSONB => catalog("jsonb"),
+        DataType::Bit(_) => catalog("bit"),
+        DataType::BitVarying(_) | DataType::VarBit(_) => catalog("varbit"),
+        DataType::Regclass => catalog("regclass"),
+        DataType::TsVector => catalog("tsvector"),
+        DataType::TsQuery => catalog("tsquery"),
+        DataType::Trigger => catalog("trigger"),
+        DataType::GeometricType(kind) => {
+            catalog(match kind {
+                sqlparser::ast::GeometricTypeKind::Point => "point",
+                sqlparser::ast::GeometricTypeKind::Line => "line",
+                sqlparser::ast::GeometricTypeKind::LineSegment => "lseg",
+                sqlparser::ast::GeometricTypeKind::GeometricBox => "box",
+                sqlparser::ast::GeometricTypeKind::GeometricPath => "path",
+                sqlparser::ast::GeometricTypeKind::Polygon => "polygon",
+                sqlparser::ast::GeometricTypeKind::Circle => "circle",
+            })
+        }
+        _ => None,
+    }
+}
 
 /// The catalog row named `name`.
 fn catalog_row(name: &str) -> Option<&'static TypeRow> {

@@ -1600,11 +1600,16 @@ pub enum HelperSetError {
 #[derive(Debug, thiserror::Error)]
 /// Defines the `Error` enum representing various error types
 pub enum Error {
-    /// PostgreSQL refuses a btree key whose type has no default operator class.
-    #[error("data type {type_name} has no default operator class for access method \"btree\"")]
-    MissingDefaultBtreeOperatorClass {
+    /// PostgreSQL refuses a key whose type has no default operator class for
+    /// its access method.
+    #[error(
+        "data type {type_name} has no default operator class for access method \"{access_method}\""
+    )]
+    MissingDefaultOperatorClass {
         /// The type of the index key.
         type_name: String,
+        /// The index access method.
+        access_method: &'static str,
     },
     /// Wrapper around identifier-aware lookup errors.
     #[error(transparent)]

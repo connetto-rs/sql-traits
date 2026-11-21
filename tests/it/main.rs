@@ -102,6 +102,7 @@ mod implied_referenced_columns;
 mod incremental_schema_ingestion;
 mod index_access_method_support;
 mod index_key_options;
+mod index_method_default_opclass;
 mod index_schema;
 mod indexed_lookup_equivalence;
 mod inheritance_changes;
