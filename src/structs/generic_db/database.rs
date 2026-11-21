@@ -1,9 +1,6 @@
 //! Implementation of the `DatabaseLike` trait for `GenericDB`.
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{string::String, vec::Vec};
 
 use crate::{
     errors::LookupError,
@@ -334,7 +331,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Table>, LookupError> {
         let probe = IndexProbe::new(self.namespaces(), &target, case, None);
-        resolve_target_from_candidates(&target, &self.probed_foreign_tables(&probe))
+        resolve_target_from_candidates(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            &target,
+            &self.probed_foreign_tables(&probe),
+        )
     }
 
     fn view_by_target(
@@ -343,7 +344,12 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         case: IdentifierCase,
     ) -> Result<Option<&Self::View>, LookupError> {
         let probe = IndexProbe::new(self.namespaces(), &target, case, None);
-        resolve_one_relation(&target, &self.probed_views(&probe), render_view_candidate)
+        resolve_one_relation(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            &target,
+            &self.probed_views(&probe),
+            render_view_candidate,
+        )
     }
 
     fn materialized_view_by_target(
@@ -353,6 +359,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     ) -> Result<Option<&Self::MaterializedView>, LookupError> {
         let probe = IndexProbe::new(self.namespaces(), &target, case, None);
         resolve_one_relation(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
             &target,
             &self.probed_materialized_views(&probe),
             render_view_candidate,
@@ -365,7 +372,12 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Sequence>, LookupError> {
         let probe = IndexProbe::new(self.namespaces(), &target, case, None);
-        resolve_one_relation(&target, &self.probed_sequences(&probe), render_sequence_candidate)
+        resolve_one_relation(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            &target,
+            &self.probed_sequences(&probe),
+            render_sequence_candidate,
+        )
     }
 
     fn function_by_target(
@@ -374,7 +386,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
         case: IdentifierCase,
     ) -> Result<Option<&Self::Function>, LookupError> {
         let probe = IndexProbe::new(self.namespaces(), &target, case, None);
-        resolve_one_function(&target.to_string(), &self.probed_functions(&probe))
+        resolve_one_function(
+            &target,
+            &self.probed_functions(&probe),
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+        )
     }
 
     fn table_by_id(&self, table_id: usize) -> Option<&Self::Table> {
@@ -450,7 +466,11 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
             .indexed_functions(&stored_identity_key(self.namespaces(), schema, name))
             .filter(|function| function_has_stored_identity(*function, schema, name))
             .collect();
-        resolve_one_function(name, &candidates)
+        resolve_one_function(
+            &TargetName::new(name, true),
+            &candidates,
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+        )
     }
 
     fn resolve_target_function(
@@ -787,10 +807,13 @@ impl<P: SchemaProfile> GenericDB<P> {
         target: &TargetName<'_>,
         case: IdentifierCase,
     ) -> Result<Option<&P::Function>, LookupError> {
-        let written = target.to_string();
         if target.schema().is_some() {
             let probe = IndexProbe::new(self.namespaces(), target, case, None);
-            return resolve_one_function(&written, &self.probed_functions(&probe));
+            return resolve_one_function(
+                target,
+                &self.probed_functions(&probe),
+                crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            );
         }
 
         let path = || self.search_path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted));
@@ -798,7 +821,11 @@ impl<P: SchemaProfile> GenericDB<P> {
             let probe = IndexProbe::new(self.namespaces(), target, case, Some(entry));
             let candidates = self.probed_functions(&probe);
             if !candidates.is_empty() {
-                return resolve_one_function(&written, &candidates);
+                return resolve_one_function(
+                    target,
+                    &candidates,
+                    crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+                );
             }
         }
 
@@ -841,7 +868,11 @@ impl<P: SchemaProfile> GenericDB<P> {
         case: IdentifierCase,
     ) -> Result<Option<&P::Table>, LookupError> {
         let probe = IndexProbe::new(self.namespaces(), target, case, None);
-        resolve_target_from_candidates(target, &self.probed_tables(&probe))
+        resolve_target_from_candidates(
+            crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+            target,
+            &self.probed_tables(&probe),
+        )
     }
 
     /// Resolves a written target to one relation of a kind, walking
@@ -860,7 +891,12 @@ impl<P: SchemaProfile> GenericDB<P> {
     {
         if target.schema().is_some() {
             let probe = IndexProbe::new(self.namespaces(), target, case, None);
-            return resolve_one_relation(target, &candidates_of(self, &probe), render);
+            return resolve_one_relation(
+                crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+                target,
+                &candidates_of(self, &probe),
+                render,
+            );
         }
 
         for (entry_schema, entry_quoted) in self.namespaces().relation_search_path(search_path) {
@@ -873,7 +909,12 @@ impl<P: SchemaProfile> GenericDB<P> {
             if self.probed_name_is_taken(&probe) {
                 // Reported under the written name: the entry qualifier is
                 // resolution machinery, not something the statement spelled.
-                return resolve_one_relation(target, &candidates_of(self, &probe), render);
+                return resolve_one_relation(
+                    crate::impls::SqlparserDialect::for_error_names(self.dialect()),
+                    target,
+                    &candidates_of(self, &probe),
+                    render,
+                );
             }
         }
 
@@ -922,7 +963,7 @@ impl<P: SchemaProfile> GenericDB<P> {
     /// # Errors
     ///
     /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches
-    /// more than one relation, reported under the written name.
+    /// more than one relation, reported under the stored name.
     fn resolve_probed_relation<'db>(
         &'db self,
         probe: &IndexProbe,
@@ -944,7 +985,8 @@ impl<P: SchemaProfile> GenericDB<P> {
             rendered.sort_unstable();
             rendered.dedup();
             return Err(LookupError::AmbiguousTableLookup {
-                object_name: target.to_string(),
+                object_name: crate::impls::SqlparserDialect::for_error_names(self.dialect())
+                    .stored_target_name(target),
                 candidates: rendered,
             });
         }

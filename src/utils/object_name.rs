@@ -754,16 +754,20 @@ pub(crate) fn function_has_stored_identity<F: FunctionLike>(
 /// than one declaration, since resolution here is by name alone and cannot
 /// choose between argument lists.
 pub(crate) fn resolve_one_function<'a, F: FunctionLike>(
-    name: &str,
+    target: &TargetName<'_>,
     candidates: &[&'a F],
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<Option<&'a F>, LookupError> {
     match candidates {
         [] => Ok(None),
         [only] => Ok(Some(only)),
         many => {
             Err(LookupError::AmbiguousFunctionLookup {
-                object_name: name.to_string(),
-                candidates: many.iter().map(|f| f.target_name().to_string()).collect(),
+                object_name: dialect.stored_target_name(target),
+                candidates: many
+                    .iter()
+                    .map(|function| dialect.stored_target_name(&function.target_name()))
+                    .collect(),
             })
         }
     }
@@ -782,11 +786,12 @@ pub(crate) fn resolve_function_on_search_path_in_iter<'a, 'path, F: FunctionLike
     target: &TargetName<'_>,
     search_path: impl Iterator<Item = (&'path str, bool)>,
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<Option<&'a F>, LookupError> {
     let indexed: Vec<(RelationKey, &'a F)> = functions
         .map(|function| (stored_function_key(namespaces, function, case), function))
         .collect();
-    let written = target.to_string();
+
     let matching = |key: &RelationKey| -> Vec<&'a F> {
         indexed
             .iter()
@@ -795,7 +800,11 @@ pub(crate) fn resolve_function_on_search_path_in_iter<'a, 'path, F: FunctionLike
     };
 
     if target.schema().is_some() {
-        return resolve_one_function(&written, &matching(&target_key(namespaces, target, case)));
+        return resolve_one_function(
+            target,
+            &matching(&target_key(namespaces, target, case)),
+            dialect,
+        );
     }
 
     let name = case.compared_form(target.name(), target.name_is_quoted()).into_owned();
@@ -806,7 +815,7 @@ pub(crate) fn resolve_function_on_search_path_in_iter<'a, 'path, F: FunctionLike
         };
         let candidates = matching(&key);
         if !candidates.is_empty() {
-            return resolve_one_function(&written, &candidates);
+            return resolve_one_function(target, &candidates, dialect);
         }
     }
 
@@ -912,6 +921,7 @@ pub(crate) fn render_table_candidate<T: TableLike>(table: &T) -> String {
 /// Returns [`LookupError::AmbiguousTableLookup`] when more than one candidate
 /// matches.
 pub(crate) fn resolve_one_relation<'a, R>(
+    dialect: crate::impls::SqlparserDialect,
     target: &TargetName<'_>,
     candidates: &[&'a R],
     render: impl Fn(&R) -> String,
@@ -924,7 +934,7 @@ pub(crate) fn resolve_one_relation<'a, R>(
             rendered.sort_unstable();
             rendered.dedup();
             Err(LookupError::AmbiguousTableLookup {
-                object_name: target.to_string(),
+                object_name: dialect.stored_target_name(target),
                 candidates: rendered,
             })
         }
@@ -950,10 +960,11 @@ pub(crate) fn render_sequence_candidate<S: SequenceLike>(sequence: &S) -> String
 /// Returns [`LookupError::AmbiguousTableLookup`] when more than one candidate
 /// matches.
 pub(crate) fn resolve_target_from_candidates<'a, T: TableLike>(
+    dialect: crate::impls::SqlparserDialect,
     target: &TargetName<'_>,
     candidates: &[&'a T],
 ) -> Result<Option<&'a T>, LookupError> {
-    resolve_one_relation(target, candidates, render_table_candidate)
+    resolve_one_relation(dialect, target, candidates, render_table_candidate)
 }
 
 /// Resolves a written target name against an iterator of tables, without
@@ -964,6 +975,7 @@ pub(crate) fn resolve_target_from_candidates<'a, T: TableLike>(
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one table.
 pub(crate) fn resolve_target_in_iter<'a, T: TableLike>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     target: &TargetName<'_>,
@@ -972,7 +984,7 @@ pub(crate) fn resolve_target_in_iter<'a, T: TableLike>(
     let key = target_key(namespaces, target, case);
     let candidates: Vec<&T> =
         tables.filter(|table| table_matches_key(namespaces, *table, &key, case)).collect();
-    resolve_target_from_candidates(target, &candidates)
+    resolve_target_from_candidates(dialect, target, &candidates)
 }
 
 /// Resolves a table from a one-part or two-part object name against an
@@ -989,6 +1001,7 @@ pub(crate) fn resolve_target_in_iter<'a, T: TableLike>(
 /// Returns an error when the object name is malformed for table lookup, or when
 /// the lookup is ambiguous.
 pub(crate) fn resolve_table_object_name_in_iter<'a, T: TableLike>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     object_name: &ObjectName,
@@ -996,7 +1009,7 @@ pub(crate) fn resolve_table_object_name_in_iter<'a, T: TableLike>(
 ) -> Result<Option<&'a T>, LookupError> {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     let target = target_name_of_idents(schema_ident, table_ident);
-    resolve_target_in_iter(namespaces, tables, &target, case)
+    resolve_target_in_iter(dialect, namespaces, tables, &target, case)
 }
 
 /// Resolves a written target name against an iterator of relations of one
@@ -1018,6 +1031,7 @@ pub(crate) fn resolve_table_object_name_in_iter<'a, T: TableLike>(
     reason = "the walk is shared by tables, views and sequences, each naming how to key and render its candidates"
 )]
 fn resolve_relation_on_search_path<'a, 'path, R, I>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     relations: impl Iterator<Item = &'a R>,
     target: &TargetName<'_>,
@@ -1034,7 +1048,7 @@ where
         let key = target_key(namespaces, target, case);
         let candidates: Vec<&R> =
             relations.filter(|relation| key_of(namespaces, relation, case) == key).collect();
-        return resolve_one_relation(target, &candidates, render);
+        return resolve_one_relation(dialect, target, &candidates, render);
     }
 
     let indexed: Vec<(RelationKey, &'a R)> =
@@ -1055,7 +1069,7 @@ where
         }
         // Reported under the written name: the entry qualifier is resolution
         // machinery, not something the statement spelled.
-        return resolve_one_relation(target, &candidates, render);
+        return resolve_one_relation(dialect, target, &candidates, render);
     }
 
     Ok(None)
@@ -1094,6 +1108,7 @@ pub(crate) fn relation_name_is_claimed<DB: DatabaseLike>(
 /// than one table in the schema that wins, reported under the name the
 /// statement wrote.
 pub(crate) fn resolve_target_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     target: &TargetName<'_>,
@@ -1105,6 +1120,7 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     resolve_table_handle_on_search_path(
+        dialect,
         namespaces,
         tables,
         target,
@@ -1116,7 +1132,12 @@ where
 }
 
 /// Resolves a table while preserving the caller's storage handle.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the walk takes the dialect that spells an ambiguous name next to the arguments of the relation walk"
+)]
 fn resolve_table_handle_on_search_path<'a, 'path, Table: TableLike, Handle, Path>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     tables: impl Iterator<Item = &'a Handle>,
     target: &TargetName<'_>,
@@ -1129,6 +1150,7 @@ where
     Path: Iterator<Item = (&'path str, bool)>,
 {
     resolve_relation_on_search_path(
+        dialect,
         namespaces,
         tables,
         target,
@@ -1152,6 +1174,7 @@ where
 /// than one view in the schema that wins, reported under the name the
 /// statement wrote.
 pub(crate) fn resolve_view_on_search_path_in_iter<'a, 'path, V: ViewLike, I>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     views: impl Iterator<Item = &'a V>,
     target: &TargetName<'_>,
@@ -1163,6 +1186,7 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     resolve_relation_on_search_path(
+        dialect,
         namespaces,
         views,
         target,
@@ -1183,12 +1207,14 @@ where
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one view.
 pub(crate) fn resolve_view_in_iter<'a, V: ViewLike>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     views: impl Iterator<Item = &'a V>,
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a V>, LookupError> {
     resolve_relation_in_iter(
+        dialect,
         namespaces,
         views,
         target,
@@ -1210,6 +1236,7 @@ pub(crate) fn resolve_view_in_iter<'a, V: ViewLike>(
 /// than one sequence in the schema that wins, reported under the name the
 /// statement wrote.
 pub(crate) fn resolve_sequence_on_search_path_in_iter<'a, 'path, S: SequenceLike, I>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     sequences: impl Iterator<Item = &'a S>,
     target: &TargetName<'_>,
@@ -1221,6 +1248,7 @@ where
     I: Iterator<Item = (&'path str, bool)>,
 {
     resolve_relation_on_search_path(
+        dialect,
         namespaces,
         sequences,
         target,
@@ -1241,12 +1269,14 @@ where
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one sequence.
 pub(crate) fn resolve_sequence_in_iter<'a, S: SequenceLike>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     sequences: impl Iterator<Item = &'a S>,
     target: &TargetName<'_>,
     case: IdentifierCase,
 ) -> Result<Option<&'a S>, LookupError> {
     resolve_relation_in_iter(
+        dialect,
         namespaces,
         sequences,
         target,
@@ -1265,6 +1295,7 @@ pub(crate) fn resolve_sequence_in_iter<'a, S: SequenceLike>(
 /// Returns [`LookupError::AmbiguousTableLookup`] when the name matches more
 /// than one relation.
 fn resolve_relation_in_iter<'a, R>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     relations: impl Iterator<Item = &'a R>,
     target: &TargetName<'_>,
@@ -1275,7 +1306,7 @@ fn resolve_relation_in_iter<'a, R>(
     let key = target_key(namespaces, target, case);
     let candidates: Vec<&R> =
         relations.filter(|relation| key_of(namespaces, relation, case) == key).collect();
-    resolve_one_relation(target, &candidates, render)
+    resolve_one_relation(dialect, target, &candidates, render)
 }
 
 /// Resolves a written function reference against an iterator of declarations,
@@ -1292,12 +1323,13 @@ pub(crate) fn resolve_function_in_iter<'a, F: FunctionLike>(
     functions: impl Iterator<Item = &'a F>,
     target: &TargetName<'_>,
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 ) -> Result<Option<&'a F>, LookupError> {
     let key = target_key(namespaces, target, case);
     let candidates: Vec<&F> = functions
         .filter(|function| stored_function_key(namespaces, *function, case) == key)
         .collect();
-    resolve_one_function(&target.to_string(), &candidates)
+    resolve_one_function(target, &candidates, dialect)
 }
 
 /// Resolves a table from a one-part or two-part object name, honouring
@@ -1311,6 +1343,7 @@ pub(crate) fn resolve_function_in_iter<'a, F: FunctionLike>(
 /// Returns an error when the object name is malformed for table lookup, or when
 /// the lookup is ambiguous.
 pub(crate) fn resolve_table_object_name_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     tables: impl Iterator<Item = &'a T>,
     object_name: &ObjectName,
@@ -1323,6 +1356,7 @@ where
 {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     resolve_target_on_search_path_in_iter(
+        dialect,
         namespaces,
         tables,
         &target_name_of_idents(schema_ident, table_ident),
@@ -1334,6 +1368,7 @@ where
 
 /// Resolves a table while retaining its owned schema handle.
 pub(crate) fn resolve_stored_table_object_name_on_search_path_in_iter<'a, 'path, T: TableLike, I>(
+    dialect: crate::impls::SqlparserDialect,
     namespaces: Namespaces,
     tables: impl Iterator<Item = &'a alloc::sync::Arc<T>>,
     object_name: &ObjectName,
@@ -1346,6 +1381,7 @@ where
 {
     let (schema_ident, table_ident) = object_name_identifiers(object_name)?;
     resolve_table_handle_on_search_path(
+        dialect,
         namespaces,
         tables,
         &target_name_of_idents(schema_ident, table_ident),
@@ -1438,8 +1474,12 @@ pub(crate) fn resolve_required_table<'db, DB: DatabaseLike>(
     database: &'db DB,
     case: IdentifierCase,
 ) -> Result<&'db DB::Table, LookupError> {
-    resolve_object_name(object_name, database, case)?
-        .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
+    resolve_object_name(object_name, database, case)?.ok_or_else(|| {
+        LookupError::TableNotFound {
+            object_name: crate::impls::SqlparserDialect::for_error_names(database.dialect())
+                .stored_object_name(object_name),
+        }
+    })
 }
 
 /// Resolves a reference a stored object carries to the base table it names.
@@ -1478,8 +1518,12 @@ pub(crate) fn resolve_required_bound_table<'db, DB: DatabaseLike>(
     object_name: &ObjectName,
     database: &'db DB,
 ) -> Result<&'db DB::Table, LookupError> {
-    resolve_bound_table(object_name, database)?
-        .ok_or_else(|| LookupError::TableNotFound { object_name: object_name.to_string() })
+    resolve_bound_table(object_name, database)?.ok_or_else(|| {
+        LookupError::TableNotFound {
+            object_name: crate::impls::SqlparserDialect::for_error_names(database.dialect())
+                .stored_object_name(object_name),
+        }
+    })
 }
 
 /// Resolves a reference a stored object carries to the relation it names, of
@@ -1670,9 +1714,15 @@ mod tests {
             assert_eq!(target.name(), "");
             assert_eq!(target.schema(), None);
             assert!(
-                resolve_target_in_iter(PG, tables.iter(), &target, IdentifierCase::AsWritten)
-                    .expect("nothing is ambiguous")
-                    .is_none()
+                resolve_target_in_iter(
+                    crate::impls::SqlparserDialect::Generic,
+                    PG,
+                    tables.iter(),
+                    &target,
+                    IdentifierCase::AsWritten
+                )
+                .expect("nothing is ambiguous")
+                .is_none()
             );
         }
     }
@@ -1770,10 +1820,30 @@ mod tests {
         let target = TargetName::new("users", false);
 
         let empty: [&CreateTable; 0] = [];
-        assert!(resolve_target_from_candidates(&target, &empty).unwrap().is_none());
-        assert!(resolve_target_from_candidates(&target, &[users]).unwrap().is_some());
+        assert!(
+            resolve_target_from_candidates(
+                crate::impls::SqlparserDialect::Generic,
+                &target,
+                &empty
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            resolve_target_from_candidates(
+                crate::impls::SqlparserDialect::Generic,
+                &target,
+                &[users]
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(matches!(
-            resolve_target_from_candidates(&target, &[users, scoped]),
+            resolve_target_from_candidates(
+                crate::impls::SqlparserDialect::Generic,
+                &target,
+                &[users, scoped]
+            ),
             Err(LookupError::AmbiguousTableLookup { .. })
         ));
     }
@@ -1782,6 +1852,7 @@ mod tests {
     fn resolve_in_iter_rejects_overqualified_names() {
         let tables = fixtures();
         let resolved = resolve_table_object_name_in_iter(
+            crate::impls::SqlparserDialect::Generic,
             PG,
             tables.iter(),
             &obj(&[("users", false)]),
@@ -1793,6 +1864,7 @@ mod tests {
 
         assert!(matches!(
             resolve_table_object_name_in_iter(
+                crate::impls::SqlparserDialect::Generic,
                 PG,
                 tables.iter(),
                 &obj(&[("a", false), ("b", false), ("c", false)]),
@@ -1808,6 +1880,7 @@ mod tests {
 
         // Qualified name delegates to the strict resolver.
         let scoped = resolve_table_object_name_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::Generic,
             PG,
             tables.iter(),
             &obj(&[("s", false), ("scoped", false)]),
@@ -1821,6 +1894,7 @@ mod tests {
 
         // Resolved only through the implicit `public` schema.
         let only_pub = resolve_table_object_name_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::Generic,
             PG,
             tables.iter(),
             &obj(&[("only_pub", false)]),
@@ -1835,7 +1909,7 @@ mod tests {
         // `things` exists both schema-less and in `public`, two tables claiming
         // one place: ambiguous, reported under the written name.
         assert!(matches!(
-            resolve_table_object_name_on_search_path_in_iter(
+            resolve_table_object_name_on_search_path_in_iter(crate::impls::SqlparserDialect::Generic,
                 PG,
                 tables.iter(),
                 &obj(&[("things", false)]),
@@ -1848,6 +1922,7 @@ mod tests {
 
         // The first schema on the path holding the name wins.
         let on_s_first = resolve_table_object_name_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::Generic,
             PG,
             tables.iter(),
             &obj(&[("users", false)]),
@@ -1860,6 +1935,7 @@ mod tests {
         assert_eq!(on_s_first.table_schema(), Some("s"));
 
         let on_public_first = resolve_table_object_name_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::Generic,
             PG,
             tables.iter(),
             &obj(&[("users", false)]),
@@ -1874,6 +1950,7 @@ mod tests {
         // A schema-less table is unreachable when `public` is off the path.
         assert!(
             resolve_table_object_name_on_search_path_in_iter(
+                crate::impls::SqlparserDialect::Generic,
                 PG,
                 tables.iter(),
                 &obj(&[("only_pub", false)]),
@@ -1888,6 +1965,7 @@ mod tests {
         // No match anywhere.
         assert!(
             resolve_table_object_name_on_search_path_in_iter(
+                crate::impls::SqlparserDialect::Generic,
                 PG,
                 tables.iter(),
                 &obj(&[("absent", false)]),
@@ -1941,6 +2019,7 @@ mod tests {
             .expect("view exists");
         assert_eq!(render_view_candidate(view), "s.v");
         let resolved = resolve_view_on_search_path_in_iter(
+            crate::impls::SqlparserDialect::Generic,
             PG,
             db.views(),
             &TargetName::new("v", false),

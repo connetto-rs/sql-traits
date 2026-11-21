@@ -38,7 +38,7 @@ use sqlparser::{
 };
 
 use crate::{
-    errors::{KeyConstraint, LookupError, ObjectKind},
+    errors::{InheritedChange, KeyConstraint, LookupError, ObjectKind},
     impls::{PrivilegeKind, SqlparserDialect},
     structs::{
         ColumnIdentity, ColumnMetadata, ConstraintDeferral, DeclaredVirtualTable, DefaultPrivilege,
@@ -531,7 +531,9 @@ fn qualify_created_collation_name(
             return Ok(ObjectName(vec![ObjectNamePart::Identifier(schema), name.0[0].clone()]));
         }
     }
-    Err(crate::errors::Error::NoSchemaSelectedForCollation { collation_name: name.to_string() })
+    Err(crate::errors::Error::NoSchemaSelectedForCollation {
+        collation_name: builder.dialect().stored_object_name_last(name),
+    })
 }
 
 fn create_collation_metadata(
@@ -544,6 +546,7 @@ fn create_collation_metadata(
     validate_created_collation_schema(builder, &create_collation.name)?;
     let name = qualify_created_collation_name(builder, &create_collation.name)?;
     let postgres_deterministic = create_collation_deterministic(
+        builder,
         &create_collation.definition,
         collations,
         catalog,
@@ -554,13 +557,14 @@ fn create_collation_metadata(
             return Ok(None);
         }
         return Err(crate::errors::Error::CollationAlreadyExists {
-            collation_name: name.to_string().into_boxed_str(),
+            collation_name: builder.dialect().stored_object_name_last(&name).into_boxed_str(),
         });
     }
     Ok(Some(CreatedCollationMetadata { name, postgres_deterministic }))
 }
 
 fn create_collation_deterministic(
+    builder: &ParserDBBuilder,
     definition: &CreateCollationDefinition,
     collations: &[CreatedCollationMetadata],
     catalog: &PostgresCatalog,
@@ -571,16 +575,17 @@ fn create_collation_deterministic(
             create_collation_options_deterministic(options)
         }
         CreateCollationDefinition::From(source) => {
+            let dialect = builder.dialect();
             if collation_source_is_pg_catalog_default(source, collations, catalog, search_path) {
                 return Err(crate::errors::Error::CollationCannotBeCopied {
-                    collation_name: source.to_string().into_boxed_str(),
+                    collation_name: dialect.stored_object_name_last(source).into_boxed_str(),
                 });
             }
             column_metadata_for_collation_name(source, collations, catalog, search_path)
                 .map(|metadata| metadata.postgres_deterministic())
                 .ok_or_else(|| {
                     crate::errors::Error::CollationNotFound {
-                        collation_name: source.to_string().into_boxed_str(),
+                        collation_name: dialect.stored_object_name(source).into_boxed_str(),
                     }
                 })
         }
@@ -599,11 +604,14 @@ fn create_collation_options_deterministic(
         // PostgreSQL's grammar takes a collation option as a single word, so
         // a namespaced key such as `x.provider` names no option.
         let [ObjectNamePart::Identifier(key)] = key.0.as_slice() else {
-            return Err(invalid_collation_option(&key.to_string(), value.to_string()));
+            return Err(invalid_collation_option(
+                &SqlparserDialect::PostgreSql.stored_object_name(key),
+                value.to_string(),
+            ));
         };
         if seen.iter().any(|seen| idents_match(seen, key)) {
             return Err(crate::errors::Error::RepeatedCollationOption {
-                option_name: key.to_string().into_boxed_str(),
+                option_name: SqlparserDialect::PostgreSql.stored_name(key).into_boxed_str(),
             });
         }
         seen.push(key);
@@ -617,7 +625,10 @@ fn create_collation_options_deterministic(
             && !collation_option_key_matches(key, "rules")
             && !collation_option_key_matches(key, "version")
         {
-            return Err(invalid_collation_option(&key.to_string(), value.to_string()));
+            return Err(invalid_collation_option(
+                &SqlparserDialect::PostgreSql.stored_name(key),
+                value.to_string(),
+            ));
         }
     }
     Ok(deterministic)
@@ -636,10 +647,18 @@ fn collation_option_bool(key: &Ident, value: &Expr) -> Result<bool, crate::error
             } else if ident.value.eq_ignore_ascii_case("false") {
                 Ok(false)
             } else {
-                Err(invalid_collation_option(&key.to_string(), value.to_string()))
+                Err(invalid_collation_option(
+                    &SqlparserDialect::PostgreSql.stored_name(key),
+                    value.to_string(),
+                ))
             }
         }
-        _ => Err(invalid_collation_option(&key.to_string(), value.to_string())),
+        _ => {
+            Err(invalid_collation_option(
+                &SqlparserDialect::PostgreSql.stored_name(key),
+                value.to_string(),
+            ))
+        }
     }
 }
 
@@ -658,12 +677,22 @@ fn validate_collation_provider(key: &Ident, value: &Expr) -> Result<(), crate::e
         Expr::Value(ValueWithSpan { value: Value::DollarQuotedString(provider), .. }) => {
             provider.value.as_str()
         }
-        _ => return Err(invalid_collation_option(&key.to_string(), value.to_string())),
+        _ => {
+            return Err(invalid_collation_option(
+                &SqlparserDialect::PostgreSql.stored_name(key),
+                value.to_string(),
+            ));
+        }
     };
     if ["builtin", "libc", "icu"].iter().any(|known| provider.eq_ignore_ascii_case(known)) {
         Ok(())
     } else {
-        Err(invalid_collation_option(&key.to_string(), value.to_string()))
+        let provider = if let Expr::Identifier(ident) = value {
+            SqlparserDialect::PostgreSql.stored_name(ident)
+        } else {
+            provider.to_string()
+        };
+        Err(invalid_collation_option(&SqlparserDialect::PostgreSql.stored_name(key), provider))
     }
 }
 
@@ -689,7 +718,9 @@ fn column_collation_name(
         if let ColumnOption::Collation(name) = &option.option {
             if collation.is_some() {
                 return Err(crate::errors::Error::RepeatedColumnCollation {
-                    column_name: column.name.to_string().into_boxed_str(),
+                    column_name: SqlparserDialect::PostgreSql
+                        .stored_name(&column.name)
+                        .into_boxed_str(),
                 });
             }
             collation = Some(name);
@@ -1079,8 +1110,8 @@ fn validate_postgres_column_collation_type(
 ) -> Result<(), crate::errors::Error> {
     validate_postgres_collatable_type(&column.data_type, catalog, search_path).map_err(|error| {
         error.into_column_error(
-            &column.name.to_string(),
-            &normalize_sqlparser_type(&column.data_type),
+            &SqlparserDialect::PostgreSql.stored_name(&column.name),
+            &column.data_type.to_string(),
         )
     })
 }
@@ -1164,7 +1195,9 @@ fn column_metadata_for_collations(
             || {
                 if validate_missing {
                     Err(crate::errors::Error::CollationNotFound {
-                        collation_name: name.to_string().into_boxed_str(),
+                        collation_name: SqlparserDialect::PostgreSql
+                            .stored_object_name(name)
+                            .into_boxed_str(),
                     })
                 } else {
                     Ok(ColumnMetadata::default())
@@ -1215,10 +1248,10 @@ fn existing_child_column_conflict(
     let own_type = &child_column.attribute().data_type;
     if inheritance::types_conflict(builder, &inherited_def.data_type, own_type) {
         return Some(crate::errors::Error::InheritedColumnTypeConflict {
-            column_name: added.name.clone(),
-            child_table: child.name.clone(),
+            column_name: builder.dialect().stored_spelling(&added.name, added.quoted),
+            child_table: builder.dialect().stored_spelling(&child.name, child.name_quoted),
             child_type: own_type.to_string(),
-            parent_table: parent.name.clone(),
+            parent_table: builder.dialect().stored_spelling(&parent.name, parent.name_quoted),
             parent_type: inherited_def.data_type.to_string(),
         });
     }
@@ -1226,14 +1259,26 @@ fn existing_child_column_conflict(
         return None;
     }
     Some(crate::errors::Error::InheritedColumnCollationConflict {
-        column_name: added.name.clone().into_boxed_str(),
-        child_table: child.name.clone().into_boxed_str(),
-        child_collation: stored_column_collation_name(child_column.attribute())
-            .map_or_else(|| "default".to_string(), ObjectName::to_string)
+        column_name: builder.dialect().stored_spelling(&added.name, added.quoted).into_boxed_str(),
+        child_table: builder
+            .dialect()
+            .stored_spelling(&child.name, child.name_quoted)
             .into_boxed_str(),
-        parent_table: parent.name.clone().into_boxed_str(),
+        child_collation: stored_column_collation_name(child_column.attribute())
+            .map_or_else(
+                || "default".to_string(),
+                |name| builder.dialect().stored_object_name(name),
+            )
+            .into_boxed_str(),
+        parent_table: builder
+            .dialect()
+            .stored_spelling(&parent.name, parent.name_quoted)
+            .into_boxed_str(),
         parent_collation: stored_column_collation_name(inherited_def)
-            .map_or_else(|| "default".to_string(), ObjectName::to_string)
+            .map_or_else(
+                || "default".to_string(),
+                |name| builder.dialect().stored_object_name(name),
+            )
             .into_boxed_str(),
     })
 }
@@ -1343,7 +1388,7 @@ impl ParserDBBuilder {
     ) -> Result<(), crate::errors::Error> {
         for function in dropping {
             if let Some(dependent) = self.function_dependent(function, dropping) {
-                return Err(function_dependents::referenced(function, dependent));
+                return Err(function_dependents::referenced(self, function, dependent));
             }
         }
         self.functions_mut()
@@ -1400,6 +1445,7 @@ impl ParserDBBuilder {
         let case = self.identifier_case();
         let resolve = |name: &ObjectName| {
             resolve_table_object_name_in_iter(
+                *self.dialect(),
                 self.namespaces(),
                 self.tables().iter().map(|(table, _, _)| table.as_ref()),
                 name,
@@ -1918,6 +1964,7 @@ impl ParserDBBuilder {
     ) -> Result<Option<&CreateTable>, LookupError> {
         let case = self.identifier_case();
         resolve_table_object_name_on_search_path_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.tables().iter().map(|(table, _, _)| table.as_ref()),
             object_name,
@@ -1967,7 +2014,7 @@ impl ParserDBBuilder {
         let actual_kind = self.stored_table_kind(table);
         if refused.contains(&actual_kind) {
             return Err(crate::errors::Error::RelationKindMismatch {
-                object_name: name.to_string(),
+                object_name: self.dialect().stored_object_name_last(name),
                 expected_kind: ObjectKind::Table,
                 actual_kind,
             });
@@ -1984,6 +2031,7 @@ impl ParserDBBuilder {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.views().iter().map(|(view, _, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
@@ -2002,6 +2050,7 @@ impl ParserDBBuilder {
         let (schema_ident, name_ident) = object_name_identifiers(object_name)?;
         let case = self.identifier_case();
         resolve_view_on_search_path_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.materialized_views().iter().map(|(view, _, _)| view.as_ref()),
             &target_name_of_idents(schema_ident, name_ident),
@@ -2287,14 +2336,17 @@ impl ParserDBBuilder {
         }
         if let Some((actual_kind, _)) = self.relation_reached(&create_index.table_name) {
             return Err(crate::errors::Error::RelationKindMismatch {
-                object_name: create_index.table_name.to_string(),
+                object_name: self.dialect().stored_object_name_last(&create_index.table_name),
                 expected_kind: ObjectKind::Table,
                 actual_kind,
             });
         }
         Err(crate::errors::Error::TableNotFoundForIndex {
-            table_name: last_str(&create_index.table_name).to_string(),
-            index_name: create_index.name.as_ref().map_or("<unnamed>", last_str).to_string(),
+            table_name: self.dialect().stored_object_name(&create_index.table_name),
+            index_name: create_index.name.as_ref().map_or_else(
+                || "<unnamed>".to_string(),
+                |name| self.dialect().stored_object_name_last(name),
+            ),
         })
     }
 
@@ -2305,6 +2357,7 @@ impl ParserDBBuilder {
         object_name: &ObjectName,
     ) -> Result<Option<&CreateTable>, LookupError> {
         resolve_table_object_name_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.tables().iter().map(|(table, _, _)| table.as_ref()),
             object_name,
@@ -2351,7 +2404,7 @@ impl ParserDBBuilder {
             }
             Some((actual_kind, _)) => {
                 Err(crate::errors::Error::RelationKindMismatch {
-                    object_name: name.to_string(),
+                    object_name: self.dialect().stored_object_name_last(name),
                     expected_kind: ObjectKind::Index,
                     actual_kind,
                 })
@@ -2408,6 +2461,7 @@ impl ParserDBBuilder {
         let claimed = |key: &RelationKey| self.relation_key_is_held(key, case);
         let path = || self.search_path();
         if let Some(table) = resolve_target_on_search_path_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.tables().iter().map(|(table, _, _)| table.as_ref()),
             &target,
@@ -2423,6 +2477,7 @@ impl ParserDBBuilder {
             });
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.views().iter().map(|(view, _, _)| view.as_ref()),
             &target,
@@ -2438,6 +2493,7 @@ impl ParserDBBuilder {
             });
         }
         if let Some(view) = resolve_view_on_search_path_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.materialized_views().iter().map(|(view, _, _)| view.as_ref()),
             &target,
@@ -2453,6 +2509,7 @@ impl ParserDBBuilder {
             });
         }
         resolve_sequence_on_search_path_in_iter(
+            *self.dialect(),
             self.namespaces(),
             self.sequences().iter().map(|(sequence, ())| sequence.as_ref()),
             &target,
@@ -3126,6 +3183,7 @@ fn tables_declaring_column(
 /// column.
 fn column_rename(
     namespaces: Namespaces,
+    dialect: SqlparserDialect,
     node: &CreateTable,
     from: &NamedColumn,
     to: &Ident,
@@ -3134,7 +3192,7 @@ fn column_rename(
     let ordinal = node.columns.iter().position(|column| from.matches(&column.name))?;
     Some(view_rewrites::Rename::Column {
         key: stored_table_key(namespaces, node, case),
-        relation_name: node.table_name().to_string(),
+        relation_name: dialect.stored_object_name_last(&node.name),
         ordinal,
         to: to.clone(),
         columns: node.columns.iter().map(|column| column.name.clone()).collect(),
@@ -3764,7 +3822,7 @@ fn policy_role_ident(owner: &Owner) -> Option<&Ident> {
 /// for a grant.
 fn validate_policy_roles(
     builder: &ParserDBBuilder,
-    policy_name: &str,
+    policy_name: &Ident,
     owners: &[Owner],
 ) -> Result<(), crate::errors::Error> {
     for owner in owners {
@@ -3776,8 +3834,8 @@ fn validate_policy_roles(
             builder.roles().iter().any(|(role, ())| role_matches_lookup_ident(role, role_ident));
         if !role_exists {
             return Err(crate::errors::Error::RoleNotFoundForPolicy {
-                role_name: role_ident.value.clone(),
-                policy_name: policy_name.to_string(),
+                role_name: builder.dialect().stored_name(role_ident),
+                policy_name: builder.dialect().stored_name(policy_name),
             });
         }
     }
@@ -3795,7 +3853,7 @@ fn validate_policy_roles(
 fn validate_owner_role_ident(
     builder: &ParserDBBuilder,
     role_ident: &Ident,
-    object_name: &str,
+    object_name: impl FnOnce() -> String,
 ) -> Result<(), crate::errors::Error> {
     if builder.roles().iter().any(|(role, ())| role_matches_lookup_ident(role, role_ident))
         || names_pg_database_owner(*builder.dialect(), role_ident)
@@ -3804,8 +3862,8 @@ fn validate_owner_role_ident(
     }
 
     Err(crate::errors::Error::RoleNotFoundForOwner {
-        role_name: role_ident.value.clone(),
-        object_name: object_name.to_string(),
+        role_name: builder.dialect().stored_name(role_ident),
+        object_name: object_name(),
     })
 }
 
@@ -3814,7 +3872,7 @@ fn validate_owner_role_ident(
 fn validate_owner_role(
     builder: &ParserDBBuilder,
     owner: &Owner,
-    object_name: &str,
+    object_name: impl FnOnce() -> String,
 ) -> Result<(), crate::errors::Error> {
     let Owner::Ident(role_ident) = owner else {
         return Ok(());
@@ -3968,7 +4026,9 @@ fn refuse_multiple_primary_keys(
         .filter(|primary_key| *primary_key);
     if primary_keys.nth(1).is_some() {
         return Err(crate::errors::Error::MultiplePrimaryKeys {
-            table_name: table.table_name().to_string(),
+            table_name: builder
+                .dialect()
+                .stored_spelling(table.table_name(), table.table_name_is_quoted()),
         });
     }
     Ok(())
@@ -4007,9 +4067,9 @@ fn refuse_unequal_written_lists(
         return Ok(());
     }
     Err(crate::errors::Error::ForeignKeyColumnCountMismatch {
-        host_table: host.name.to_string(),
+        host_table: SqlparserDialect::SQLite.stored_object_name_last(&host.name),
         host_columns: foreign_key.columns.len(),
-        referenced_table: foreign_key.foreign_table.to_string(),
+        referenced_table: SqlparserDialect::SQLite.stored_object_name(&foreign_key.foreign_table),
         referenced_columns,
     })
 }
@@ -4107,8 +4167,8 @@ fn validate_created_collation_schema(
         return Ok(());
     }
     Err(crate::errors::Error::SchemaNotFoundForCollation {
-        schema_name: schema_name.to_string(),
-        collation_name: name.to_string(),
+        schema_name: builder.dialect().stored_spelling(schema_name, schema_quoted),
+        collation_name: builder.dialect().stored_object_name(name),
     })
 }
 
@@ -4117,7 +4177,7 @@ fn validate_relation_schema(
     builder: &ParserDBBuilder,
     schema: Option<(&str, bool)>,
     object_kind: crate::errors::ObjectKind,
-    relation_name: &str,
+    relation_name: (&str, bool),
 ) -> Result<(), crate::errors::Error> {
     let Some((schema_name, schema_quoted)) = schema else {
         return Ok(());
@@ -4128,9 +4188,9 @@ fn validate_relation_schema(
     }
 
     Err(crate::errors::Error::SchemaNotFoundForRelation {
-        schema_name: schema_name.to_string(),
+        schema_name: builder.dialect().stored_spelling(schema_name, schema_quoted),
         object_kind,
-        relation_name: relation_name.to_string(),
+        relation_name: builder.dialect().stored_spelling(relation_name.0, relation_name.1),
     })
 }
 
@@ -4143,7 +4203,7 @@ fn validate_table_schema(
         builder,
         create_table.table_schema().map(|schema| (schema, create_table.table_schema_is_quoted())),
         crate::errors::ObjectKind::Table,
-        create_table.table_name(),
+        (create_table.table_name(), create_table.table_name_is_quoted()),
     )
 }
 
@@ -4282,6 +4342,7 @@ fn column_key_constraint(option: &ColumnOptionDef) -> Option<KeyConstraint> {
 /// on a foreign table, which stores no rows to enforce one against.
 fn refuse_key_constraints_on_foreign_table(
     create_table: &CreateTable,
+    dialect: SqlparserDialect,
 ) -> Result<(), crate::errors::Error> {
     let on_columns = create_table
         .columns
@@ -4306,7 +4367,7 @@ fn refuse_key_constraints_on_foreign_table(
     match on_columns.or_else(on_table) {
         Some(constraint) => {
             Err(crate::errors::Error::ConstraintUnsupportedOnForeignTable {
-                table_name: create_table.table_name().to_string(),
+                table_name: dialect.stored_object_name_last(&create_table.name),
                 constraint,
             })
         }
@@ -4328,6 +4389,7 @@ fn first_repeated_key<K: AsRef<str>>(keys: &[K]) -> Option<&str> {
 fn refuse_unholdable_foreign_options(
     create_table: &CreateTable,
     source: Option<&ForeignTableSource>,
+    dialect: SqlparserDialect,
 ) -> Result<(), crate::errors::Error> {
     let Some(source) = source else {
         return match create_table
@@ -4337,8 +4399,8 @@ fn refuse_unholdable_foreign_options(
         {
             Some(column) => {
                 Err(crate::errors::Error::ForeignOptionsOnTableColumn {
-                    table_name: create_table.table_name().to_string(),
-                    column_name: column.name.value.clone(),
+                    table_name: dialect.stored_object_name_last(&create_table.name),
+                    column_name: dialect.stored_name(&column.name),
                 })
             }
             None => Ok(()),
@@ -4346,8 +4408,8 @@ fn refuse_unholdable_foreign_options(
     };
     let repeated = |column_name: Option<&Ident>, option_name: &str| {
         crate::errors::Error::RepeatedForeignOption {
-            table_name: create_table.table_name().to_string(),
-            column_name: column_name.map(|name| name.value.clone()),
+            table_name: dialect.stored_object_name_last(&create_table.name),
+            column_name: column_name.map(|name| dialect.stored_name(name)),
             option_name: option_name.to_string(),
         }
     };
@@ -4418,7 +4480,7 @@ fn refuse_alter_foreign_table_of_other_kind(
         return Ok(());
     }
     Err(crate::errors::Error::RelationKindMismatch {
-        object_name: alter_table.name.to_string(),
+        object_name: builder.dialect().stored_object_name_last(&alter_table.name),
         expected_kind: ObjectKind::ForeignTable,
         actual_kind,
     })
@@ -4430,6 +4492,7 @@ fn refuse_alter_foreign_table_of_other_kind(
 /// partitions, so the one spelling that would keep a check from them is
 /// refused, written as a table constraint or on a column alike.
 fn refuse_no_inherit_constraints_on_partitioned(
+    dialect: SqlparserDialect,
     create_table: &CreateTable,
 ) -> Result<(), crate::errors::Error> {
     if create_table.partition_by.is_none() {
@@ -4446,24 +4509,27 @@ fn refuse_no_inherit_constraints_on_partitioned(
         .any(|option| matches!(&option.option, ColumnOption::Check(check) if check.no_inherit));
     if check_on_table || check_on_column {
         return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
-            table_name: create_table.table_name().to_string(),
+            table_name: dialect.stored_object_name_last(&create_table.name),
         });
     }
     if create_table.constraints.iter().any(|constraint| {
         matches!(constraint, TableConstraint::NotNull(not_null) if not_null.no_inherit)
     }) {
         return Err(crate::errors::Error::NoInheritNotNullOnPartitionedTable {
-            table_name: create_table.table_name().to_string(),
+            table_name: dialect.stored_object_name_last(&create_table.name),
         });
     }
     Ok(())
 }
 
 /// Refuses an unlogged partitioned relation.
-fn refuse_unlogged_partitioned(table: &CreateTable) -> Result<(), crate::errors::Error> {
+fn refuse_unlogged_partitioned(
+    table: &CreateTable,
+    dialect: SqlparserDialect,
+) -> Result<(), crate::errors::Error> {
     if table.unlogged && table.partition_by.is_some() {
         return Err(crate::errors::Error::UnloggedPartitionedTable {
-            table_name: table.table_name().to_string(),
+            table_name: dialect.stored_object_name_last(&table.name),
         });
     }
     Ok(())
@@ -4479,10 +4545,11 @@ fn relation_kind(foreign: bool) -> ObjectKind {
 fn refuse_not_null_conflicts(
     create_table: &CreateTable,
     case: IdentifierCase,
+    dialect: SqlparserDialect,
 ) -> Result<(), crate::errors::Error> {
     for column in &create_table.columns {
-        NotNullRequirement::new(column, &create_table.constraints, case)
-            .validate(create_table.table_name())?;
+        NotNullRequirement::new(column, &create_table.constraints, case, dialect)
+            .validate(&create_table.name, dialect)?;
     }
     Ok(())
 }
@@ -4490,6 +4557,8 @@ fn refuse_not_null_conflicts(
 /// The local declarations of one column's nullability.
 struct NotNullRequirement<'column> {
     column_name: Cow<'column, str>,
+    column_name_quoted: bool,
+    /// The stored names the declarations give.
     names: Vec<String>,
     no_inherit: bool,
     spellings: usize,
@@ -4501,6 +4570,7 @@ impl<'column> NotNullRequirement<'column> {
         column: &'column ColumnDef,
         constraints: &[TableConstraint],
         case: IdentifierCase,
+        dialect: SqlparserDialect,
     ) -> Self {
         let mut names = Vec::new();
         let mut no_inherit = false;
@@ -4509,7 +4579,7 @@ impl<'column> NotNullRequirement<'column> {
             if matches!(&option.option, ColumnOption::NotNull) {
                 spellings += 1;
                 if let Some(name) = &option.name {
-                    names.push(stored_ident_name(name).into_owned());
+                    names.push(dialect.stored_name(name));
                 }
             }
         }
@@ -4523,10 +4593,16 @@ impl<'column> NotNullRequirement<'column> {
             spellings += 1;
             no_inherit |= not_null.no_inherit;
             if let Some(name) = &not_null.name {
-                names.push(stored_ident_name(name).into_owned());
+                names.push(dialect.stored_name(name));
             }
         }
-        Self { column_name: Cow::Borrowed(&column.name.value), names, no_inherit, spellings }
+        Self {
+            column_name: Cow::Borrowed(&column.name.value),
+            column_name_quoted: column.name.quote_style.is_some(),
+            names,
+            no_inherit,
+            spellings,
+        }
     }
 
     /// Retains local requirements while the column's inherited definition is
@@ -4534,24 +4610,30 @@ impl<'column> NotNullRequirement<'column> {
     fn into_owned(self) -> NotNullRequirement<'static> {
         NotNullRequirement {
             column_name: Cow::Owned(self.column_name.into_owned()),
+            column_name_quoted: self.column_name_quoted,
             names: self.names,
             no_inherit: self.no_inherit,
             spellings: self.spellings,
         }
     }
 
-    /// Refuses conflicting inheritance settings and names.
-    fn validate(&self, table_name: &str) -> Result<(), crate::errors::Error> {
+    /// Refuses conflicting inheritance settings and names on the table
+    /// `table_name`.
+    fn validate(
+        &self,
+        table_name: &ObjectName,
+        dialect: SqlparserDialect,
+    ) -> Result<(), crate::errors::Error> {
         if self.no_inherit && self.spellings > 1 {
             return Err(crate::errors::Error::ConflictingNoInheritNotNull {
-                table_name: table_name.to_string(),
-                column_name: self.column_name.to_string(),
+                table_name: dialect.stored_object_name_last(table_name),
+                column_name: dialect.stored_spelling(&self.column_name, self.column_name_quoted),
             });
         }
         if let Some((first, second)) = first_repeated_name(&self.names) {
             return Err(crate::errors::Error::ConflictingNotNullConstraintNames {
-                table_name: table_name.to_string(),
-                column_name: self.column_name.to_string(),
+                table_name: dialect.stored_object_name_last(table_name),
+                column_name: dialect.stored_spelling(&self.column_name, self.column_name_quoted),
                 first_name: first,
                 second_name: second,
             });
@@ -4576,19 +4658,19 @@ fn first_repeated_name(named: &[String]) -> Option<(String, String)> {
 fn refuse_reference_across_storage(
     host: &CreateTable,
     referenced: &CreateTable,
-    referenced_name: &str,
+    dialect: SqlparserDialect,
 ) -> Result<(), crate::errors::Error> {
     if referenced.is_temporary() != host.is_temporary() {
         return Err(crate::errors::Error::ForeignKeyCrossesTemporaryStorage {
-            host_table: host.name.to_string(),
-            referenced_table: referenced_name.to_string(),
+            host_table: dialect.stored_object_name_last(&host.name),
+            referenced_table: dialect.stored_object_name_last(&referenced.name),
             host_is_temporary: host.is_temporary(),
         });
     }
     if referenced.unlogged && !host.unlogged && !host.is_temporary() {
         return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
-            host_table: host.name.to_string(),
-            referenced_table: referenced_name.to_string(),
+            host_table: dialect.stored_object_name_last(&host.name),
+            referenced_table: dialect.stored_object_name_last(&referenced.name),
         });
     }
     Ok(())
@@ -4606,7 +4688,7 @@ fn place_relation(
 ) -> Result<bool, crate::errors::Error> {
     // A hand-assembled node may carry no name part, which names nothing to
     // place.
-    let Some((relation_name, _)) = object_name_last_part(name) else {
+    let Some((relation_name, relation_quoted)) = object_name_last_part(name) else {
         return Ok(temporary);
     };
     let namespaces = builder.namespaces();
@@ -4617,16 +4699,23 @@ fn place_relation(
             if namespaces == Namespaces::PostgreSql
                 && identifiers_match(schema, quoted, PG_CATALOG, false) =>
         {
-            refuse_system_schema_relation(object_kind, relation_name)?;
+            refuse_system_schema_relation(builder, object_kind, (relation_name, relation_quoted))?;
             return Ok(false);
         }
         Qualifier::Named(schema, quoted) => {
-            validate_relation_schema(builder, Some((schema, quoted)), object_kind, relation_name)?;
+            validate_relation_schema(
+                builder,
+                Some((schema, quoted)),
+                object_kind,
+                (relation_name, relation_quoted),
+            )?;
             if temporary {
                 return Err(crate::errors::Error::TemporaryRelationInPermanentSchema {
                     object_kind,
-                    relation_name: relation_name.to_string(),
-                    schema_name: schema.to_string(),
+                    relation_name: builder
+                        .dialect()
+                        .stored_spelling(relation_name, relation_quoted),
+                    schema_name: builder.dialect().stored_spelling(schema, quoted),
                 });
             }
             // A database name may be spelled several ways that compare equal,
@@ -4645,7 +4734,12 @@ fn place_relation(
         // `main`, which the model leaves unwritten, whatever the path holds.
         Qualifier::Absent if namespaces == Namespaces::Sqlite => return Ok(false),
         Qualifier::Absent => {
-            let qualifier = search_path_qualifier(builder, object_kind, relation_name, role)?;
+            let qualifier = search_path_qualifier(
+                builder,
+                object_kind,
+                (relation_name, relation_quoted),
+                role,
+            )?;
             let Some(qualifier) = qualifier else {
                 return Ok(false);
             };
@@ -4781,6 +4875,7 @@ fn bind_foreign_key_targets(
     let bindings: Vec<Option<ForeignKeyBinding>> = foreign_keys_of(node)
         .map(|foreign_key| {
             resolve_table_object_name_on_search_path_in_iter(
+                *builder.dialect(),
                 builder.namespaces(),
                 builder
                     .tables()
@@ -4825,7 +4920,8 @@ fn bind_to_host_schema(
     let [_] = foreign_key.foreign_table.0.as_slice() else {
         return Err(crate::errors::Error::QualifiedForeignKeyTarget {
             host_table: host_table.to_string(),
-            referenced_table: foreign_key.foreign_table.to_string(),
+            referenced_table: SqlparserDialect::SQLite
+                .stored_object_name(&foreign_key.foreign_table),
         });
     };
     bind_reference(&mut foreign_key.foreign_table, host_qualifier);
@@ -4854,7 +4950,7 @@ fn bind_to_host_schema(
 fn search_path_qualifier(
     builder: &ParserDBBuilder,
     object_kind: crate::errors::ObjectKind,
-    relation_name: &str,
+    relation_name: (&str, bool),
     role: Option<&str>,
 ) -> Result<Option<Ident>, crate::errors::Error> {
     for (entry, quoted) in builder.search_path().filter(|(entry, _)| !entry.is_empty()) {
@@ -4868,7 +4964,7 @@ fn search_path_qualifier(
             return Ok(Some(Ident::new(TEMPORARY_SCHEMA)));
         }
         if identifiers_match(entry, quoted, PG_CATALOG, false) {
-            refuse_system_schema_relation(object_kind, relation_name)?;
+            refuse_system_schema_relation(builder, object_kind, relation_name)?;
             return Ok(Some(Ident::new(PG_CATALOG)));
         }
         let (entry, quoted) = match (entry, role) {
@@ -4884,22 +4980,23 @@ fn search_path_qualifier(
     }
     Err(crate::errors::Error::NoSchemaSelectedForRelation {
         object_kind,
-        relation_name: relation_name.to_string(),
+        relation_name: builder.dialect().stored_spelling(relation_name.0, relation_name.1),
     })
 }
 
 /// Refuses a relation created in `pg_catalog`, which PostgreSQL refuses to
 /// every role while it lets a superuser create a function or a domain there.
 fn refuse_system_schema_relation(
+    builder: &ParserDBBuilder,
     object_kind: crate::errors::ObjectKind,
-    relation_name: &str,
+    relation_name: (&str, bool),
 ) -> Result<(), crate::errors::Error> {
     if matches!(object_kind, ObjectKind::Function | ObjectKind::Domain | ObjectKind::Operator) {
         return Ok(());
     }
     Err(crate::errors::Error::SystemSchemaRelationRefused {
         object_kind,
-        relation_name: relation_name.to_string(),
+        relation_name: builder.dialect().stored_spelling(relation_name.0, relation_name.1),
     })
 }
 
@@ -4908,27 +5005,26 @@ fn refuse_system_schema_relation(
 fn first_repeated_column<'a>(
     mut names: impl Iterator<Item = (&'a str, bool)>,
     case: IdentifierCase,
-) -> Option<&'a str> {
+) -> Option<(&'a str, bool)> {
     let mut compared = BTreeSet::new();
-    names
-        .find(|&(name, quoted)| !compared.insert(case.compared_form(name, quoted)))
-        .map(|(name, _)| name)
+    names.find(|&(name, quoted)| !compared.insert(case.compared_form(name, quoted)))
 }
 
 /// Checks that a table declares no column name twice.
 fn validate_distinct_columns(
     create_table: &CreateTable,
     case: IdentifierCase,
+    dialect: SqlparserDialect,
 ) -> Result<(), crate::errors::Error> {
     let names = create_table
         .columns
         .iter()
         .map(|column| (column.name.value.as_str(), column.name.quote_style.is_some()));
     match first_repeated_column(names, case) {
-        Some(column_name) => {
+        Some((column_name, quoted)) => {
             Err(crate::errors::Error::ColumnAlreadyExists {
-                table_name: create_table.table_name().to_string(),
-                column_name: column_name.to_string(),
+                table_name: dialect.stored_object_name_last(&create_table.name),
+                column_name: dialect.stored_spelling(column_name, quoted),
             })
         }
         None => Ok(()),
@@ -5020,7 +5116,7 @@ fn skip_existing_index(
     Err(crate::errors::Error::RelationNameAlreadyTaken {
         object_kind: ObjectKind::Index,
         conflicting_kind,
-        object_name: index_name.value.clone(),
+        object_name: builder.dialect().stored_name(index_name),
     })
 }
 
@@ -5034,10 +5130,11 @@ fn skip_existing_index(
 /// names another schema.
 fn refuse_index_in_another_schema(
     create_index: &CreateIndex,
-    relation_name: &str,
+    relation_name: impl FnOnce() -> String,
     schema: SchemaQualifier<'_>,
     namespaces: Namespaces,
     case: IdentifierCase,
+    dialect: SqlparserDialect,
 ) -> Result<(), crate::errors::Error> {
     let Some(name) = create_index.name.as_ref() else {
         return Ok(());
@@ -5049,9 +5146,9 @@ fn refuse_index_in_another_schema(
         return Ok(());
     }
     Err(crate::errors::Error::IndexInAnotherSchema {
-        index_name: last_str(name).to_string(),
-        schema_name: written.0.to_string(),
-        table_name: relation_name.to_string(),
+        index_name: dialect.stored_object_name_last(name),
+        schema_name: dialect.stored_spelling(written.0, written.1),
+        table_name: relation_name(),
     })
 }
 
@@ -5331,7 +5428,7 @@ fn validate_relation_names(
             return Err(crate::errors::Error::RelationNameAlreadyTaken {
                 object_kind: *object_kind,
                 conflicting_kind,
-                object_name: name.value.clone(),
+                object_name: builder.dialect().stored_name(name),
             });
         }
     }
@@ -5355,13 +5452,13 @@ fn validate_index_columns(
     let refuses_repeats = refuses_repeated_index_columns(*builder.dialect());
     for (position, column) in columns.iter().enumerate() {
         if let Expr::Identifier(name) = &column.column.expr {
-            validate_declared_column(name, create_table, case)?;
+            validate_declared_column(name, create_table, builder)?;
         }
         if refuses_repeats && let Some(name) = repeated_key_column(columns, position, case) {
             return Err(repeated_index_column(create_table, name));
         }
     }
-    Ok(validate_include_columns(include, create_table, case)?)
+    Ok(validate_include_columns(include, create_table, builder)?)
 }
 
 /// Whether the dialect refuses a primary key or unique constraint naming one
@@ -5409,28 +5506,47 @@ fn repeated_index_column(create_table: &CreateTable, name: &Ident) -> crate::err
     }
 }
 
+/// Reads a primary-key entry consisting of one column identifier.
+fn primary_key_column<'expression>(
+    expression: &'expression Expr,
+    table: &CreateTable,
+    dialect: crate::impls::SqlparserDialect,
+) -> Result<&'expression Ident, crate::errors::Error> {
+    match expression {
+        Expr::Identifier(column) => Ok(column),
+        _ => {
+            Err(crate::errors::Error::InvalidPrimaryKey {
+                table_name: dialect.stored_object_name_last(&table.name),
+                reason: format!(
+                    "primary key entries must be plain columns, found expression `{expression}`"
+                ),
+            })
+        }
+    }
+}
+
 /// Checks that every column an `INCLUDE` list names is declared by its table,
 /// for an index and for the key constraint backing one alike.
 fn validate_include_columns(
     include: &[Ident],
     create_table: &CreateTable,
-    case: IdentifierCase,
+    builder: &ParserDBBuilder,
 ) -> Result<(), LookupError> {
-    include.iter().try_for_each(|name| validate_declared_column(name, create_table, case))
+    include.iter().try_for_each(|name| validate_declared_column(name, create_table, builder))
 }
 
 /// Checks that `create_table` declares the column `name` spells.
 fn validate_declared_column(
     name: &Ident,
     create_table: &CreateTable,
-    case: IdentifierCase,
+    builder: &ParserDBBuilder,
 ) -> Result<(), LookupError> {
-    if NamedColumn::of(name, case).declared_by(create_table) {
+    if NamedColumn::of(name, builder.identifier_case()).declared_by(create_table) {
         Ok(())
     } else {
         Err(LookupError::ColumnNotFound {
-            table_name: create_table.name.to_string(),
-            column_name: name.value.clone(),
+            table_name: builder.dialect().stored_object_name_last(&create_table.name),
+            column_name: builder.dialect().stored_name(name),
         })
     }
 }
@@ -5456,7 +5572,7 @@ fn validate_access_targets_against_builder(
                 && !sequences::holds_sequence(builder, table_obj)
             {
                 return Err(crate::errors::Error::TableNotFoundForGrant {
-                    table_name: last_str(table_obj).to_string(),
+                    table_name: builder.dialect().stored_object_name(table_obj),
                 });
             }
         }
@@ -5472,7 +5588,7 @@ fn validate_access_targets_against_builder(
                 || names_pg_database_owner(*builder.dialect(), grantee_ident);
         if !role_exists {
             return Err(crate::errors::Error::RoleNotFoundForGrant {
-                role_name: grantee_ident.value.clone(),
+                role_name: builder.dialect().stored_name(grantee_ident),
             });
         }
     }
@@ -6150,7 +6266,7 @@ impl ParserDBIngestor {
         let builder = &self.catalog.builder;
         if !builder.dialect().is_sqlite() {
             return Err(crate::errors::Error::DatabaseOutsideSqlite {
-                database_name: database.value.clone(),
+                database_name: builder.dialect().stored_name(database),
             });
         }
         let mut source = ParsedSource::parse(sql, builder.dialect().sqlparser_dialect())?;
@@ -6704,32 +6820,34 @@ impl ParserDB {
         match self.unresolved_access_references()?.next() {
             Some(UnresolvedAccessReference::GranteeRole(grantee_ident)) => {
                 Err(crate::errors::Error::RoleNotFoundForGrant {
-                    role_name: grantee_ident.value.clone(),
+                    role_name: self.dialect.stored_name(grantee_ident),
                 })
             }
             Some(UnresolvedAccessReference::GrantTable(table_obj)) => {
                 Err(crate::errors::Error::TableNotFoundForGrant {
-                    table_name: last_str(table_obj).to_string(),
+                    table_name: self.dialect.stored_object_name(table_obj),
                 })
             }
             Some(UnresolvedAccessReference::GrantFunction(function)) => {
                 Err(crate::errors::Error::FunctionNotFoundForGrant {
-                    function_name: function.to_string(),
+                    function_name: self.dialect.stored_object_name(&function.name),
                 })
             }
             Some(UnresolvedAccessReference::PolicyRole { policy, role }) => {
                 Err(crate::errors::Error::RoleNotFoundForPolicy {
-                    role_name: role.value.clone(),
-                    policy_name: policy.value.clone(),
+                    role_name: self.dialect.stored_name(role),
+                    policy_name: self.dialect.stored_name(policy),
                 })
             }
             Some(UnresolvedAccessReference::MembershipRole(role)) => {
                 Err(crate::errors::Error::RoleNotFoundForMembership {
-                    role_name: role.value.clone(),
+                    role_name: self.dialect.stored_name(role),
                 })
             }
             Some(UnresolvedAccessReference::AlteredRole { role, .. }) => {
-                Err(crate::errors::Error::AlterRoleNotFound { role_name: role.value.clone() })
+                Err(crate::errors::Error::AlterRoleNotFound {
+                    role_name: self.dialect.stored_name(role),
+                })
             }
             None => Ok(()),
         }
@@ -6750,6 +6868,7 @@ impl ParserDB {
                 &target_name_of_object_name(&create_table.name),
                 table_metadata.column_arc_slice(),
                 builder.identifier_case(),
+                crate::traits::DialectLike::sqlparser_dialect(builder.dialect()),
             )?;
         let calls = builder.calls_carried(check_expr, carried);
         Ok((columns_in_expression, calls))
@@ -6845,10 +6964,11 @@ impl ParserDB {
         let table = builder.index_table(&create_index)?;
         refuse_index_in_another_schema(
             &create_index,
-            table.table_name(),
+            || builder.dialect().stored_object_name_last(&table.name),
             table_schema_qualifier(table),
             builder.namespaces(),
             builder.identifier_case(),
+            *builder.dialect(),
         )?;
         // `ONLY` keeps the index off the partitions, so none of them can
         // refuse it, and PostgreSQL marks it invalid while one exists.
@@ -6870,17 +6990,20 @@ impl ParserDB {
             validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
         }
         index_opclasses::index(&create_index, Some(table), builder)?;
-        partition_keys::validate_unique_index(&create_index, table, builder.identifier_case())?;
+        partition_keys::validate_unique_index(
+            &create_index,
+            table,
+            builder.identifier_case(),
+            *builder.dialect(),
+        )?;
 
         let index_arc = Arc::new(TableAttribute::new(Arc::new(table.clone()), create_index));
         let Some(expression) = Self::create_index_expression(&index_arc.attribute().columns) else {
             return Err(crate::errors::Error::InvalidIndex {
-                index_name: index_arc
-                    .attribute()
-                    .name
-                    .as_ref()
-                    .map_or("<unnamed>", last_str)
-                    .to_string(),
+                index_name: index_arc.attribute().name.as_ref().map_or_else(
+                    || "<unnamed>".to_string(),
+                    |name| builder.dialect().stored_object_name_last(name),
+                ),
                 reason: "index has no columns".to_string(),
             });
         };
@@ -6909,7 +7032,7 @@ impl ParserDB {
                 return Ok(builder);
             }
             return Err(crate::errors::Error::RenameTableNotFound {
-                table_name: last_str(old_name).to_string(),
+                table_name: builder.dialect().stored_object_name(old_name),
             });
         };
         let renamed = StoredTable::of(resolved_table);
@@ -6924,7 +7047,7 @@ impl ParserDB {
             return Err(crate::errors::Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Table,
                 conflicting_kind,
-                object_name: new_ident.value.clone(),
+                object_name: builder.dialect().stored_name(new_ident),
             });
         }
         let changing_schema = !schema_qualifiers_match(
@@ -7072,7 +7195,8 @@ impl ParserDB {
                 ))
             })
             .collect();
-        builder = function_moves::move_functions(builder, &function_moves::Moves::new(functions))?;
+        let relocations = function_moves::Moves::new(functions, *builder.dialect());
+        builder = function_moves::move_functions(builder, &relocations)?;
 
         builder = sequences::move_sequences(builder, from, to)?;
         let tables: Vec<(ObjectName, Ident)> = builder
@@ -7479,6 +7603,7 @@ impl ParserDB {
                         &target_name_of_object_name(&create_table.name),
                         create_table.columns.iter().map(|column| &column.name),
                         builder.identifier_case(),
+                        *builder.dialect(),
                     )?;
                 }
                 _ => {}
@@ -7501,6 +7626,7 @@ impl ParserDB {
     ) -> Result<&'a Arc<CreateTable>, crate::errors::Error> {
         let case = builder.identifier_case();
         let referenced_table = resolve_stored_table_object_name_on_search_path_in_iter(
+            *builder.dialect(),
             builder.namespaces(),
             builder
                 .tables()
@@ -7518,14 +7644,14 @@ impl ParserDB {
             // database reports.
             if let Some(actual_kind) = views::holds_view(builder, &fk.foreign_table) {
                 return Err(crate::errors::Error::RelationKindMismatch {
-                    object_name: fk.foreign_table.to_string(),
+                    object_name: builder.dialect().stored_object_name_last(&fk.foreign_table),
                     expected_kind: ObjectKind::Table,
                     actual_kind,
                 });
             }
             return Err(crate::errors::Error::ReferencedTableNotFoundForForeignKey {
-                referenced_table: fk.foreign_table.to_string(),
-                host_table: create_table.name.to_string(),
+                referenced_table: builder.dialect().stored_object_name(&fk.foreign_table),
+                host_table: builder.dialect().stored_object_name_last(&create_table.name),
             });
         };
         builder.refuse_table_kinds(
@@ -7548,7 +7674,7 @@ impl ParserDB {
             && !builder.dialect().is_sqlite()
         {
             return Err(crate::errors::Error::InitiallyDeferredNotDeferrable {
-                table_name: table_name.to_string(),
+                table_name: builder.dialect().stored_object_name_last(table_name),
             });
         }
         Ok(())
@@ -7612,8 +7738,8 @@ impl ParserDB {
                 .find(|column| case_idents_match(&column.attribute().name, column_ident, case))
                 .ok_or_else(|| {
                     crate::errors::Error::HostColumnNotFoundForForeignKey {
-                        host_column: column_ident.value.clone(),
-                        host_table: create_table.name.to_string(),
+                        host_column: builder.dialect().stored_name(column_ident),
+                        host_table: builder.dialect().stored_object_name_last(&create_table.name),
                     }
                 })?;
             if postgres {
@@ -7699,9 +7825,9 @@ impl ParserDB {
     ) -> Result<(&'table Arc<CreateTable>, Vec<foreign_key_types::BoundColumn>), crate::errors::Error>
     {
         let case = builder.identifier_case();
-        let referenced_table_name = fk.foreign_table.to_string();
+        let referenced_table_name = builder.dialect().stored_object_name_last(&fk.foreign_table);
         let referenced_table = Self::foreign_key_target(builder, create_table, fk)?;
-        refuse_reference_across_storage(create_table, referenced_table, &referenced_table_name)?;
+        refuse_reference_across_storage(create_table, referenced_table, *builder.dialect())?;
 
         let mut columns = Vec::new();
         for column_ident in &fk.referred_columns {
@@ -7711,9 +7837,9 @@ impl ParserDB {
                 .find(|column| case_idents_match(&column.name, column_ident, case))
                 .ok_or_else(|| {
                     crate::errors::Error::ReferencedColumnNotFoundForForeignKey {
-                        referenced_column: column_ident.value.clone(),
+                        referenced_column: builder.dialect().stored_name(column_ident),
                         referenced_table: referenced_table_name.clone(),
-                        host_table: create_table.name.to_string(),
+                        host_table: builder.dialect().stored_object_name_last(&create_table.name),
                     }
                 })?;
             if matches!(builder.dialect(), SqlparserDialect::PostgreSql) {
@@ -7743,7 +7869,7 @@ impl ParserDB {
         if referred.is_empty() && has_deferrable_primary_key(referenced_table) {
             return Err(crate::errors::Error::DeferrablePrimaryKeyForForeignKey {
                 referenced_table: referenced_table_name,
-                host_table: create_table.name.to_string(),
+                host_table: builder.dialect().stored_object_name_last(&create_table.name),
             });
         }
         let unique_indexes = builder
@@ -7766,17 +7892,17 @@ impl ParserDB {
             if is_deferrable_key(referenced_table, &referred, case) {
                 return Err(crate::errors::Error::DeferrableUniqueKeyForForeignKey {
                     referenced_table: referenced_table_name,
-                    host_table: create_table.name.to_string(),
+                    host_table: builder.dialect().stored_object_name_last(&create_table.name),
                 });
             }
             return Err(crate::errors::Error::ReferencedColumnsNotUniqueForForeignKey {
                 referenced_columns: referred
                     .iter()
-                    .map(|ident| ident.value.clone())
+                    .map(|ident| builder.dialect().stored_name(ident))
                     .collect::<Vec<_>>()
                     .join(", "),
                 referenced_table: referenced_table_name,
-                host_table: create_table.name.to_string(),
+                host_table: builder.dialect().stored_object_name_last(&create_table.name),
             });
         }
 
@@ -7785,7 +7911,7 @@ impl ParserDB {
         // key, so a foreign key failing both reports the missing key.
         if fk.columns.len() != referred.len() {
             return Err(crate::errors::Error::ForeignKeyColumnCountMismatch {
-                host_table: create_table.name.to_string(),
+                host_table: builder.dialect().stored_object_name_last(&create_table.name),
                 host_columns: fk.columns.len(),
                 referenced_table: referenced_table_name,
                 referenced_columns: referred.len(),
@@ -7833,15 +7959,11 @@ impl ParserDB {
                 TableConstraint::PrimaryKey(pk) => {
                     let mut primary_key_columns = Vec::new();
                     for col_name in &pk.columns {
-                        let Expr::Identifier(column_name) = &col_name.column.expr else {
-                            return Err(crate::errors::Error::InvalidPrimaryKey {
-                                table_name: create_table.name.to_string(),
-                                reason: format!(
-                                    "primary key entries must be plain columns, found expression `{}`",
-                                    col_name.column.expr
-                                ),
-                            });
-                        };
+                        let column_name = primary_key_column(
+                            &col_name.column.expr,
+                            create_table,
+                            *builder.dialect(),
+                        )?;
                         primary_key_columns.extend(
                             table_metadata
                                 .column_arcs()
@@ -7890,8 +8012,10 @@ impl ParserDB {
                     });
                     if !declared {
                         return Err(LookupError::ColumnNotFound {
-                            table_name: create_table.name.to_string(),
-                            column_name: not_null.column.value.clone(),
+                            table_name: builder
+                                .dialect()
+                                .stored_object_name_last(&create_table.name),
+                            column_name: builder.dialect().stored_name(&not_null.column),
                         }
                         .into());
                     }
@@ -7942,7 +8066,7 @@ impl ParserDB {
             index_name: constraint
                 .name
                 .as_ref()
-                .map_or_else(|| "<unnamed>".to_string(), |name| name.value.clone()),
+                .map_or_else(|| "<unnamed>".to_string(), |name| dialect.stored_name(name)),
             reason: format!(
                 "unique constraint entries must be plain columns, found expression `{}`",
                 entry.column.expr
@@ -7977,8 +8101,9 @@ impl ParserDB {
         let refuses_repeats = refuses_repeated_key_columns(*builder.dialect());
         let resolve_inherited =
             |name: &Ident| create_table_transform::key_column(builder, create_table, name);
-        let resolve_local =
-            |name: &Ident| validate_declared_column(name, create_table, case).map_err(Into::into);
+        let resolve_local = |name: &Ident| {
+            validate_declared_column(name, create_table, builder).map_err(Into::into)
+        };
         let resolve: &dyn Fn(&Ident) -> Result<(), crate::errors::Error> =
             if inherited { &resolve_inherited } else { &resolve_local };
         for (position, column) in columns.iter().enumerate() {
@@ -7988,8 +8113,8 @@ impl ParserDB {
             resolve(column_name)?;
             if refuses_repeats && let Some(name) = repeated_key_column(columns, position, case) {
                 return Err(crate::errors::Error::RepeatedKeyColumn {
-                    table_name: create_table.name.to_string(),
-                    column_name: name.value.clone(),
+                    table_name: builder.dialect().stored_object_name_last(&create_table.name),
+                    column_name: builder.dialect().stored_name(name),
                     constraint: kind,
                 });
             }
@@ -8020,18 +8145,23 @@ impl ParserDB {
         table_metadata: &TableMetadata<CreateTable>,
         transformed: bool,
     ) -> Result<(), crate::errors::Error> {
+        let dialect = *builder.dialect();
         if !transformed {
-            validate_distinct_columns(create_table, builder.identifier_case())?;
+            validate_distinct_columns(create_table, builder.identifier_case(), dialect)?;
             refuse_multiple_primary_keys(builder, create_table, None)?;
             let table_kind = relation_kind(table_metadata.foreign_source().is_some());
             validate_relation_names(builder, create_table, table_kind, RelationNamePhase::All)?;
         }
         if table_metadata.foreign_source().is_some() {
-            refuse_key_constraints_on_foreign_table(create_table)?;
+            refuse_key_constraints_on_foreign_table(create_table, dialect)?;
         }
-        refuse_unholdable_foreign_options(create_table, table_metadata.foreign_source())?;
+        refuse_unholdable_foreign_options(create_table, table_metadata.foreign_source(), dialect)?;
         if !transformed {
-            partition_keys::validate_partitioned_table(create_table, builder.identifier_case())?;
+            partition_keys::validate_partitioned_table(
+                create_table,
+                builder.identifier_case(),
+                dialect,
+            )?;
             index_opclasses::table(create_table, builder)?;
         }
         Ok(())
@@ -8197,6 +8327,7 @@ impl ParserDB {
         scope: AlterTableScope,
         constraint: &TableConstraint,
     ) -> Result<(), crate::errors::Error> {
+        let dialect = builder.dialect();
         if matches!(
             constraint,
             TableConstraint::PrimaryKey(_)
@@ -8210,7 +8341,7 @@ impl ParserDB {
             TableConstraint::Check(check) if check.no_inherit => {
                 if Self::stored_node(builder, stored)?.partition_by.is_some() {
                     return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
-                        table_name: stored.name.clone(),
+                        table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
                     });
                 }
             }
@@ -8225,7 +8356,7 @@ impl ParserDB {
             TableConstraint::ForeignKey(_) => {
                 if scope.only && Self::stored_node(builder, stored)?.partition_by.is_some() {
                     return Err(crate::errors::Error::OnlyForeignKeyOnPartitionedTable {
-                        table_name: stored.name.clone(),
+                        table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
                     });
                 }
             }
@@ -8239,8 +8370,9 @@ impl ParserDB {
                             && !requires_value(node, &column.name, case)
                     }) {
                         return Err(crate::errors::Error::OnlyPrimaryKeyOnNullableColumn {
-                            table_name: descendant.name.clone(),
-                            column_name: column.name.value.clone(),
+                            table_name: dialect
+                                .stored_spelling(&descendant.name, descendant.name_quoted),
+                            column_name: dialect.stored_name(&column.name),
                         });
                     }
                 }
@@ -8250,7 +8382,7 @@ impl ParserDB {
                 let case = builder.identifier_case();
                 if not_null.no_inherit && node.partition_by.is_some() {
                     return Err(crate::errors::Error::NoInheritNotNullOnPartitionedTable {
-                        table_name: stored.name.clone(),
+                        table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
                     });
                 }
                 if requires_value(node, &not_null.column, case) {
@@ -8260,7 +8392,7 @@ impl ParserDB {
                         .is_some_and(|held| held.no_inherit);
                     if existing_no_inherit != not_null.no_inherit {
                         return Err(crate::errors::Error::NotNullNoInheritStatusChange {
-                            table_name: stored.name.clone(),
+                            table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
                             constraint_name: existing,
                         });
                     }
@@ -8270,9 +8402,9 @@ impl ParserDB {
                         && stored_ident_name(name) != existing.as_str()
                     {
                         return Err(crate::errors::Error::NotNullConstraintAlreadyExists {
-                            table_name: stored.name.clone(),
-                            column_name: not_null.column.value.clone(),
-                            constraint_name: stored_ident_name(name).into_owned(),
+                            table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
+                            column_name: dialect.stored_name(&not_null.column),
+                            constraint_name: dialect.stored_name(name),
                             existing_name: existing,
                         });
                     }
@@ -8319,8 +8451,10 @@ impl ParserDB {
         match inheritance::first_foreign_partition_below(builder, stored) {
             Some(partition) => {
                 Err(crate::errors::Error::UniqueIndexOverForeignPartition {
-                    table_name: stored.name.clone(),
-                    partition_name: partition.name,
+                    table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                    partition_name: builder
+                        .dialect()
+                        .stored_spelling(&partition.name, partition.name_quoted),
                 })
             }
             None => Ok(()),
@@ -8439,7 +8573,7 @@ impl ParserDB {
         validated: bool,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         if !validated {
-            constraint_validity::refuse_not_valid(table_name, &constraint)?;
+            constraint_validity::refuse_not_valid(*builder.dialect(), table_name, &constraint)?;
         }
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
@@ -8565,9 +8699,11 @@ impl ParserDB {
                 if let Some(name) = inheritance::declared_name(&copy)
                     && node.constraints.iter().any(|held| table_constraint_has_name(held, name))
                 {
+                    let table_name =
+                        builder.dialect().stored_spelling(&child.name, child.name_quoted);
                     return Err(crate::errors::Error::InheritedConstraintConflict {
-                        table_name: child.name.clone(),
-                        constraint_name: name.value.clone(),
+                        table_name,
+                        constraint_name: builder.dialect().stored_name(name),
                     });
                 }
 
@@ -8603,8 +8739,8 @@ impl ParserDB {
             .is_some()
         {
             return Err(crate::errors::Error::ConstraintAlreadyExists {
-                table_name: stored.name.clone(),
-                constraint_name: name.value.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                constraint_name: builder.dialect().stored_name(name),
             });
         }
         Ok(())
@@ -8668,7 +8804,7 @@ impl ParserDB {
             Some(name) => {
                 Err(crate::errors::Error::RepeatedKeyColumn {
                     table_name: stored.name.clone(),
-                    column_name: name.value.clone(),
+                    column_name: builder.dialect().stored_name(name),
                     constraint: kind,
                 })
             }
@@ -8724,11 +8860,12 @@ impl ParserDB {
             return Self::drop_named_constraint(builder, &stored, scope, name, if_exists);
         };
         let removed = referenced_keys::removed_keys(&builder, &stored, key, scope.only)?;
-        let key_name = stored_ident_name(name);
+        let key_name = builder.dialect().stored_name(name);
+        let table_name = builder.dialect().stored_spelling(&stored.name, stored.name_quoted);
         let on_dependents = if cascade {
             referenced_keys::OnDependents::Cascade
         } else {
-            referenced_keys::OnDependents::Refuse { key_name: &key_name, table_name: &stored.name }
+            referenced_keys::OnDependents::Refuse { key_name: &key_name, table_name: &table_name }
         };
         Self::drop_keys(builder, &removed, on_dependents, |builder| {
             Self::drop_named_constraint(builder, &stored, scope, name, if_exists)
@@ -8783,8 +8920,8 @@ impl ParserDB {
             return Ok(builder);
         }
         Err(crate::errors::Error::DropConstraintNotFound {
-            table_name: node.name.to_string(),
-            constraint_name: name.value.clone(),
+            table_name: builder.dialect().stored_object_name_last(&node.name),
+            constraint_name: builder.dialect().stored_name(name),
         })
     }
 
@@ -8804,8 +8941,8 @@ impl ParserDB {
         {
             partition_indexes::refuse_drop(&builder, &stored, index_name)?;
             return Err(crate::errors::Error::IndexRequiredByConstraint {
-                index_name: index_name.value.clone(),
-                table_name: stored.name,
+                index_name: builder.dialect().stored_name(index_name),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
             });
         }
         match builder.index_position(name)? {
@@ -8829,7 +8966,7 @@ impl ParserDB {
                 return Ok(builder);
             }
             return Err(crate::errors::Error::DropIndexNotFound {
-                index_name: last_str(name).to_string(),
+                index_name: builder.dialect().stored_object_name_last(name),
             });
         };
         builder.remove_index_at(position);
@@ -8858,8 +8995,8 @@ impl ParserDB {
         // is checked before anything moves so a refusal changes nothing.
         if inheritance::receives_constraint(&builder, node, &dropped) {
             return Err(crate::errors::Error::InheritedConstraintNotDroppable {
-                table_name: stored.name.clone(),
-                constraint_name: name.value.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                constraint_name: builder.dialect().stored_name(name),
             });
         }
 
@@ -8969,8 +9106,8 @@ impl ParserDB {
         let held = TableConstraint::NotNull(not_null.clone());
         if inheritance::requires_a_value(&builder, node, &not_null.column) {
             return Err(crate::errors::Error::InheritedConstraintNotDroppable {
-                table_name: stored.name.clone(),
-                constraint_name: name.value.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                constraint_name: builder.dialect().stored_name(name),
             });
         }
         if node.constraints.iter().any(|constraint| {
@@ -8984,17 +9121,12 @@ impl ParserDB {
                     .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
         }) {
             return Err(crate::errors::Error::RequiredValueNotDroppable {
-                table_name: stored.name.clone(),
-                column_name: not_null.column.value.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_name(&not_null.column),
                 reason: crate::errors::RequiredValue::CoveredByKey,
             });
         }
-        replica_identity::refuse_losing_requirement(
-            &builder,
-            &stored.name,
-            node,
-            &not_null.column,
-        )?;
+        replica_identity::refuse_losing_requirement(&builder, stored, node, &not_null.column)?;
 
         let column = not_null.column.clone();
         let column_name = not_null.column.value.clone();
@@ -9145,19 +9277,19 @@ impl ParserDB {
             }))
         {
             return Err(crate::errors::Error::RequiredValueNotDroppable {
-                table_name: stored.name.clone(),
-                column_name: written_on.value.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_name(written_on),
                 reason: crate::errors::RequiredValue::CoveredByKey,
             });
         }
         if inheritance::receives_column_constraint(&builder, node, written_on, option) {
             return Err(crate::errors::Error::InheritedConstraintNotDroppable {
-                table_name: stored.name.clone(),
-                constraint_name: name.value.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                constraint_name: builder.dialect().stored_name(name),
             });
         }
         if matches!(&option.option, ColumnOption::NotNull) {
-            replica_identity::refuse_losing_requirement(&builder, &stored.name, node, written_on)?;
+            replica_identity::refuse_losing_requirement(&builder, stored, node, written_on)?;
         }
 
         let mut builder = builder;
@@ -9300,7 +9432,7 @@ impl ParserDB {
                 return Ok(builder);
             }
             return Err(crate::errors::Error::AlterTableNotFound {
-                table_name: last_str(table_name).to_string(),
+                table_name: builder.dialect().stored_object_name(table_name),
             });
         };
         let resolved_table_name = resolved_table.table_name().to_string();
@@ -9343,7 +9475,7 @@ impl ParserDB {
             None if scope.if_exists => Ok(None),
             None => {
                 Err(crate::errors::Error::AlterTableNotFound {
-                    table_name: last_str(table_name).to_string(),
+                    table_name: builder.dialect().stored_object_name(table_name),
                 })
             }
         }
@@ -9361,6 +9493,7 @@ impl ParserDB {
             return Ok(builder);
         };
         let case = builder.identifier_case();
+        let dialect = *builder.dialect();
         if let Some(source) = builder
             .tables_mut()
             .iter_mut()
@@ -9368,8 +9501,9 @@ impl ParserDB {
             .and_then(|(_, metadata, _)| metadata.foreign_source_mut())
         {
             let mut options = source.options().to_vec();
-            foreign_options::change_table(&mut options, changes)
-                .map_err(|refusal| refusal.into_error(stored.name.clone(), None))?;
+            foreign_options::change_table(&mut options, changes).map_err(|refusal| {
+                refusal.into_error(dialect.stored_spelling(&stored.name, stored.name_quoted), None)
+            })?;
             *source.options_mut() = options;
         }
         Ok(builder)
@@ -9429,7 +9563,18 @@ impl ParserDB {
             let disagree = matches!((found.first(), full.first()), (Some(by_input), Some(by_every)) if by_input != by_every);
             if ambiguous || disagree {
                 return Err(crate::errors::Error::AmbiguousRoutineSignature {
-                    signature: func_desc.to_string(),
+                    signature: format!(
+                        "{}({})",
+                        builder.dialect().stored_object_name(&func_desc.name),
+                        func_desc
+                            .args
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
                 });
             }
             if found.is_empty() {
@@ -9437,7 +9582,7 @@ impl ParserDB {
             }
         }
         if let Some(&position) = found.first() {
-            routine.refuse_other_kind(func_desc, kind(position))?;
+            routine.refuse_other_kind(func_desc, kind(position), builder)?;
         }
         Ok(found)
     }
@@ -9453,13 +9598,13 @@ impl ParserDB {
 
         let Some(&position) = matching.first() else {
             return Err(crate::errors::Error::AlterFunctionNotFound {
-                function_name: last_str(&func_desc.name).to_string(),
+                function_name: builder.dialect().stored_object_name(&func_desc.name),
             });
         };
 
         if func_desc.args.is_none() && matching.len() > 1 {
             return Err(crate::errors::Error::AmbiguousAlterFunction {
-                function_name: last_str(&func_desc.name).to_string(),
+                function_name: builder.dialect().stored_object_name(&func_desc.name),
             });
         }
 
@@ -9491,13 +9636,11 @@ impl ParserDB {
             )
         }) {
             return Err(crate::errors::Error::FunctionAlreadyExists {
-                function_name: last_str(&moved).to_string(),
+                function_name: builder.dialect().stored_object_name_last(&moved),
             });
         }
-        function_moves::move_functions(
-            builder,
-            &function_moves::Moves::new(vec![(function, moved)]),
-        )
+        let relocations = function_moves::Moves::new(vec![(function, moved)], *builder.dialect());
+        function_moves::move_functions(builder, &relocations)
     }
 
     /// Returns the stored node of a table whose identity is known to be
@@ -9561,18 +9704,18 @@ impl ParserDB {
         let node = Self::stored_node(builder, stored)?;
         if node.partition_by.is_some() {
             return Err(crate::errors::Error::PersistenceNotChangeable {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_object_name_last(&node.name),
                 reason: crate::errors::FixedPersistence::Partitioned,
             });
         }
         if changed.is_some() {
             return Err(crate::errors::Error::PersistenceChangedTwice {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_object_name_last(&node.name),
             });
         }
         if node.is_temporary() {
             return Err(crate::errors::Error::PersistenceNotChangeable {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_object_name_last(&node.name),
                 reason: crate::errors::FixedPersistence::Temporary,
             });
         }
@@ -9581,8 +9724,8 @@ impl ParserDB {
         }
         if unlogged && let Some(host) = Self::permanent_table_referencing(builder, stored)? {
             return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
-                host_table: host.name.to_string(),
-                referenced_table: node.name.to_string(),
+                host_table: builder.dialect().stored_object_name_last(&host.name),
+                referenced_table: builder.dialect().stored_object_name_last(&node.name),
             });
         }
         *changed = Some(node.unlogged);
@@ -9603,14 +9746,14 @@ impl ParserDB {
         let node = Self::stored_node(&builder, &stored)?;
         if node.partition_by.is_some() {
             return Err(crate::errors::Error::StorageParametersOnPartitionedTable {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_object_name_last(&node.name),
             });
         }
         // Another dialect's table options, such as MySQL's `ENGINE`, leave the
         // parameters nowhere to go.
         if !matches!(node.table_options, CreateTableOptions::None | CreateTableOptions::With(_)) {
             return Err(crate::errors::Error::UnsupportedAlterTableOperation {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 operation: AlterTableOperation::SetOptionsParens { options }.to_string(),
             });
         }
@@ -9650,6 +9793,7 @@ impl ParserDB {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
+        let dialect = *builder.dialect();
         Self::replace_table_node(builder, &stored, |_, replacement| {
             match &mut replacement.table_options {
                 CreateTableOptions::With(parameters) => {
@@ -9670,7 +9814,7 @@ impl ParserDB {
                 // hold no parameters to reset.
                 _ => {
                     Err(crate::errors::Error::UnsupportedAlterTableOperation {
-                        table_name: stored.name.clone(),
+                        table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
                         operation: AlterTableOperation::ResetOptions { options: names }.to_string(),
                     })
                 }
@@ -9724,8 +9868,8 @@ impl ParserDB {
         };
         if referenced.unlogged && !core::ptr::eq(host, referenced) {
             return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
-                host_table: host.name.to_string(),
-                referenced_table: foreign_table.to_string(),
+                host_table: builder.dialect().stored_object_name_last(&host.name),
+                referenced_table: builder.dialect().stored_object_name_last(&referenced.name),
             });
         }
         Ok(())
@@ -9770,8 +9914,10 @@ impl ParserDB {
             if !cascade && let Some(child) = inheritance::first_inheritor_below(&builder, &dropped)
             {
                 return Err(crate::errors::Error::DropTableInheritedFrom {
-                    parent_table: dropped.name.clone(),
-                    child_table: child.name,
+                    parent_table: builder
+                        .dialect()
+                        .stored_spelling(&dropped.name, dropped.name_quoted),
+                    child_table: builder.dialect().stored_spelling(&child.name, child.name_quoted),
                 });
             }
 
@@ -9787,17 +9933,20 @@ impl ParserDB {
                 removed.types.extend(reader_rowtypes.types);
                 removed.functions.extend(reader_rowtypes.functions);
             }
-            let table_name = dropped.name.clone();
-            doomed.push(dropped);
-            for table in &doomed {
+            for table in doomed.iter().chain(core::iter::once(&dropped)) {
                 let node = Self::stored_node(&builder, table)?;
                 for name in core::iter::once(&node.name).chain(arrays.array(&node.name)) {
                     if let Some(dependent) =
                         refusing.and_then(|catalog| catalog.dependent_naming_type(name))
                     {
+                        let key = stored_table_key(
+                            builder.namespaces(),
+                            Self::stored_node(&builder, &dropped)?,
+                            IdentifierCase::AsWritten,
+                        );
                         return Err(crate::errors::Error::RelationHasDependents {
                             object_kind: expected_kind,
-                            object_name: table_name,
+                            object_name: key.name.clone(),
                             dependent_kind: dependent.kind,
                             dependent_name: dependent.name,
                         });
@@ -9805,6 +9954,8 @@ impl ParserDB {
                     removed.types.push(name.clone());
                 }
             }
+            let dropped_index = doomed.len();
+            doomed.push(dropped);
 
             // SQLite drops a table other tables' foreign keys reference and
             // leaves those keys naming it, to reach whatever table takes the
@@ -9813,7 +9964,10 @@ impl ParserDB {
                 && !builder.dialect().binds_foreign_keys_on_use()
                 && builder.is_referenced_from_outside(&doomed)
             {
-                return Err(crate::errors::Error::TableReferenced { table_name });
+                let owner = Self::stored_node(&builder, &doomed[dropped_index])?;
+                return Err(crate::errors::Error::TableReferenced {
+                    table_name: builder.dialect().stored_object_name_last(&owner.name),
+                });
             }
 
             builder = Self::remove_tables(builder, &doomed, arrays)?;
@@ -9845,7 +9999,12 @@ impl ParserDB {
         } else {
             ObjectKind::Table
         };
-        views::refuse_dependent_views(builder, &key, dropped_kind, &dropped.name)?;
+        let dropped_key = stored_table_key(
+            builder.namespaces(),
+            Self::stored_node(builder, dropped)?,
+            IdentifierCase::AsWritten,
+        );
+        views::refuse_dependent_views(builder, &key, dropped_kind, &dropped_key)?;
         Ok(user_defined_types::TypeDrop::default())
     }
 
@@ -9909,7 +10068,7 @@ impl ParserDB {
     ) -> Result<(), crate::errors::Error> {
         if scope.only && !inheritance::direct_children(builder, stored).is_empty() {
             return Err(crate::errors::Error::OnlyRefusedWithChildren {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 change,
             });
         }
@@ -9931,7 +10090,7 @@ impl ParserDB {
             .any(|(kind, _)| *kind == inheritance::ParentKind::PartitionOf);
         if scope.only && has_partitions {
             return Err(crate::errors::Error::OnlyRefusedWithChildren {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 change,
             });
         }
@@ -9942,6 +10101,7 @@ impl ParserDB {
     /// root may do for all of them, and under `ONLY` to a column of a
     /// partitioned table, even one without partitions yet.
     fn refuse_partition_identity(
+        dialect: SqlparserDialect,
         stored: &StoredTable,
         node: &CreateTable,
         scope: AlterTableScope,
@@ -9949,14 +10109,14 @@ impl ParserDB {
     ) -> Result<(), crate::errors::Error> {
         if node.partition_of.is_some() {
             return Err(crate::errors::Error::IdentityAddedToPartitionColumn {
-                table_name: stored.name.clone(),
-                column_name: column.name.clone(),
+                table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
+                column_name: dialect.stored_spelling(&column.name, column.quoted),
             });
         }
         if scope.only && node.partition_strategy().is_some() {
             return Err(crate::errors::Error::IdentityAddedToOnlyPartitionedTable {
-                table_name: stored.name.clone(),
-                column_name: column.name.clone(),
+                table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
+                column_name: dialect.stored_spelling(&column.name, column.quoted),
             });
         }
         Ok(())
@@ -9971,8 +10131,8 @@ impl ParserDB {
     ) -> Result<(), crate::errors::Error> {
         if Self::stored_node(builder, stored)?.partition_of.is_some() {
             return Err(crate::errors::Error::ColumnAddedToPartition {
-                table_name: stored.name.clone(),
-                column_name: added.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_spelling(&added.name, added.quoted),
             });
         }
         Ok(())
@@ -10015,7 +10175,7 @@ impl ParserDB {
             })
         {
             return Err(crate::errors::Error::RenameCommandNotAlone {
-                relation_name: alter_table.name.to_string(),
+                relation_name: dialect.stored_object_name(&alter_table.name),
             });
         }
         if alter_table.operations.len() > 1
@@ -10024,7 +10184,7 @@ impl ParserDB {
             })
         {
             return Err(crate::errors::Error::PartitionCommandNotAlone {
-                table_name: alter_table.name.to_string(),
+                table_name: dialect.stored_object_name_last(&alter_table.name),
             });
         }
         // Rename handlers retain their operation-specific missing-name errors.
@@ -10091,7 +10251,7 @@ impl ParserDB {
                 if alter_passes::refuses(object_kind, &operation) {
                     return Err(crate::errors::Error::AlterActionUnsupportedOnRelation {
                         object_kind,
-                        relation_name: alter_table.name.to_string(),
+                        relation_name: dialect.stored_object_name_last(&alter_table.name),
                         operation: operation.to_string(),
                     });
                 }
@@ -10362,7 +10522,7 @@ impl ParserDB {
                 | AlterTableOperation::SwapWith { .. }) => {
                     if Self::alter_table_target(&builder, &alter_table.name, scope)?.is_some() {
                         return Err(crate::errors::Error::UnsupportedAlterTableOperation {
-                            table_name: last_str(&alter_table.name).to_string(),
+                            table_name: dialect.stored_object_name_last(&alter_table.name),
                             operation: operation.to_string(),
                         });
                     }
@@ -10405,7 +10565,9 @@ impl ParserDB {
                         && let Some(ident) = &role_ident
                         && builder.resolve_table_object_name(&alter_table.name)?.is_some()
                     {
-                        validate_owner_role_ident(&builder, ident, last_str(&alter_table.name))?;
+                        validate_owner_role_ident(&builder, ident, || {
+                            dialect.stored_object_name_last(&alter_table.name)
+                        })?;
                     }
                 }
 
@@ -10543,7 +10705,7 @@ impl ParserDB {
             && let Some(constraint) = column_def.options.iter().find_map(column_key_constraint)
         {
             return Err(crate::errors::Error::ConstraintUnsupportedOnForeignTable {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 constraint,
             });
         }
@@ -10568,7 +10730,7 @@ impl ParserDB {
         if is_no_inherit_check(option) && Self::stored_node(builder, stored)?.partition_by.is_some()
         {
             return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
             });
         }
         if matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_)) {
@@ -10639,16 +10801,12 @@ impl ParserDB {
                 return Ok((builder, None));
             }
             return Err(crate::errors::Error::ColumnAlreadyExists {
-                table_name: stored.name.clone(),
-                column_name: added.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_name(&column_def.name),
             });
         }
-        Self::refuse_only_with_children(
-            &builder,
-            &stored,
-            scope,
-            crate::errors::InheritedChange::AddColumn,
-        )?;
+        let change = InheritedChange::AddColumn;
+        Self::refuse_only_with_children(&builder, &stored, scope, change)?;
 
         let deferred = Self::refuse_unaddable_column_options(&builder, &stored, &mut column_def)?;
         // Named against the schema as it stands, before the column lands.
@@ -10659,7 +10817,7 @@ impl ParserDB {
         let creator = Creator::new(owner.as_deref(), context.defaults);
         let (builder, column_sequences) =
             sequences::create_column_sequences(builder, &stored, column_sequences, creator)?;
-        sequences::bind_column_defaults(&builder, &stored.name, core::iter::once(&mut column_def))?;
+        sequences::bind_column_defaults(&builder, &stored, core::iter::once(&mut column_def))?;
         let bound_to_primary_key = referenced_keys::bind_noting_primary_key(
             &mut column_def,
             referenced_keys::column_foreign_keys,
@@ -10754,6 +10912,7 @@ impl ParserDB {
             let namespaces = builder.namespaces();
             probes.extend(column_rename(
                 namespaces,
+                *builder.dialect(),
                 Self::stored_node(builder, table)?,
                 column,
                 &probe,
@@ -10778,16 +10937,16 @@ impl ParserDB {
         let inheritors =
             if scope.only { Vec::new() } else { inheritance::descendants(builder, stored) };
         let tables: Vec<&StoredTable> = core::iter::once(stored).chain(&inheritors).collect();
-        let blocked = |dependent_kind, dependent_name: &str| {
+        let blocked = |dependent_kind, dependent_name: String| {
             crate::errors::Error::ColumnTypeChangeBlocked {
-                table_name: stored.name.clone(),
-                column_name: column.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                 dependent_kind,
-                dependent_name: dependent_name.to_string(),
+                dependent_name,
             }
         };
         if let Some(reader) = Self::column_readers(builder, &tables, column)?.first() {
-            return Err(blocked(reader.kind(), reader.name()));
+            return Err(blocked(reader.kind(), reader.stored_name(*builder.dialect())));
         }
         for table in tables {
             let declaring = tables_declaring_column(builder, table, column);
@@ -10795,17 +10954,23 @@ impl ParserDB {
                 table.named_by(&policy.table_name)
                     && column.in_expressions(policy.as_ref(), table, &declaring)
             }) {
-                return Err(blocked(ObjectKind::Policy, &policy.name.value));
+                return Err(blocked(
+                    ObjectKind::Policy,
+                    builder.dialect().stored_name(&policy.name),
+                ));
             }
             if let Some((trigger, _)) = builder.triggers().iter().find(|(trigger, _)| {
                 table.named_by(&trigger.table_name) && trigger_depends_on_column(trigger, column)
             }) {
-                return Err(blocked(ObjectKind::Trigger, last_str(&trigger.name)));
+                return Err(blocked(
+                    ObjectKind::Trigger,
+                    builder.dialect().stored_object_name_last(&trigger.name),
+                ));
             }
             if let Some((rule, _)) = builder.rules().iter().find(|(rule, _)| {
                 table.named_by(&rule.table_name) && rules::reads_row_column(rule, column)
             }) {
-                return Err(blocked(ObjectKind::Rule, &rule.name.value));
+                return Err(blocked(ObjectKind::Rule, builder.dialect().stored_name(&rule.name)));
             }
         }
         Ok(())
@@ -10836,8 +11001,8 @@ impl ParserDB {
                     continue;
                 }
                 return Err(LookupError::ColumnNotFound {
-                    table_name: stored.name.clone(),
-                    column_name: column.name.clone(),
+                    table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                    column_name: builder.dialect().stored_name(column_name),
                 }
                 .into());
             }
@@ -10850,8 +11015,8 @@ impl ParserDB {
                 column_name,
             ) {
                 return Err(crate::errors::Error::InheritedColumnNotDroppable {
-                    table_name: stored.name.clone(),
-                    column_name: column.name.clone(),
+                    table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                    column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                 });
             }
             Self::refuse_only_with_partitions(
@@ -10888,8 +11053,8 @@ impl ParserDB {
                     || builder.column_has_outside_dependents(&stored, &declaring, &column))
             {
                 return Err(crate::errors::Error::ColumnReferenced {
-                    table_name: stored.name.clone(),
-                    column_name: column.name.clone(),
+                    table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                    column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                 });
             }
             if !readers.is_empty() {
@@ -10981,8 +11146,8 @@ impl ParserDB {
 
         if !from.declared_by(node) {
             return Err(LookupError::ColumnNotFound {
-                table_name: stored.name.clone(),
-                column_name: from.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_name(old_column_name),
             }
             .into());
         }
@@ -10991,14 +11156,14 @@ impl ParserDB {
         // `ONLY` and for a column the child also declares.
         if inheritance::is_inherited_column(&builder, node, old_column_name) {
             return Err(crate::errors::Error::InheritedColumnNotRenamable {
-                table_name: stored.name.clone(),
-                column_name: from.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_spelling(&from.name, from.quoted),
             });
         }
         if !from.matches(new_column_name) && to.declared_by(node) {
             return Err(crate::errors::Error::ColumnAlreadyExists {
-                table_name: stored.name.clone(),
-                column_name: to.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_name(new_column_name),
             });
         }
 
@@ -11025,6 +11190,7 @@ impl ParserDB {
         for table in core::iter::once(&stored).chain(&inheritors) {
             renames.extend(column_rename(
                 builder.namespaces(),
+                *builder.dialect(),
                 Self::stored_node(&builder, table)?,
                 &from,
                 new_column_name,
@@ -11105,8 +11271,8 @@ impl ParserDB {
 
         if !column.declared_by(Self::stored_node(&builder, &stored)?) {
             return Err(LookupError::ColumnNotFound {
-                table_name: stored.name.clone(),
-                column_name: column.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_name(column_name),
             }
             .into());
         }
@@ -11171,8 +11337,8 @@ impl ParserDB {
     ) -> Result<(), crate::errors::Error> {
         if inheritance::is_inherited_column(builder, node, column_name) {
             return Err(crate::errors::Error::GenerationExpressionNotDroppable {
-                table_name: stored.name.clone(),
-                column_name: column.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                 reason: crate::errors::GenerationExpressionRefusal::Inherited,
             });
         }
@@ -11203,7 +11369,13 @@ impl ParserDB {
             let column = NamedColumn::of(column_name, builder.identifier_case());
             if column.declared_by(node) {
                 if matches!(operation, AlterColumnOperation::AddGenerated { .. }) {
-                    Self::refuse_partition_identity(&stored, node, scope, &column)?;
+                    Self::refuse_partition_identity(
+                        *builder.dialect(),
+                        &stored,
+                        node,
+                        scope,
+                        &column,
+                    )?;
                 }
                 Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
                 if matches!(operation, AlterColumnOperation::SetDataType { .. }) {
@@ -11212,7 +11384,7 @@ impl ParserDB {
             }
             let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
             if let AlterColumnOperation::SetDefault { value } = &mut operation {
-                sequences::bind_default(&builder, &stored.name, &column_name.value, value)?;
+                sequences::bind_default(&builder, &stored, column_name, value)?;
             }
             // An identity added to a column brings its sequence, named before
             // the identity lands.
@@ -11293,8 +11465,8 @@ impl ParserDB {
         let node = Self::stored_node(&builder, &stored)?;
         if !column.declared_by(node) {
             return Err(LookupError::ColumnNotFound {
-                table_name: stored.name.clone(),
-                column_name: column.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                column_name: builder.dialect().stored_name(column_name),
             }
             .into());
         }
@@ -11304,7 +11476,7 @@ impl ParserDB {
                 .is_some_and(|held| held.no_inherit)
         {
             return Err(crate::errors::Error::NotNullNoInheritStatusChange {
-                table_name: stored.name.clone(),
+                table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
                 constraint_name: Self::not_null_requirement_name(
                     &builder,
                     &stored,
@@ -11587,21 +11759,25 @@ impl ParserDB {
                         .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
                 }) {
                     return Err(crate::errors::Error::RequiredValueNotDroppable {
-                        table_name: stored.name.clone(),
-                        column_name: column.name.clone(),
+                        table_name: builder
+                            .dialect()
+                            .stored_spelling(&stored.name, stored.name_quoted),
+                        column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                         reason: crate::errors::RequiredValue::CoveredByKey,
                     });
                 }
                 if inheritance::requires_a_value(builder, node, &column.ident()) {
                     return Err(crate::errors::Error::RequiredValueNotDroppable {
-                        table_name: stored.name.clone(),
-                        column_name: column.name.clone(),
+                        table_name: builder
+                            .dialect()
+                            .stored_spelling(&stored.name, stored.name_quoted),
+                        column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                         reason: crate::errors::RequiredValue::EnforcedByParent,
                     });
                 }
                 replica_identity::refuse_losing_requirement(
                     builder,
-                    &stored.name,
+                    stored,
                     node,
                     &column.ident(),
                 )?;
@@ -11609,8 +11785,10 @@ impl ParserDB {
             AlterColumnOperation::AddGenerated { .. } => {
                 if !requires_value(node, &column.ident(), column.case) {
                     return Err(crate::errors::Error::IdentityNeedsRequiredValue {
-                        table_name: stored.name.clone(),
-                        column_name: column.name.clone(),
+                        table_name: builder
+                            .dialect()
+                            .stored_spelling(&stored.name, stored.name_quoted),
+                        column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                     });
                 }
             }
@@ -11619,7 +11797,12 @@ impl ParserDB {
                 if let Some(declared) = declared {
                     foreign_options::change_column(&mut declared.clone(), options).map_err(
                         |refusal| {
-                            refusal.into_error(stored.name.clone(), Some(column.name.clone()))
+                            refusal.into_error(
+                                builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                                Some(
+                                    builder.dialect().stored_spelling(&column.name, column.quoted),
+                                ),
+                            )
                         },
                     )?;
                 }
@@ -11741,7 +11924,7 @@ impl ParserDB {
                         .any(|(declared, ())| role_matches_lookup_ident(declared, role))
                 {
                     return Err(crate::errors::Error::RoleNotFoundForSession {
-                        role_name: role.value.clone(),
+                        role_name: dialect.stored_name(role),
                     });
                 }
                 session_roles.apply(&change, in_transaction);
@@ -11791,8 +11974,14 @@ impl ParserDB {
                 Statement::CreateProcedure { or_alter, name, params, language, body }
                     if procedures::holds_procedures(dialect) =>
                 {
-                    let function =
-                        procedures::procedure_function(or_alter, name, params, language, body)?;
+                    let function = procedures::procedure_function(
+                        or_alter,
+                        name,
+                        params,
+                        language,
+                        body,
+                        *builder.dialect(),
+                    )?;
                     (Statement::CreateFunction(function), RoutineKeyword::Procedure)
                 }
                 Statement::DropProcedure { if_exists, proc_desc, drop_behavior }
@@ -11829,7 +12018,7 @@ impl ParserDB {
                         let qualifier = search_path_qualifier(
                             &builder,
                             crate::errors::ObjectKind::Function,
-                            last_str(&create_function.name),
+                            object_name_last_part(&create_function.name).unwrap_or(("", false)),
                             session_roles.creating_role(),
                         )?;
                         bind_reference(&mut create_function.name, qualifier);
@@ -11855,14 +12044,18 @@ impl ParserDB {
                     let replace_position = match (existing, create_function.or_replace) {
                         (Some(_), false) => {
                             return Err(crate::errors::Error::FunctionAlreadyExists {
-                                function_name: last_str(&create_function.name).to_string(),
+                                function_name: builder
+                                    .dialect()
+                                    .stored_object_name_last(&create_function.name),
                             });
                         }
                         (Some(position), true) => {
                             let kind = builder.functions()[position].1.kind();
                             if kind != FunctionKind::Normal {
                                 return Err(crate::errors::Error::FunctionKindChange {
-                                    function_name: last_str(&create_function.name).to_string(),
+                                    function_name: builder
+                                        .dialect()
+                                        .stored_object_name_last(&create_function.name),
                                     kind,
                                 });
                             }
@@ -11931,7 +12124,6 @@ impl ParserDB {
                     let cascade = drop_function.drop_behavior == Some(DropBehavior::Cascade);
                     let mut removed = user_defined_types::TypeDrop::default();
                     for func_desc in &drop_function.func_desc {
-                        let function_name = last_str(&func_desc.name);
                         let matching =
                             Self::functions_named(&builder, func_desc, &type_arrays, routine)?;
 
@@ -11941,11 +12133,15 @@ impl ParserDB {
                             }
                             return Err(if routine == RoutineKeyword::Procedure {
                                 crate::errors::Error::DropProcedureNotFound {
-                                    procedure_name: function_name.to_string(),
+                                    procedure_name: builder
+                                        .dialect()
+                                        .stored_object_name(&func_desc.name),
                                 }
                             } else {
                                 crate::errors::Error::DropFunctionNotFound {
-                                    function_name: function_name.to_string(),
+                                    function_name: builder
+                                        .dialect()
+                                        .stored_object_name(&func_desc.name),
                                 }
                             });
                         };
@@ -11953,11 +12149,15 @@ impl ParserDB {
                         if func_desc.args.is_none() && matching.len() > 1 {
                             return Err(if routine == RoutineKeyword::Procedure {
                                 crate::errors::Error::AmbiguousDropProcedure {
-                                    procedure_name: function_name.to_string(),
+                                    procedure_name: builder
+                                        .dialect()
+                                        .stored_object_name(&func_desc.name),
                                 }
                             } else {
                                 crate::errors::Error::AmbiguousDropFunction {
-                                    function_name: function_name.to_string(),
+                                    function_name: builder
+                                        .dialect()
+                                        .stored_object_name(&func_desc.name),
                                 }
                             });
                         }
@@ -11965,8 +12165,10 @@ impl ParserDB {
                         let (function, metadata) = &builder.functions()[position];
                         if let Some(extension) = metadata.extension() {
                             return Err(crate::errors::Error::FunctionRequiredByExtension {
-                                function_name: function_name.to_string(),
-                                extension_name: extension.value.clone(),
+                                function_name: builder
+                                    .dialect()
+                                    .stored_object_name_last(&function.name),
+                                extension_name: builder.dialect().stored_name(extension),
                             });
                         }
                         if let Some(type_name) =
@@ -11975,13 +12177,17 @@ impl ParserDB {
                             })
                         {
                             return Err(crate::errors::Error::FunctionRequiredByType {
-                                function_name: function_name.to_string(),
-                                type_name,
+                                function_name: builder
+                                    .dialect()
+                                    .stored_object_name_last(&function.name),
+                                type_name: builder.dialect().stored_object_name_last(type_name),
                             });
                         }
                         let refused = |(dependent_kind, dependent_name)| {
                             crate::errors::Error::FunctionReferenced {
-                                function_name: function_name.to_string(),
+                                function_name: builder
+                                    .dialect()
+                                    .stored_object_name_last(&function.name),
                                 dependent_kind,
                                 dependent_name,
                             }
@@ -12037,13 +12243,13 @@ impl ParserDB {
                             None if if_exists => {}
                             None if expected_kind == ObjectKind::Table => {
                                 return Err(crate::errors::Error::DropTableNotFound {
-                                    table_name: last_str(name).to_string(),
+                                    table_name: builder.dialect().stored_object_name_last(name),
                                 });
                             }
                             None => {
                                 return Err(crate::errors::Error::RelationNotFound {
                                     object_kind: expected_kind,
-                                    object_name: name.to_string(),
+                                    object_name: dialect.stored_object_name_last(name),
                                 });
                             }
                         }
@@ -12124,7 +12330,7 @@ impl ParserDB {
                     }
                     let Some(slot) = builder.index_position(&name)? else {
                         return Err(crate::errors::Error::AlterIndexNotFound {
-                            index_name: last_str(&name).to_string(),
+                            index_name: builder.dialect().stored_object_name(&name),
                         });
                     };
 
@@ -12150,7 +12356,7 @@ impl ParserDB {
                         return Err(crate::errors::Error::RelationNameAlreadyTaken {
                             object_kind: ObjectKind::Index,
                             conflicting_kind,
-                            object_name: new_ident.value.clone(),
+                            object_name: dialect.stored_name(new_ident),
                         });
                     }
 
@@ -12222,7 +12428,7 @@ impl ParserDB {
                             continue;
                         }
                         return Err(crate::errors::Error::DropPolicyNotFound {
-                            policy_name: drop_policy.name.value.clone(),
+                            policy_name: dialect.stored_name(&drop_policy.name),
                         });
                     };
 
@@ -12241,7 +12447,6 @@ impl ParserDB {
                         let Some(role_ident) = object_name_last_identifier(&name) else {
                             continue;
                         };
-                        let role_name = role_ident.value.as_str();
 
                         // Check if role exists
                         let role_exists = builder
@@ -12254,20 +12459,20 @@ impl ParserDB {
                                 continue;
                             }
                             return Err(crate::errors::Error::DropRoleNotFound {
-                                role_name: role_name.to_string(),
+                                role_name: dialect.stored_name(role_ident),
                             });
                         }
 
                         if session_roles.runs_as(role_ident) {
                             return Err(crate::errors::Error::RoleInUseBySession {
-                                role_name: role_name.to_string(),
+                                role_name: dialect.stored_name(role_ident),
                             });
                         }
                         if builder.is_role_referenced(role_ident)
                             || default_privileges.references_role(role_ident)
                         {
                             return Err(crate::errors::Error::RoleReferenced {
-                                role_name: role_name.to_string(),
+                                role_name: dialect.stored_name(role_ident),
                             });
                         }
 
@@ -12289,12 +12494,12 @@ impl ParserDB {
                         .position(|(role, ())| role_matches_lookup_ident(role, &name))
                     else {
                         return Err(crate::errors::Error::AlterRoleNotFound {
-                            role_name: name.value.clone(),
+                            role_name: builder.dialect().stored_name(&name),
                         });
                     };
                     if session_roles.runs_as(&name) {
                         return Err(crate::errors::Error::RoleInUseBySession {
-                            role_name: name.value.clone(),
+                            role_name: dialect.stored_name(&name),
                         });
                     }
 
@@ -12304,7 +12509,7 @@ impl ParserDB {
                         .any(|(role, ())| role_matches_lookup_ident(role, &new_name))
                     {
                         return Err(crate::errors::Error::RoleAlreadyExists {
-                            role_name: new_name.value.clone(),
+                            role_name: builder.dialect().stored_name(&new_name),
                         });
                     }
 
@@ -12337,7 +12542,7 @@ impl ParserDB {
                     else {
                         if access_resolution == AccessResolution::ClosedWorld {
                             return Err(crate::errors::Error::AlterRoleNotFound {
-                                role_name: name.value,
+                                role_name: builder.dialect().stored_name(&name),
                             });
                         }
                         if let Some(kept) =
@@ -12380,7 +12585,6 @@ impl ParserDB {
                     ..
                 } => {
                     for name in names {
-                        let schema_name = last_str(&name);
                         let maybe_schema = object_name_last_identifier(&name)
                             .and_then(|ident| builder.resolve_schema_ident(ident));
 
@@ -12389,19 +12593,17 @@ impl ParserDB {
                                 continue;
                             }
                             return Err(crate::errors::Error::DropSchemaNotFound {
-                                schema_name: schema_name.to_string(),
+                                schema_name: builder.dialect().stored_object_name_last(&name),
                             });
                         };
                         let resolved_schema_name = schema.name().to_string();
                         let resolved_schema_quoted = schema.is_quoted();
-                        if let Some(operator_name) = active_postgres_catalog
-                            .built_in_operator_in_schema(
-                                &resolved_schema_name,
-                                resolved_schema_quoted,
-                            )
-                        {
+                        if let Some(operator) = active_postgres_catalog.built_in_operator_in_schema(
+                            &resolved_schema_name,
+                            resolved_schema_quoted,
+                        ) {
                             return Err(crate::errors::Error::OperatorRequiredBySystem {
-                                operator_name: operator_name.into(),
+                                operator_name: operator.name().into(),
                             });
                         }
 
@@ -12417,7 +12619,9 @@ impl ParserDB {
                                 ))
                         {
                             return Err(crate::errors::Error::SchemaNotEmpty {
-                                schema_name: resolved_schema_name.clone(),
+                                schema_name: builder
+                                    .dialect()
+                                    .stored_spelling(&resolved_schema_name, resolved_schema_quoted),
                             });
                         }
 
@@ -12708,7 +12912,9 @@ impl ParserDB {
                     // while placing the name.
                     if create_table.temporary && create_table.unlogged {
                         return Err(crate::errors::Error::UnloggedTemporaryTable {
-                            table_name: create_table.table_name().to_string(),
+                            table_name: builder
+                                .dialect()
+                                .stored_object_name_last(&create_table.name),
                         });
                     }
 
@@ -12774,7 +12980,7 @@ impl ParserDB {
                         for column in &mut create_table.columns {
                             domains::bind_type(&builder, &mut column.data_type, &type_arrays)?;
                         }
-                        refuse_unlogged_partitioned(&create_table)?;
+                        refuse_unlogged_partitioned(&create_table, dialect)?;
                         Vec::new()
                     };
 
@@ -12795,7 +13001,11 @@ impl ParserDB {
                     }
                     // The query's columns are the table's own, so they are in
                     // place before anything below reads the column list.
-                    let mut creations = table_as::apply_query(&mut create_table, query_columns)?;
+                    let mut creations = table_as::apply_query(
+                        &mut create_table,
+                        query_columns,
+                        *builder.dialect(),
+                    )?;
                     // Named before anything is created, so copied columns bring
                     // none.
                     let stored = StoredTable::of(&create_table);
@@ -12857,7 +13067,7 @@ impl ParserDB {
                     // leaves the edges acyclic.
                     let case = builder.identifier_case();
                     if !matches!(dialect, SqlparserDialect::PostgreSql) {
-                        refuse_not_null_conflicts(&create_table, case)?;
+                        refuse_not_null_conflicts(&create_table, case, dialect)?;
                     }
                     // What the child requires a value of itself stays its own,
                     // whatever a parent requires.
@@ -12868,7 +13078,7 @@ impl ParserDB {
                         .map(|column| column.name.clone())
                         .collect();
                     let not_null = if matches!(dialect, SqlparserDialect::PostgreSql) {
-                        create_table_transform::not_null_requirements(&create_table, case)
+                        create_table_transform::not_null_requirements(&create_table, case, dialect)
                     } else {
                         Vec::new()
                     };
@@ -12881,8 +13091,8 @@ impl ParserDB {
                     let merged = constraint_names::merge_named_copies(&builder, &mut create_table);
                     inherited.constraints.retain(|rendering| !merged.contains(rendering));
                     if matches!(dialect, SqlparserDialect::PostgreSql) {
-                        refuse_unlogged_partitioned(&create_table)?;
-                        validate_distinct_columns(&create_table, case)?;
+                        refuse_unlogged_partitioned(&create_table, dialect)?;
+                        validate_distinct_columns(&create_table, case, dialect)?;
                         Self::take_over_table_shell(&mut builder, &create_table)?;
                         let table_kind = relation_kind(foreign_source.is_some());
                         validate_relation_names(
@@ -12909,7 +13119,7 @@ impl ParserDB {
                         partition_bounds::validate_bound(
                             &builder,
                             root,
-                            create_table.table_name(),
+                            &builder.dialect().stored_object_name_last(&create_table.name),
                             bound,
                         )?;
                     }
@@ -12920,7 +13130,7 @@ impl ParserDB {
                     if matches!(dialect, SqlparserDialect::PostgreSql) {
                         stored_expressions::refuse_table_checks(&create_table)?;
                     } else {
-                        refuse_no_inherit_constraints_on_partitioned(&create_table)?;
+                        refuse_no_inherit_constraints_on_partitioned(dialect, &create_table)?;
                     }
                     record_implied_not_null(&mut create_table, *builder.dialect(), case);
                     let bound_to_primary_key = referenced_keys::bind_noting_primary_key(
@@ -13124,7 +13334,7 @@ impl ParserDB {
                     if access_resolution == AccessResolution::ClosedWorld {
                         validate_policy_roles(
                             &builder,
-                            &policy.name.value,
+                            &policy.name,
                             policy.to.as_deref().unwrap_or_default(),
                         )?;
                     }
@@ -13140,14 +13350,14 @@ impl ParserDB {
                         // policy, which is what the database reports.
                         if let Some(actual_kind) = views::holds_view(&builder, &policy.table_name) {
                             return Err(crate::errors::Error::RelationKindMismatch {
-                                object_name: last_str(&policy.table_name).to_string(),
+                                object_name: dialect.stored_object_name_last(&policy.table_name),
                                 expected_kind: crate::errors::ObjectKind::Table,
                                 actual_kind,
                             });
                         }
                         return Err(crate::errors::Error::TableNotFoundForPolicy {
-                            table_name: last_str(&policy.table_name).to_string(),
-                            policy_name: policy.name.value.clone(),
+                            table_name: builder.dialect().stored_object_name(&policy.table_name),
+                            policy_name: builder.dialect().stored_name(&policy.name),
                         });
                     };
                     builder.refuse_table_kinds(
@@ -13176,8 +13386,10 @@ impl ParserDB {
                             )
                     }) {
                         return Err(crate::errors::Error::PolicyAlreadyExists {
-                            policy_name: policy.name.value.clone(),
-                            table_name: last_str(&policy.table_name).to_string(),
+                            policy_name: builder.dialect().stored_name(&policy.name),
+                            table_name: builder
+                                .dialect()
+                                .stored_object_name_last(&policy.table_name),
                         });
                     }
 
@@ -13224,7 +13436,7 @@ impl ParserDB {
                             .any(|(existing, ())| role_matches_lookup_ident(existing, role_ident))
                         {
                             return Err(crate::errors::Error::RoleAlreadyExists {
-                                role_name: role_ident.value.clone(),
+                                role_name: builder.dialect().stored_name(role_ident),
                             });
                         }
                     }
@@ -13297,7 +13509,9 @@ impl ParserDB {
                             | SchemaName::NamedAuthorization(_, auth) => Some(auth),
                         };
                         if let Some(auth) = authorization_ident {
-                            validate_owner_role_ident(&builder, auth, &name)?;
+                            validate_owner_role_ident(&builder, auth, || {
+                                builder.dialect().stored_spelling(&name, quoted)
+                            })?;
                         }
                     }
 
@@ -13316,7 +13530,7 @@ impl ParserDB {
                     if schema_exists {
                         if !if_not_exists {
                             return Err(crate::errors::Error::SchemaAlreadyExists {
-                                schema_name: name.clone(),
+                                schema_name: dialect.stored_spelling(&name, quoted),
                             });
                         }
                         // IF NOT EXISTS - skip adding duplicate
@@ -13377,11 +13591,11 @@ impl ParserDB {
                         for objects in builder.per_object_targets(grant.objects.take()) {
                             let mut part = Grant { objects, ..grant.clone() };
                             crate::impls::validate_granted_columns(
-                                builder.namespaces(),
                                 &part.privileges,
                                 part.objects.as_ref(),
                                 &tables,
                                 &path,
+                                *builder.dialect(),
                                 builder.identifier_case(),
                                 |key| builder.relation_key_is_held(key, builder.identifier_case()),
                             )?;
@@ -13455,11 +13669,11 @@ impl ParserDB {
                         for objects in builder.per_object_targets(revoke.objects.clone()) {
                             let part = sqlparser::ast::Revoke { objects, ..revoke.clone() };
                             crate::impls::validate_granted_columns(
-                                builder.namespaces(),
                                 &part.privileges,
                                 part.objects.as_ref(),
                                 &tables,
                                 &path,
+                                *builder.dialect(),
                                 builder.identifier_case(),
                                 |key| builder.relation_key_is_held(key, builder.identifier_case()),
                             )?;
@@ -13531,7 +13745,8 @@ impl ParserDB {
                         AlterFunctionSignature::Function(func_desc) => func_desc,
                         // `ALTER AGGREGATE` never names a function.
                         AlterFunctionSignature::Aggregate(aggregate) => {
-                            let aggregate_name = last_str(&aggregate.name).to_string();
+                            let aggregate_name =
+                                builder.dialect().stored_object_name_last(&aggregate.name);
                             return Err(match operation {
                                 AlterFunctionOperation::OwnerTo(_) => {
                                     crate::errors::Error::AggregateOwnerUnsupported {
@@ -13557,11 +13772,9 @@ impl ParserDB {
                             if access_resolution == AccessResolution::ClosedWorld
                                 && let Owner::Ident(ident) = &new_owner
                             {
-                                validate_owner_role_ident(
-                                    &builder,
-                                    ident,
-                                    last_str(&func_desc.name),
-                                )?;
+                                validate_owner_role_ident(&builder, ident, || {
+                                    builder.dialect().stored_object_name_last(&func_desc.name)
+                                })?;
                             }
 
                             let owner = match new_owner {
@@ -13671,8 +13884,12 @@ impl ParserDB {
                                 .is_some_and(|ident| ident.quote_style.is_some());
                             if !schema_is_declared(&builder, schema, quoted) {
                                 return Err(crate::errors::Error::AlterFunctionSchemaNotFound {
-                                    schema_name: schema.to_string(),
-                                    function_name: last_str(&function.name).to_string(),
+                                    schema_name: builder
+                                        .dialect()
+                                        .stored_object_name_last(&schema_name),
+                                    function_name: builder
+                                        .dialect()
+                                        .stored_object_name_last(&function.name),
                                 });
                             }
                             // A function set into the schema it is in stays.
@@ -13719,7 +13936,7 @@ impl ParserDB {
                             )
                     }) else {
                         return Err(crate::errors::Error::AlterPolicyNotFound {
-                            policy_name: name.value.clone(),
+                            policy_name: builder.dialect().stored_name(&name),
                         });
                     };
 
@@ -13731,7 +13948,7 @@ impl ParserDB {
                             if access_resolution == AccessResolution::ClosedWorld {
                                 validate_policy_roles(
                                     &builder,
-                                    &name.value,
+                                    &name,
                                     to.as_deref().unwrap_or_default(),
                                 )?;
                             }
@@ -13792,8 +14009,6 @@ impl ParserDB {
                     }
                 }
                 Statement::AlterSchema(AlterSchema { name, if_exists, operations }) => {
-                    let schema_name = last_str(&name);
-
                     // Check if schema exists
                     let resolved_schema = object_name_last_identifier(&name)
                         .and_then(|ident| builder.resolve_schema_ident(ident));
@@ -13803,7 +14018,7 @@ impl ParserDB {
                             continue;
                         }
                         return Err(crate::errors::Error::AlterSchemaNotFound {
-                            schema_name: schema_name.to_string(),
+                            schema_name: builder.dialect().stored_object_name_last(&name),
                         });
                     };
 
@@ -13845,7 +14060,8 @@ impl ParserDB {
                                 );
                                 if duplicate_exists {
                                     return Err(crate::errors::Error::SchemaAlreadyExists {
-                                        schema_name: new_schema_name.clone(),
+                                        schema_name: dialect
+                                            .stored_spelling(&new_schema_name, new_schema_quoted),
                                     });
                                 }
 
@@ -13904,7 +14120,12 @@ impl ParserDB {
                             }
                             AlterSchemaOperation::OwnerTo { owner } => {
                                 if access_resolution == AccessResolution::ClosedWorld {
-                                    validate_owner_role(&builder, owner, &current_schema_name)?;
+                                    validate_owner_role(&builder, owner, || {
+                                        builder.dialect().stored_spelling(
+                                            &current_schema_name,
+                                            current_schema_quoted,
+                                        )
+                                    })?;
                                 }
                                 // Update the authorization
                                 let (owner_name, owner_ident) = match owner {
@@ -14819,7 +15040,7 @@ mod tests {
                     table,
                     conflicting_table,
                     ..
-                })) if table == "public.t" && conflicting_table == "t"
+                })) if table == "t" && conflicting_table == "t"
             ));
         }
     }
@@ -15022,7 +15243,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::DropFunctionNotFound { function_name }) if function_name == "nonexistent_func"
+                Err(Error::DropFunctionNotFound { function_name, .. }) if function_name == "nonexistent_func"
             ));
         }
 
@@ -15091,7 +15312,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::DropFunctionNotFound { function_name }) if function_name == "foobar"
+                Err(Error::DropFunctionNotFound { function_name, .. }) if function_name == "foobar"
             ));
         }
     }
@@ -15124,7 +15345,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::TableReferenced { table_name }) if table_name == "parent"
+                Err(Error::TableReferenced { table_name, .. }) if table_name == "parent"
             ));
         }
 
@@ -15148,7 +15369,7 @@ mod tests {
             // IF EXISTS doesn't bypass the reference check
             assert!(matches!(
                 result,
-                Err(Error::TableReferenced { table_name }) if table_name == "parent"
+                Err(Error::TableReferenced { table_name, .. }) if table_name == "parent"
             ));
         }
 
@@ -15293,7 +15514,7 @@ mod tests {
             // Should fail because parent is referenced
             assert!(matches!(
                 result,
-                Err(Error::TableReferenced { table_name }) if table_name == "parent"
+                Err(Error::TableReferenced { table_name, .. }) if table_name == "parent"
             ));
         }
 
@@ -15688,7 +15909,7 @@ mod tests {
             let drop_parent = format!("{sql}\nDROP TABLE parent;");
             assert!(matches!(
                 ParserDB::parse::<GenericDialect>(&drop_parent),
-                Err(Error::TableReferenced { table_name }) if table_name == "parent"
+                Err(Error::TableReferenced { table_name, .. }) if table_name == "parent"
             ));
 
             // Child can be dropped (not referenced)
@@ -15749,14 +15970,14 @@ mod tests {
             let drop_gp = format!("{sql}\nDROP TABLE grandparent;");
             assert!(matches!(
                 ParserDB::parse::<GenericDialect>(&drop_gp),
-                Err(Error::TableReferenced { table_name }) if table_name == "grandparent"
+                Err(Error::TableReferenced { table_name, .. }) if table_name == "grandparent"
             ));
 
             // Cannot drop parent (referenced by child)
             let drop_parent = format!("{sql}\nDROP TABLE parent;");
             assert!(matches!(
                 ParserDB::parse::<GenericDialect>(&drop_parent),
-                Err(Error::TableReferenced { table_name }) if table_name == "parent"
+                Err(Error::TableReferenced { table_name, .. }) if table_name == "parent"
             ));
 
             // Can drop child (not referenced)
@@ -16160,7 +16381,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::DropTriggerNotFound { trigger_name }) if trigger_name == "nonexistent_trigger"
+                Err(Error::DropTriggerNotFound { trigger_name, .. }) if trigger_name == "nonexistent_trigger"
             ));
         }
 
@@ -16316,7 +16537,7 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(Error::DropPolicyNotFound { policy_name }) if policy_name == "nonexistent_policy"
+                Err(Error::DropPolicyNotFound { policy_name, .. }) if policy_name == "nonexistent_policy"
             ));
         }
 
@@ -17881,7 +18102,7 @@ mod tests {
             match ParserDB::parse::<GenericDialect>(
                 "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a - b));",
             ) {
-                Err(Error::InvalidPrimaryKey { table_name, reason }) => {
+                Err(Error::InvalidPrimaryKey { table_name, reason, .. }) => {
                     assert_eq!(table_name, "t");
                     assert!(
                         reason.contains("a - b"),
@@ -18177,6 +18398,7 @@ mod tests {
                         Err(Error::IdentifierLookupError(LookupError::ColumnNotFound {
                             ref table_name,
                             ref column_name,
+                            ..
                         })) if table_name == "t" && column_name == "missing"
                     ),
                     "expected ColumnNotFound for `{sql}`"

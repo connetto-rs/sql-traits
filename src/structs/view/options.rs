@@ -16,6 +16,7 @@ use sqlparser::ast::{
 
 use crate::{
     errors::{Error, ObjectKind},
+    impls::SqlparserDialect,
     utils::identifier_resolution::identifiers_match,
 };
 
@@ -115,12 +116,13 @@ impl<'key> KeyScope<'key> {
 pub(crate) fn plain_view_options(
     view_name: &ObjectName,
     options: &[SqlOption],
+    dialect: SqlparserDialect,
 ) -> Result<PlainViewOptions, Error> {
     let mut read = PlainViewOptions::default();
     let mut check_option_written = false;
     for option in options {
         let Some((key, value)) = named_value(option) else {
-            return Err(unrecognized(ObjectKind::View, view_name, option.to_string()));
+            return Err(unrecognized(ObjectKind::View, view_name, option.to_string(), dialect));
         };
         // A view has no TOAST table, and PostgreSQL drops a `toast.` option
         // written on one unread, whatever its name or value.
@@ -128,11 +130,21 @@ pub(crate) fn plain_view_options(
             KeyScope::Own(key) => key,
             KeyScope::Toast(_) => continue,
             KeyScope::Unrecognized => {
-                return Err(unrecognized(ObjectKind::View, view_name, key.to_string()));
+                return Err(unrecognized(
+                    ObjectKind::View,
+                    view_name,
+                    dialect.stored_object_name(key),
+                    dialect,
+                ));
             }
         };
         let Some(name) = ViewOptionName::named_by(key) else {
-            return Err(unrecognized(ObjectKind::View, view_name, key.to_string()));
+            return Err(unrecognized(
+                ObjectKind::View,
+                view_name,
+                dialect.stored_name(key),
+                dialect,
+            ));
         };
         let repeated = match name {
             ViewOptionName::CheckOption => core::mem::replace(&mut check_option_written, true),
@@ -141,15 +153,26 @@ pub(crate) fn plain_view_options(
         };
         if repeated {
             return Err(Error::RepeatedViewOption {
-                view_name: view_name.to_string(),
+                view_name: dialect.stored_object_name_last(view_name),
                 option_name: name.as_str().to_string(),
             });
         }
         let invalid = || {
             Error::InvalidViewOptionValue {
-                view_name: view_name.to_string(),
+                view_name: dialect.stored_object_name_last(view_name),
                 option_name: name.as_str().to_string(),
-                option_value: value.map_or_else(|| "true".to_string(), ToString::to_string),
+                option_value: value.map_or_else(
+                    || "true".to_string(),
+                    |value| {
+                        match value {
+                            Expr::Identifier(identifier) => dialect.stored_name(identifier),
+                            _ => {
+                                option_text(value)
+                                    .map_or_else(|| value.to_string(), ToString::to_string)
+                            }
+                        }
+                    },
+                ),
             }
         };
         match name {
@@ -202,21 +225,36 @@ pub(crate) fn plain_view_reset<'name>(
 pub(crate) fn refuse_plain_view_options(
     view_name: &ObjectName,
     options: &[SqlOption],
+    dialect: SqlparserDialect,
 ) -> Result<(), Error> {
     for option in options {
         if let Some((key, _)) = named_value(option)
             && let KeyScope::Own(name) | KeyScope::Toast(name) = KeyScope::of(key)
             && ViewOptionName::named_by(name).is_some()
         {
-            return Err(unrecognized(ObjectKind::MaterializedView, view_name, key.to_string()));
+            return Err(unrecognized(
+                ObjectKind::MaterializedView,
+                view_name,
+                dialect.stored_name(name),
+                dialect,
+            ));
         }
     }
     Ok(())
 }
 
 /// The refusal of option `option_name` on a view of `object_kind`.
-fn unrecognized(object_kind: ObjectKind, view_name: &ObjectName, option_name: String) -> Error {
-    Error::UnrecognizedViewOption { object_kind, view_name: view_name.to_string(), option_name }
+fn unrecognized(
+    object_kind: ObjectKind,
+    view_name: &ObjectName,
+    option_name: String,
+    dialect: SqlparserDialect,
+) -> Error {
+    Error::UnrecognizedViewOption {
+        object_kind,
+        view_name: dialect.stored_object_name_last(view_name),
+        option_name,
+    }
 }
 
 /// Whether `value` is one of the two `check_option` settings, in any case.

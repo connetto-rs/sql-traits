@@ -98,7 +98,7 @@ fn a_view_exposing_a_column_twice_is_refused() {
     for (sql, view, column) in [
         ("CREATE VIEW v (a, a) AS SELECT 1, 2;", "v", "a"),
         ("CREATE VIEW v AS SELECT 1 AS c, 2 AS c;", "v", "c"),
-        ("CREATE VIEW v AS SELECT 1 AS c, 2 AS C;", "v", "C"),
+        ("CREATE VIEW v AS SELECT 1 AS c, 2 AS C;", "v", "c"),
         ("CREATE TABLE s (a INT); CREATE VIEW v AS SELECT a, a FROM s;", "v", "a"),
         ("CREATE TABLE s (a INT); CREATE VIEW v AS SELECT *, a FROM s;", "v", "a"),
         ("CREATE VIEW v AS SELECT 1, 2;", "v", "?column?"),

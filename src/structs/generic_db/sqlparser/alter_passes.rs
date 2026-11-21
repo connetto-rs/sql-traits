@@ -258,7 +258,11 @@ pub(super) fn grammar(
                     ParserDB::validate_foreign_key_deferral(builder, constraint_name, key)?;
                 }
                 if *not_valid {
-                    constraint_validity::refuse_not_valid(table_name, constraint)?;
+                    constraint_validity::refuse_not_valid(
+                        *builder.dialect(),
+                        table_name,
+                        constraint,
+                    )?;
                 }
             }
             AlterTableOperation::AddColumn { column_def, .. } => {
@@ -356,7 +360,7 @@ pub(super) fn prepare(
     if refuses(object_kind, operation) {
         return Err(Error::AlterActionUnsupportedOnRelation {
             object_kind,
-            relation_name: table_name.to_string(),
+            relation_name: builder.dialect().stored_object_name_last(table_name),
             operation: operation.to_string(),
         });
     }
@@ -377,10 +381,11 @@ pub(super) fn prepare(
                 )?;
             }
             let column = NamedColumn::of(column_name, builder.identifier_case());
+            let dialect = builder.dialect();
             if !column.declared_by(node) {
                 return Err(LookupError::ColumnNotFound {
-                    table_name: stored.name.clone(),
-                    column_name: column.name.clone(),
+                    table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
+                    column_name: dialect.stored_spelling(&column.name, column.quoted),
                 }
                 .into());
             }
@@ -388,8 +393,8 @@ pub(super) fn prepare(
                 AlterColumnOperation::SetDataType { data_type, .. } => {
                     if inheritance::is_inherited_column(builder, node, column_name) {
                         return Err(Error::InheritedColumnTypeNotAlterable {
-                            table_name: stored.name.clone(),
-                            column_name: column.name,
+                            table_name: dialect.stored_spelling(&stored.name, stored.name_quoted),
+                            column_name: dialect.stored_spelling(&column.name, column.quoted),
                         });
                     }
                     if postgres {
@@ -415,7 +420,7 @@ pub(super) fn prepare(
             }
         }
         AlterTableOperation::Inherit { .. } => {
-            super::alter_inheritance::refuse_inheritance_child(node, table_name)?;
+            super::alter_inheritance::refuse_inheritance_child(builder, node)?;
         }
         AlterTableOperation::SetLogged | AlterTableOperation::SetUnlogged => {
             ParserDB::prepare_table_persistence(

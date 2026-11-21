@@ -312,7 +312,7 @@ fn a_second_rule_of_the_same_name_on_the_relation_is_refused() {
         matches!(
             &error,
             Error::RuleAlreadyExists { rule_name, relation_name }
-                if rule_name == "R" && relation_name == "orders"
+                if rule_name == "r" && relation_name == "orders"
         ),
         "got {error:?}"
     );

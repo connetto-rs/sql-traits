@@ -9,12 +9,16 @@
 //! `INTEGER` used as a boolean by convention, MySQL `CHAR(36)` used to hold
 //! a UUID).
 
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::any::TypeId;
 
 use sqlparser::{
     ast::{
         ArrayElemTypeDef, BinaryLength, CharLengthUnits, CharacterLength, ColumnDef, CreateTable,
-        DataType, ExactNumberInfo, ObjectName, ObjectNamePart, TimezoneInfo, TypeModifier,
+        DataType, ExactNumberInfo, Ident, ObjectName, ObjectNamePart, TimezoneInfo, TypeModifier,
     },
     dialect::{
         AnsiDialect, BigQueryDialect, ClickHouseDialect, DatabricksDialect, Dialect, DuckDbDialect,
@@ -30,7 +34,7 @@ use crate::{
         ArrayDimension, CharacterLengthUnit, CollationMatch, ColumnCollation, DialectLike,
         TypeMatch,
     },
-    utils::identifier_resolution::identifiers_match,
+    utils::identifier_resolution::{identifiers_match, stored_identifier},
 };
 
 /// Closed enumeration of every stock `sqlparser` dialect.
@@ -157,6 +161,74 @@ impl SqlparserDialect {
     /// created, altered or dropped.
     pub(crate) fn binds_foreign_keys_on_use(self) -> bool {
         matches!(self, Self::SQLite)
+    }
+
+    /// The name this dialect's engine stores for `ident`, which an error
+    /// reports. PostgreSQL folds an unquoted identifier and clips it to 63
+    /// bytes, and every other engine keeps the name as written.
+    pub(crate) fn stored_name(self, ident: &Ident) -> String {
+        self.stored_spelling(&ident.value, ident.quote_style.is_some())
+    }
+
+    /// The name this dialect's engine stores for an identifier spelled
+    /// `value`, `quoted` telling whether it was written in quotes, as
+    /// [`Self::stored_name`] gives it.
+    pub(crate) fn stored_spelling(self, value: &str, quoted: bool) -> String {
+        if self == Self::PostgreSql {
+            stored_identifier(value, quoted).into_owned()
+        } else {
+            String::from(value)
+        }
+    }
+
+    /// The stored name of one part of an object name, as [`Self::stored_name`]
+    /// gives it. A part spelled as a call, such as `IDENTIFIER('t')`, keeps
+    /// its written text.
+    fn stored_part(self, part: &ObjectNamePart) -> String {
+        match part.as_ident() {
+            Some(ident) => self.stored_name(ident),
+            None => part.to_string(),
+        }
+    }
+
+    /// The stored name of each part of `name`, outermost first.
+    pub(crate) fn stored_object_name_parts(self, name: &ObjectName) -> Vec<String> {
+        name.0.iter().map(|part| self.stored_part(part)).collect()
+    }
+
+    /// The stored name of the last part of `name`, the object it names
+    /// without its schema, which most PostgreSQL messages print alone.
+    pub(crate) fn stored_object_name_last(self, name: &ObjectName) -> String {
+        name.0.last().map(|part| self.stored_part(part)).unwrap_or_default()
+    }
+
+    /// The stored parts of `name` joined with dots, as PostgreSQL prints a
+    /// qualified name, such as `public.t`.
+    pub(crate) fn stored_object_name(self, name: &ObjectName) -> String {
+        self.stored_object_name_parts(name).join(".")
+    }
+
+    /// Identifier storage rules for error names from a database dialect.
+    pub(crate) fn for_error_names(dialect: &impl DialectLike) -> Self {
+        if dialect.sqlparser_dialect().is::<PostgreSqlDialect>() {
+            Self::PostgreSql
+        } else {
+            Self::Generic
+        }
+    }
+
+    /// The stored parts of a lookup target joined with dots.
+    pub(crate) fn stored_target_name(self, target: &crate::structs::TargetName<'_>) -> String {
+        let name = self.stored_spelling(target.name(), target.name_is_quoted());
+        match target.schema() {
+            Some(schema) => {
+                let mut qualified = self.stored_spelling(schema, target.schema_is_quoted());
+                qualified.push('.');
+                qualified.push_str(&name);
+                qualified
+            }
+            None => name,
+        }
     }
 
     /// The stock sqlparser dialect this variant names.

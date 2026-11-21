@@ -874,7 +874,9 @@ fn assign_name(
                 }
             } else {
                 Error::ConstraintAlreadyExists {
-                    table_name: node.table_name().to_string(),
+                    table_name: builder
+                        .dialect()
+                        .stored_spelling(node.table_name(), node.table_name_is_quoted()),
                     constraint_name: name,
                 }
             });
@@ -1214,7 +1216,7 @@ pub(super) fn key_index_table(
             Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::UniqueIndex,
                 conflicting_kind,
-                object_name: new.value.clone(),
+                object_name: builder.dialect().stored_name(new),
             })
         }
         None => Ok(Some(stored)),
@@ -1288,16 +1290,16 @@ fn rename_constraint_of(
         locate(node, recorded, old, case).and_then(|position| slot_at(node, position))
     else {
         return Err(Error::RenameConstraintNotFound {
-            table_name: stored.name.clone(),
-            constraint_name: old.value.clone(),
+            table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+            constraint_name: builder.dialect().stored_name(old),
         });
     };
     // PostgreSQL leaves a received check or `NOT NULL` to the parent to
     // rename, and lets a table rename a key or foreign key it received.
     if passes_down(slot) && received_from_parent(&builder, node, slot) {
         return Err(Error::InheritedConstraintNotRenamable {
-            table_name: stored.name.clone(),
-            constraint_name: old.value.clone(),
+            table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+            constraint_name: builder.dialect().stored_name(old),
         });
     }
     if passes_down(slot) {
@@ -1310,8 +1312,8 @@ fn rename_constraint_of(
     }
     if locate(node, recorded, new, case).is_some() {
         return Err(Error::ConstraintAlreadyExists {
-            table_name: stored.name.clone(),
-            constraint_name: new.value.clone(),
+            table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+            constraint_name: builder.dialect().stored_name(new),
         });
     }
     let index_backed = backed_by_index(slot);
@@ -1322,7 +1324,7 @@ fn rename_constraint_of(
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::UniqueIndex,
             conflicting_kind,
-            object_name: new.value.clone(),
+            object_name: builder.dialect().stored_name(new),
         });
     }
 

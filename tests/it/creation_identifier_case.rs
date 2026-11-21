@@ -73,7 +73,7 @@ fn a_folding_parse_refuses_a_quoted_case_variant() {
     else {
         panic!("expected a conflict, got {refused:?}")
     };
-    assert_eq!(table, "\"Docs\"");
+    assert_eq!(table, "Docs");
     assert_eq!(conflicting_table, "docs");
     assert_eq!(case, IdentifierCase::Folded);
     assert!(

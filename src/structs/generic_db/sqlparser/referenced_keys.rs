@@ -600,7 +600,9 @@ impl ParserDB {
                 return Err(Error::KeyReferenced {
                     key_name: key_name.into(),
                     table_name: table_name.into(),
-                    referencing_table: dependence.host.name.clone(),
+                    referencing_table: builder
+                        .dialect()
+                        .stored_spelling(&dependence.host.name, dependence.host.name_quoted),
                 });
             }
             return drop(builder);

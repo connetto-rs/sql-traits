@@ -609,7 +609,12 @@ impl Rules {
                 else {
                     return Err(unsupported(statement));
                 };
-                let (open, position) = savepoints.find(transaction.as_mut(), name, statement)?;
+                let (open, position) = savepoints.find(
+                    transaction.as_mut(),
+                    name,
+                    statement,
+                    *catalog.builder.dialect(),
+                )?;
                 open.savepoints.truncate(position);
                 if position == 0 && open.opened_by_savepoint {
                     *transaction = None;
@@ -617,7 +622,12 @@ impl Rules {
             }
             Control::RollbackTo(name) => {
                 let Some(savepoints) = self.savepoints else { return Err(unsupported(statement)) };
-                let (open, position) = savepoints.find(transaction.as_mut(), name, statement)?;
+                let (open, position) = savepoints.find(
+                    transaction.as_mut(),
+                    name,
+                    statement,
+                    *catalog.builder.dialect(),
+                )?;
                 open.savepoints.truncate(position + 1);
                 let returned = if savepoints.rollback_keeps {
                     open.savepoints[position].saved.clone()
@@ -666,17 +676,18 @@ impl Savepoints {
         transaction: Option<&'t mut Transaction>,
         name: &Ident,
         statement: &Statement,
+        dialect: SqlparserDialect,
     ) -> Result<(&'t mut Transaction, usize), Error> {
         let Some(open) = transaction else {
             return Err(if self.outside == SavepointOutside::Refused {
                 Error::NoOpenTransaction { statement: statement.to_string() }
             } else {
-                Error::SavepointNotFound { savepoint_name: name.value.clone() }
+                Error::SavepointNotFound { savepoint_name: dialect.stored_name(name) }
             });
         };
         match self.position(&open.savepoints, name) {
             Some(position) => Ok((open, position)),
-            None => Err(Error::SavepointNotFound { savepoint_name: name.value.clone() }),
+            None => Err(Error::SavepointNotFound { savepoint_name: dialect.stored_name(name) }),
         }
     }
 }

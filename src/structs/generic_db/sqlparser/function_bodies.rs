@@ -36,7 +36,7 @@ use super::{
 };
 use crate::{
     errors::Error,
-    utils::{last_str, object_name::RelationKey, walk::walk_mut, with_scopes::WithScopes},
+    utils::{object_name::RelationKey, walk::walk_mut, with_scopes::WithScopes},
 };
 
 /// Binds every stored relation the body of `function` reads, refusing the
@@ -64,13 +64,13 @@ use crate::{
 /// [`Error::IdentifierLookupError`] for a reference or a factor name it will
 /// not analyze.
 pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> Result<(), Error> {
-    let function_name = last_str(&function.name).to_string();
+    let function_name = builder.dialect().stored_object_name_last(&function.name);
     let Some(body) = function.function_body.as_mut() else {
         return Ok(());
     };
     let missing = |missing: &ObjectName| {
         Error::RelationNotFoundForFunctionBody {
-            relation_name: missing.to_string(),
+            relation_name: builder.dialect().stored_object_name(missing),
             function_name: function_name.clone(),
         }
     };
@@ -98,7 +98,7 @@ pub(super) fn bind(builder: &ParserDBBuilder, function: &mut CreateFunction) -> 
                 super::view_rewrites::shape_of_block_statement(statement, &function_name)?;
                 let ambiguous = |column: Ident| {
                     Error::FunctionBodyReferenceAmbiguous {
-                        column_name: column.value,
+                        column_name: builder.dialect().stored_name(&column),
                         function_name: function_name.clone(),
                     }
                 };

@@ -53,7 +53,7 @@ use crate::{
     structs::{
         AttributeCollation, IdentifierCase, OperatorRow, UserDefinedType, metadata::ExpressionCalls,
     },
-    traits::{DomainLike, UserDefinedTypeKind, UserDefinedTypeLike},
+    traits::{UserDefinedTypeKind, UserDefinedTypeLike},
     utils::{
         identifier_resolution::stored_identifier,
         object_name::{Qualifier, object_name_identifiers, qualifier_of},
@@ -141,6 +141,7 @@ pub(super) fn require_composite_attribute(
     name: &Ident,
     schema: (&str, bool),
     attribute: &Ident,
+    relation_name: &sqlparser::ast::ObjectName,
 ) -> Result<(), Error> {
     let case = builder.identifier_case();
     let held = composites_named(builder, name, Some(schema))
@@ -157,8 +158,8 @@ pub(super) fn require_composite_attribute(
         return Ok(());
     }
     Err(LookupError::ColumnNotFound {
-        table_name: name.value.clone(),
-        column_name: attribute.value.clone(),
+        table_name: builder.dialect().stored_object_name(relation_name),
+        column_name: builder.dialect().stored_name(attribute),
     }
     .into())
 }
@@ -363,7 +364,7 @@ pub(super) fn create_user_defined_type(
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind,
-                object_name: name_ident.value.clone(),
+                object_name: builder.dialect().stored_name(name_ident),
             });
         }
     }
@@ -379,21 +380,21 @@ pub(super) fn create_user_defined_type(
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: ObjectKind::Type,
-                object_name: name_ident.value.clone(),
+                object_name: builder.dialect().stored_name(name_ident),
             });
         }
         Some(CreationTarget::Domain) => {
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: ObjectKind::Domain,
-                object_name: name_ident.value.clone(),
+                object_name: builder.dialect().stored_name(name_ident),
             });
         }
         Some(CreationTarget::RowType(conflicting_kind)) => {
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind,
-                object_name: name_ident.value.clone(),
+                object_name: builder.dialect().stored_name(name_ident),
             });
         }
         None => None,
@@ -477,6 +478,7 @@ fn attribute_collations(
 /// Refuses a composite that writes an attribute name twice, compared as
 /// PostgreSQL folds identifiers.
 fn refuse_duplicate_composite_attributes(
+    dialect: crate::impls::SqlparserDialect,
     case: IdentifierCase,
     attributes: &[UserDefinedTypeCompositeAttributeDef],
     type_name: &str,
@@ -492,7 +494,7 @@ fn refuse_duplicate_composite_attributes(
         }) {
             return Err(Error::DuplicateCompositeAttribute {
                 type_name: type_name.to_string(),
-                attribute: attribute.name.value.clone(),
+                attribute: dialect.stored_name(&attribute.name),
             });
         }
     }
@@ -513,9 +515,10 @@ fn bind_representation(
     match representation {
         UserDefinedTypeRepresentation::Composite { attributes } => {
             refuse_duplicate_composite_attributes(
+                *builder.dialect(),
                 builder.identifier_case(),
                 attributes,
-                &name_ident.value,
+                &builder.dialect().stored_name(name_ident),
             )?;
             for attribute in attributes {
                 bind_type(builder, &mut attribute.data_type, arrays)?;
@@ -527,7 +530,7 @@ fn bind_representation(
             for (index, label) in labels.iter().enumerate() {
                 if labels.iter().take(index).any(|other| other.value == label.value) {
                     return Err(Error::DuplicateEnumLabel {
-                        type_name: name_ident.value.clone(),
+                        type_name: builder.dialect().stored_name(name_ident),
                         label: label.value.clone(),
                     });
                 }
@@ -546,7 +549,9 @@ fn bind_representation(
                     _ => None,
                 }
             }) else {
-                return Err(Error::RangeSubtypeRequired { type_name: name_ident.value.clone() });
+                return Err(Error::RangeSubtypeRequired {
+                    type_name: builder.dialect().stored_name(name_ident),
+                });
             };
             bind_type(builder, subtype, arrays)?;
             require_existing_type(builder, subtype)?;
@@ -566,21 +571,21 @@ fn bind_representation(
                     return Err(Error::RelationNameAlreadyTaken {
                         object_kind: ObjectKind::Type,
                         conflicting_kind: kind,
-                        object_name: multirange_ident.value.clone(),
+                        object_name: builder.dialect().stored_name(multirange_ident),
                     });
                 }
                 Some(Reached::Domain(_)) => {
                     return Err(Error::RelationNameAlreadyTaken {
                         object_kind: ObjectKind::Type,
                         conflicting_kind: ObjectKind::Domain,
-                        object_name: multirange_ident.value.clone(),
+                        object_name: builder.dialect().stored_name(multirange_ident),
                     });
                 }
                 Some(Reached::UserType(_, _)) => {
                     return Err(Error::RelationNameAlreadyTaken {
                         object_kind: ObjectKind::Type,
                         conflicting_kind: ObjectKind::Type,
-                        object_name: multirange_ident.value.clone(),
+                        object_name: builder.dialect().stored_name(multirange_ident),
                     });
                 }
                 Some(Reached::Catalog) | None => {}
@@ -603,8 +608,12 @@ fn bind_representation(
 /// The name of a doomed type, for a refusal that names it.
 fn doomed_type_name(builder: &ParserDBBuilder, doomed: &Doomed) -> String {
     match doomed {
-        Doomed::Domain(position) => builder.domains()[*position].0.name().to_string(),
-        Doomed::UserType(position) => builder.user_defined_types()[*position].0.name().to_string(),
+        Doomed::Domain(position) => {
+            builder.dialect().stored_object_name(&builder.domains()[*position].0.name)
+        }
+        Doomed::UserType(position) => {
+            builder.dialect().stored_object_name(&builder.user_defined_types()[*position].0.name)
+        }
     }
 }
 
@@ -764,7 +773,7 @@ pub(super) fn drop_types(
             }
             (Some(Reached::UserType(_position, _is_multirange)), DropSpelling::Domain) => {
                 return Err(Error::RelationKindMismatch {
-                    object_name: name.to_string(),
+                    object_name: builder.dialect().stored_object_name(name),
                     expected_kind: ObjectKind::Domain,
                     actual_kind: ObjectKind::Type,
                 });
@@ -777,16 +786,18 @@ pub(super) fn drop_types(
             }
             // A multirange goes only with its range.
             (Some(Reached::UserType(position, true)), DropSpelling::Type) => {
-                let range_name = builder.user_defined_types()[position].0.name().to_string();
+                let range_name = builder
+                    .dialect()
+                    .stored_object_name(&builder.user_defined_types()[position].0.name);
                 return Err(Error::TypeDropRequiredBy {
-                    type_name: name.to_string(),
+                    type_name: builder.dialect().stored_object_name(name),
                     requiring_kind: ObjectKind::Type,
                     requiring_name: range_name,
                 });
             }
             (Some(Reached::RowType(kind)), DropSpelling::Domain) => {
                 return Err(Error::RelationKindMismatch {
-                    object_name: name.to_string(),
+                    object_name: builder.dialect().stored_object_name(name),
                     expected_kind: ObjectKind::Domain,
                     actual_kind: kind,
                 });
@@ -794,19 +805,25 @@ pub(super) fn drop_types(
             // A row type goes only with its relation.
             (Some(Reached::RowType(kind)), DropSpelling::Type) => {
                 return Err(Error::TypeDropRequiredBy {
-                    type_name: name.to_string(),
+                    type_name: builder.dialect().stored_object_name(name),
                     requiring_kind: kind,
-                    requiring_name: name.to_string(),
+                    requiring_name: builder.dialect().stored_object_name(name),
                 });
             }
             (Some(Reached::Catalog), DropSpelling::Type) => {
-                return Err(Error::TypeRequiredBySystem { type_name: name.to_string() });
+                return Err(Error::TypeRequiredBySystem {
+                    type_name: builder.dialect().stored_object_name(name),
+                });
             }
             (Some(Reached::Catalog) | None, DropSpelling::Domain) if !skipped => {
-                return Err(Error::DropDomainNotFound { domain_name: name.to_string() });
+                return Err(Error::DropDomainNotFound {
+                    domain_name: builder.dialect().stored_object_name(name),
+                });
             }
             (None, DropSpelling::Type) if !skipped => {
-                return Err(Error::TypeNotFound { type_name: name.to_string() });
+                return Err(Error::TypeNotFound {
+                    type_name: builder.dialect().stored_object_name(name),
+                });
             }
             _ => None,
         };
@@ -814,7 +831,7 @@ pub(super) fn drop_types(
             for candidate in held_type_identities(&builder, arrays, held) {
                 if let Some(dependent) = dependent_holding(&candidate) {
                     return Err(Error::TypeDropRequiredBy {
-                        type_name: name.to_string(),
+                        type_name: builder.dialect().stored_object_name(name),
                         requiring_kind: dependent.kind,
                         requiring_name: dependent.name,
                     });
@@ -889,7 +906,7 @@ fn extend_doomed_by_dependents(
                     builder,
                     &used,
                     ObjectKind::Domain,
-                    domain.name.to_string(),
+                    builder.dialect().stored_object_name(&domain.name),
                 ));
             }
             doomed.push(Doomed::Domain(position));
@@ -907,7 +924,7 @@ fn extend_doomed_by_dependents(
                     builder,
                     &used,
                     ObjectKind::Type,
-                    type_.name().to_string(),
+                    builder.dialect().stored_object_name(&type_.name),
                 ));
             }
             doomed.push(Doomed::UserType(position));
@@ -950,7 +967,7 @@ fn drop_positions(
                         &builder,
                         &used,
                         ObjectKind::Column,
-                        alloc::format!("{}.{}", table.name, column.name),
+                        stored_attribute_name(&builder, &table.name, &column.name),
                     ));
                 }
             }
@@ -967,7 +984,7 @@ fn drop_positions(
                         &builder,
                         &used,
                         ObjectKind::Column,
-                        alloc::format!("{}.{}", type_.name(), attribute.name.value),
+                        stored_attribute_name(&builder, &type_.name, &attribute.name),
                     ));
                 }
             }
@@ -1006,7 +1023,7 @@ fn drop_positions(
             &builder,
             used,
             ObjectKind::Function,
-            function.name.to_string(),
+            builder.dialect().stored_object_name(&function.name),
         ));
     }
     let naming: Vec<Arc<CreateFunction>> =
@@ -1361,15 +1378,22 @@ fn resolve_named_type(
         Some(Reached::UserType(position, is_multirange)) => {
             if builder.user_defined_types()[position].0.is_shell() {
                 return Err(Error::TypeIsOnlyShell {
-                    type_name: builder.user_defined_types()[position].0.name().to_string(),
+                    type_name: builder
+                        .dialect()
+                        .stored_object_name(&builder.user_defined_types()[position].0.name),
                 });
             }
             Ok((Doomed::UserType(position), is_multirange))
         }
         Some(Reached::RowType(kind)) => {
-            Err(Error::TypeIsRowType { type_name: name.to_string(), relation_kind: kind })
+            Err(Error::TypeIsRowType {
+                type_name: builder.dialect().stored_object_name(name),
+                relation_kind: kind,
+            })
         }
-        Some(Reached::Catalog) | None => Err(Error::TypeNotFound { type_name: name.to_string() }),
+        Some(Reached::Catalog) | None => {
+            Err(Error::TypeNotFound { type_name: builder.dialect().stored_object_name(name) })
+        }
     }
 }
 
@@ -1396,10 +1420,9 @@ fn alter_type_rename(
         Doomed::UserType(position) => {
             let type_ = &builder.user_defined_types()[position].0;
             if is_multirange {
-                type_
-                    .multirange_name
-                    .clone()
-                    .ok_or_else(|| Error::TypeNotFound { type_name: name.to_string() })?
+                type_.multirange_name.clone().ok_or_else(|| {
+                    Error::TypeNotFound { type_name: builder.dialect().stored_object_name(name) }
+                })?
             } else {
                 type_.name.clone()
             }
@@ -1409,7 +1432,7 @@ fn alter_type_rename(
     match reach_in_schema(&builder, new_name, schema) {
         Some(Reached::RowType(kind)) => {
             return Err(Error::TypeIsRowType {
-                type_name: new_name.value.clone(),
+                type_name: builder.dialect().stored_name(new_name),
                 relation_kind: kind,
             });
         }
@@ -1417,14 +1440,14 @@ fn alter_type_rename(
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: ObjectKind::Type,
-                object_name: new_name.value.clone(),
+                object_name: builder.dialect().stored_name(new_name),
             });
         }
         Some(Reached::Domain(_)) => {
             return Err(Error::RelationNameAlreadyTaken {
                 object_kind: ObjectKind::Type,
                 conflicting_kind: ObjectKind::Domain,
-                object_name: new_name.value.clone(),
+                object_name: builder.dialect().stored_name(new_name),
             });
         }
         Some(Reached::Catalog) | None => {}
@@ -1442,7 +1465,7 @@ fn alter_type_rename(
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Type,
             conflicting_kind,
-            object_name: new_name.value.clone(),
+            object_name: builder.dialect().stored_name(new_name),
         });
     }
     let mut destination = old_name.clone();
@@ -1466,14 +1489,14 @@ fn alter_type_rename(
             rewrite_last_ident(&mut type_.name, new_name);
         }
         Doomed::UserType(position) => {
+            let dialect = *builder.dialect();
             let (type_, _) = &mut builder.user_defined_types_mut()[position];
             let type_ = Arc::make_mut(type_);
             // The name matched the multirange's spelling, which only a type
             // that declares one holds.
-            let multirange = type_
-                .multirange_name
-                .as_mut()
-                .ok_or(Error::TypeNotFound { type_name: name.to_string() })?;
+            let multirange = type_.multirange_name.as_mut().ok_or_else(|| {
+                Error::TypeNotFound { type_name: dialect.stored_object_name(name) }
+            })?;
             rewrite_last_ident(multirange, new_name);
         }
     }
@@ -1521,10 +1544,10 @@ fn alter_type_add_value(
         Doomed::Domain(_) => (0, false),
     };
     if !is_user_type {
-        return Err(Error::NotAnEnum { type_name: name.to_string() });
+        return Err(Error::NotAnEnum { type_name: builder.dialect().stored_object_name(name) });
     }
     let case = builder.identifier_case();
-    let type_name = name.to_string();
+    let type_name = builder.dialect().stored_object_name(name);
     let (type_, _) = &mut builder.user_defined_types_mut()[position];
     let type_ = Arc::make_mut(type_);
     let Some(UserDefinedTypeRepresentation::Enum { labels }) = type_.representation.as_mut() else {
@@ -1568,10 +1591,10 @@ fn alter_type_rename_value(
         Doomed::Domain(_) => (0, false),
     };
     if !is_user_type {
-        return Err(Error::NotAnEnum { type_name: name.to_string() });
+        return Err(Error::NotAnEnum { type_name: builder.dialect().stored_object_name(name) });
     }
     let case = builder.identifier_case();
-    let type_name = name.to_string();
+    let type_name = builder.dialect().stored_object_name(name);
     let (type_, _) = &mut builder.user_defined_types_mut()[position];
     let type_ = Arc::make_mut(type_);
     let Some(UserDefinedTypeRepresentation::Enum { labels }) = type_.representation.as_mut() else {
@@ -1775,4 +1798,17 @@ fn representation_mut_refs(
         UserDefinedTypeRepresentation::Enum { .. } => {}
     }
     Some(names)
+}
+
+/// The stored names identifying a column or composite attribute.
+fn stored_attribute_name(
+    builder: &ParserDBBuilder,
+    owner: &ObjectName,
+    attribute: &Ident,
+) -> String {
+    format!(
+        "{}.{}",
+        builder.dialect().stored_object_name(owner),
+        builder.dialect().stored_name(attribute),
+    )
 }

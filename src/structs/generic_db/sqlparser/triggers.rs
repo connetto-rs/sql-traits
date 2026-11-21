@@ -16,7 +16,7 @@
 //! PostgreSQL also `BEFORE` or `AFTER` it once per statement. It goes with
 //! the view, follows its renames and outlives its replacement.
 
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use sqlparser::ast::{
     CreateTable, CreateTrigger, DropTrigger, Ident, ObjectName, TriggerEvent, TriggerObject,
@@ -35,8 +35,6 @@ use crate::{
     errors::{Error, ObjectKind, TriggerFiringRefusal},
     impls::SqlparserDialect,
     structs::{TriggerEnablement, metadata::TriggerMetadata},
-    traits::TableLike,
-    utils::last_str,
 };
 
 /// Records a `CREATE TRIGGER` on the table or plain view its target reaches,
@@ -88,17 +86,16 @@ pub(super) fn create_trigger(
         bind_reference(&mut create_trigger.table_name, qualifier);
         return create_on_view(builder, create_trigger, &host);
     }
-    let relation_name = last_str(&create_trigger.table_name).to_string();
     if let Some(actual_kind) = views::holds_view(&builder, &create_trigger.table_name) {
         return Err(Error::RelationKindMismatch {
-            object_name: relation_name,
+            object_name: builder.dialect().stored_object_name_last(&create_trigger.table_name),
             expected_kind: ObjectKind::Table,
             actual_kind,
         });
     }
     Err(Error::RelationNotFoundForTrigger {
-        relation_name,
-        trigger_name: last_str(&create_trigger.name).to_string(),
+        relation_name: builder.dialect().stored_object_name(&create_trigger.table_name),
+        trigger_name: builder.dialect().stored_object_name_last(&create_trigger.name),
     })
 }
 
@@ -117,8 +114,8 @@ fn refuse_firing(
     };
     refusal.map_or(Ok(()), |reason| {
         Err(Error::TriggerFiringRefused {
-            trigger_name: last_str(&trigger.name).to_string(),
-            relation_name: last_str(&trigger.table_name).to_string(),
+            trigger_name: builder.dialect().stored_object_name_last(&trigger.name),
+            relation_name: builder.dialect().stored_object_name_last(&trigger.table_name),
             reason,
         })
     })
@@ -186,8 +183,8 @@ fn bind_parts(
     if let Some(exec_body) = &mut create_trigger.exec_body {
         let Some(function) = builder.trigger_function(&exec_body.func_desc.name) else {
             return Err(Error::FunctionNotFoundForTrigger {
-                function_name: last_str(&exec_body.func_desc.name).to_string(),
-                trigger_name: last_str(&create_trigger.name).to_string(),
+                function_name: builder.dialect().stored_object_name(&exec_body.func_desc.name),
+                trigger_name: builder.dialect().stored_object_name_last(&create_trigger.name),
             });
         };
         bind_reference(&mut exec_body.func_desc.name, stored_qualifier(&function.name));
@@ -213,12 +210,12 @@ fn create_on_table(
 
     if let Some(position) = position_on(&builder, &create_trigger.name, table) {
         if !create_trigger.or_replace {
-            return Err(already_exists(&create_trigger, last_str(&create_trigger.table_name)));
+            return Err(already_exists(&builder, &create_trigger, table));
         }
         if builder.triggers()[position].1.is_clone() {
             return Err(Error::ClonedTriggerReplaced {
-                trigger_name: last_str(&create_trigger.name).to_string(),
-                table_name: last_str(&create_trigger.table_name).to_string(),
+                trigger_name: builder.dialect().stored_object_name_last(&create_trigger.name),
+                table_name: builder.dialect().stored_spelling(&table.name, table.name_quoted),
             });
         }
         builder.triggers_mut().remove(position);
@@ -241,7 +238,7 @@ fn create_on_view(
     let existing = position_on(&builder, &create_trigger.name, host.stored());
     if let Some(position) = existing {
         if !create_trigger.or_replace {
-            return Err(already_exists(&create_trigger, last_str(&create_trigger.table_name)));
+            return Err(already_exists(&builder, &create_trigger, host.stored()));
         }
         builder.triggers_mut().remove(position);
     }
@@ -283,7 +280,7 @@ pub(super) fn drop_trigger(
             return Ok(builder);
         }
         return Err(Error::DropTriggerNotFound {
-            trigger_name: last_str(&drop_trigger.trigger_name).to_string(),
+            trigger_name: builder.dialect().stored_object_name_last(&drop_trigger.trigger_name),
         });
     };
 
@@ -295,12 +292,13 @@ pub(super) fn drop_trigger(
     };
     let name = trigger.name.clone();
     if metadata.is_clone() {
-        let parent = ParserDB::stored_node(&builder, &table)?.partition_of.as_ref();
+        let node = ParserDB::stored_node(&builder, &table)?;
+        let parent = node.partition_of.as_ref();
         return Err(Error::ClonedTriggerDropped {
-            trigger_name: last_str(&name).to_string(),
-            table_name: table.name,
+            trigger_name: builder.dialect().stored_object_name_last(&name),
+            table_name: builder.dialect().stored_spelling(&table.name, table.name_quoted),
             parent_table_name: parent
-                .map(|parent| last_str(parent).to_string())
+                .map(|parent| builder.dialect().stored_object_name_last(parent))
                 .unwrap_or_default(),
         });
     }
@@ -330,7 +328,7 @@ pub(super) fn clone_onto_partition(
         .collect();
     for (trigger, metadata) in row_triggers {
         if position_on(builder, &trigger.name, partition).is_some() {
-            return Err(already_exists(&trigger, &partition.name));
+            return Err(already_exists(builder, &trigger, partition));
         }
         let clone = clone_onto(builder, &trigger, partition)?;
         clone_down(builder, &clone, &metadata, partition, false)?;
@@ -391,8 +389,8 @@ pub(super) fn alter_enablement(
         .collect();
     if named.is_empty() && !every {
         return Err(Error::AlterTableTriggerNotFound {
-            trigger_name: trigger_name.value.clone(),
-            table_name: table.name,
+            trigger_name: builder.dialect().stored_name(trigger_name),
+            table_name: builder.dialect().stored_spelling(&table.name, table.name_quoted),
         });
     }
     for (name, per_row) in &named {
@@ -461,12 +459,15 @@ fn position_on(builder: &ParserDBBuilder, name: &ObjectName, table: &StoredTable
     })
 }
 
-/// The refusal of `trigger` on the relation `relation_name`, which carries
-/// one of its name.
-fn already_exists(trigger: &CreateTrigger, relation_name: &str) -> Error {
+/// The refusal of a trigger name already held on `relation`.
+fn already_exists(
+    builder: &ParserDBBuilder,
+    trigger: &CreateTrigger,
+    relation: &StoredTable,
+) -> Error {
     Error::TriggerAlreadyExists {
-        trigger_name: last_str(&trigger.name).to_string(),
-        relation_name: relation_name.to_string(),
+        trigger_name: builder.dialect().stored_object_name_last(&trigger.name),
+        relation_name: builder.dialect().stored_spelling(&relation.name, relation.name_quoted),
     }
 }
 
@@ -478,8 +479,8 @@ fn refuse_constraint_trigger_on_foreign_table(
 ) -> Result<(), Error> {
     if trigger.is_constraint && builder.is_foreign_table(table) {
         return Err(Error::ConstraintTriggerOnForeignTable {
-            trigger_name: last_str(&trigger.name).to_string(),
-            table_name: table.table_name().to_string(),
+            trigger_name: builder.dialect().stored_object_name_last(&trigger.name),
+            table_name: builder.dialect().stored_object_name_last(&table.name),
         });
     }
     Ok(())
@@ -512,7 +513,7 @@ fn clone_down(
     for partition in partitions(builder, table) {
         if let Some(position) = position_on(builder, &trigger.name, &partition) {
             if !replace {
-                return Err(already_exists(trigger, &partition.name));
+                return Err(already_exists(builder, trigger, &partition));
             }
             builder.triggers_mut().remove(position);
         }

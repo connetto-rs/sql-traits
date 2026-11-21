@@ -334,15 +334,15 @@ impl PostgresCatalog {
         self.operators.iter().any(|operator| operator.lives_in_schema(schema, quoted))
     }
 
-    /// The symbol of a built-in operator `ALTER OPERATOR ... SET SCHEMA`
-    /// moved into `schema`, which keeps the schema from dropping at all.
-    pub(crate) fn built_in_operator_in_schema(&self, schema: &str, quoted: bool) -> Option<&str> {
-        self.operators
-            .iter()
-            .find(|operator| {
-                operator.row == OperatorRow::BuiltIn && operator.lives_in_schema(schema, quoted)
-            })
-            .map(PostgresCatalogOperator::name)
+    /// A built-in operator whose schema cannot be dropped.
+    pub(crate) fn built_in_operator_in_schema(
+        &self,
+        schema: &str,
+        quoted: bool,
+    ) -> Option<&PostgresCatalogOperator> {
+        self.operators.iter().find(|operator| {
+            operator.row == OperatorRow::BuiltIn && operator.lives_in_schema(schema, quoted)
+        })
     }
 
     /// Drops the operators of `schema` and every operator or cast a dropped

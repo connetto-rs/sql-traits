@@ -1,11 +1,6 @@
 //! PostgreSQL foreign-key equality compatibility.
 
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef, CreateTable, Expr, ForeignKeyConstraint,
@@ -211,10 +206,19 @@ pub(super) fn validate(
             if compatible(database, &host_type, &referenced_type) == Proof::No {
                 return Err(Error::ForeignKeyCannotBeImplemented {
                     constraint_name: installed.name.clone(),
-                    host_table: foreign_key.table().name.to_string().into_boxed_str(),
-                    host_column: pair.host.name.value.as_str().into(),
-                    referenced_table: binding.target.name.to_string().into_boxed_str(),
-                    referenced_column: pair.referenced.name.value.as_str().into(),
+                    host_table: builder
+                        .dialect()
+                        .stored_object_name_last(&foreign_key.table().name)
+                        .into_boxed_str(),
+                    host_column: builder.dialect().stored_name(&pair.host.name).into_boxed_str(),
+                    referenced_table: builder
+                        .dialect()
+                        .stored_object_name_last(&binding.target.name)
+                        .into_boxed_str(),
+                    referenced_column: builder
+                        .dialect()
+                        .stored_name(&pair.referenced.name)
+                        .into_boxed_str(),
                 });
             }
         }

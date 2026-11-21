@@ -1,7 +1,5 @@
 //! Implementation of the `RuleLike` trait for sqlparser's `CreateRule` type.
 
-use alloc::string::ToString;
-
 use sqlparser::ast::{CreateRule, CreateRuleAction, CreateRuleDoKind, CreateRuleEvent, Expr};
 
 use crate::{
@@ -55,7 +53,9 @@ impl RuleLike for CreateRule {
             )?
             .map(Relation::View)
             .ok_or_else(|| {
-                LookupError::RelationNotFound { object_name: self.table_name.to_string() }
+                LookupError::RelationNotFound {
+                    object_name: database.dialect().stored_object_name(&self.table_name),
+                }
             })
     }
 

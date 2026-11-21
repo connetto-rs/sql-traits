@@ -135,7 +135,7 @@ fn a_qualified_absent_table_is_refused() {
          ALTER TABLE s.absent ENABLE ROW LEVEL SECURITY;",
     )
     .expect_err("s.absent is not created");
-    assert!(matches!(&error, Error::AlterTableNotFound { table_name } if table_name == "absent"));
+    assert!(matches!(&error, Error::AlterTableNotFound { table_name } if table_name == "s.absent"));
 
     let database = parse(
         "CREATE SCHEMA s;

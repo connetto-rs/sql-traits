@@ -2255,12 +2255,7 @@ fn a_block_body_stores_a_temporary_relation_bare() {
     )
     .expect_err("f writes f19u");
     assert!(
-        matches!(&refused, Error::RelationHasDependents {
-            object_kind,
-            object_name,
-            dependent_kind,
-            dependent_name
-        } if *object_kind == ObjectKind::Table
+        matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name } if *object_kind == ObjectKind::Table
             && object_name == "f19u"
             && *dependent_kind == ObjectKind::Function
             && dependent_name == "f"),

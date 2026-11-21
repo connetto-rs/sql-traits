@@ -7,7 +7,7 @@
 //! columns the view exposes. It follows the view's renames and column renames,
 //! and goes when the view goes.
 
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use sqlparser::ast::{CreateIndex, Ident, ObjectName, ObjectNamePart};
 
@@ -63,10 +63,11 @@ pub(super) fn create(
     let schema = view.view_schema().map(|schema| (schema, view.view_schema_is_quoted()));
     refuse_index_in_another_schema(
         &create_index,
-        view.view_name(),
+        || builder.dialect().stored_spelling(view.view_name(), view.view_name_is_quoted()),
         schema,
         builder.namespaces(),
         builder.identifier_case(),
+        *builder.dialect(),
     )?;
     stored_expressions::refuse_in_index(&builder, &create_index)?;
     super::index_access_methods::refuse_in_index(&builder, &create_index)?;
@@ -81,10 +82,10 @@ pub(super) fn create(
     super::index_opclasses::index(&create_index, None, &builder)?;
     let Some(expression) = ParserDB::create_index_expression(&create_index.columns) else {
         return Err(Error::InvalidIndex {
-            index_name: create_index
-                .name
-                .as_ref()
-                .map_or_else(|| "<unnamed>".into(), ToString::to_string),
+            index_name: create_index.name.as_ref().map_or_else(
+                || "<unnamed>".into(),
+                |name| builder.dialect().stored_object_name_last(name),
+            ),
             reason: "index has no columns".into(),
         });
     };
@@ -99,7 +100,7 @@ pub(super) fn create(
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Index,
             conflicting_kind,
-            object_name: index_name.value.clone(),
+            object_name: builder.dialect().stored_name(index_name),
         });
     }
 

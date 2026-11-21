@@ -183,14 +183,14 @@ fn drops_reach_routines_of_their_own_kind() {
 
     let result = parse(&format!("{BOTH} DROP FUNCTION p(int);"));
     assert!(
-        matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p(INT)"),
+        matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p"),
         "{result:?}"
     );
     let result = parse(&format!("{BOTH} DROP FUNCTION IF EXISTS p(int);"));
     assert!(matches!(&result, Err(Error::NotAFunction { .. })), "{result:?}");
     let result = parse(&format!("{BOTH} DROP PROCEDURE f(int);"));
     assert!(
-        matches!(&result, Err(Error::NotAProcedure { procedure_name }) if procedure_name == "f(INT)"),
+        matches!(&result, Err(Error::NotAProcedure { procedure_name }) if procedure_name == "f"),
         "{result:?}"
     );
 
@@ -340,7 +340,7 @@ fn alter_function_refuses_a_procedure() {
             "CREATE ROLE bob; CREATE PROCEDURE p(a int) LANGUAGE sql AS 'SELECT 1'; {alter}"
         ));
         assert!(
-            matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p(INT)"),
+            matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p"),
             "{alter}: {result:?}"
         );
     }
@@ -380,12 +380,12 @@ fn grants_reach_routines_of_their_kind() {
 
     let result = parse(&format!("{BOTH} GRANT EXECUTE ON FUNCTION p(int) TO bob;"));
     assert!(
-        matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p(INT)"),
+        matches!(&result, Err(Error::NotAFunction { function_name }) if function_name == "p"),
         "{result:?}"
     );
     let result = parse(&format!("{BOTH} GRANT EXECUTE ON PROCEDURE f(int) TO bob;"));
     assert!(
-        matches!(&result, Err(Error::NotAProcedure { procedure_name }) if procedure_name == "f(INT)"),
+        matches!(&result, Err(Error::NotAProcedure { procedure_name }) if procedure_name == "f"),
         "{result:?}"
     );
     let result = parse(&format!("{BOTH} GRANT EXECUTE ON FUNCTION p TO bob;"));

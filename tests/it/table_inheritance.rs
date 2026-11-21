@@ -561,7 +561,7 @@ fn a_table_names_each_column_and_each_parent_once() {
         (
             "CREATE TABLE p PARTITION OF orders (note NOT NULL, NOTE DEFAULT 'x')
                  FOR VALUES FROM (0) TO (10);",
-            "NOTE",
+            "note",
         ),
         ("CREATE TABLE p (x INT, x INT) INHERITS (plain);", "x"),
         ("CREATE TABLE p (id INT, id INT) INHERITS (plain);", "id"),
@@ -571,7 +571,7 @@ fn a_table_names_each_column_and_each_parent_once() {
             matches!(
                 &error,
                 Error::ColumnAlreadyExists { table_name, column_name }
-                    if table_name == "app.p" && column_name == column
+                    if table_name == "p" && column_name == column
             ),
             "{statement}: {error:?}"
         );
@@ -586,7 +586,7 @@ fn a_table_names_each_column_and_each_parent_once() {
             matches!(
                 &error,
                 Error::ParentRepeated { table_name, parent_name }
-                    if table_name == "app.c" && parent_name == "plain"
+                    if table_name == "c" && parent_name == "plain"
             ),
             "{statement}: {error:?}"
         );

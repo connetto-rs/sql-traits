@@ -45,7 +45,7 @@ pub(super) fn detach_partition(
     if ParserDB::stored_node(&builder, &root)?.partition_by.is_none() {
         return Err(Error::AlterActionUnsupportedOnRelation {
             object_kind: ObjectKind::Table,
-            relation_name: root_name.to_string(),
+            relation_name: builder.dialect().stored_object_name_last(root_name),
             operation: AlterTableOperation::DetachPartitionOf {
                 partition: partition_name.clone(),
                 mode,
@@ -54,7 +54,10 @@ pub(super) fn detach_partition(
         });
     }
     let partition = partition_of(&builder, &root, root_name, partition_name)?;
-    let (table_name, detached_name) = (root.name.clone(), partition.name.clone());
+    let (table_name, detached_name) = (
+        builder.dialect().stored_spelling(&root.name, root.name_quoted),
+        builder.dialect().stored_spelling(&partition.name, partition.name_quoted),
+    );
     match mode {
         Some(DetachPartitionMode::Finalize) => {
             return Err(Error::NoDetachPending { table_name, partition_name: detached_name });
@@ -118,8 +121,8 @@ fn partition_of(
 ) -> Result<StoredTable, Error> {
     let not_a_partition = || {
         Error::NotAPartitionOf {
-            table_name: root_name.to_string(),
-            partition_name: partition_name.to_string(),
+            table_name: builder.dialect().stored_object_name_last(root_name),
+            partition_name: builder.dialect().stored_object_name_last(partition_name),
         }
     };
     let Some(node) = builder.resolve_table_object_name(partition_name)? else {
@@ -128,7 +131,7 @@ fn partition_of(
         }
         return Err(Error::RelationNotFound {
             object_kind: ObjectKind::Table,
-            object_name: partition_name.to_string(),
+            object_name: builder.dialect().stored_object_name(partition_name),
         });
     };
     let case = builder.identifier_case();

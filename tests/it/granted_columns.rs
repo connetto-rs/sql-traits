@@ -119,7 +119,7 @@ fn a_column_on_a_path_resolved_table_is_validated() {
     );
     assert!(
         matches!(&refused, Err(Error::ColumnNotFoundForGrant { column_name, table_name })
-            if column_name == "nope" && table_name == "app.docs"),
+            if column_name == "nope" && table_name == "docs"),
         "got {refused:?}"
     );
 

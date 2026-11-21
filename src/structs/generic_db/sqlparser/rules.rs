@@ -7,7 +7,7 @@
 //! creation, the way a `BEGIN ATOMIC` function body does, and follow their
 //! renames and drops.
 
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -22,10 +22,10 @@ use super::{
 };
 use crate::{
     errors::{Error, ObjectKind},
+    impls::SqlparserDialect,
     structs::IdentifierCase,
     utils::{
         identifier_resolution::identifiers_match,
-        last_str,
         object_name::{Namespaces, RelationKey, target_key, target_name_of_object_name},
         walk::{walk, walk_mut},
     },
@@ -48,14 +48,13 @@ pub(super) fn create_rule(
         return Err(Error::UnnamedObject { object_kind: ObjectKind::Rule });
     }
     require_named(&rule.table_name, ObjectKind::Rule)?;
-    let relation_name = |rule: &CreateRule| last_str(&rule.table_name).to_string();
 
     // Bound to the qualifier of the relation reached, as the other objects
     // naming a relation are.
     let unsupported = |rule: CreateRule, relation_kind| {
         Err(Error::RuleOnUnsupportedRelation {
-            relation_name: relation_name(&rule),
-            rule_name: rule.name.value,
+            relation_name: builder.dialect().stored_object_name_last(&rule.table_name),
+            rule_name: builder.dialect().stored_name(&rule.name),
             relation_kind,
         })
     };
@@ -72,28 +71,28 @@ pub(super) fn create_rule(
         return unsupported(rule, ObjectKind::Sequence);
     } else {
         return Err(Error::RelationNotFoundForRule {
-            relation_name: relation_name(&rule),
-            rule_name: rule.name.value,
+            relation_name: builder.dialect().stored_object_name(&rule.table_name),
+            rule_name: builder.dialect().stored_name(&rule.name),
         });
     };
     if rule.event == CreateRuleEvent::Select {
         return Err(Error::SelectRuleUnsupported {
-            relation_name: relation_name(&rule),
-            rule_name: rule.name.value,
+            relation_name: builder.dialect().stored_object_name_last(&rule.table_name),
+            rule_name: builder.dialect().stored_name(&rule.name),
         });
     }
     bind_reference(&mut rule.table_name, qualifier);
 
     // The action and condition bind the relations they name the way a
     // `BEGIN ATOMIC` body does, under the search path in effect now.
-    let rule_name = rule.name.value.clone();
+    let rule_name = builder.dialect().stored_name(&rule.name);
     let statements = action_statements_mut(&mut rule.action);
     super::view_rewrites::normalize_block_references(&builder, statements)?;
     let too_wide = || Error::RuleActionInsertTooWide { rule_name: rule_name.clone() };
     for statement in statements.iter_mut() {
         let ambiguous = |column: Ident| {
             Error::RuleActionReferenceAmbiguous {
-                column_name: column.value,
+                column_name: builder.dialect().stored_name(&column),
                 rule_name: rule_name.clone(),
             }
         };
@@ -102,7 +101,7 @@ pub(super) fn create_rule(
     }
     let missing = |name: &sqlparser::ast::ObjectName| {
         Error::RelationNotFoundForRuleAction {
-            relation_name: name.to_string(),
+            relation_name: builder.dialect().stored_object_name(name),
             rule_name: rule_name.clone(),
         }
     };
@@ -116,8 +115,8 @@ pub(super) fn create_rule(
     match (existing, rule.or_replace) {
         (Some(_), false) => {
             return Err(Error::RuleAlreadyExists {
-                relation_name: relation_name(&rule),
-                rule_name: rule.name.value,
+                relation_name: builder.dialect().stored_object_name_last(&rule.table_name),
+                rule_name: builder.dialect().stored_name(&rule.name),
             });
         }
         (Some(position), true) => {
@@ -167,14 +166,15 @@ pub(super) fn relation_key(
     target_key(namespaces, &target_name_of_object_name(&rule.table_name), case)
 }
 
-/// The rule as a dependency walk reaches it, by its name on its relation.
+/// The rule as a dependency walk reaches it, by its stored name on its
+/// relation keyed under `case`.
 pub(super) fn dependent(
     namespaces: Namespaces,
+    dialect: SqlparserDialect,
     rule: &CreateRule,
     case: IdentifierCase,
 ) -> views::Dependent {
-    let name = case.compared_form(&rule.name.value, rule.name.quote_style.is_some()).into_owned();
-    views::Dependent::Rule(relation_key(namespaces, rule, case), name)
+    views::Dependent::Rule(relation_key(namespaces, rule, case), dialect.stored_name(&rule.name))
 }
 
 /// The normalized identity of every relation the rule's action and condition

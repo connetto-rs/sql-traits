@@ -24,7 +24,7 @@ use sqlparser::ast::{
 use super::{ParserDB, ParserDBBuilder, StoredTable, inheritance, partition_keys};
 use crate::{
     errors::{Error, InvalidBound},
-    traits::{PartitionStrategy, TableLike},
+    traits::PartitionStrategy,
     utils::walk::walk,
 };
 
@@ -676,7 +676,7 @@ fn validate_against_key(
 ) -> Result<(), Error> {
     let invalid = |reason| {
         Error::PartitionBoundInvalid {
-            table_name: root.table_name().to_string(),
+            table_name: builder.dialect().stored_object_name_last(&root.name),
             partition_name: partition_name.to_string(),
             reason,
         }
@@ -692,11 +692,11 @@ fn validate_against_key(
             .for_values
             .as_ref()
             .and_then(|sibling_bound| read_bound(strategy, columns, sibling_bound).ok());
-        let other_partition = sibling_node.table_name().to_string();
+        let other_partition = builder.dialect().stored_object_name_last(&sibling_node.name);
         match sibling_read.and_then(|sibling_read| clash(&new, &sibling_read)) {
             Some(Clash::Overlap) => {
                 return Err(Error::PartitionBoundOverlaps {
-                    table_name: root.table_name().to_string(),
+                    table_name: builder.dialect().stored_object_name_last(&root.name),
                     partition_name: partition_name.to_string(),
                     other_partition,
                 });

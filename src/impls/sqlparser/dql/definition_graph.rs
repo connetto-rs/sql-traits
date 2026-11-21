@@ -225,6 +225,7 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// address, at a range of [`Self::lists`].
     values: Vec<(usize, Range<usize>)>,
     case: IdentifierCase,
+    dialect: crate::impls::SqlparserDialect,
 }
 
 impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
@@ -690,6 +691,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     /// A derivation reading the caller's names under `case` and the stored
     /// definitions of `database` under its own comparison.
     pub(super) fn new(database: &DB, case: IdentifierCase) -> Self {
+        let dialect = crate::impls::SqlparserDialect::for_error_names(database.dialect());
         Self {
             graph: DefinitionGraph {
                 definitions: alloc::vec![DefinitionNode::Opaque],
@@ -702,6 +704,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 lists: Vec::new(),
                 values: Vec::new(),
                 case,
+                dialect,
             },
             catalog_case: database.identifier_case(),
             created: Vec::new(),
@@ -769,7 +772,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             parent,
             owner: parent.map(|parent| parent.scope),
             owner_level: false,
-            data: FromScope::new(self.graph.case),
+            data: FromScope::new(self.graph.case, self.graph.dialect),
             outputs: Vec::new(),
         });
         scope
@@ -780,7 +783,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     /// `RETURNING` list.
     pub(super) fn begin_qualified_scope(&mut self, parent: ScopeCursor) -> ScopeId {
         let scope = ScopeId(self.graph.scopes.len());
-        let mut data = FromScope::new(self.graph.case);
+        let mut data = FromScope::new(self.graph.case, self.graph.dialect);
         data.qualified_only = true;
         self.graph.scopes.push(ScopeNode {
             select: None,
@@ -918,10 +921,13 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             parent,
             owner,
             owner_level: false,
-            data: FromScope::new(match select {
-                AstRef::Query(_) => self.graph.case,
-                AstRef::Database(_) => self.catalog_case,
-            }),
+            data: FromScope::new(
+                match select {
+                    AstRef::Query(_) => self.graph.case,
+                    AstRef::Database(_) => self.catalog_case,
+                },
+                self.graph.dialect,
+            ),
             outputs: Vec::new(),
         });
         self.graph.select_index.push(SelectIndex { address: select_address(select.get()), scope });
@@ -951,10 +957,13 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             parent,
             owner: parent.map(|parent| parent.scope),
             owner_level: true,
-            data: FromScope::new(match join {
-                AstRef::Query(_) => self.graph.case,
-                AstRef::Database(_) => self.catalog_case,
-            }),
+            data: FromScope::new(
+                match join {
+                    AstRef::Query(_) => self.graph.case,
+                    AstRef::Database(_) => self.catalog_case,
+                },
+                self.graph.dialect,
+            ),
             outputs: Vec::new(),
         });
         self.graph.joins.push((factor_address(join.get()), scope));
