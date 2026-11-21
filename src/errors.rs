@@ -1594,6 +1594,18 @@ pub enum HelperSetError {
         /// The condition, as written.
         condition: String,
     },
+    /// A grant arm keeps only the rows outside the set another helper
+    /// returns, read where the reading leaves exclusions unread (see
+    /// [`FunctionLike::helper_set_with_exclusions`](crate::traits::FunctionLike::helper_set_with_exclusions)).
+    #[error(
+        "helper `{function}` excludes a helper's set by `{condition}`, which this reading leaves unread"
+    )]
+    UnreadExclusion {
+        /// The helper.
+        function: String,
+        /// The condition, as written.
+        condition: String,
+    },
     /// The body is not a `UNION` of grant arms and parent arms, alone or
     /// walked along a tree by a `WITH RECURSIVE` term.
     #[error(
