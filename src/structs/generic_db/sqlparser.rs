@@ -4889,6 +4889,29 @@ fn relation_names_of(create_table: &CreateTable) -> Vec<(ObjectKind, &Ident)> {
     names
 }
 
+/// Skips an occupied index name under `IF NOT EXISTS` or refuses its conflict.
+fn skip_existing_index(
+    builder: &ParserDBBuilder,
+    name: Option<&ObjectName>,
+    schema: SchemaQualifier<'_>,
+    if_not_exists: bool,
+) -> Result<bool, crate::errors::Error> {
+    let Some(index_name) = name.and_then(object_name_last_identifier) else {
+        return Ok(false);
+    };
+    let Some(conflicting_kind) = relation_name_holder(builder, index_name, schema) else {
+        return Ok(false);
+    };
+    if if_not_exists {
+        return Ok(true);
+    }
+    Err(crate::errors::Error::RelationNameAlreadyTaken {
+        object_kind: ObjectKind::Index,
+        conflicting_kind,
+        object_name: index_name.value.clone(),
+    })
+}
+
 /// Refuses a qualifier on the name of `create_index` naming a schema other
 /// than `schema`, the one its relation `relation_name` is in, since an index
 /// lives in its relation's schema.
@@ -6601,11 +6624,6 @@ impl ParserDB {
             builder.namespaces(),
             builder.identifier_case(),
         )?;
-        builder.refuse_table_kinds(
-            table,
-            &create_index.table_name,
-            &[ObjectKind::ForeignTable, ObjectKind::VirtualTable],
-        )?;
         // `ONLY` keeps the index off the partitions, so none of them can
         // refuse it, and PostgreSQL marks it invalid while one exists.
         let has_partitions = inheritance::direct_children(builder, &StoredTable::of(table))
@@ -6615,7 +6633,16 @@ impl ParserDB {
         if create_index.unique && !create_index.only {
             Self::refuse_unique_index_over_foreign_partition(builder, &StoredTable::of(table))?;
         }
-        validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
+        stored_expressions::refuse_in_index(builder, &create_index)?;
+        builder.refuse_table_kinds(
+            table,
+            &create_index.table_name,
+            &[ObjectKind::ForeignTable, ObjectKind::VirtualTable],
+        )?;
+        index_access_methods::refuse_in_index(builder, &create_index)?;
+        if *builder.dialect() != SqlparserDialect::PostgreSql {
+            validate_index_columns(&create_index.columns, &create_index.include, table, builder)?;
+        }
         index_opclasses::index(&create_index, Some(table), builder)?;
         partition_keys::validate_unique_index(&create_index, table, builder.identifier_case())?;
 
@@ -11666,7 +11693,6 @@ impl ParserDB {
                     }
                 }
                 Statement::CreateIndex(mut create_index) => {
-                    index_access_methods::refuse_in_index(&builder, &create_index)?;
                     if let Some(index_name) = create_index.name.as_ref() {
                         require_named(index_name, crate::errors::ObjectKind::Index)?;
                     }
@@ -11680,6 +11706,17 @@ impl ParserDB {
                         continue;
                     }
                     builder.bind_table_reference(&mut create_index.table_name);
+                    if *builder.dialect() == SqlparserDialect::SQLite {
+                        let table = builder.index_table(&create_index)?;
+                        if skip_existing_index(
+                            &builder,
+                            create_index.name.as_ref(),
+                            table_schema_qualifier(table),
+                            create_index.if_not_exists,
+                        )? {
+                            continue;
+                        }
+                    }
                     if create_index.name.is_none() {
                         create_index.name = builder
                             .generated_index_name(&create_index)?
@@ -11687,33 +11724,19 @@ impl ParserDB {
                     }
                     let if_not_exists = create_index.if_not_exists;
                     let (index, metadata) = Self::process_create_index(create_index, &builder)?;
-                    stored_expressions::refuse_in_index(&builder, index.attribute())?;
-                    column_references::refuse_in_index(&builder, index.attribute())?;
                     let resolved_table = index.table();
                     let resolved_table_name = resolved_table.table_name().to_string();
                     let resolved_table_quoted = resolved_table.table_name_is_quoted();
                     let resolved_schema_name = resolved_table.table_schema().map(str::to_string);
                     let resolved_schema_quoted = resolved_table.table_schema_is_quoted();
 
-                    // An index takes its schema from its table, and shares one
-                    // pool of names there with tables and with the indexes
-                    // behind named constraints.
-                    if let Some(index_name) = index.attribute().name.as_ref()
-                        && let Some(ObjectNamePart::Identifier(index_name)) = index_name.0.last()
-                        && let Some(conflicting_kind) = relation_name_holder(
-                            &builder,
-                            index_name,
-                            table_schema_qualifier(resolved_table),
-                        )
-                    {
-                        if if_not_exists {
-                            continue;
-                        }
-                        return Err(crate::errors::Error::RelationNameAlreadyTaken {
-                            object_kind: ObjectKind::Index,
-                            conflicting_kind,
-                            object_name: index_name.value.clone(),
-                        });
+                    if skip_existing_index(
+                        &builder,
+                        index.attribute().name.as_ref(),
+                        table_schema_qualifier(resolved_table),
+                        if_not_exists,
+                    )? {
+                        continue;
                     }
 
                     let case = builder.identifier_case();

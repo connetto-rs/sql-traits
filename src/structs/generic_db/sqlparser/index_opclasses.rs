@@ -60,17 +60,32 @@ pub(super) fn table(table: &CreateTable, builder: &ParserDBBuilder) -> Result<()
     Ok(())
 }
 
-/// Checks the resolved key types of an index.
+/// Checks PostgreSQL index keys in order, then included columns.
 pub(super) fn index(
     index: &CreateIndex,
     table: Option<&CreateTable>,
     builder: &ParserDBBuilder,
 ) -> Result<(), Error> {
-    if *builder.dialect() == SqlparserDialect::PostgreSql
-        && let Some(method) = Method::of(index.using.as_ref(), builder)
-    {
-        columns(&index.columns, table, method, builder)?;
+    if *builder.dialect() != SqlparserDialect::PostgreSql {
+        return Ok(());
     }
+    let method = Method::of(index.using.as_ref(), builder);
+    let require_column = |name: &Ident| -> Result<(), Error> {
+        if let Some(table) = table {
+            Ok(super::validate_declared_column(name, table, builder.identifier_case())?)
+        } else {
+            super::views::require_exposed_column(builder, &index.table_name, name)
+        }
+    };
+    for key in &index.columns {
+        if let Expr::Identifier(name) = &key.column.expr {
+            require_column(name)?;
+        }
+        if let Some(method) = method {
+            column(key, table, method, builder)?;
+        }
+    }
+    index.include.iter().try_for_each(require_column)?;
     Ok(())
 }
 
