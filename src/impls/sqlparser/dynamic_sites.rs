@@ -313,6 +313,7 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
             LookupError::ColumnNotFound {
                 table_name: dialect.stored_object_name(&relation),
                 column_name: dialect.stored_object_name_last(of),
+                site: crate::errors::ColumnLookupSite::Relation,
             }
         })?;
         Ok(column_type(self.database, column.data_type(self.database)))

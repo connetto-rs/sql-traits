@@ -1,9 +1,6 @@
 //! Functions to extract columns from SQL expressions.
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
@@ -56,19 +53,6 @@ fn qualifier_names_table(
         }
         _ => false,
     }
-}
-
-/// Renders a reference the way it was written, for an error that has to name
-/// it.
-fn rendered_reference(idents: &[Ident]) -> String {
-    let mut rendered = String::new();
-    for (index, ident) in idents.iter().enumerate() {
-        if index > 0 {
-            rendered.push('.');
-        }
-        rendered.push_str(&ident.to_string());
-    }
-    rendered
 }
 
 /// The labels among `arguments`, which name a parameter rather than read a
@@ -153,7 +137,20 @@ impl<Resolve: FnMut(&Ident) -> bool> ColumnsRead<'_, '_, Resolve> {
     /// reference as written.
     fn column(&mut self, ident: &Ident, reference: &Expr) -> Result<(), crate::errors::Error> {
         if !(self.resolve)(ident) {
-            return Err(crate::errors::Error::UnknownColumn { reference: reference.to_string() });
+            let parts = match reference {
+                Expr::Identifier(ident) => core::slice::from_ref(ident),
+                Expr::CompoundIdentifier(parts) => parts.as_slice(),
+                _ => &[],
+            };
+            return Err(crate::errors::Error::UnknownColumn {
+                reference: crate::errors::ColumnReference::unresolved(
+                    self.dialect,
+                    parts,
+                    self.catalog_name,
+                    true,
+                    false,
+                ),
+            });
         }
         Ok(())
     }
@@ -170,7 +167,13 @@ impl<Resolve: FnMut(&Ident) -> bool> ColumnsRead<'_, '_, Resolve> {
                 }
                 if !qualifier_names_table(qualifier, self.catalog_name, self.table, self.case) {
                     return Err(crate::errors::Error::ForeignColumnReference {
-                        reference: rendered_reference(idents),
+                        reference: crate::errors::ColumnReference::unresolved(
+                            self.dialect,
+                            idents,
+                            self.catalog_name,
+                            false,
+                            false,
+                        ),
                         table_name: self
                             .dialect
                             .stored_spelling(self.table.name(), self.table.name_is_quoted()),
@@ -325,7 +328,10 @@ fn visit_columns(
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{
+        string::{String, ToString},
+        sync::Arc,
+    };
 
     use sqlparser::{
         ast::{
@@ -592,7 +598,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(crate::errors::Error::UnknownColumn { reference }) if reference == "b"
+            Err(crate::errors::Error::UnknownColumn { reference }) if reference.to_string() == "b"
         ));
     }
 
@@ -616,7 +622,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(crate::errors::Error::UnknownColumn { reference }) if reference == "t.b"
+            Err(crate::errors::Error::UnknownColumn { reference }) if reference.to_string() == "t.b"
         ));
     }
 
@@ -717,7 +723,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(crate::errors::Error::UnknownColumn { reference }) if reference == "missing"
+            Err(crate::errors::Error::UnknownColumn { reference }) if reference.to_string() == "missing"
         ));
     }
 
@@ -847,7 +853,7 @@ mod tests {
             assert!(
                 matches!(
                     names_in(dialect, sql),
-                    Err(crate::errors::Error::UnknownColumn { reference }) if reference == "missing"
+                    Err(crate::errors::Error::UnknownColumn { reference }) if reference.to_string() == "missing"
                 ),
                 "{sql}"
             );

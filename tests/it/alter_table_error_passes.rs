@@ -30,24 +30,21 @@ const STORAGE: &str = "SET(fillfactor=999)";
 
 const ERROR_COLUMN_ALREADY_EXISTS: &str =
     "ColumnAlreadyExists { table_name: \"probe\", column_name: \"z\" }";
-const ERROR_ABSENT_DROP: &str =
-    "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_drop\" })";
+const ERROR_ABSENT_DROP: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_drop\", site: Relation })";
 const ERROR_ABSENT_CONSTRAINT: &str =
     "DropConstraintNotFound { table_name: \"probe\", constraint_name: \"absent_constraint\" }";
-const ERROR_ABSENT_DEFAULT: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_default\" })";
-const ERROR_ABSENT_NOTNULL: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_notnull\" })";
-const ERROR_ABSENT_TYPE: &str =
-    "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_type\" })";
-const ERROR_ABSENT_EXPRESSION: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_expression\" })";
+const ERROR_ABSENT_DEFAULT: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_default\", site: Relation })";
+const ERROR_ABSENT_NOTNULL: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_notnull\", site: Relation })";
+const ERROR_ABSENT_TYPE: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_type\", site: Relation })";
+const ERROR_ABSENT_EXPRESSION: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_expression\", site: Relation })";
 const ERROR_ABSENT_COLLATION: &str = "CollationNotFound { collation_name: \"absent_collation\" }";
 const ERROR_INVALID_SEQUENCE_PARAMETERS: &str = "InvalidSequenceParameters { sequence_name: \"probe_g_seq\", reason: UnsupportedType { data_type: \"TEXT\" } }";
-const ERROR_ABSENT_EXPRESSION_COLUMN: &str =
-    "UnknownColumn { reference: \"absent_expression_column\" }";
-const ERROR_ABSENT_KEY: &str =
-    "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_key\" })";
+const ERROR_ABSENT_EXPRESSION_COLUMN: &str = "UnknownColumn { reference: Column { column_name: \"absent_expression_column\", relation_name: None } }";
+const ERROR_ABSENT_KEY: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_key\", site: Key })";
 const ERROR_ABSENT_REFERENCE: &str = "ReferencedTableNotFoundForForeignKey { referenced_table: \"absent_reference\", host_table: \"probe\" }";
-const ERROR_ABSENT_IDENTITY: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_identity\" })";
-const ERROR_ABSENT_CHECK: &str = "UnknownColumn { reference: \"absent_check\" }";
+const ERROR_ABSENT_IDENTITY: &str = "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_identity\", site: Relation })";
+const ERROR_ABSENT_CHECK: &str =
+    "UnknownColumn { reference: Column { column_name: \"absent_check\", relation_name: None } }";
 const ERROR_ABSENT_INHERIT: &str =
     "ParentTableNotFound { parent_table: \"absent_inherit\", child_table: \"probe\" }";
 const ERROR_ABSENT_VALIDATE: &str =
@@ -599,15 +596,15 @@ fn preparation_uses_original_columns() {
     for (operations, expected) in [
         (
             "ADD COLUMN x int, ALTER COLUMN x TYPE text",
-            "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"x\" })",
+            "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"x\", site: Relation })",
         ),
         (
             "ALTER COLUMN x TYPE text, ADD COLUMN x int",
-            "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"x\" })",
+            "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"x\", site: Relation })",
         ),
         (
             "ADD COLUMN g int GENERATED ALWAYS AS(x+1) STORED, ADD COLUMN x int",
-            "UnknownColumn { reference: \"x\" }",
+            "UnknownColumn { reference: Column { column_name: \"x\", relation_name: None } }",
         ),
     ] {
         let result = ParserDB::parse::<PostgreSqlDialect>(&format!(
@@ -771,7 +768,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P175",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD COLUMN e int REFERENCES absent_parent(id), ADD CONSTRAINT bad UNIQUE(absent_column);",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Key })",
     ),
     (
         "P176",
@@ -781,7 +778,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P177",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD COLUMN e int REFERENCES absent_parent(id), ALTER COLUMN absent_column SET NOT NULL;",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P179",
@@ -806,7 +803,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P187",
         "CREATE TABLE probe(z int PRIMARY KEY,q int);\nALTER TABLE probe ADD PRIMARY KEY(q), ALTER COLUMN absent_column SET NOT NULL;",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P191",
@@ -841,7 +838,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P215",
         "CREATE TABLE probe(z int);\nALTER TABLE probe INHERIT absent_parent, ADD CONSTRAINT bad UNIQUE(absent_column);",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Key })",
     ),
     (
         "P217",
@@ -851,7 +848,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P218",
         "CREATE TABLE probe(z int);\nALTER TABLE probe INHERIT absent_parent, ALTER COLUMN absent_column SET NOT NULL;",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P221",
@@ -901,27 +898,27 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P399",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD CONSTRAINT bad UNIQUE(absent_column),ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P401",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ADD COLUMN e int REFERENCES absent_parent(id),ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P403",
         "CREATE TABLE probe(z int PRIMARY KEY,q int);\nALTER TABLE probe ADD PRIMARY KEY(q),ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P405",
         "CREATE TABLE probe(z int);\nALTER TABLE probe ALTER COLUMN absent_column SET NOT NULL,ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P407",
         "CREATE TABLE probe(z int);\nALTER TABLE probe INHERIT absent_parent,ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P133",
@@ -996,22 +993,22 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P165",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD CONSTRAINT bad UNIQUE(absent_column), ADD COLUMN e int REFERENCES absent_parent(id);",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Key })",
     ),
     (
         "P166",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD CONSTRAINT bad UNIQUE(absent_column), ADD PRIMARY KEY(q);",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Key })",
     ),
     (
         "P167",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD CONSTRAINT bad UNIQUE(absent_column), ALTER COLUMN absent_column SET NOT NULL;",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P169",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ADD CONSTRAINT bad UNIQUE(absent_column), INHERIT absent_parent;",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Key })",
     ),
     (
         "P185",
@@ -1031,22 +1028,22 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P195",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ALTER COLUMN absent_column SET NOT NULL, ADD CONSTRAINT bad UNIQUE(absent_column);",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P196",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ALTER COLUMN absent_column SET NOT NULL, ADD COLUMN e int REFERENCES absent_parent(id);",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P197",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ALTER COLUMN absent_column SET NOT NULL, ADD PRIMARY KEY(q);",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P199",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); ALTER TABLE probe ALTER COLUMN absent_column SET NOT NULL, INHERIT absent_parent;",
-        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\" })",
+        "IdentifierLookupError(ColumnNotFound { table_name: \"probe\", column_name: \"absent_column\", site: Relation })",
     ),
     (
         "P216",
@@ -1131,7 +1128,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P394",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,ADD COLUMN z int;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P395",
@@ -1141,7 +1138,7 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P396",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,ADD COLUMN b text COLLATE absent_collation;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P397",
@@ -1151,32 +1148,32 @@ const MATCHING_HUNT_CASES: &[(&str, &str, &str)] = &[
     (
         "P398",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,ADD CONSTRAINT bad UNIQUE(absent_column);",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P400",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,ADD COLUMN e int REFERENCES absent_parent(id);",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P402",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,ADD PRIMARY KEY(q);",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P404",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,ALTER COLUMN absent_column SET NOT NULL;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P406",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,INHERIT absent_parent;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P408",
         "CREATE TABLE probe(z int PRIMARY KEY, q int); CREATE TABLE target(id int PRIMARY KEY); ALTER TABLE probe ADD COLUMN f int GENERATED ALWAYS AS(absent_expression_column + 1) STORED,ADD COLUMN g text GENERATED ALWAYS AS IDENTITY;",
-        "UnknownColumn { reference: \"absent_expression_column\" }",
+        ERROR_ABSENT_EXPRESSION_COLUMN,
     ),
     (
         "P409",
@@ -1502,7 +1499,10 @@ fn mysql_redeclaration_refuses_missing_check_column() {
         ));
         assert_eq!(
             result.err().map(|error| format!("{error:?}")),
-            Some("UnknownColumn { reference: \"absent\" }".to_owned()),
+            Some(
+                "UnknownColumn { reference: Column { column_name: \"absent\", relation_name: None } }"
+                    .to_owned()
+            ),
             "{operation}"
         );
     }

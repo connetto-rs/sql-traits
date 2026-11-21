@@ -372,7 +372,7 @@ fn missing_altered_column_precedes_storage_options() {
             "CREATE TABLE t(a int); ALTER TABLE t {operations};"
         ));
         assert!(
-            matches!(result, Err(Error::IdentifierLookupError(sql_traits::errors::LookupError::ColumnNotFound { table_name, column_name })) if table_name == "t" && column_name == "absent")
+            matches!(result, Err(Error::IdentifierLookupError(sql_traits::errors::LookupError::ColumnNotFound { table_name, column_name, .. })) if table_name == "t" && column_name == "absent")
         );
     }
 }
