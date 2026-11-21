@@ -105,7 +105,26 @@ fn valid_values_and_resets() -> Result<(), Error> {
             "CREATE TABLE t(id {datatype}); CREATE INDEX i ON t USING {method}(id) WITH({parameters});"
         ))?;
     }
-    ParserDB::parse::<GenericDialect>("CREATE TABLE t(id INT) WITH(unknown=999);")?;
+    Ok(())
+}
+
+#[test]
+fn other_dialects_leave_storage_parameters_unchecked() -> Result<(), Error> {
+    ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE t(id INT) WITH(unknown=999);
+         CREATE MATERIALIZED VIEW m WITH(unknown=999) AS SELECT id FROM t;
+         ALTER TABLE m SET(fillfactor=999);",
+    )?;
+    let refused = ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE root (id INT) PARTITION BY RANGE (id); ALTER TABLE root SET (fillfactor = 70);",
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(Error::StorageParametersOnPartitionedTable { table_name }) if table_name == "root"
+        ),
+        "got {refused:?}"
+    );
     Ok(())
 }
 
