@@ -402,6 +402,14 @@ pub(super) fn constraint_foreign_keys(constraint: &TableConstraint) -> Vec<&Fore
     }
 }
 
+/// The foreign key written in a column option.
+pub(super) fn option_foreign_keys(option: &super::ColumnOptionDef) -> Vec<&ForeignKeyConstraint> {
+    match &option.option {
+        ColumnOption::ForeignKey(foreign_key) => alloc::vec![foreign_key],
+        _ => Vec::new(),
+    }
+}
+
 /// The foreign keys written on the column.
 pub(super) fn column_foreign_keys(column: &ColumnDef) -> Vec<&ForeignKeyConstraint> {
     column

@@ -8,17 +8,16 @@ use super::{
 };
 use crate::{errors::Error, utils::identifier_resolution::stored_ident_name};
 
-/// Materializes an adopted index as an ordinary key constraint.
-pub(super) fn adopt(
-    builder: &mut ParserDBBuilder,
+/// Checks an adopted index without detaching it from the catalog.
+pub(super) fn validate_adoption(
+    builder: &ParserDBBuilder,
     stored: &StoredTable,
-    constraint: &mut TableConstraint,
-) -> Result<(), Error> {
-    let primary = matches!(constraint, TableConstraint::PrimaryKeyUsingIndex(_));
+    constraint: &TableConstraint,
+) -> Result<Option<usize>, Error> {
     let (TableConstraint::PrimaryKeyUsingIndex(adoption)
     | TableConstraint::UniqueUsingIndex(adoption)) = constraint
     else {
-        return Ok(());
+        return Ok(None);
     };
     let table = ParserDB::stored_node(builder, stored)?;
     let schema = table_schema_qualifier(table);
@@ -57,6 +56,26 @@ pub(super) fn adopt(
     if table.partition_by.is_some() {
         return Err(Error::AdoptedIndexOnPartitionedTable);
     }
+    Ok(Some(position))
+}
+
+/// Materializes an adopted index as an ordinary key constraint.
+pub(super) fn adopt(
+    builder: &mut ParserDBBuilder,
+    stored: &StoredTable,
+    constraint: &mut TableConstraint,
+) -> Result<(), Error> {
+    let Some(position) = validate_adoption(builder, stored, constraint)? else {
+        return Ok(());
+    };
+    let primary = matches!(constraint, TableConstraint::PrimaryKeyUsingIndex(_));
+    let (TableConstraint::PrimaryKeyUsingIndex(adoption)
+    | TableConstraint::UniqueUsingIndex(adoption)) = constraint
+    else {
+        return Ok(());
+    };
+    let index_name = &adoption.index_name;
+    let index = builder.indices()[position].0.attribute();
     let key = adoption.name.as_ref().unwrap_or(index_name);
     let identity = replica_identity::created_index_name(index)
         .map(|adopted| (adopted.into_owned(), stored_ident_name(key).into_owned()));

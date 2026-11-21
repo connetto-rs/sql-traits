@@ -80,6 +80,7 @@ use crate::{
 };
 
 mod alter_inheritance;
+mod alter_passes;
 mod attach_partition;
 mod call_selection;
 mod calls_in_expression;
@@ -423,6 +424,18 @@ struct AddedColumnContext<'a> {
     catalog: &'a PostgresCatalog,
     defaults: &'a DefaultPrivileges,
     declared_type_text: Option<String>,
+}
+
+/// Catalog and session context used by table alterations.
+struct AlterTableContext<'a> {
+    type_arrays: &'a mut Arc<TypeArrays>,
+    active_postgres_catalog: &'a mut Arc<PostgresCatalog>,
+    collation_metadata: &'a [CreatedCollationMetadata],
+    default_privileges: &'a DefaultPrivileges,
+    access_resolution: AccessResolution,
+    in_transaction: bool,
+    /// The statement's place in the SQL text it was parsed from.
+    source: Option<StatementSource<'a>>,
 }
 
 enum CollationResolution<'a> {
@@ -4229,20 +4242,26 @@ fn foreign_table_node(foreign_table: CreateForeignTable) -> (CreateTable, Foreig
     (node, source)
 }
 
+/// The key constraint enforced by a column option.
+fn column_key_constraint(option: &ColumnOptionDef) -> Option<KeyConstraint> {
+    match option.option {
+        ColumnOption::PrimaryKey(_) => Some(KeyConstraint::PrimaryKey),
+        ColumnOption::Unique(_) => Some(KeyConstraint::Unique),
+        ColumnOption::ForeignKey(_) => Some(KeyConstraint::ForeignKey),
+        _ => None,
+    }
+}
+
 /// Refuses the first primary key, unique, exclusion or foreign key constraint
 /// on a foreign table, which stores no rows to enforce one against.
 fn refuse_key_constraints_on_foreign_table(
     create_table: &CreateTable,
 ) -> Result<(), crate::errors::Error> {
-    let on_columns =
-        create_table.columns.iter().flat_map(|column| &column.options).find_map(|option| {
-            match option.option {
-                ColumnOption::PrimaryKey(_) => Some(KeyConstraint::PrimaryKey),
-                ColumnOption::Unique(_) => Some(KeyConstraint::Unique),
-                ColumnOption::ForeignKey(_) => Some(KeyConstraint::ForeignKey),
-                _ => None,
-            }
-        });
+    let on_columns = create_table
+        .columns
+        .iter()
+        .flat_map(|column| &column.options)
+        .find_map(column_key_constraint);
     let on_table = || {
         create_table.constraints.iter().find_map(|constraint| {
             match constraint {
@@ -9441,31 +9460,41 @@ impl ParserDB {
             .and_then(|(_, metadata, _)| metadata.owner().map(ToString::to_string))
     }
 
-    /// Applies `ALTER TABLE ... SET UNLOGGED`, when `unlogged`, or `SET LOGGED`
-    /// to the table the statement names.
-    ///
-    /// The checks run in PostgreSQL 18's order. A partitioned table refuses
-    /// either clause, a second change in one statement is refused, and so is
-    /// either clause on a temporary table. A clause naming the state the table
-    /// already holds then changes nothing and checks nothing further.
-    /// `changed` holds, for the whole statement, the persistence the table had
-    /// before a clause changed it.
-    ///
-    /// A permanent table never references an unlogged one, so `SET UNLOGGED`
-    /// is refused while a permanent table references this one. `SET LOGGED`
-    /// needs no check of its own, because the rebuild checks the table's own
-    /// foreign keys again and refuses one referencing an unlogged table.
-    fn alter_table_persistence(
+    /// Applies the prepared persistence to the table.
+    fn apply_table_persistence(
         builder: ParserDBBuilder,
         table_name: &ObjectName,
         scope: AlterTableScope,
         unlogged: bool,
-        changed: &mut Option<bool>,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
             return Ok(builder);
         };
-        let node = Self::stored_node(&builder, &stored)?;
+        if Self::stored_node(&builder, &stored)?.unlogged == unlogged {
+            return Ok(builder);
+        }
+        Self::replace_table_node(builder, &stored, |_, replacement| {
+            replacement.unlogged = unlogged;
+            Ok(())
+        })
+    }
+
+    /// Checks persistence against the statement's original catalog.
+    ///
+    /// Partitioned tables, repeated changes and temporary tables are refused in
+    /// that order. An unchanged persistence needs no further checks.
+    /// `changed` records the persistence at the start of the statement.
+    ///
+    /// `SET UNLOGGED` is refused while a permanent table references this table.
+    /// The rebuild for `SET LOGGED` checks foreign keys referencing unlogged
+    /// tables.
+    fn prepare_table_persistence(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        unlogged: bool,
+        changed: &mut Option<bool>,
+    ) -> Result<(), crate::errors::Error> {
+        let node = Self::stored_node(builder, stored)?;
         if node.partition_by.is_some() {
             return Err(crate::errors::Error::PersistenceNotChangeable {
                 table_name: stored.name.clone(),
@@ -9484,19 +9513,16 @@ impl ParserDB {
             });
         }
         if node.unlogged == unlogged {
-            return Ok(builder);
+            return Ok(());
         }
-        if unlogged && let Some(host) = Self::permanent_table_referencing(&builder, &stored)? {
+        if unlogged && let Some(host) = Self::permanent_table_referencing(builder, stored)? {
             return Err(crate::errors::Error::ForeignKeyReferencesUnloggedTable {
                 host_table: host.name.to_string(),
                 referenced_table: node.name.to_string(),
             });
         }
         *changed = Some(node.unlogged);
-        Self::replace_table_node(builder, &stored, |_, replacement| {
-            replacement.unlogged = unlogged;
-            Ok(())
-        })
+        Ok(())
     }
 
     /// Applies `ALTER TABLE ... SET (...)` to the storage parameters of the
@@ -9616,7 +9642,7 @@ impl ParserDB {
     /// PostgreSQL checks an added key against the persistence the table had
     /// when the statement began, which the rebuild no longer sees once the
     /// earlier clause has changed the node. `changed` is what
-    /// [`Self::alter_table_persistence`] recorded for the statement.
+    /// [`Self::prepare_table_persistence`] recorded for the statement.
     fn refuse_reference_from_permanent_start(
         builder: &ParserDBBuilder,
         table_name: &ObjectName,
@@ -9888,26 +9914,600 @@ impl ParserDB {
         Ok(())
     }
 
-    /// Refuses a column option the table cannot take: a `NO INHERIT` check on
-    /// a partitioned table, which would keep it from the partitions, a key
-    /// whose unique index would reach a foreign partition, and an expression
-    /// holding a subquery.
+    /// Applies a table alteration through its preparation and catalog passes.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "The alteration dispatcher exhaustively handles the parser's operation variants."
+    )]
+    fn apply_alter_table(
+        mut builder: ParserDBBuilder,
+        mut alter_table: AlterTable,
+        context: AlterTableContext<'_>,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let AlterTableContext {
+            type_arrays,
+            active_postgres_catalog,
+            collation_metadata,
+            default_privileges,
+            access_resolution,
+            in_transaction,
+            source,
+        } = context;
+        let dialect = *builder.dialect();
+        let scope = AlterTableScope { if_exists: alter_table.if_exists, only: alter_table.only };
+        let mut persistence_before_change = None;
+        let mut replica_identities = Vec::new();
+        let postgres = matches!(dialect, SqlparserDialect::PostgreSql);
+        if postgres {
+            alter_passes::grammar(&builder, &alter_table.name, &alter_table.operations)?;
+        }
+        if alter_table.table_type == Some(AlterTableType::Foreign) {
+            refuse_alter_foreign_table_of_other_kind(&builder, &alter_table)?;
+        }
+        if matches!(dialect, SqlparserDialect::PostgreSql)
+            && alter_table.operations.len() > 1
+            && alter_table.operations.iter().any(|operation| {
+                alter_passes::standalone(operation) == Some(alter_passes::Standalone::Rename)
+            })
+        {
+            return Err(crate::errors::Error::RenameCommandNotAlone {
+                relation_name: alter_table.name.to_string(),
+            });
+        }
+        if alter_table.operations.len() > 1
+            && alter_table.operations.iter().any(|operation| {
+                alter_passes::standalone(operation) == Some(alter_passes::Standalone::Partition)
+            })
+        {
+            return Err(crate::errors::Error::PartitionCommandNotAlone {
+                table_name: alter_table.name.to_string(),
+            });
+        }
+        // Rename handlers retain their operation-specific missing-name errors.
+        if postgres
+            && views::holds_view(&builder, &alter_table.name).is_none()
+            && !alter_table.operations.first().is_some_and(|operation| {
+                alter_passes::standalone(operation) == Some(alter_passes::Standalone::Rename)
+            })
+        {
+            for operation in &mut alter_table.operations {
+                alter_passes::prepare(
+                    &builder,
+                    &alter_table.name,
+                    scope,
+                    operation,
+                    type_arrays,
+                    &mut persistence_before_change,
+                )?;
+            }
+        }
+        let mut work = alter_passes::Queue::new(alter_table.operations, postgres);
+        while let Some((pass, action)) = work.next() {
+            let mut operation = match action {
+                alter_passes::Work::Operation(operation) => operation,
+                alter_passes::Work::ColumnConstraint { column, position, option } => {
+                    let position = work.option_position(&column, position);
+                    builder = alter_passes::install_column_constraint(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &column,
+                        position,
+                        option,
+                        persistence_before_change,
+                    )?;
+                    continue;
+                }
+            };
+            if let Some(kind) = views::holds_view(&builder, &alter_table.name) {
+                builder = views::alter_view(
+                    builder,
+                    &alter_table.name,
+                    kind,
+                    &operation,
+                    type_arrays,
+                    active_postgres_catalog,
+                )?;
+                continue;
+            }
+            if !postgres
+                && alter_passes::standalone(&operation) != Some(alter_passes::Standalone::Rename)
+            {
+                alter_passes::prepare(
+                    &builder,
+                    &alter_table.name,
+                    scope,
+                    &mut operation,
+                    type_arrays,
+                    &mut persistence_before_change,
+                )?;
+            }
+            if let Some(table) = builder.resolve_table_object_name(&alter_table.name)? {
+                let object_kind = builder.stored_table_kind(table);
+                if alter_passes::refuses(object_kind, &operation) {
+                    return Err(crate::errors::Error::AlterActionUnsupportedOnRelation {
+                        object_kind,
+                        relation_name: alter_table.name.to_string(),
+                        operation: operation.to_string(),
+                    });
+                }
+            }
+            match operation {
+                AlterTableOperation::EnableRowLevelSecurity => {
+                    builder = Self::alter_table_metadata(
+                        builder,
+                        &alter_table.name,
+                        alter_table.if_exists,
+                        |_, metadata| metadata.set_rls_enabled(true),
+                    )?;
+                }
+                AlterTableOperation::DisableRowLevelSecurity => {
+                    builder = Self::alter_table_metadata(
+                        builder,
+                        &alter_table.name,
+                        alter_table.if_exists,
+                        |_, metadata| metadata.set_rls_enabled(false),
+                    )?;
+                }
+                AlterTableOperation::ForceRowLevelSecurity => {
+                    builder = Self::alter_table_metadata(
+                        builder,
+                        &alter_table.name,
+                        alter_table.if_exists,
+                        |_, metadata| metadata.set_rls_forced(true),
+                    )?;
+                }
+                AlterTableOperation::NoForceRowLevelSecurity => {
+                    builder = Self::alter_table_metadata(
+                        builder,
+                        &alter_table.name,
+                        alter_table.if_exists,
+                        |_, metadata| metadata.set_rls_forced(false),
+                    )?;
+                }
+                AlterTableOperation::RenameTable { table_name } => {
+                    let new_name = match table_name {
+                        RenameTableNameKind::As(name) | RenameTableNameKind::To(name) => name,
+                    };
+                    builder = virtual_tables::rename_table(
+                        builder,
+                        &alter_table.name,
+                        new_name,
+                        alter_table.if_exists,
+                        type_arrays,
+                        active_postgres_catalog,
+                    )?;
+                }
+                AlterTableOperation::AddConstraint { constraint, not_valid } => {
+                    if postgres && pass == alter_passes::Pass::TransformConstraint {
+                        let next_pass = alter_passes::transform_constraint(
+                            &builder,
+                            &alter_table.name,
+                            scope,
+                            &constraint,
+                        )?;
+                        work.push(
+                            next_pass,
+                            alter_passes::Work::Operation(AlterTableOperation::AddConstraint {
+                                constraint,
+                                not_valid,
+                            }),
+                        );
+                        continue;
+                    }
+                    if let TableConstraint::ForeignKey(foreign_key) = &constraint {
+                        Self::refuse_reference_from_permanent_start(
+                            &builder,
+                            &alter_table.name,
+                            persistence_before_change,
+                            &foreign_key.foreign_table,
+                        )?;
+                    }
+                    builder = Self::alter_table_add_constraint(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        constraint,
+                        !not_valid,
+                    )?;
+                }
+                AlterTableOperation::RenameConstraint { old_name, new_name } => {
+                    builder = constraint_names::rename_constraint(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &old_name,
+                        &new_name,
+                    )?;
+                }
+                AlterTableOperation::ValidateConstraint { name } => {
+                    builder = constraint_validity::validate_constraint(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &name,
+                    )?;
+                }
+                AlterTableOperation::DropConstraint { if_exists, name, drop_behavior } => {
+                    builder = Self::alter_table_drop_constraint(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &name,
+                        if_exists,
+                        drop_behavior == Some(DropBehavior::Cascade),
+                    )?;
+                }
+                AlterTableOperation::AddColumn {
+                    if_not_exists,
+                    mut column_def,
+                    column_position,
+                    ..
+                } => {
+                    if matches!(dialect, SqlparserDialect::PostgreSql) {
+                        duplicate_keys::merge(
+                            core::slice::from_mut(&mut column_def),
+                            &mut Vec::new(),
+                            builder.identifier_case(),
+                        );
+                    }
+                    domains::bind_type(&builder, &mut column_def.data_type, type_arrays)?;
+                    if !postgres {
+                        for option in &column_def.options {
+                            Self::refuse_column_reference_from_permanent_start(
+                                &builder,
+                                &alter_table.name,
+                                persistence_before_change,
+                                option,
+                            )?;
+                        }
+                    }
+                    let declared_type_text = source
+                        .filter(|_| dialect.is_sqlite())
+                        .and_then(|source| declared_types::declared_type(&column_def, source.text));
+                    let (next, deferred) = Self::alter_table_add_column(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        column_def,
+                        if_not_exists,
+                        column_position.as_ref(),
+                        AddedColumnContext {
+                            created: collation_metadata,
+                            catalog: active_postgres_catalog,
+                            defaults: default_privileges,
+                            declared_type_text,
+                        },
+                    )?;
+                    builder = next;
+                    if let Some(deferred) = deferred {
+                        work.defer_column_constraints(deferred);
+                    }
+                }
+                AlterTableOperation::DropColumn {
+                    column_names, if_exists, drop_behavior, ..
+                } => {
+                    let (next, removed) = Self::alter_table_drop_columns(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &column_names,
+                        if_exists,
+                        drop_behavior == Some(DropBehavior::Cascade),
+                        type_arrays,
+                    )?;
+                    builder =
+                        Self::finish_drop(next, removed, type_arrays, active_postgres_catalog)?;
+                }
+                AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                    builder = Self::alter_table_rename_column(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &old_column_name,
+                        &new_column_name,
+                    )?;
+                }
+                AlterTableOperation::AlterColumn { column_name, op } => {
+                    if matches!(op, AlterColumnOperation::SetDefault { .. }) {
+                        work.replace_default(&column_name, builder.identifier_case());
+                    }
+                    builder = Self::alter_table_alter_column(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &column_name,
+                        &op,
+                        default_privileges,
+                    )?;
+                }
+                AlterTableOperation::ChangeColumn {
+                    old_name,
+                    new_name,
+                    data_type,
+                    options,
+                    ..
+                } => {
+                    builder = Self::alter_table_rename_column(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &old_name,
+                        &new_name,
+                    )?;
+                    builder = Self::alter_table_column_def(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &new_name,
+                        &ColumnOption::NotNull,
+                        true,
+                        |declared| {
+                            redeclare_column(declared, data_type.clone(), options.clone());
+                        },
+                    )?;
+                }
+                AlterTableOperation::ModifyColumn { col_name, data_type, options, .. } => {
+                    builder = Self::alter_table_column_def(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &col_name,
+                        &ColumnOption::NotNull,
+                        true,
+                        |declared| {
+                            redeclare_column(declared, data_type.clone(), options.clone());
+                        },
+                    )?;
+                }
+
+                AlterTableOperation::AttachPartitionOf { partition, for_values } => {
+                    builder = attach_partition::attach_partition(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &partition,
+                        &for_values,
+                    )?;
+                }
+
+                AlterTableOperation::Inherit { parent } => {
+                    builder =
+                        alter_inheritance::inherit(builder, &alter_table.name, scope, &parent)?;
+                }
+
+                AlterTableOperation::NoInherit { parent } => {
+                    builder =
+                        alter_inheritance::no_inherit(builder, &alter_table.name, scope, &parent)?;
+                }
+
+                AlterTableOperation::DetachPartitionOf { partition, mode } => {
+                    builder = detach_partition::detach_partition(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &partition,
+                        mode,
+                        in_transaction,
+                    )?;
+                }
+
+                operation @ (AlterTableOperation::DropPrimaryKey { .. }
+                | AlterTableOperation::DropForeignKey { .. }
+                | AlterTableOperation::DropIndex { .. }
+                | AlterTableOperation::SwapWith { .. }) => {
+                    if Self::alter_table_target(&builder, &alter_table.name, scope)?.is_some() {
+                        return Err(crate::errors::Error::UnsupportedAlterTableOperation {
+                            table_name: last_str(&alter_table.name).to_string(),
+                            operation: operation.to_string(),
+                        });
+                    }
+                }
+
+                AlterTableOperation::OwnerTo { new_owner } => {
+                    let role_ident = match &new_owner {
+                        Owner::Ident(ident) => Some(ident.clone()),
+                        _ => None,
+                    };
+                    let owner = match &new_owner {
+                        Owner::Ident(ident) => Some(stored_role_name(ident)),
+                        Owner::CurrentRole | Owner::CurrentUser | Owner::SessionUser => None,
+                    };
+                    let mut handover = None;
+                    builder = Self::alter_table_metadata(
+                        builder,
+                        &alter_table.name,
+                        alter_table.if_exists,
+                        |table, metadata| {
+                            handover = metadata
+                                .owner()
+                                .filter(|previous| owner.as_deref() != Some(*previous))
+                                .map(|previous| (Arc::clone(table), previous.to_string()));
+                            if let Some((_, previous)) = &handover {
+                                table_owner::hand_over_revocations(
+                                    metadata.revocations_mut(),
+                                    previous,
+                                    &new_owner,
+                                );
+                            }
+                            metadata.set_owner(owner);
+                        },
+                    )?;
+                    sequences::change_table_owner(&mut builder, &alter_table.name, &new_owner);
+                    if let Some((table, previous)) = handover {
+                        table_owner::change_owner(&mut builder, &table, &previous, &new_owner);
+                    }
+                    if access_resolution == AccessResolution::ClosedWorld
+                        && let Some(ident) = &role_ident
+                        && builder.resolve_table_object_name(&alter_table.name)?.is_some()
+                    {
+                        validate_owner_role_ident(&builder, ident, last_str(&alter_table.name))?;
+                    }
+                }
+
+                AlterTableOperation::SetLogged | AlterTableOperation::SetUnlogged => {
+                    builder = Self::apply_table_persistence(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        matches!(operation, AlterTableOperation::SetUnlogged),
+                    )?;
+                }
+
+                AlterTableOperation::SetOptionsParens { options } => {
+                    builder = Self::alter_table_storage_parameters(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        options,
+                    )?;
+                }
+
+                AlterTableOperation::ResetOptions { options } => {
+                    builder = Self::alter_table_reset_storage_parameters(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        options,
+                    )?;
+                }
+
+                AlterTableOperation::GenericOptions { options } => {
+                    builder = Self::alter_foreign_table_options(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &options,
+                    )?;
+                }
+
+                AlterTableOperation::EnableTrigger { name } => {
+                    builder = triggers::alter_enablement(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &name,
+                        TriggerEnablement::Origin,
+                    )?;
+                }
+                AlterTableOperation::DisableTrigger { name } => {
+                    builder = triggers::alter_enablement(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &name,
+                        TriggerEnablement::Disabled,
+                    )?;
+                }
+                AlterTableOperation::EnableReplicaTrigger { name } => {
+                    builder = triggers::alter_enablement(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &name,
+                        TriggerEnablement::Replica,
+                    )?;
+                }
+                AlterTableOperation::EnableAlwaysTrigger { name } => {
+                    builder = triggers::alter_enablement(
+                        builder,
+                        &alter_table.name,
+                        scope,
+                        &name,
+                        TriggerEnablement::Always,
+                    )?;
+                }
+
+                AlterTableOperation::SetTblProperties { .. }
+                | AlterTableOperation::ClusterBy { .. }
+                | AlterTableOperation::DropClusteringKey
+                | AlterTableOperation::AlterSortKey { .. }
+                | AlterTableOperation::ModifyOrderBy { .. }
+                | AlterTableOperation::SuspendRecluster
+                | AlterTableOperation::ResumeRecluster
+                | AlterTableOperation::AttachPartition { .. }
+                | AlterTableOperation::DetachPartition { .. }
+                | AlterTableOperation::AddPartitions { .. }
+                | AlterTableOperation::DropPartitions { .. }
+                | AlterTableOperation::RenamePartitions { .. }
+                | AlterTableOperation::FreezePartition { .. }
+                | AlterTableOperation::UnfreezePartition { .. }
+                | AlterTableOperation::AddProjection { .. }
+                | AlterTableOperation::DropProjection { .. }
+                | AlterTableOperation::MaterializeProjection { .. }
+                | AlterTableOperation::ClearProjection { .. }
+                | AlterTableOperation::EnableRule { .. }
+                | AlterTableOperation::EnableAlwaysRule { .. }
+                | AlterTableOperation::EnableReplicaRule { .. }
+                | AlterTableOperation::DisableRule { .. }
+                | AlterTableOperation::AutoIncrement { .. }
+                | AlterTableOperation::Refresh { .. }
+                | AlterTableOperation::Suspend
+                | AlterTableOperation::Resume
+                | AlterTableOperation::Algorithm { .. }
+                | AlterTableOperation::Lock { .. } => {}
+                AlterTableOperation::ReplicaIdentity { identity } => {
+                    if postgres {
+                        builder = replica_identity::set(
+                            builder,
+                            &alter_table.name,
+                            alter_table.if_exists,
+                            &identity,
+                        )?;
+                    } else {
+                        replica_identities.push(identity);
+                    }
+                }
+            }
+        }
+        for identity in &replica_identities {
+            builder =
+                replica_identity::set(builder, &alter_table.name, alter_table.if_exists, identity)?;
+        }
+        Ok(builder)
+    }
+
+    /// Checks immediate options and extracts constraints for later catalog
+    /// passes.
     fn refuse_unaddable_column_options(
         builder: &ParserDBBuilder,
         stored: &StoredTable,
-        column_def: &ColumnDef,
+        column_def: &mut ColumnDef,
+    ) -> Result<Option<alter_passes::DeferredColumn>, crate::errors::Error> {
+        let node = Self::stored_node(builder, stored)?;
+        if builder.is_foreign_table(node)
+            && let Some(constraint) = column_def.options.iter().find_map(column_key_constraint)
+        {
+            return Err(crate::errors::Error::ConstraintUnsupportedOnForeignTable {
+                table_name: stored.name.clone(),
+                constraint,
+            });
+        }
+        let deferred = if matches!(builder.dialect(), SqlparserDialect::PostgreSql) {
+            alter_passes::DeferredColumn::extract(column_def)
+        } else {
+            None
+        };
+        for option in &column_def.options {
+            Self::refuse_unaddable_column_option(builder, stored, option)?;
+        }
+        Ok(deferred)
+    }
+
+    /// Refuses an expression or constraint the receiving table cannot support.
+    fn refuse_unaddable_column_option(
+        builder: &ParserDBBuilder,
+        stored: &StoredTable,
+        option: &ColumnOptionDef,
     ) -> Result<(), crate::errors::Error> {
-        stored_expressions::refuse_in_column(builder, column_def)?;
-        if column_def.options.iter().any(is_no_inherit_check)
-            && Self::stored_node(builder, stored)?.partition_by.is_some()
+        stored_expressions::refuse_in_column_option(builder, &option.option)?;
+        if is_no_inherit_check(option) && Self::stored_node(builder, stored)?.partition_by.is_some()
         {
             return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
                 table_name: stored.name.clone(),
             });
         }
-        if column_def.options.iter().any(|option| {
-            matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_))
-        }) {
+        if matches!(option.option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_)) {
             Self::refuse_unique_index_over_foreign_partition(builder, stored)?;
         }
         Ok(())
@@ -9936,6 +10536,24 @@ impl ParserDB {
         Ok(())
     }
 
+    /// Checks a column reference against the table's original persistence.
+    fn refuse_column_reference_from_permanent_start(
+        builder: &ParserDBBuilder,
+        table_name: &ObjectName,
+        persistence: Option<bool>,
+        option: &ColumnOptionDef,
+    ) -> Result<(), crate::errors::Error> {
+        if let ColumnOption::ForeignKey(foreign_key) = &option.option {
+            Self::refuse_reference_from_permanent_start(
+                builder,
+                table_name,
+                persistence,
+                &foreign_key.foreign_table,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Adds a column to a table.
     fn alter_table_add_column(
         builder: ParserDBBuilder,
@@ -9945,16 +10563,16 @@ impl ParserDB {
         if_not_exists: bool,
         position: Option<&MySQLColumnPosition>,
         context: AddedColumnContext<'_>,
-    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+    ) -> Result<(ParserDBBuilder, Option<alter_passes::DeferredColumn>), crate::errors::Error> {
         let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? else {
-            return Ok(builder);
+            return Ok((builder, None));
         };
         let added = NamedColumn::of(&column_def.name, builder.identifier_case());
         Self::refuse_column_on_partition(&builder, &stored, &added)?;
 
         if added.declared_by(Self::stored_node(&builder, &stored)?) {
             if if_not_exists {
-                return Ok(builder);
+                return Ok((builder, None));
             }
             return Err(crate::errors::Error::ColumnAlreadyExists {
                 table_name: stored.name.clone(),
@@ -9968,7 +10586,7 @@ impl ParserDB {
             crate::errors::InheritedChange::AddColumn,
         )?;
 
-        Self::refuse_unaddable_column_options(&builder, &stored, &column_def)?;
+        let deferred = Self::refuse_unaddable_column_options(&builder, &stored, &mut column_def)?;
         // Named against the schema as it stands, before the column lands.
         let column_sequences =
             sequences::plan_column_sequences(&builder, &stored, core::iter::once(&column_def));
@@ -10055,7 +10673,7 @@ impl ParserDB {
         }
 
         sequences::own_column_sequences(&mut builder, &stored, column_sequences);
-        Ok(builder)
+        Ok((builder, deferred))
     }
 
     /// The views, materialized views, bound function bodies and rules naming
@@ -10484,7 +11102,6 @@ impl ParserDB {
         builder: &ParserDBBuilder,
         stored: &StoredTable,
         node: &CreateTable,
-        scope: AlterTableScope,
         column: &NamedColumn,
         column_name: &Ident,
     ) -> Result<(), crate::errors::Error> {
@@ -10495,12 +11112,7 @@ impl ParserDB {
                 reason: crate::errors::GenerationExpressionRefusal::Inherited,
             });
         }
-        Self::refuse_only_with_children(
-            builder,
-            stored,
-            scope,
-            crate::errors::InheritedChange::DropExpression,
-        )
+        Ok(())
     }
 
     /// Applies an `ALTER COLUMN` operation, refusing the ones PostgreSQL will
@@ -10512,50 +11124,25 @@ impl ParserDB {
         column_name: &Ident,
         operation: &AlterColumnOperation,
         defaults: &DefaultPrivileges,
-        arrays: &TypeArrays,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let mut operation = operation.clone();
-        if let AlterColumnOperation::SetDataType { data_type, .. } = &mut operation {
-            domains::bind_type(&builder, data_type, arrays)?;
-        }
         let mut identity_sequence = None;
         if let Some(stored) = Self::alter_table_target(&builder, table_name, scope)? {
-            stored_expressions::refuse_in_column_change(&builder, &operation)?;
+            if !matches!(
+                operation,
+                AlterColumnOperation::SetDataType { .. }
+                    | AlterColumnOperation::DropExpression { .. }
+            ) {
+                stored_expressions::refuse_in_column_change(&builder, &operation)?;
+            }
             let node = Self::stored_node(&builder, &stored)?;
             let column = NamedColumn::of(column_name, builder.identifier_case());
             if column.declared_by(node) {
                 if matches!(operation, AlterColumnOperation::AddGenerated { .. }) {
                     Self::refuse_partition_identity(&stored, node, scope, &column)?;
                 }
-                if matches!(operation, AlterColumnOperation::DropExpression { .. })
-                    && matches!(builder.dialect(), SqlparserDialect::PostgreSql)
-                {
-                    Self::refuse_inherited_expression_drop(
-                        &builder,
-                        &stored,
-                        node,
-                        scope,
-                        &column,
-                        column_name,
-                    )?;
-                }
                 Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
                 if matches!(operation, AlterColumnOperation::SetDataType { .. }) {
-                    // A column keeps one type across its inheritance tree,
-                    // which only the table it comes from may change, for all of
-                    // it.
-                    if inheritance::is_inherited_column(&builder, node, column_name) {
-                        return Err(crate::errors::Error::InheritedColumnTypeNotAlterable {
-                            table_name: stored.name.clone(),
-                            column_name: column.name.clone(),
-                        });
-                    }
-                    Self::refuse_only_with_children(
-                        &builder,
-                        &stored,
-                        scope,
-                        crate::errors::InheritedChange::AlterColumnType,
-                    )?;
                     Self::refuse_type_change_under_dependents(&builder, &stored, scope, &column)?;
                 }
             }
@@ -11940,591 +12527,19 @@ impl ParserDB {
                     )?;
                 }
                 Statement::AlterTable(alter_table) => {
-                    let scope = AlterTableScope {
-                        if_exists: alter_table.if_exists,
-                        only: alter_table.only,
-                    };
-                    // The persistence the table had before a clause of this
-                    // statement changed it.
-                    let mut persistence_before_change = None;
-                    let mut replica_identities = Vec::new();
-                    if alter_table.table_type == Some(AlterTableType::Foreign) {
-                        refuse_alter_foreign_table_of_other_kind(&builder, &alter_table)?;
-                    }
-                    if matches!(dialect, SqlparserDialect::PostgreSql)
-                        && alter_table.operations.len() > 1
-                        && alter_table.operations.iter().any(|operation| {
-                            matches!(
-                                operation,
-                                AlterTableOperation::RenameColumn { .. }
-                                    | AlterTableOperation::RenameConstraint { .. }
-                                    | AlterTableOperation::RenameTable { .. }
-                            )
-                        })
-                    {
-                        return Err(crate::errors::Error::RenameCommandNotAlone {
-                            relation_name: alter_table.name.to_string(),
-                        });
-                    }
-                    // PostgreSQL's grammar takes a partition command only as
-                    // the whole of its statement.
-                    if alter_table.operations.len() > 1
-                        && alter_table.operations.iter().any(|operation| {
-                            matches!(
-                                operation,
-                                AlterTableOperation::AttachPartitionOf { .. }
-                                    | AlterTableOperation::DetachPartitionOf { .. }
-                            )
-                        })
-                    {
-                        return Err(crate::errors::Error::PartitionCommandNotAlone {
-                            table_name: alter_table.name.to_string(),
-                        });
-                    }
-                    for operation in alter_table.operations {
-                        // `ALTER TABLE` names a relation, and PostgreSQL
-                        // accepts it against a view for the actions a view
-                        // supports. A view takes over here so the table path
-                        // never sees a name it does not hold.
-                        if let Some(kind) = views::holds_view(&builder, &alter_table.name) {
-                            builder = views::alter_view(
-                                builder,
-                                &alter_table.name,
-                                kind,
-                                &operation,
-                                &mut type_arrays,
-                                &mut active_postgres_catalog,
-                            )?;
-                            continue;
-                        }
-                        if let Some(table) = builder.resolve_table_object_name(&alter_table.name)? {
-                            let object_kind = builder.stored_table_kind(table);
-                            // SQLite renames a virtual table and alters nothing
-                            // else of it.
-                            let refused = match object_kind {
-                                ObjectKind::VirtualTable => {
-                                    !matches!(operation, AlterTableOperation::RenameTable { .. })
-                                }
-                                ObjectKind::ForeignTable => foreign_table_refuses(&operation),
-                                _ => needs_foreign_table(&operation),
-                            };
-                            if refused {
-                                return Err(
-                                    crate::errors::Error::AlterActionUnsupportedOnRelation {
-                                        object_kind,
-                                        relation_name: alter_table.name.to_string(),
-                                        operation: operation.to_string(),
-                                    },
-                                );
-                            }
-                        }
-                        match operation {
-                            AlterTableOperation::EnableRowLevelSecurity => {
-                                builder = Self::alter_table_metadata(
-                                    builder,
-                                    &alter_table.name,
-                                    alter_table.if_exists,
-                                    |_, metadata| metadata.set_rls_enabled(true),
-                                )?;
-                            }
-                            AlterTableOperation::DisableRowLevelSecurity => {
-                                builder = Self::alter_table_metadata(
-                                    builder,
-                                    &alter_table.name,
-                                    alter_table.if_exists,
-                                    |_, metadata| metadata.set_rls_enabled(false),
-                                )?;
-                            }
-                            AlterTableOperation::ForceRowLevelSecurity => {
-                                builder = Self::alter_table_metadata(
-                                    builder,
-                                    &alter_table.name,
-                                    alter_table.if_exists,
-                                    |_, metadata| metadata.set_rls_forced(true),
-                                )?;
-                            }
-                            AlterTableOperation::NoForceRowLevelSecurity => {
-                                builder = Self::alter_table_metadata(
-                                    builder,
-                                    &alter_table.name,
-                                    alter_table.if_exists,
-                                    |_, metadata| metadata.set_rls_forced(false),
-                                )?;
-                            }
-                            AlterTableOperation::RenameTable { table_name } => {
-                                let new_name = match table_name {
-                                    RenameTableNameKind::As(name)
-                                    | RenameTableNameKind::To(name) => name,
-                                };
-                                builder = virtual_tables::rename_table(
-                                    builder,
-                                    &alter_table.name,
-                                    new_name,
-                                    alter_table.if_exists,
-                                    &mut type_arrays,
-                                    &mut active_postgres_catalog,
-                                )?;
-                            }
-                            AlterTableOperation::AddConstraint { constraint, not_valid } => {
-                                if let TableConstraint::ForeignKey(foreign_key) = &constraint {
-                                    Self::refuse_reference_from_permanent_start(
-                                        &builder,
-                                        &alter_table.name,
-                                        persistence_before_change,
-                                        &foreign_key.foreign_table,
-                                    )?;
-                                }
-                                builder = Self::alter_table_add_constraint(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    constraint,
-                                    !not_valid,
-                                )?;
-                            }
-                            AlterTableOperation::RenameConstraint { old_name, new_name } => {
-                                builder = constraint_names::rename_constraint(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &old_name,
-                                    &new_name,
-                                )?;
-                            }
-                            AlterTableOperation::ValidateConstraint { name } => {
-                                builder = constraint_validity::validate_constraint(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &name,
-                                )?;
-                            }
-                            AlterTableOperation::DropConstraint {
-                                if_exists,
-                                name,
-                                drop_behavior,
-                            } => {
-                                builder = Self::alter_table_drop_constraint(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &name,
-                                    if_exists,
-                                    drop_behavior == Some(DropBehavior::Cascade),
-                                )?;
-                            }
-                            AlterTableOperation::AddColumn {
-                                if_not_exists,
-                                mut column_def,
-                                column_position,
-                                ..
-                            } => {
-                                if matches!(dialect, SqlparserDialect::PostgreSql) {
-                                    duplicate_keys::merge(
-                                        core::slice::from_mut(&mut column_def),
-                                        &mut Vec::new(),
-                                        builder.identifier_case(),
-                                    );
-                                }
-                                domains::bind_type(&builder, &mut column_def.data_type, &type_arrays)?;
-                                for option in &column_def.options {
-                                    if let ColumnOption::ForeignKey(foreign_key) = &option.option {
-                                        Self::refuse_reference_from_permanent_start(
-                                            &builder,
-                                            &alter_table.name,
-                                            persistence_before_change,
-                                            &foreign_key.foreign_table,
-                                        )?;
-                                    }
-                                }
-                                let declared_type_text = source
-                                    .filter(|_| dialect.is_sqlite())
-                                    .and_then(|source| {
-                                        declared_types::declared_type(&column_def, source.text)
-                                    });
-                                builder = Self::alter_table_add_column(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    column_def,
-                                    if_not_exists,
-                                    column_position.as_ref(),
-                                    AddedColumnContext {
-                                        created: &collation_metadata,
-                                        catalog: &active_postgres_catalog,
-                                        defaults: &default_privileges,
-                                        declared_type_text,
-                                    },
-                                )?;
-                            }
-                            AlterTableOperation::DropColumn {
-                                column_names,
-                                if_exists,
-                                drop_behavior,
-                                ..
-                            } => {
-                                let (next, removed) = Self::alter_table_drop_columns(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &column_names,
-                                    if_exists,
-                                    drop_behavior == Some(DropBehavior::Cascade),
-                                    &mut type_arrays,
-                                )?;
-                                builder = Self::finish_drop(
-                                    next,
-                                    removed,
-                                    &mut type_arrays,
-                                    &mut active_postgres_catalog,
-                                )?;
-                            }
-                            AlterTableOperation::RenameColumn {
-                                old_column_name,
-                                new_column_name,
-                            } => {
-                                builder = Self::alter_table_rename_column(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &old_column_name,
-                                    &new_column_name,
-                                )?;
-                            }
-                            AlterTableOperation::AlterColumn { column_name, op } => {
-                                builder = Self::alter_table_alter_column(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &column_name,
-                                    &op,
-                                    &default_privileges,
-                                    &type_arrays,
-                                )?;
-                            }
-                            AlterTableOperation::ChangeColumn {
-                                old_name,
-                                new_name,
-                                data_type,
-                                options,
-                                ..
-                            } => {
-                                builder = Self::alter_table_rename_column(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &old_name,
-                                    &new_name,
-                                )?;
-                                builder = Self::alter_table_column_def(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &new_name,
-                                    &ColumnOption::NotNull,
-                                    true,
-                                    |declared| {
-                                        redeclare_column(
-                                            declared,
-                                            data_type.clone(),
-                                            options.clone(),
-                                        );
-                                    },
-                                )?;
-                            }
-                            AlterTableOperation::ModifyColumn {
-                                col_name,
-                                data_type,
-                                options,
-                                ..
-                            } => {
-                                builder = Self::alter_table_column_def(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &col_name,
-                                    &ColumnOption::NotNull,
-                                    true,
-                                    |declared| {
-                                        redeclare_column(
-                                            declared,
-                                            data_type.clone(),
-                                            options.clone(),
-                                        );
-                                    },
-                                )?;
-                            }
-
-                            AlterTableOperation::AttachPartitionOf { partition, for_values } => {
-                                builder = attach_partition::attach_partition(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &partition,
-                                    &for_values,
-                                )?;
-                            }
-
-                            AlterTableOperation::Inherit { parent } => {
-                                builder = alter_inheritance::inherit(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &parent,
-                                )?;
-                            }
-
-                            AlterTableOperation::NoInherit { parent } => {
-                                builder = alter_inheritance::no_inherit(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &parent,
-                                )?;
-                            }
-
-                            AlterTableOperation::DetachPartitionOf { partition, mode } => {
-                                builder = detach_partition::detach_partition(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &partition,
-                                    mode,
-                                    in_transaction,
-                                )?;
-                            }
-
-                            // Refused: each of these changes part of the schema
-                            // the model represents, so discarding it would
-                            // leave the model wrong rather than merely coarse.
-                            // An absent table is reported first, so that a
-                            // statement wrong in both ways names the plainer
-                            // fault and `IF EXISTS` still excuses it.
-                            operation @ (AlterTableOperation::DropPrimaryKey { .. }
-                            | AlterTableOperation::DropForeignKey { .. }
-                            | AlterTableOperation::DropIndex { .. }
-                            | AlterTableOperation::SwapWith { .. }) => {
-                                if Self::alter_table_target(
-                                    &builder,
-                                    &alter_table.name,
-                                    scope,
-                                )?
-                                .is_some()
-                                {
-                                    return Err(
-                                        crate::errors::Error::UnsupportedAlterTableOperation {
-                                            table_name: last_str(&alter_table.name).to_string(),
-                                            operation: operation.to_string(),
-                                        },
-                                    );
-                                }
-                            }
-
-                            AlterTableOperation::OwnerTo { new_owner } => {
-                                let role_ident = match &new_owner {
-                                    Owner::Ident(ident) => Some(ident.clone()),
-                                    _ => None,
-                                };
-                                let owner = match &new_owner {
-                                    Owner::Ident(ident) => Some(stored_role_name(ident)),
-                                    // These name whoever runs the statement,
-                                    // so the owner changed to one the input
-                                    // never spells and the model can no longer
-                                    // name it either.
-                                    Owner::CurrentRole
-                                    | Owner::CurrentUser
-                                    | Owner::SessionUser => None,
-                                };
-                                let mut handover = None;
-                                builder = Self::alter_table_metadata(
-                                    builder,
-                                    &alter_table.name,
-                                    alter_table.if_exists,
-                                    |table, metadata| {
-                                        handover = metadata
-                                            .owner()
-                                            .filter(|previous| owner.as_deref() != Some(*previous))
-                                            .map(|previous| (Arc::clone(table), previous.to_string()));
-                                        if let Some((_, previous)) = &handover {
-                                            table_owner::hand_over_revocations(
-                                                metadata.revocations_mut(),
-                                                previous,
-                                                &new_owner,
-                                            );
-                                        }
-                                        metadata.set_owner(owner);
-                                    },
-                                )?;
-                                sequences::change_table_owner(
-                                    &mut builder,
-                                    &alter_table.name,
-                                    &new_owner,
-                                );
-                                if let Some((table, previous)) = handover {
-                                    table_owner::change_owner(
-                                        &mut builder,
-                                        &table,
-                                        &previous,
-                                        &new_owner,
-                                    );
-                                }
-                                // After the table, because the database reports
-                                // an absent table first, and skipped entirely
-                                // when `IF EXISTS` excused an absent one, since
-                                // the statement then did nothing at all.
-                                if access_resolution == AccessResolution::ClosedWorld
-                                    && let Some(ident) = &role_ident
-                                    && builder.resolve_table_object_name(&alter_table.name)?.is_some()
-                                {
-                                    validate_owner_role_ident(
-                                        &builder,
-                                        ident,
-                                        last_str(&alter_table.name),
-                                    )?;
-                                }
-                            }
-
-                            AlterTableOperation::SetLogged | AlterTableOperation::SetUnlogged => {
-                                builder = Self::alter_table_persistence(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    matches!(operation, AlterTableOperation::SetUnlogged),
-                                    &mut persistence_before_change,
-                                )?;
-                            }
-
-                            AlterTableOperation::SetOptionsParens { options } => {
-                                builder = Self::alter_table_storage_parameters(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    options,
-                                )?;
-                            }
-
-                            AlterTableOperation::ResetOptions { options } => {
-                                builder = Self::alter_table_reset_storage_parameters(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    options,
-                                )?;
-                            }
-
-                            AlterTableOperation::GenericOptions { options } => {
-                                builder = Self::alter_foreign_table_options(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &options,
-                                )?;
-                            }
-
-                            AlterTableOperation::EnableTrigger { name } => {
-                                builder = triggers::alter_enablement(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &name,
-                                    TriggerEnablement::Origin,
-                                )?;
-                            }
-                            AlterTableOperation::DisableTrigger { name } => {
-                                builder = triggers::alter_enablement(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &name,
-                                    TriggerEnablement::Disabled,
-                                )?;
-                            }
-                            AlterTableOperation::EnableReplicaTrigger { name } => {
-                                builder = triggers::alter_enablement(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &name,
-                                    TriggerEnablement::Replica,
-                                )?;
-                            }
-                            AlterTableOperation::EnableAlwaysTrigger { name } => {
-                                builder = triggers::alter_enablement(
-                                    builder,
-                                    &alter_table.name,
-                                    scope,
-                                    &name,
-                                    TriggerEnablement::Always,
-                                )?;
-                            }
-
-                            // Ignored: each of these changes something the
-                            // model carries no representation of, so nothing it
-                            // answers can change.
-                            //
-                            // Physical layout: Hive table properties,
-                            // clustering and sort keys describe how rows are
-                            // kept, which the model does not describe at all.
-                            AlterTableOperation::SetTblProperties { .. }
-                            | AlterTableOperation::ClusterBy { .. }
-                            | AlterTableOperation::DropClusteringKey
-                            | AlterTableOperation::AlterSortKey { .. }
-                            | AlterTableOperation::ModifyOrderBy { .. }
-                            | AlterTableOperation::SuspendRecluster
-                            | AlterTableOperation::ResumeRecluster
-                            // ClickHouse and Hive partitions group a table's
-                            // rows on disk, which the model does not describe.
-                            | AlterTableOperation::AttachPartition { .. }
-                            | AlterTableOperation::DetachPartition { .. }
-                            | AlterTableOperation::AddPartitions { .. }
-                            | AlterTableOperation::DropPartitions { .. }
-                            | AlterTableOperation::RenamePartitions { .. }
-                            | AlterTableOperation::FreezePartition { .. }
-                            | AlterTableOperation::UnfreezePartition { .. }
-                            // Projections are a ClickHouse object the model has
-                            // no equivalent of.
-                            | AlterTableOperation::AddProjection { .. }
-                            | AlterTableOperation::DropProjection { .. }
-                            | AlterTableOperation::MaterializeProjection { .. }
-                            | AlterTableOperation::ClearProjection { .. }
-                            // Rewrite rules are not modelled, so their
-                            // enablement has nothing to attach to.
-                            | AlterTableOperation::EnableRule { .. }
-                            | AlterTableOperation::EnableAlwaysRule { .. }
-                            | AlterTableOperation::EnableReplicaRule { .. }
-                            | AlterTableOperation::DisableRule { .. }
-                            // The next value of an auto-increment counter is
-                            // table data rather than schema.
-                            | AlterTableOperation::AutoIncrement { .. }
-                            // Refresh, suspend and resume drive a Snowflake
-                            // dynamic table's schedule, not its shape.
-                            | AlterTableOperation::Refresh { .. }
-                            | AlterTableOperation::Suspend
-                            | AlterTableOperation::Resume
-                            // MySQL hints choosing how the server performs the
-                            // change, with no effect on the result.
-                            | AlterTableOperation::Algorithm { .. }
-                            | AlterTableOperation::Lock { .. } => {}
-                            AlterTableOperation::ReplicaIdentity { identity } => {
-                                replica_identities.push(identity);
-                            }
-                        }
-                    }
-                    // PostgreSQL sets the replica identity in its last pass.
-                    if !replica_identities.is_empty() {
-                        constraint_names::name_pending(
-                            &mut builder,
-                            constraint_names::CreationOrder::AlterTable,
-                        )?;
-                    }
-                    for identity in &replica_identities {
-                        builder = replica_identity::set(
-                            builder,
-                            &alter_table.name,
-                            alter_table.if_exists,
-                            identity,
-                        )?;
-                    }
+                    builder = Self::apply_alter_table(
+                        builder,
+                        alter_table,
+                        AlterTableContext {
+                            type_arrays: &mut type_arrays,
+                            active_postgres_catalog: &mut active_postgres_catalog,
+                            collation_metadata: &collation_metadata,
+                            default_privileges: &default_privileges,
+                            access_resolution,
+                            in_transaction,
+                            source,
+                        },
+                    )?;
                 }
                 Statement::CreateExtension(create_extension) => {
                     let creator = Creator::session(&session_roles, &default_privileges);
