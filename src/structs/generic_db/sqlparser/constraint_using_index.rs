@@ -4,9 +4,9 @@ use sqlparser::ast::{CreateIndex, KeyOrIndexDisplay, NullsDistinctOption};
 
 use super::{
     IndexSlot, ParserDB, ParserDBBuilder, PrimaryKeyConstraint, StoredTable, TableConstraint,
-    UniqueConstraint, constraint_names, index_holds_name, table_schema_qualifier,
+    UniqueConstraint, constraint_names, index_holds_name, replica_identity, table_schema_qualifier,
 };
-use crate::errors::Error;
+use crate::{errors::Error, utils::identifier_resolution::stored_ident_name};
 
 /// Materializes an adopted index as an ordinary key constraint.
 pub(super) fn adopt(
@@ -54,7 +54,10 @@ pub(super) fn adopt(
     }
     let index = index.attribute();
     validate(index, index_name)?;
-    let name = Some(adoption.name.as_ref().unwrap_or(index_name).clone());
+    let key = adoption.name.as_ref().unwrap_or(index_name);
+    let identity = replica_identity::created_index_name(index)
+        .map(|adopted| (adopted.into_owned(), stored_ident_name(key).into_owned()));
+    let name = Some(key.clone());
     *constraint = if primary {
         TableConstraint::PrimaryKey(PrimaryKeyConstraint {
             name,
@@ -84,7 +87,16 @@ pub(super) fn adopt(
             on_conflict: None,
         })
     };
-    builder.remove_index_at(IndexSlot::Table(position));
+    builder.detach_index_at(IndexSlot::Table(position));
+    // PostgreSQL keeps the replica identity on the index under its new name.
+    let case = builder.identifier_case();
+    for (table, metadata, _) in builder.tables_mut() {
+        if let Some((adopted, key)) = &identity
+            && stored.matches(table, case)
+        {
+            replica_identity::follow_rename(metadata, adopted, key);
+        }
+    }
     Ok(())
 }
 

@@ -8,9 +8,9 @@ use alloc::{
 };
 
 use sqlparser::ast::{
-    ColumnOption, ColumnOptionDef, ConstraintCharacteristics, ConstraintUsingIndex, CreateIndex,
-    CreateTable, Expr, Ident, IndexColumn, ObjectName, PrimaryKeyConstraint, ReplicaIdentity,
-    TableConstraint, UniqueConstraint,
+    ColumnOption, ColumnOptionDef, ConstraintCharacteristics, CreateIndex, CreateTable, Expr,
+    Ident, IndexColumn, ObjectName, PrimaryKeyConstraint, ReplicaIdentity, TableConstraint,
+    UniqueConstraint,
 };
 
 use super::{
@@ -212,51 +212,8 @@ fn refuse_key(
             refuse_immediate(*characteristics)?;
             refuse_nullable(builder, table, &plain_column_names(columns))
         }
-        // The model keeps the adopted index under its own name.
-        Slot::Table(
-            _,
-            TableConstraint::PrimaryKeyUsingIndex(using_index)
-            | TableConstraint::UniqueUsingIndex(using_index),
-        ) => {
-            refuse_immediate(using_index.characteristics)?;
-            adopted_index(builder, table, using_index)
-                .map_or(Ok(()), |created| refuse_created_index(builder, table, created))
-        }
         Slot::Column { .. } | Slot::Table(..) => Err(ReplicaIdentityRefusal::NotUnique),
     }
-}
-
-/// The `CREATE INDEX` index of `table` that `using_index` adopts.
-fn adopted_index<'db>(
-    builder: &'db ParserDBBuilder,
-    table: &CreateTable,
-    using_index: &ConstraintUsingIndex,
-) -> Option<&'db CreateIndex> {
-    let case = builder.identifier_case();
-    let owner = StoredTable::of(table);
-    let adopted = stored_ident_name(&using_index.index_name);
-    builder
-        .indices()
-        .iter()
-        .filter(|(created, _)| owner.matches(TableAttribute::table(created.as_ref()), case))
-        .map(|(created, _)| created.attribute())
-        .find(|created| created_index_name(created).as_deref() == Some(&*adopted))
-}
-
-/// The stored names of the index an `ADD ... USING INDEX` constraint adopts
-/// and of the constraint, which PostgreSQL renames that index to, when the
-/// constraint is named.
-pub(super) fn adoption(constraint: &TableConstraint) -> Option<(String, String)> {
-    let (TableConstraint::PrimaryKeyUsingIndex(using_index)
-    | TableConstraint::UniqueUsingIndex(using_index)) = constraint
-    else {
-        return None;
-    };
-    let name = using_index.name.as_ref()?;
-    Some((
-        stored_ident_name(&using_index.index_name).into_owned(),
-        stored_ident_name(name).into_owned(),
-    ))
 }
 
 /// The column of each key of an index, a parenthesized or collated column
@@ -332,16 +289,15 @@ fn covers_column(builder: &ParserDBBuilder, table: &CreateTable, column: &Ident)
             constraint_names::names(table, metadata.generated_constraint_names(), case)
                 .into_iter()
                 .find(|(_, name)| name.as_deref() == Some(wanted))
-                .map(|(slot, _)| key_slot_columns(builder, table, slot))
+                .map(|(slot, _)| key_slot_columns(slot))
                 .unwrap_or_default()
         }
     };
     columns.iter().any(|key| case_idents_match(key, column, case))
 }
 
-/// The key columns of the primary key or unique constraint in `slot` of
-/// `table`.
-fn key_slot_columns(builder: &ParserDBBuilder, table: &CreateTable, slot: Slot<'_>) -> Vec<Ident> {
+/// The key columns of the primary key or unique constraint in `slot`.
+fn key_slot_columns(slot: Slot<'_>) -> Vec<Ident> {
     match slot {
         Slot::Column { def, .. } => alloc::vec![def.name.clone()],
         Slot::Table(
@@ -349,15 +305,6 @@ fn key_slot_columns(builder: &ParserDBBuilder, table: &CreateTable, slot: Slot<'
             TableConstraint::PrimaryKey(PrimaryKeyConstraint { columns, .. })
             | TableConstraint::Unique(UniqueConstraint { columns, .. }),
         ) => plain_column_names(columns),
-        Slot::Table(
-            _,
-            TableConstraint::PrimaryKeyUsingIndex(using_index)
-            | TableConstraint::UniqueUsingIndex(using_index),
-        ) => {
-            adopted_index(builder, table, using_index)
-                .and_then(|created| key_columns(&created.columns))
-                .unwrap_or_default()
-        }
         Slot::Table(..) => Vec::new(),
     }
 }

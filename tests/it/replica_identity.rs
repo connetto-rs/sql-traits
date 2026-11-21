@@ -384,19 +384,29 @@ fn an_index_a_key_adopts_carries_the_identity_under_the_key() {
         "{index} ALTER TABLE t ADD PRIMARY KEY USING INDEX i;
          ALTER TABLE t REPLICA IDENTITY USING INDEX i;"
     );
-    // The model holds the adopted index under the name it was created with.
-    for setting in [&adopted, &adopted_after, &unnamed] {
-        assert_eq!(identity_of(setting, "t"), "index i", "{setting}");
-        let renamed =
-            format!("{setting} ALTER TABLE t RENAME CONSTRAINT {} TO j;", key_of(setting));
-        assert_eq!(identity_of(&renamed, "t"), "index i", "{renamed}");
+    let unnamed_after = format!(
+        "{index} ALTER TABLE t REPLICA IDENTITY USING INDEX i;
+         ALTER TABLE t ADD PRIMARY KEY USING INDEX i;"
+    );
+    // PostgreSQL renames the adopted index to the key, keeping the identity.
+    for setting in [&adopted, &adopted_after, &unnamed, &unnamed_after] {
+        let key = key_of(setting);
+        assert_eq!(identity_of(setting, "t"), format!("key {key}"), "{setting}");
+        let renamed = format!("{setting} ALTER TABLE t RENAME CONSTRAINT {key} TO j;");
+        assert_eq!(identity_of(&renamed, "t"), "key j", "{renamed}");
         let dropped = format!("{renamed} ALTER TABLE t DROP CONSTRAINT j;");
         assert_eq!(identity_of(&dropped, "t"), "index -", "{dropped}");
+        // PostgreSQL names the primary key ahead of the replica identity.
+        let expected = if setting.contains("PRIMARY KEY") {
+            RequiredValue::CoveredByKey
+        } else {
+            RequiredValue::InReplicaIdentity
+        };
         let sql = format!("{setting} ALTER TABLE t ALTER COLUMN a DROP NOT NULL;");
         assert!(
             matches!(
                 refusal(&sql),
-                Error::RequiredValueNotDroppable { reason: RequiredValue::InReplicaIdentity, .. }
+                Error::RequiredValueNotDroppable { reason, .. } if reason == expected
             ),
             "{sql}"
         );

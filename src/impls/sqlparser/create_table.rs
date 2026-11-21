@@ -5,7 +5,7 @@ use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use ::sqlparser::ast::{
     Action, CreateTable, CreateTableOptions, Expr, ForValues, ObjectNamePart, PartitionBoundValue,
-    SqlOption, TableConstraint, Value, ValueWithSpan,
+    SqlOption, Value, ValueWithSpan,
 };
 
 use crate::{
@@ -419,25 +419,8 @@ impl TableLike for CreateTable {
             StoredReplicaIdentity::Index(None) => return Ok(ReplicaIdentity::Index(None)),
             StoredReplicaIdentity::Index(Some(name)) => name.as_str(),
         };
-        // An adopting key holds the index under the index's own name.
-        let adopted = self.constraints.iter().find_map(|constraint| {
-            match constraint {
-                TableConstraint::PrimaryKeyUsingIndex(using_index)
-                | TableConstraint::UniqueUsingIndex(using_index)
-                    if stored_ident_name(
-                        using_index.name.as_ref().unwrap_or(&using_index.index_name),
-                    ) == name =>
-                {
-                    Some(stored_ident_name(&using_index.index_name))
-                }
-                _ => None,
-            }
-        });
-        let created = adopted.as_deref().unwrap_or(name);
         if let Some(index) = self.indices(database)?.find(|index| {
-            index
-                .name()
-                .is_some_and(|held| stored_identifier(held, index.name_is_quoted()) == created)
+            index.name().is_some_and(|held| stored_identifier(held, index.name_is_quoted()) == name)
         }) {
             return Ok(ReplicaIdentity::Index(Some(ReplicaIdentityIndex::Index(index))));
         }

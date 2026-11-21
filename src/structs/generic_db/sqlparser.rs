@@ -2248,25 +2248,40 @@ impl ParserDBBuilder {
     }
 
     /// Removes the index stored at `slot`, an index on a table from the
-    /// metadata of that table too.
+    /// metadata of that table too, and a table's replica identity naming it
+    /// is left naming none.
     fn remove_index_at(&mut self, slot: IndexSlot) {
+        if let Some(removed) = self.detach_index_at(slot)
+            && let Some(name) = replica_identity::created_index_name(removed.attribute())
+        {
+            let owner = StoredTable::of(TableAttribute::table(&removed));
+            let case = self.identifier_case();
+            for (table, table_meta, _) in self.tables_mut() {
+                if owner.matches(table, case) {
+                    replica_identity::forget(table_meta, &name);
+                }
+            }
+        }
+    }
+
+    /// Removes the index stored at `slot` as [`Self::remove_index_at`] does
+    /// but leaves the replica identity naming it, handing back an index on a
+    /// table.
+    fn detach_index_at(
+        &mut self,
+        slot: IndexSlot,
+    ) -> Option<Arc<TableAttribute<CreateTable, CreateIndex>>> {
         match slot {
             IndexSlot::Table(position) => {
                 let (removed, _) = self.indices_mut().remove(position);
-                let owner = StoredTable::of(TableAttribute::table(&removed));
-                let name = replica_identity::created_index_name(removed.attribute());
-                let case = self.identifier_case();
-                for (table, table_meta, _) in self.tables_mut() {
+                for (_, table_meta, _) in self.tables_mut() {
                     table_meta.retain_indices(|index| !Arc::ptr_eq(index, &removed));
-                    if let Some(name) = &name
-                        && owner.matches(table, case)
-                    {
-                        replica_identity::forget(table_meta, name);
-                    }
                 }
+                Some(removed)
             }
             IndexSlot::MaterializedView(position) => {
                 self.materialized_view_indices_mut().remove(position);
+                None
             }
         }
     }
@@ -11172,7 +11187,6 @@ impl ParserDB {
                                         &foreign_key.foreign_table,
                                     )?;
                                 }
-                                let adoption = replica_identity::adoption(&constraint);
                                 builder = Self::alter_table_add_constraint(
                                     builder,
                                     &alter_table.name,
@@ -11180,16 +11194,6 @@ impl ParserDB {
                                     constraint,
                                     !not_valid,
                                 )?;
-                                if let Some((index, key)) = adoption {
-                                    builder = Self::alter_table_metadata(
-                                        builder,
-                                        &alter_table.name,
-                                        alter_table.if_exists,
-                                        |_, metadata| {
-                                            replica_identity::follow_rename(metadata, &index, &key);
-                                        },
-                                    )?;
-                                }
                             }
                             AlterTableOperation::RenameConstraint { old_name, new_name } => {
                                 builder = constraint_names::rename_constraint(
