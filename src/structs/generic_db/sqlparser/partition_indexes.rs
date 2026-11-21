@@ -174,6 +174,7 @@ fn constraint_index(node: &CreateTable, slot: Slot<'_>, name: &str) -> Option<Cr
     };
     Some(CreateIndex {
         name: Some(ObjectName::from(vec![Ident::with_quote('"', name)])),
+        only: false,
         table_name: node.name.clone(),
         using: using.clone(),
         columns: columns.clone(),
@@ -274,6 +275,7 @@ fn receive(
     copy.table_name = node.name.clone();
     copy.name = builder.generated_index_name(&copy)?.map(|name| ObjectName::from(vec![name]));
     copy.if_not_exists = false;
+    copy.only = false;
     let (index, metadata) = ParserDB::process_create_index(copy, &builder)?;
     let case = builder.identifier_case();
     for (_, table_metadata, _) in

@@ -21,9 +21,6 @@ pub(super) fn adopt(
         return Ok(());
     };
     let table = ParserDB::stored_node(builder, stored)?;
-    if table.partition_by.is_some() {
-        return Err(Error::AdoptedIndexOnPartitionedTable);
-    }
     let schema = table_schema_qualifier(table);
     let index_name = &adoption.index_name;
     if constraint_names::index_name_held(builder, index_name, schema)
@@ -45,15 +42,21 @@ pub(super) fn adopt(
             )
         })
         .ok_or_else(|| Error::AdoptedIndexNotFound { index_name: index_name.value.clone() })?;
-    let index = builder.indices()[position].0.as_ref();
+    let (index, metadata) = &builder.indices()[position];
     if !stored.matches(index.table(), builder.identifier_case()) {
         return Err(Error::AdoptedIndexWrongTable {
             index_name: index_name.value.clone(),
             table_name: stored.name.clone(),
         });
     }
+    if !metadata.is_valid() {
+        return Err(Error::AdoptedIndexInvalid { index_name: index_name.value.clone() });
+    }
     let index = index.attribute();
     validate(index, index_name)?;
+    if table.partition_by.is_some() {
+        return Err(Error::AdoptedIndexOnPartitionedTable);
+    }
     let key = adoption.name.as_ref().unwrap_or(index_name);
     let identity = replica_identity::created_index_name(index)
         .map(|adopted| (adopted.into_owned(), stored_ident_name(key).into_owned()));

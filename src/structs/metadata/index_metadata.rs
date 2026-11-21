@@ -20,6 +20,9 @@ pub struct IndexMetadata<I: IndexLike> {
     /// The identity the index was given when it was created on a table,
     /// which orders it among the table's keys.
     key_identity: Option<KeyIdentity>,
+    /// Whether the index is valid, which an index created `ON ONLY` a
+    /// partitioned table holding a partition is not.
+    valid: bool,
 }
 
 impl<I: IndexLike> IndexMetadata<I> {
@@ -27,7 +30,19 @@ impl<I: IndexLike> IndexMetadata<I> {
     #[must_use]
     #[inline]
     pub fn new(expression: Expr) -> Self {
-        Self { expression, calls: ExpressionCalls::default(), key_identity: None }
+        Self { expression, calls: ExpressionCalls::default(), key_identity: None, valid: true }
+    }
+
+    /// Stores whether the index is valid.
+    #[must_use]
+    pub(crate) fn with_validity(mut self, valid: bool) -> Self {
+        self.valid = valid;
+        self
+    }
+
+    /// Whether the index is valid.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid
     }
 
     /// Stores the identity the index was given when it was created.
