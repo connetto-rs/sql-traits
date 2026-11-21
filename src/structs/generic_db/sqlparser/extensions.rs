@@ -169,10 +169,19 @@ fn drop_extension_functions(builder: &mut ParserDBBuilder, name: &Ident) -> Resu
             .any(|extension| case_idents_match(extension, name, case))
     };
     let held = builder.functions().iter().find_map(|(function, metadata)| {
-        belongs(metadata)
-            .then(|| builder.function_dependent(function, &[]))
-            .flatten()
-            .map(|dependent| super::function_dependents::referenced(builder, function, dependent))
+        belongs(metadata).then(|| builder.function_dependent(function, &[])).flatten().map(
+            |dependent| {
+                super::function_dependents::referenced(
+                    builder,
+                    function,
+                    metadata.kind() == crate::structs::FunctionKind::Procedure,
+                    Some(crate::errors::FunctionOwner::Extension {
+                        extension_name: builder.dialect().stored_name(name),
+                    }),
+                    dependent,
+                )
+            },
+        )
     });
     if let Some(error) = held {
         return Err(error);

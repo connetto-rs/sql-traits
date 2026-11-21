@@ -240,9 +240,9 @@ fn an_ordered_set_aggregate_counts_its_direct_arguments() {
         (
             "percentile_cont() WITHIN GROUP (ORDER BY 0.5, d)",
             "percentile_cont",
-            &["numeric", "float8"][..],
+            &["numeric", "double precision"][..],
         ),
-        ("rank(1, 2) WITHIN GROUP (ORDER BY a)", "rank", &["int4", "int4", "int4"][..]),
+        ("rank(1, 2) WITHIN GROUP (ORDER BY a)", "rank", &["integer", "integer", "integer"][..]),
     ] {
         match parse(&view(expression)) {
             Err(Error::UnresolvedCall { function_name, argument_types, reason }) => {

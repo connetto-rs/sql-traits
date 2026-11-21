@@ -261,8 +261,8 @@ impl<'node, 'db, DB: DatabaseLike> CallApplication<'node, 'db, DB> {
 
     /// The name looked up and why PostgreSQL refuses the call, for a call
     /// PostgreSQL refuses.
-    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, CallRefusal)> {
-        Some((self.name, self.refused?))
+    pub(crate) fn into_refusal(self) -> Option<(TargetName<'node>, CallRefusal, Vec<&'node Expr>)> {
+        Some((self.name, self.refused?, self.arguments))
     }
 }
 

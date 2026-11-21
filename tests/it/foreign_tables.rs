@@ -531,7 +531,7 @@ fn a_foreign_table_is_not_attached_below_a_unique_index() {
     assert!(
         matches!(
             &error,
-            Error::UniqueIndexOverForeignPartition { table_name, partition_name }
+            Error::UniqueIndexOverForeignPartition { table_name, partition_name, .. }
                 if table_name == "orders" && partition_name == "remote_orders"
         ),
         "{error:?}"
@@ -581,7 +581,7 @@ fn a_unique_index_does_not_reach_a_foreign_partition() {
         assert!(
             matches!(
                 &error,
-                Error::UniqueIndexOverForeignPartition { table_name: table, partition_name: partition }
+                Error::UniqueIndexOverForeignPartition { table_name: table, partition_name: partition, .. }
                     if table == table_name && partition == partition_name
             ),
             "{statement}: {error:?}"
@@ -1204,7 +1204,7 @@ fn a_foreign_partition_is_refused_where_postgresql_refuses_it() {
         assert!(
             matches!(
                 &error,
-                Error::UniqueIndexOverForeignPartition { table_name: refused, partition_name }
+                Error::UniqueIndexOverForeignPartition { table_name: refused, partition_name, .. }
                     if refused == table_name && partition_name == "f"
             ),
             "{sql}: {error:?}"

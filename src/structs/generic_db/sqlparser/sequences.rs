@@ -69,7 +69,8 @@ use crate::{
         identifier_resolution::{MAX_NAME_BYTES, clipped, identifiers_match, stored_identifier},
         object_name::{
             object_name_identifiers, qualifier_of, require_static_object_name,
-            resolve_sequence_on_search_path_in_iter, stored_sequence_key, target_name_of_idents,
+            resolve_sequence_on_search_path_in_iter, stored_sequence_key, stored_table_key,
+            target_name_of_idents,
         },
         walk::{walk_expressions, walk_expressions_mut},
     },
@@ -114,6 +115,7 @@ pub(super) fn create_sequence(
         Error::InvalidSequenceParameters {
             sequence_name: builder.dialect().stored_name(name_ident),
             reason,
+            identity: false,
         }
     })?;
     // PostgreSQL refuses a sequence a name of the type pool, `IF NOT EXISTS` or
@@ -511,12 +513,42 @@ fn refuse_dropping_identity_sequence(
         return Err(Error::SequenceRequiredByColumn {
             sequence_name: builder
                 .dialect()
-                .stored_spelling(sequence.sequence_name(), sequence.sequence_name_is_quoted()),
-            table_name: builder.dialect().stored_object_name_last(&table.name),
-            column_name: builder.dialect().stored_name(&column.attribute().name),
+                .stored_spelling(sequence.sequence_name(), sequence.sequence_name_is_quoted())
+                .into(),
+            sequence_schema: sequence_schema_for_error(builder, sequence).map(Into::into),
+            table_name: builder.dialect().stored_object_name_last(&table.name).into(),
+            table_schema: views::relation_schema_for_error(
+                builder,
+                &stored_table_key(builder.namespaces(), table, builder.identifier_case()),
+            )
+            .map(Into::into),
+            column_name: builder.dialect().stored_name(&column.attribute().name).into(),
         });
     }
     Ok(())
+}
+
+/// The schema PostgreSQL prints before the name of `sequence`, none when the
+/// search path reaches it by its bare name.
+///
+/// The sequence may already be gone from the builder, so its own schema
+/// reaches it wherever it stands on the path, and a schema before it holding
+/// another relation of that name hides it.
+fn sequence_schema_for_error(builder: &ParserDBBuilder, sequence: &Sequence) -> Option<String> {
+    let key = stored_sequence_key(builder.namespaces(), sequence, builder.identifier_case());
+    let name = Ident::with_quote('"', key.name.as_str());
+    let visible = builder
+        .namespaces()
+        .relation_search_path(|| builder.search_path())
+        .find_map(|(schema, quoted)| {
+            if identifiers_match(schema, quoted, &key.schema, true) {
+                Some(true)
+            } else {
+                relation_name_holder(builder, &name, Some((schema, quoted)), None).map(|_| false)
+            }
+        })
+        .unwrap_or(false);
+    (!visible).then_some(key.schema)
 }
 
 /// Joins a table name, a column name and a label the way PostgreSQL's
@@ -700,7 +732,11 @@ pub(super) fn create_column_sequences(
                 .collect::<Vec<_>>(),
         );
         let parameters = SequenceParameters::from_options(&options).map_err(|reason| {
-            Error::InvalidSequenceParameters { sequence_name: name.clone(), reason }
+            Error::InvalidSequenceParameters {
+                sequence_name: name.clone(),
+                reason,
+                identity: origin == SequenceOrigin::Identity,
+            }
         })?;
         let sequence = Arc::new(Sequence::new(
             (name, quoted),
@@ -809,6 +845,7 @@ pub(super) fn follow_identity_types(builder: &mut ParserDBBuilder) -> Result<(),
                 sequence_name: dialect
                     .stored_spelling(sequence.sequence_name(), sequence.sequence_name_is_quoted()),
                 reason,
+                identity: true,
             }
         })?;
     }
@@ -936,14 +973,16 @@ fn regclass_constant_mut(expr: &mut Expr) -> Option<&mut String> {
 
 /// Reads a `regclass` constant as PostgreSQL does, blanks trimmed and at most
 /// this database's name before the schema.
-fn regclass_name(builder: &ParserDBBuilder, text: &str) -> Option<ObjectName> {
-    let mut parser = Parser::new(&PostgreSqlDialect {}).try_with_sql(text).ok()?;
-    let mut name = parser.parse_object_name(false).ok()?;
+fn regclass_name(builder: &ParserDBBuilder, text: &str) -> Result<ObjectName, Vec<String>> {
+    let mut parser =
+        Parser::new(&PostgreSqlDialect {}).try_with_sql(text).map_err(|_| Vec::new())?;
+    let mut name = parser.parse_object_name(false).map_err(|_| Vec::new())?;
     if parser.peek_token().token != Token::EOF {
-        return None;
+        return Err(Vec::new());
     }
-    require_named_in_catalog(&mut name, ObjectKind::Sequence, builder.catalog_name()).ok()?;
-    Some(name)
+    require_named_in_catalog(&mut name, ObjectKind::Sequence, builder.catalog_name())
+        .map_err(|_| builder.dialect().stored_object_name_parts(&name))?;
+    Ok(name)
 }
 
 /// The text of a `regclass` constant bound to `sequence`.
@@ -1000,14 +1039,18 @@ pub(super) fn bind_default(
         let Some(text) = regclass_constant_mut(node) else {
             return ControlFlow::Continue(());
         };
-        let Some(name) = regclass_name(builder, text) else {
-            return ControlFlow::Break(Error::InvalidRelationNameForDefault {
-                relation_name: text.clone(),
-                table_name: builder
-                    .dialect()
-                    .stored_spelling(&table_name.name, table_name.name_quoted),
-                column_name: builder.dialect().stored_name(column_name),
-            });
+        let name = match regclass_name(builder, text) {
+            Ok(name) => name,
+            Err(name_parts) => {
+                return ControlFlow::Break(Error::InvalidRelationNameForDefault {
+                    relation_name: text.clone(),
+                    table_name: builder
+                        .dialect()
+                        .stored_spelling(&table_name.name, table_name.name_quoted),
+                    column_name: builder.dialect().stored_name(column_name),
+                    name_parts,
+                });
+            }
         };
         match resolve_sequence(builder, &name) {
             Ok(Some(sequence)) => *text = bound_regclass(sequence),
@@ -1172,6 +1215,7 @@ pub(super) fn settle_dropped_sequences(
                 sequence_name: builder
                     .dialect()
                     .stored_spelling(sequence.sequence_name(), sequence.sequence_name_is_quoted()),
+                sequence_schema: sequence_schema_for_error(&builder, sequence),
                 table_name: builder.dialect().stored_object_name_last(&table.name),
                 column_name: builder.dialect().stored_name(&column.attribute().name),
             });

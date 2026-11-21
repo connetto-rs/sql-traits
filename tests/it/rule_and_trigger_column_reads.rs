@@ -430,7 +430,7 @@ fn a_trigger_when_naming_the_column_refuses_the_drop() {
     assert!(
         matches!(
             &error,
-            Error::ColumnReferenced { table_name, column_name }
+            Error::ColumnReferenced { table_name, column_name, .. }
                 if table_name == "t" && column_name == "a"
         ),
         "got {error:?}"
@@ -472,7 +472,7 @@ fn a_rule_on_another_relation_refuses_the_drop_column() {
     assert!(
         matches!(
             &error,
-            Error::ColumnReferenced { table_name, column_name }
+            Error::ColumnReferenced { table_name, column_name, .. }
                 if table_name == "t" && column_name == "a"
         ),
         "got {error:?}"
@@ -512,7 +512,7 @@ fn a_rule_action_without_a_column_list_spells_the_target_columns() {
     assert!(
         matches!(
             &error,
-            Error::ColumnReferenced { table_name, column_name }
+            Error::ColumnReferenced { table_name, column_name, .. }
                 if table_name == "t" && column_name == "a"
         ),
         "got {error:?}"

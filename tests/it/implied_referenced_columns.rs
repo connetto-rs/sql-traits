@@ -92,7 +92,7 @@ fn dropping_a_referenced_column_needs_cascade() {
     let error = parse(&format!("{schema} ALTER TABLE host DROP COLUMN id;"))
         .expect_err("child's key depends on host.id");
     assert!(
-        matches!(&error, Error::ColumnReferenced { table_name, column_name }
+        matches!(&error, Error::ColumnReferenced { table_name, column_name, .. }
             if table_name == "host" && column_name == "id"),
         "got {error:?}"
     );

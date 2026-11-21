@@ -212,6 +212,7 @@ pub(super) fn refuse_foreign_partition_under_unique_index(
         return Err(Error::UniqueIndexOverForeignPartition {
             table_name: builder.dialect().stored_object_name_last(&root_node.name),
             partition_name: builder.dialect().stored_object_name_last(&partition.name),
+            creating_partition: true,
         });
     }
     Ok(())

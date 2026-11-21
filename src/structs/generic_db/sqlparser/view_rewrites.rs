@@ -1863,58 +1863,76 @@ pub(super) fn shape_of_block_statement(
     statement: &Statement,
     function_name: &str,
 ) -> Result<(), Error> {
-    let refused = match statement {
-        Statement::Query(query) => {
-            dml_body_has_refused_shape(query.body.as_ref())
-                || query.with.as_ref().is_some_and(|with| {
-                    with.cte_tables.iter().any(|cte| cte_has_refused_shape(&cte.query))
-                })
-        }
+    let written_token = match statement {
+        Statement::Query(query) => query_refused_token(query).map(str::to_string),
         Statement::Return(_) => {
-            part_of(statement).is_some_and(|query| dml_ref(&query.body).is_some())
+            part_of(statement).and_then(|query| dml_ref(&query.body)).map(|dml| {
+                match dml {
+                    DmlRef::Insert(_) | DmlRef::Merge(_) => "INTO".to_string(),
+                    DmlRef::Delete(_) => "FROM".to_string(),
+                    DmlRef::Update(update) => {
+                        match &update.table.relation {
+                            TableFactor::Table { name, .. } => {
+                                name.0.first().map(ToString::to_string).unwrap_or_default()
+                            }
+                            _ => "(".to_string(),
+                        }
+                    }
+                }
+            })
         }
-        _ => statement_dml(statement).is_some_and(|dml| dml.has_refused_shape()),
+        _ => statement_dml(statement).and_then(|dml| dml.refused_token()).map(str::to_string),
     };
-    if refused {
-        return Err(Error::FunctionBodyStatementUnsupported {
+    if let Some(written_token) = written_token {
+        return Err(Error::FunctionBodySyntaxUnsupported {
             statement: statement.to_string(),
             function_name: function_name.to_string(),
-            command_tag: None,
+            written_token,
         });
     }
     Ok(())
 }
 
-/// Whether a `DELETE` names a join on its target.
-fn dml_target_has_join(delete: &Delete) -> bool {
-    delete_from_tables(&delete.from).iter().any(|table| !table.joins.is_empty())
+/// The first token PostgreSQL refuses in a target join.
+fn join_token(join: &sqlparser::ast::Join) -> &'static str {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    match &join.join_operator {
+        JoinOperator::Join(JoinConstraint::Natural)
+        | JoinOperator::Inner(JoinConstraint::Natural)
+        | JoinOperator::Left(JoinConstraint::Natural)
+        | JoinOperator::LeftOuter(JoinConstraint::Natural)
+        | JoinOperator::Right(JoinConstraint::Natural)
+        | JoinOperator::RightOuter(JoinConstraint::Natural)
+        | JoinOperator::FullOuter(JoinConstraint::Natural) => "NATURAL",
+        JoinOperator::Join(_) => "JOIN",
+        JoinOperator::Inner(_) | JoinOperator::InnerArrayJoin => "INNER",
+        JoinOperator::Left(_)
+        | JoinOperator::LeftOuter(_)
+        | JoinOperator::LeftSemi(_)
+        | JoinOperator::LeftAnti(_)
+        | JoinOperator::LeftArrayJoin => "LEFT",
+        JoinOperator::Right(_)
+        | JoinOperator::RightOuter(_)
+        | JoinOperator::RightSemi(_)
+        | JoinOperator::RightAnti(_) => "RIGHT",
+        JoinOperator::FullOuter(_) => "FULL",
+        JoinOperator::CrossJoin(_) | JoinOperator::CrossApply => "CROSS",
+        JoinOperator::Semi(_) => "SEMI",
+        JoinOperator::Anti(_) => "ANTI",
+        JoinOperator::OuterApply => "OUTER",
+        JoinOperator::AsOf { .. } => "ASOF",
+        JoinOperator::StraightJoin(_) => "STRAIGHT_JOIN",
+        JoinOperator::ArrayJoin => "ARRAY",
+    }
 }
 
-/// Whether a `MERGE` writes a clause shape the body's kind cannot hold,
-/// which is a wildcard update or an `OUTPUT` clause.
-fn merge_has_refused_shape(merge: &Merge) -> bool {
-    matches!(merge.output.as_ref(), Some(OutputClause::Output { .. }))
-        || merge.clauses.iter().any(|clause| {
-            matches!(
-                &clause.action,
-                MergeAction::Update(update) if matches!(update.kind, MergeUpdateKind::Wildcard)
-            )
-        })
-}
-
-/// Whether a `WITH` item's query holds a clause shape the body's own kind
-/// refuses, the items the item's own `WITH` clause writes included.
-fn cte_has_refused_shape(query: &Query) -> bool {
-    dml_body_has_refused_shape(query.body.as_ref())
-        || query
-            .with
-            .as_ref()
-            .is_some_and(|with| with.cte_tables.iter().any(|cte| cte_has_refused_shape(&cte.query)))
-}
-
-/// Whether a query body holds a clause shape the body's own kind refuses.
-fn dml_body_has_refused_shape(body: &SetExpr) -> bool {
-    dml_ref(body).is_some_and(|dml| dml.has_refused_shape())
+/// The first unsupported token in a query's common tables or body.
+fn query_refused_token(query: &Query) -> Option<&'static str> {
+    query
+        .with
+        .as_ref()
+        .and_then(|with| with.cte_tables.iter().find_map(|cte| query_refused_token(&cte.query)))
+        .or_else(|| dml_ref(&query.body).and_then(|dml| dml.refused_token()))
 }
 
 /// A relation a bare reference can reach in one scope, by the name it
@@ -2115,13 +2133,28 @@ impl<'a> DmlRef<'a> {
         factors
     }
 
-    /// Whether the statement's clause shape is one the body's kind refuses.
-    fn has_refused_shape(&self) -> bool {
+    /// The first token PostgreSQL refuses in the statement's clause shape.
+    fn refused_token(&self) -> Option<&'static str> {
         match self {
-            DmlRef::Insert(_) => false,
-            DmlRef::Update(update) => !update.table.joins.is_empty(),
-            DmlRef::Delete(delete) => dml_target_has_join(delete),
-            DmlRef::Merge(merge) => merge_has_refused_shape(merge),
+            DmlRef::Insert(_) => None,
+            DmlRef::Update(update) => update.table.joins.first().map(join_token),
+            DmlRef::Delete(delete) => {
+                delete_from_tables(&delete.from)
+                    .iter()
+                    .find_map(|table| table.joins.first().map(join_token))
+            }
+            DmlRef::Merge(merge) => {
+                if merge.clauses.iter().any(|clause| matches!(
+                    &clause.action,
+                    MergeAction::Update(update) if matches!(update.kind, MergeUpdateKind::Wildcard)
+                )) {
+                    Some("*")
+                } else if matches!(merge.output.as_ref(), Some(OutputClause::Output { .. })) {
+                    Some("OUTPUT")
+                } else {
+                    None
+                }
+            }
         }
     }
 
