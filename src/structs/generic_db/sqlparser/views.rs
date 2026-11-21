@@ -165,7 +165,7 @@ pub(super) fn create_view(
     // A view takes a shell of its name over, filling the type name.
     user_defined_types::take_over_shell(&mut builder, name_ident, schema);
 
-    let holder = relation_name_holder(&builder, name_ident, schema)
+    let holder = relation_name_holder(&builder, name_ident, schema, None)
         .or_else(|| domains::domain_or_user_type_holder(&builder, name_ident, schema));
 
     if let Some(conflicting_kind) = holder {

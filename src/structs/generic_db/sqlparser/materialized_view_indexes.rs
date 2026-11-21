@@ -91,7 +91,7 @@ pub(super) fn create(
 
     if let Some(ObjectNamePart::Identifier(index_name)) =
         create_index.name.as_ref().and_then(|name| name.0.last())
-        && let Some(conflicting_kind) = relation_name_holder(&builder, index_name, schema)
+        && let Some(conflicting_kind) = relation_name_holder(&builder, index_name, schema, None)
     {
         if create_index.if_not_exists {
             return Ok(builder);

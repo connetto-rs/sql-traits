@@ -1322,9 +1322,6 @@ pub(super) fn apply_parents(
 
     for (kind, parent_name) in &parents {
         let parent = resolve_parent(builder, parent_name, &child_name)?;
-        if *kind == ParentKind::PartitionOf {
-            super::refuse_multiple_primary_keys(builder, create_table, Some(parent))?;
-        }
 
         for column in &parent.columns {
             // A second parent declaring the same column merges into the one
@@ -1497,6 +1494,31 @@ fn parent_owning(
         .map(|parent| parent.name.to_string())
 }
 
+/// Resolves a parent's written name through the current search path.
+pub(super) fn resolve_unbound_parent<'builder>(
+    builder: &'builder ParserDBBuilder,
+    parent_name: &ObjectName,
+    child_name: &str,
+) -> Result<&'builder CreateTable, Error> {
+    builder.resolve_table_object_name(parent_name)?.ok_or_else(|| {
+        match builder.relation_reached(parent_name) {
+            Some((object_kind, _)) => {
+                Error::InheritsFromNonTable {
+                    table_name: child_name.to_string(),
+                    parent_name: parent_name.to_string(),
+                    object_kind,
+                }
+            }
+            None => {
+                Error::ParentTableNotFound {
+                    parent_table: parent_name.to_string(),
+                    child_table: child_name.to_string(),
+                }
+            }
+        }
+    })
+}
+
 /// Binds every parent a table being created names to the table it reaches
 /// through the session's path, refusing an absent one, one PostgreSQL will
 /// not link across temporary and permanent storage, a `PARTITION OF` parent
@@ -1521,23 +1543,7 @@ fn bind_parents(
             create_table.partition_of.iter_mut().map(|name| (ParentKind::PartitionOf, name)),
         );
     for (kind, parent_name) in parents {
-        let Some(parent) = builder.resolve_table_object_name(parent_name)? else {
-            return Err(match builder.relation_reached(parent_name) {
-                Some((object_kind, _)) => {
-                    Error::InheritsFromNonTable {
-                        table_name: child_name.to_string(),
-                        parent_name: parent_name.to_string(),
-                        object_kind,
-                    }
-                }
-                None => {
-                    Error::ParentTableNotFound {
-                        parent_table: parent_name.to_string(),
-                        child_table: child_name.to_string(),
-                    }
-                }
-            });
-        };
+        let parent = resolve_unbound_parent(builder, parent_name, child_name)?;
         if parent.is_temporary() && !child_temporary {
             return Err(Error::PermanentRelationInheritsTemporary {
                 table_name: child_name.to_string(),

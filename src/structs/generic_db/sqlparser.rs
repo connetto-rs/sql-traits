@@ -92,6 +92,7 @@ mod comment_on;
 mod constraint_names;
 mod constraint_using_index;
 mod constraint_validity;
+mod create_table_transform;
 mod declared_types;
 mod default_privileges;
 mod detach_partition;
@@ -315,10 +316,9 @@ impl UndeclaredRoleAlteration {
 }
 
 enum TableOrigin {
-    /// A `CREATE TABLE` statement, with the comments written above it, the
-    /// query output each column without a declared type was created from and
-    /// the declared type text SQLite reports for each column it knows.
-    Declaration(TableDocumentation, Vec<(Ident, ColumnCreation)>, ColumnTexts),
+    /// A `CREATE TABLE` statement, with what it declares about its columns
+    /// and its local constraint requirements.
+    Declaration(TableDeclaration),
     /// A rebuild of a stored table, keeping its identity and the bindings
     /// and operator selections its expressions held.
     Replacement(RelationIdentity, Box<CarriedCalls>),
@@ -328,17 +328,29 @@ impl TableOrigin {
     /// Gives `metadata` what the statement declaring the column `name` wrote
     /// for it.
     fn declared_column(&mut self, name: &Ident, metadata: ColumnMetadata) -> ColumnMetadata {
-        let TableOrigin::Declaration(documentation, creations, declared_types) = self else {
+        let TableOrigin::Declaration(declaration) = self else {
             return metadata;
         };
         let metadata = metadata
-            .with_documentation(documentation.columns.take(name))
-            .with_declared_type_text(declared_types.take(name));
-        match creations.iter().position(|(created, _)| created == name) {
-            Some(position) => metadata.with_creation(creations.swap_remove(position).1),
+            .with_documentation(declaration.documentation.columns.take(name))
+            .with_declared_type_text(declaration.declared_types.take(name));
+        match declaration.creations.iter().position(|(created, _)| created == name) {
+            Some(position) => metadata.with_creation(declaration.creations.swap_remove(position).1),
             None => metadata,
         }
     }
+}
+
+/// What a `CREATE TABLE` statement wrote: the comments above it, the query
+/// output each column without a declared type was created from, the declared
+/// type text SQLite reports for each column it knows, and the local
+/// requirements retained through inheritance merging.
+struct TableDeclaration {
+    documentation: TableDocumentation,
+    creations: Vec<(Ident, ColumnCreation)>,
+    declared_types: ColumnTexts,
+    primary_key_declared: bool,
+    not_null: Vec<NotNullRequirement<'static>>,
 }
 
 /// The continuation state the parser carries inside every built database so
@@ -1995,7 +2007,7 @@ impl ParserDBBuilder {
     ) -> Option<(ObjectKind, (&'name str, bool))> {
         let ident = object_name_last_identifier(name)?;
         let holder = |schema: (&'name str, bool)| {
-            relation_name_holder(self, ident, Some(schema)).map(|kind| (kind, schema))
+            relation_name_holder(self, ident, Some(schema), None).map(|kind| (kind, schema))
         };
         match qualifier_of(name) {
             Qualifier::Named(schema, quoted) => holder((schema, quoted)),
@@ -4402,31 +4414,61 @@ fn refuse_no_inherit_constraints_on_partitioned(
     Ok(())
 }
 
-/// Refuses the spellings of a table's own `NOT NULL` requirements that
-/// PostgreSQL refuses while creating it, measured on 18.
-///
-/// The two spellings of one requirement, written on the column and in the
-/// constraint list, are one constraint carrying one name and one
-/// inheritability, so two different names for them are refused, as is a
-/// `NO INHERIT` one beside any other spelling of the same requirement. A
-/// constraint names its column under `case`.
+/// Refuses an unlogged partitioned relation.
+fn refuse_unlogged_partitioned(table: &CreateTable) -> Result<(), crate::errors::Error> {
+    if table.unlogged && table.partition_by.is_some() {
+        return Err(crate::errors::Error::UnloggedPartitionedTable {
+            table_name: table.table_name().to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Identifies the relation namespace occupied by a table.
+fn relation_kind(foreign: bool) -> ObjectKind {
+    if foreign { ObjectKind::ForeignTable } else { ObjectKind::Table }
+}
+
+/// Refuses conflicting names and inheritance settings for local nullability
+/// declarations.
 fn refuse_not_null_conflicts(
     create_table: &CreateTable,
     case: IdentifierCase,
 ) -> Result<(), crate::errors::Error> {
     for column in &create_table.columns {
-        let mut named: Vec<String> = Vec::new();
-        let mut spelled_no_inherit = false;
-        let mut spellings = 0usize;
+        NotNullRequirement::new(column, &create_table.constraints, case)
+            .validate(create_table.table_name())?;
+    }
+    Ok(())
+}
+
+/// The local declarations of one column's nullability.
+struct NotNullRequirement<'column> {
+    column_name: Cow<'column, str>,
+    names: Vec<String>,
+    no_inherit: bool,
+    spellings: usize,
+}
+
+impl<'column> NotNullRequirement<'column> {
+    /// Reads the declarations before inherited requirements are merged.
+    fn new(
+        column: &'column ColumnDef,
+        constraints: &[TableConstraint],
+        case: IdentifierCase,
+    ) -> Self {
+        let mut names = Vec::new();
+        let mut no_inherit = false;
+        let mut spellings = 0;
         for option in &column.options {
             if matches!(&option.option, ColumnOption::NotNull) {
                 spellings += 1;
                 if let Some(name) = &option.name {
-                    named.push(stored_ident_name(name).into_owned());
+                    names.push(stored_ident_name(name).into_owned());
                 }
             }
         }
-        for constraint in &create_table.constraints {
+        for constraint in constraints {
             let TableConstraint::NotNull(not_null) = constraint else {
                 continue;
             };
@@ -4434,27 +4476,43 @@ fn refuse_not_null_conflicts(
                 continue;
             }
             spellings += 1;
-            spelled_no_inherit |= not_null.no_inherit;
+            no_inherit |= not_null.no_inherit;
             if let Some(name) = &not_null.name {
-                named.push(stored_ident_name(name).into_owned());
+                names.push(stored_ident_name(name).into_owned());
             }
         }
-        if spelled_no_inherit && spellings > 1 {
+        Self { column_name: Cow::Borrowed(&column.name.value), names, no_inherit, spellings }
+    }
+
+    /// Retains local requirements while the column's inherited definition is
+    /// merged.
+    fn into_owned(self) -> NotNullRequirement<'static> {
+        NotNullRequirement {
+            column_name: Cow::Owned(self.column_name.into_owned()),
+            names: self.names,
+            no_inherit: self.no_inherit,
+            spellings: self.spellings,
+        }
+    }
+
+    /// Refuses conflicting inheritance settings and names.
+    fn validate(&self, table_name: &str) -> Result<(), crate::errors::Error> {
+        if self.no_inherit && self.spellings > 1 {
             return Err(crate::errors::Error::ConflictingNoInheritNotNull {
-                table_name: create_table.table_name().to_string(),
-                column_name: column.name.value.clone(),
+                table_name: table_name.to_string(),
+                column_name: self.column_name.to_string(),
             });
         }
-        if let Some((first, second)) = first_repeated_name(&named) {
+        if let Some((first, second)) = first_repeated_name(&self.names) {
             return Err(crate::errors::Error::ConflictingNotNullConstraintNames {
-                table_name: create_table.table_name().to_string(),
-                column_name: column.name.value.clone(),
+                table_name: table_name.to_string(),
+                column_name: self.column_name.to_string(),
                 first_name: first,
                 second_name: second,
             });
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// The first two different written names of one column's `NOT NULL`, in the
@@ -4899,7 +4957,7 @@ fn skip_existing_index(
     let Some(index_name) = name.and_then(object_name_last_identifier) else {
         return Ok(false);
     };
-    let Some(conflicting_kind) = relation_name_holder(builder, index_name, schema) else {
+    let Some(conflicting_kind) = relation_name_holder(builder, index_name, schema, None) else {
         return Ok(false);
     };
     if if_not_exists {
@@ -4974,7 +5032,7 @@ fn index_name_holder(
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
     standalone_index_name_holder(builder, name, schema)
-        .or_else(|| constraint_index_name_holder(builder, name, schema))
+        .or_else(|| constraint_index_name_holder(builder, name, schema, None))
 }
 
 /// Finds a named index created independently of a table constraint.
@@ -5009,13 +5067,17 @@ fn constraint_index_name_holder(
     builder: &ParserDBBuilder,
     name: &Ident,
     schema: SchemaQualifier<'_>,
+    excluded: Option<&CreateTable>,
 ) -> Option<ObjectKind> {
     let namespaces = builder.namespaces();
     let case = builder.identifier_case();
     builder
         .unique_indices()
         .iter()
-        .any(|(index, _)| index_holds_name(index, name, schema, namespaces, case))
+        .any(|(index, _)| {
+            !excluded.is_some_and(|table| core::ptr::eq(index.table(), table))
+                && index_holds_name(index, name, schema, namespaces, case)
+        })
         .then_some(ObjectKind::UniqueIndex)
 }
 
@@ -5101,9 +5163,10 @@ fn relation_name_holder(
     builder: &ParserDBBuilder,
     name: &Ident,
     schema: SchemaQualifier<'_>,
+    excluded: Option<&CreateTable>,
 ) -> Option<ObjectKind> {
     non_constraint_relation_name_holder(builder, name, schema)
-        .or_else(|| constraint_index_name_holder(builder, name, schema))
+        .or_else(|| constraint_index_name_holder(builder, name, schema, excluded))
         .or_else(|| {
             constraint_names::index_name_held(builder, name, schema)
                 .then_some(ObjectKind::UniqueIndex)
@@ -5144,6 +5207,17 @@ fn non_constraint_relation_name_holder(
         .or_else(|| user_defined_types::composite_name_holder(builder, name, schema))
 }
 
+/// The relation names checked at one creation phase.
+#[derive(Clone, Copy)]
+enum RelationNamePhase {
+    /// The table and its indexes together.
+    All,
+    /// The table before expression binding.
+    Table,
+    /// Constraint-backed indexes after operator-class selection.
+    Indexes,
+}
+
 /// Checks that nothing in the schema of a table node already holds a name the
 /// node introduces, neither the table name itself nor a constraint-backed index
 /// name, and that the node does not repeat one of its own.
@@ -5154,15 +5228,37 @@ fn validate_relation_names(
     builder: &ParserDBBuilder,
     create_table: &CreateTable,
     table_kind: ObjectKind,
+    phase: RelationNamePhase,
 ) -> Result<(), crate::errors::Error> {
     let schema = table_schema_qualifier(create_table);
-    let introduced: Vec<(ObjectKind, &Ident)> = relation_names_of(create_table)
-        .into_iter()
-        .map(|(kind, name)| (if kind == ObjectKind::Table { table_kind } else { kind }, name))
-        .collect();
+    let table_name = object_name_last_identifier(&create_table.name)
+        .ok_or(crate::errors::Error::UnnamedObject { object_kind: table_kind })?;
+    let table_names = [(table_kind, table_name)];
+    let introduced: Cow<'_, [(ObjectKind, &Ident)]> = match phase {
+        RelationNamePhase::Table => Cow::Borrowed(&table_names),
+        RelationNamePhase::All | RelationNamePhase::Indexes => {
+            Cow::Owned(
+                relation_names_of(create_table)
+                    .into_iter()
+                    .map(|(kind, name)| {
+                        (if kind == ObjectKind::Table { table_kind } else { kind }, name)
+                    })
+                    .collect(),
+            )
+        }
+    };
 
     for (position, (object_kind, name)) in introduced.iter().enumerate() {
-        let against_stores = match relation_name_holder(builder, name, schema) {
+        if matches!(phase, RelationNamePhase::Indexes) && *object_kind == table_kind {
+            continue;
+        }
+        let holder = relation_name_holder(
+            builder,
+            name,
+            schema,
+            matches!(phase, RelationNamePhase::Indexes).then_some(create_table),
+        );
+        let against_stores = match holder {
             Some(holder) if holder == *object_kind && *object_kind == table_kind => None,
             holder => holder,
         }
@@ -7218,6 +7314,7 @@ impl ParserDB {
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
         carried: &mut CarriedCalls,
+        transformed: bool,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let options = &column.attribute().options;
         for (position, option) in options.iter().enumerate() {
@@ -7232,8 +7329,8 @@ impl ParserDB {
                 Some(ColumnOption::OnConflict(keyword)) => Some(*keyword),
                 _ => None,
             };
-            if let ColumnOption::ForeignKey(foreign_key) = &option.option {
-                Self::validate_foreign_key_deferral(&builder, create_table, foreign_key)?;
+            if !transformed && let ColumnOption::ForeignKey(foreign_key) = &option.option {
+                Self::validate_foreign_key_deferral(&builder, &create_table.name, foreign_key)?;
                 continue;
             }
             match option.option.clone() {
@@ -7304,13 +7401,14 @@ impl ParserDB {
                 // PostgreSQL reads a generation expression over the table's
                 // columns, as it reads a check constraint.
                 ColumnOption::Generated { generation_expr: Some(expression), .. }
-                    if matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
+                    if !transformed
+                        && matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
                 {
-                    columns_in_expression::<Arc<TableAttribute<CreateTable, ColumnDef>>>(
+                    columns_in_expression::validate_columns_in_expression(
                         &expression,
                         builder.catalog_name(),
                         &target_name_of_object_name(&create_table.name),
-                        table_metadata.column_arc_slice(),
+                        create_table.columns.iter().map(|column| &column.name),
                         builder.identifier_case(),
                     )?;
                 }
@@ -7372,7 +7470,7 @@ impl ParserDB {
     /// Validates the deferral options without resolving the foreign-key target.
     fn validate_foreign_key_deferral(
         builder: &ParserDBBuilder,
-        create_table: &CreateTable,
+        table_name: &ObjectName,
         foreign_key: &ForeignKeyConstraint,
     ) -> Result<(), crate::errors::Error> {
         if let Some(characteristics) = foreign_key.characteristics
@@ -7381,7 +7479,7 @@ impl ParserDB {
             && !builder.dialect().is_sqlite()
         {
             return Err(crate::errors::Error::InitiallyDeferredNotDeferrable {
-                table_name: create_table.name.to_string(),
+                table_name: table_name.to_string(),
             });
         }
         Ok(())
@@ -7633,10 +7731,13 @@ impl ParserDB {
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
         carried: &mut CarriedCalls,
+        transformed: bool,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let case = builder.identifier_case();
         for constraint in constraints {
-            Self::validate_key_columns(constraint, create_table, table_metadata, &builder)?;
+            if !transformed {
+                Self::validate_key_columns(constraint, create_table, &builder, false)?;
+            }
             match constraint {
                 TableConstraint::Unique(uc) => {
                     builder = Self::add_unique_table_constraint(
@@ -7647,8 +7748,8 @@ impl ParserDB {
                         carried,
                     )?;
                 }
-                TableConstraint::ForeignKey(foreign_key) => {
-                    Self::validate_foreign_key_deferral(&builder, create_table, foreign_key)?;
+                TableConstraint::ForeignKey(foreign_key) if !transformed => {
+                    Self::validate_foreign_key_deferral(&builder, &create_table.name, foreign_key)?;
                 }
                 TableConstraint::Check(check) => {
                     builder = Self::add_check_constraint(
@@ -7779,21 +7880,13 @@ impl ParserDB {
         })
     }
 
-    /// Checks the columns a key constraint names.
-    ///
-    /// Every plain key column must be declared by the table the constraint is
-    /// attached to and, where the dialect refuses it, repeat no earlier entry,
-    /// each entry checked in turn as `CREATE TABLE` does, and every `INCLUDE`
-    /// column must be declared too. An inline index is checked for a repeat
-    /// alone, where the dialect refuses one.
-    ///
-    /// Entries that are expressions rather than plain columns name no single
-    /// column, so they are left alone.
+    /// Resolves key and included columns, optionally through parents, and
+    /// refuses repeated keys.
     fn validate_key_columns(
         constraint: &TableConstraint,
         create_table: &CreateTable,
-        table_metadata: &TableMetadata<CreateTable>,
         builder: &ParserDBBuilder,
+        inherited: bool,
     ) -> Result<(), crate::errors::Error> {
         let case = builder.identifier_case();
         let (columns, include, kind) = match constraint {
@@ -7812,25 +7905,17 @@ impl ParserDB {
             _ => return Ok(()),
         };
         let refuses_repeats = refuses_repeated_key_columns(*builder.dialect());
+        let resolve_inherited =
+            |name: &Ident| create_table_transform::key_column(builder, create_table, name);
+        let resolve_local =
+            |name: &Ident| validate_declared_column(name, create_table, case).map_err(Into::into);
+        let resolve: &dyn Fn(&Ident) -> Result<(), crate::errors::Error> =
+            if inherited { &resolve_inherited } else { &resolve_local };
         for (position, column) in columns.iter().enumerate() {
             let Expr::Identifier(column_name) = &column.column.expr else {
                 continue;
             };
-            let declared = table_metadata.column_arcs().any(|declared| {
-                case.identifiers_match(
-                    declared.column_name(),
-                    declared.column_name_is_quoted(),
-                    column_name.value.as_str(),
-                    column_name.quote_style.is_some(),
-                )
-            });
-            if !declared {
-                return Err(LookupError::ColumnNotFound {
-                    table_name: create_table.name.to_string(),
-                    column_name: column_name.value.clone(),
-                }
-                .into());
-            }
+            resolve(column_name)?;
             if refuses_repeats && let Some(name) = repeated_key_column(columns, position, case) {
                 return Err(crate::errors::Error::RepeatedKeyColumn {
                     table_name: create_table.name.to_string(),
@@ -7839,7 +7924,47 @@ impl ParserDB {
                 });
             }
         }
-        Ok(validate_include_columns(include, create_table, case)?)
+        include.iter().try_for_each(resolve)
+    }
+
+    /// Validates the table schema and claims its shell type.
+    fn take_over_table_shell(
+        builder: &mut ParserDBBuilder,
+        create_table: &CreateTable,
+    ) -> Result<(), crate::errors::Error> {
+        validate_table_schema(builder, create_table)?;
+        let name_ident = object_name_last_identifier(&create_table.name)
+            .ok_or(crate::errors::Error::UnnamedObject { object_kind: ObjectKind::Table })?;
+        user_defined_types::take_over_shell(
+            builder,
+            name_ident,
+            table_schema_qualifier(create_table),
+        );
+        Ok(())
+    }
+
+    /// Validates the structure that precedes column metadata ingestion.
+    fn validate_table_structure(
+        builder: &ParserDBBuilder,
+        create_table: &CreateTable,
+        table_metadata: &TableMetadata<CreateTable>,
+        transformed: bool,
+    ) -> Result<(), crate::errors::Error> {
+        if !transformed {
+            validate_distinct_columns(create_table, builder.identifier_case())?;
+            refuse_multiple_primary_keys(builder, create_table, None)?;
+            let table_kind = relation_kind(table_metadata.foreign_source().is_some());
+            validate_relation_names(builder, create_table, table_kind, RelationNamePhase::All)?;
+        }
+        if table_metadata.foreign_source().is_some() {
+            refuse_key_constraints_on_foreign_table(create_table)?;
+        }
+        refuse_unholdable_foreign_options(create_table, table_metadata.foreign_source())?;
+        if !transformed {
+            partition_keys::validate_partitioned_table(create_table, builder.identifier_case())?;
+            index_opclasses::table(create_table, builder)?;
+        }
+        Ok(())
     }
 
     /// Ingests a table with preserved identities and documentation.
@@ -7852,37 +7977,18 @@ impl ParserDB {
         preserved: &[PreservedColumnMetadata],
         mut origin: TableOrigin,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        if matches!(origin, TableOrigin::Declaration(..)) {
-            validate_table_schema(&builder, &create_table)?;
-            // A table takes a shell of its name over, filling the type name.
-            let name_ident = object_name_last_identifier(&create_table.name)
-                .ok_or(crate::errors::Error::UnnamedObject { object_kind: ObjectKind::Table })?;
-            user_defined_types::take_over_shell(
-                &mut builder,
-                name_ident,
-                table_schema_qualifier(&create_table),
-            );
+        let transformed = matches!(origin, TableOrigin::Declaration(..))
+            && matches!(builder.dialect(), SqlparserDialect::PostgreSql);
+        if !transformed && matches!(origin, TableOrigin::Declaration(..)) {
+            Self::take_over_table_shell(&mut builder, &create_table)?;
         }
-        validate_distinct_columns(&create_table, builder.identifier_case())?;
-        refuse_multiple_primary_keys(&builder, &create_table, None)?;
-        let table_kind = if table_metadata.foreign_source().is_some() {
-            ObjectKind::ForeignTable
-        } else {
-            ObjectKind::Table
-        };
-        validate_relation_names(&builder, &create_table, table_kind)?;
-        if table_metadata.foreign_source().is_some() {
-            refuse_key_constraints_on_foreign_table(&create_table)?;
-        }
-        refuse_unholdable_foreign_options(&create_table, table_metadata.foreign_source())?;
-        partition_keys::validate_partitioned_table(&create_table, builder.identifier_case())?;
-        index_opclasses::table(&create_table, &builder)?;
+        Self::validate_table_structure(&builder, &create_table, &table_metadata, transformed)?;
 
         let (identity, documentation, mut carried) = match &mut origin {
-            TableOrigin::Declaration(documentation, ..) => {
+            TableOrigin::Declaration(declaration) => {
                 (
                     builder.draw_relation_identity(),
-                    documentation.table.take(),
+                    declaration.documentation.table.take(),
                     CarriedCalls::default(),
                 )
             }
@@ -7907,6 +8013,7 @@ impl ParserDB {
                 &mut table_metadata,
                 builder,
                 &mut carried,
+                transformed,
             )?;
             carried.operators.build_column(None);
             let mut calls = builder.calls_carried(column.attribute(), &mut carried);
@@ -7932,11 +8039,16 @@ impl ParserDB {
             &mut table_metadata,
             builder,
             &mut carried,
+            transformed,
         )?;
-        if !matches!(origin, TableOrigin::Declaration(..))
-            || (!builder.dialect().is_sqlite()
-                && create_table.query.is_none()
-                && table_metadata.virtual_source().is_none())
+        if transformed && let TableOrigin::Declaration(declaration) = &origin {
+            create_table_transform::finish(&builder, &create_table, declaration)?;
+        }
+        if !transformed
+            && (!matches!(origin, TableOrigin::Declaration(..))
+                || (!builder.dialect().is_sqlite()
+                    && create_table.query.is_none()
+                    && table_metadata.virtual_source().is_none()))
         {
             builder.ensure_table_lookup_invariants(&create_table)?;
         }
@@ -11376,7 +11488,7 @@ impl ParserDB {
                     // came out of, so the new name has to be free there.
                     if let Some(ObjectNamePart::Identifier(new_ident)) = new_name.0.last()
                         && let Some(conflicting_kind) =
-                            relation_name_holder(&builder, new_ident, schema)
+                            relation_name_holder(&builder, new_ident, schema, None)
                     {
                         return Err(crate::errors::Error::RelationNameAlreadyTaken {
                             object_kind: ObjectKind::Index,
@@ -12525,6 +12637,7 @@ impl ParserDB {
                             &builder,
                             table_name,
                             table_schema_qualifier(&create_table),
+                            None,
                         )
                         .is_some()
                     {
@@ -12537,7 +12650,12 @@ impl ParserDB {
                     // arguments.
                     let declaration = match &virtual_source {
                         Some(source) => {
-                            validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
+                            validate_relation_names(
+                                &builder,
+                                &create_table,
+                                ObjectKind::Table,
+                                RelationNamePhase::All,
+                            )?;
                             builder.ensure_table_lookup_invariants(&create_table)?;
                             let mut declaration = virtual_tables::declare_columns(
                                 &builder,
@@ -12558,26 +12676,34 @@ impl ParserDB {
                         Arc::make_mut(&mut active_postgres_catalog)
                             .rename_type_identity(&previous, current);
                     }
-                    for column in &mut create_table.columns {
-                        domains::bind_type(&builder, &mut column.data_type, &type_arrays)?;
-                    }
-                    stored_expressions::refuse_in_table(&builder, &create_table)?;
-                    for constraint in &create_table.constraints {
-                        index_access_methods::refuse_in_constraint(&builder, constraint)?;
-                    }
-
-                    if create_table.unlogged && create_table.partition_by.is_some() {
-                        return Err(crate::errors::Error::UnloggedPartitionedTable {
-                            table_name: create_table.table_name().to_string(),
-                        });
-                    }
+                    let mut transformed_columns = if matches!(dialect, SqlparserDialect::PostgreSql)
+                    {
+                        create_table_transform::columns(
+                            &builder,
+                            &mut create_table,
+                            &collation_metadata,
+                            &active_postgres_catalog,
+                            &type_arrays,
+                        )?
+                    } else {
+                        for column in &mut create_table.columns {
+                            domains::bind_type(&builder, &mut column.data_type, &type_arrays)?;
+                        }
+                        refuse_unlogged_partitioned(&create_table)?;
+                        Vec::new()
+                    };
 
                     // PostgreSQL reads the query of a `CREATE TABLE … AS`
                     // first, then refuses a taken name, then fits the column
                     // list to the query's outputs and refuses a repeated one.
                     let query_columns = table_as::query_columns(&builder, &create_table)?;
                     if create_table.query.is_some() {
-                        validate_relation_names(&builder, &create_table, ObjectKind::Table)?;
+                        validate_relation_names(
+                            &builder,
+                            &create_table,
+                            ObjectKind::Table,
+                            RelationNamePhase::All,
+                        )?;
                         if !dialect.is_sqlite() && virtual_source.is_none() {
                             builder.ensure_table_lookup_invariants(&create_table)?;
                         }
@@ -12591,6 +12717,31 @@ impl ParserDB {
                     let creator = Creator::session(&session_roles, &default_privileges);
                     let column_sequences =
                         sequences::plan_column_sequences(&builder, &stored, &create_table.columns);
+                    let (primary_key_declared, written_defaults) =
+                        if matches!(dialect, SqlparserDialect::PostgreSql) {
+                            let written_defaults: Vec<Ident> = create_table
+                                .columns
+                                .iter()
+                                .filter(|column| {
+                                    column.options.iter().any(|option| {
+                                        matches!(option.option, ColumnOption::Default(_))
+                                    })
+                                })
+                                .map(|column| column.name.clone())
+                                .collect();
+                            creations.extend(like::apply_like(&builder, &mut create_table)?);
+                            let primary_key_declared =
+                                create_table_transform::keys(&builder, &create_table)?;
+                            duplicate_keys::merge(
+                                &mut create_table.columns,
+                                &mut create_table.constraints,
+                                builder.identifier_case(),
+                            );
+                            (primary_key_declared, written_defaults)
+                        } else {
+                            creations.extend(like::apply_like(&builder, &mut create_table)?);
+                            (false, Vec::new())
+                        };
                     sequences::spell_out_serials(
                         &column_sequences,
                         &stored,
@@ -12603,23 +12754,6 @@ impl ParserDB {
                         creator,
                     )?;
                     builder = with_sequences;
-                    let table_name = create_table.name.to_string();
-                    sequences::bind_column_defaults(
-                        &builder,
-                        &table_name,
-                        &mut create_table.columns,
-                    )?;
-
-                    // A `LIKE` copy becomes the table's own columns, so it
-                    // runs before the parents contribute theirs.
-                    creations.extend(like::apply_like(&builder, &mut create_table)?);
-                    if matches!(dialect, SqlparserDialect::PostgreSql) {
-                        duplicate_keys::merge(
-                            &mut create_table.columns,
-                            &mut create_table.constraints,
-                            builder.identifier_case(),
-                        );
-                    }
 
                     // A foreign partition is refused under a unique index
                     // before it takes the keys a partition receives.
@@ -12637,7 +12771,9 @@ impl ParserDB {
                     // way a foreign key target does, which is also what
                     // leaves the edges acyclic.
                     let case = builder.identifier_case();
-                    refuse_not_null_conflicts(&create_table, case)?;
+                    if !matches!(dialect, SqlparserDialect::PostgreSql) {
+                        refuse_not_null_conflicts(&create_table, case)?;
+                    }
                     // What the child requires a value of itself stays its own,
                     // whatever a parent requires.
                     let own_not_null: Vec<Ident> = create_table
@@ -12646,6 +12782,11 @@ impl ParserDB {
                         .filter(|column| requires_value(&create_table, &column.name, case))
                         .map(|column| column.name.clone())
                         .collect();
+                    let not_null = if matches!(dialect, SqlparserDialect::PostgreSql) {
+                        create_table_transform::not_null_requirements(&create_table, case)
+                    } else {
+                        Vec::new()
+                    };
                     let mut inherited = inheritance::apply_parents(
                         &builder,
                         &mut create_table,
@@ -12654,12 +12795,32 @@ impl ParserDB {
                     )?;
                     let merged = constraint_names::merge_named_copies(&builder, &mut create_table);
                     inherited.constraints.retain(|rendering| !merged.contains(rendering));
+                    if matches!(dialect, SqlparserDialect::PostgreSql) {
+                        refuse_unlogged_partitioned(&create_table)?;
+                        validate_distinct_columns(&create_table, case)?;
+                        Self::take_over_table_shell(&mut builder, &create_table)?;
+                        let table_kind = relation_kind(foreign_source.is_some());
+                        validate_relation_names(
+                            &builder,
+                            &create_table,
+                            table_kind,
+                            RelationNamePhase::Table,
+                        )?;
+                        builder.ensure_table_lookup_invariants(&create_table)?;
+                        create_table_transform::expressions(
+                            &builder,
+                            &mut create_table,
+                            &written_defaults,
+                        )?;
+                        inherited.column_metadata.append(&mut transformed_columns);
+                    }
                     // The bound is checked against the partitions the root
                     // already has, which the parents just resolved.
                     if let (Some(root), Some(bound)) =
                         (&create_table.partition_of, &create_table.for_values)
                         && let Some(root) = builder.resolve_bound_table_name(root)?
                     {
+                        stored_expressions::refuse_in_bound(&builder, bound)?;
                         partition_bounds::validate_bound(
                             &builder,
                             root,
@@ -12671,7 +12832,11 @@ impl ParserDB {
                         Some(root) => builder.resolve_bound_table_name(root)?.map(StoredTable::of),
                         None => None,
                     };
-                    refuse_no_inherit_constraints_on_partitioned(&create_table)?;
+                    if matches!(dialect, SqlparserDialect::PostgreSql) {
+                        stored_expressions::refuse_table_checks(&create_table)?;
+                    } else {
+                        refuse_no_inherit_constraints_on_partitioned(&create_table)?;
+                    }
                     record_implied_not_null(&mut create_table, *builder.dialect(), case);
                     let bound_to_primary_key = referenced_keys::bind_noting_primary_key(
                         &mut create_table,
@@ -12722,7 +12887,13 @@ impl ParserDB {
                         &collation_metadata,
                         &active_postgres_catalog,
                         &inherited.column_metadata,
-                        TableOrigin::Declaration(documentation, creations, declared_types),
+                        TableOrigin::Declaration(TableDeclaration {
+                            documentation,
+                            creations,
+                            declared_types,
+                            primary_key_declared,
+                            not_null,
+                        }),
                     )?;
                     referenced_keys::record_primary_key_references(
                         &mut builder,

@@ -357,7 +357,7 @@ pub(super) fn create_user_defined_type(
         matches!(representation, Some(UserDefinedTypeRepresentation::Composite { .. }));
     // A composite takes a relation name, which the other kinds do not.
     if is_composite {
-        let holder = relation_name_holder(&builder, name_ident, Some(schema))
+        let holder = relation_name_holder(&builder, name_ident, Some(schema), None)
             .or_else(|| composite_name_holder(&builder, name_ident, Some(schema)));
         if let Some(conflicting_kind) = holder {
             return Err(Error::RelationNameAlreadyTaken {
@@ -1437,7 +1437,7 @@ fn alter_type_rename(
         Doomed::Domain(_) => false,
     };
     if let Some(conflicting_kind) =
-        is_composite.then(|| relation_name_holder(&builder, new_name, Some(schema))).flatten()
+        is_composite.then(|| relation_name_holder(&builder, new_name, Some(schema), None)).flatten()
     {
         return Err(Error::RelationNameAlreadyTaken {
             object_kind: ObjectKind::Type,

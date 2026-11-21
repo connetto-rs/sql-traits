@@ -151,7 +151,7 @@ pub(super) fn relation_or_domain_holder(
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
-    relation_name_holder(builder, name, schema)
+    relation_name_holder(builder, name, schema, None)
         .or_else(|| domain_name_holder(builder, name, schema))
 }
 
@@ -207,8 +207,9 @@ pub(super) fn type_name_holder(
     name: &Ident,
     schema: SchemaQualifier<'_>,
 ) -> Option<ObjectKind> {
-    domain_or_user_type_holder(builder, name, schema)
-        .or_else(|| relation_name_holder(builder, name, schema).filter(|kind| has_row_type(*kind)))
+    domain_or_user_type_holder(builder, name, schema).or_else(|| {
+        relation_name_holder(builder, name, schema, None).filter(|kind| has_row_type(*kind))
+    })
 }
 
 /// Whether a relation of this kind carries a row type, whose name is taken in
@@ -284,7 +285,7 @@ pub(super) fn reach_in_schema(
     {
         return Some(Reached::UserType(position, is_multirange));
     }
-    relation_name_holder(builder, name, Some(schema))
+    relation_name_holder(builder, name, Some(schema), None)
         .filter(|kind| has_row_type(*kind))
         .map(Reached::RowType)
 }
