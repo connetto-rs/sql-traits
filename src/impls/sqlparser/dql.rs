@@ -4035,6 +4035,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
             Err(LookupError::AmbiguousTableLookup {
                 object_name: scope.dialect.stored_name(column),
                 candidates,
+                site: crate::errors::AmbiguousLookupSite::Column,
             })
         }
     }
@@ -4160,6 +4161,7 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
                 Some(DerivedMatch::Ambiguous) => {
                     Err(LookupError::AmbiguousTableLookup {
                         object_name: scope.dialect.stored_name(column),
+                        site: crate::errors::AmbiguousLookupSite::Column,
                         candidates: vec![relation_key_display(relation)],
                     })
                 }

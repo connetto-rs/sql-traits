@@ -338,7 +338,7 @@ fn an_invalid_path_in_a_branch_is_reported() {
         "CREATE FUNCTION refused(p BOOLEAN) RETURNS VOID LANGUAGE plpgsql AS $$
          BEGIN IF p THEN SET search_path = a.b; END IF; END $$;",
     );
-    assert!(matches!(read_by(&database, "refused"), Err(LookupError::InvalidObjectName { .. })));
+    assert!(matches!(read_by(&database, "refused"), Err(LookupError::InvalidSetting { .. })));
 }
 
 /// An `ELSIF` is tried only once the branch before it was not taken, so a

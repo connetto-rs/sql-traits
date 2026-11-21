@@ -742,7 +742,10 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
         &self,
         key: &Expr,
     ) -> Result<Option<ColumnDefinition<'scope, 'query, 'db, DB>>, LookupError> {
-        Ok(self.graph.resolve_output_first(self.cursor, key)?.map(|(definition, _)| definition))
+        Ok(self
+            .graph
+            .resolve_output_first(self.cursor, key, crate::errors::AmbiguousLookupSite::DistinctOn)?
+            .map(|(definition, _)| definition))
     }
 
     /// Resolves a whole `DISTINCT ON` key like
@@ -788,7 +791,11 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnDefinitionScope<'scope, 'query
         Option<(ColumnDefinition<'scope, 'query, 'db, DB>, ColumnBinding<'scope>)>,
         LookupError,
     > {
-        self.graph.resolve_output_first(self.cursor, key)
+        self.graph.resolve_output_first(
+            self.cursor,
+            key,
+            crate::errors::AmbiguousLookupSite::DistinctOn,
+        )
     }
 
     /// Resolves a relation qualifier with no column, such as a qualified

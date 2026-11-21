@@ -67,13 +67,21 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     ) -> Result<&'db <Self::DB as DatabaseLike>::Table, LookupError> {
         let foreign_table = &self.attribute().foreign_table;
         let (schema, table) = object_name_identifiers(foreign_table)?;
-        database
+        if let Some(table) = database
             .table_by_target(target_name_of_idents(schema, table), database.identifier_case())?
-            .ok_or_else(|| {
-                LookupError::TableNotFound {
-                    object_name: database.dialect().stored_object_name(foreign_table),
-                }
-            })
+        {
+            return Ok(table);
+        }
+        if crate::utils::object_name::resolve_bound_relation_object_name(foreign_table, database)?
+            .is_some()
+        {
+            return Err(LookupError::ReferencedRelationWrongKind {
+                object_name: database.dialect().stored_object_name_last(foreign_table),
+            });
+        }
+        Err(LookupError::TableNotFound {
+            object_name: database.dialect().stored_object_name(foreign_table),
+        })
     }
 
     #[inline]

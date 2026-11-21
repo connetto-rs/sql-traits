@@ -378,7 +378,7 @@ fn a_function_path_postgresql_rejects_is_refused() {
             matches!(
                 result,
                 Err(sql_traits::errors::Error::IdentifierLookupError(
-                    LookupError::InvalidObjectName { .. }
+                    LookupError::InvalidSetting { .. }
                 ))
             ),
             "{sql}: {result:?}"
@@ -400,7 +400,7 @@ fn a_node_never_ingested_reports_a_path_postgresql_rejects() {
     };
     assert!(matches!(
         function.referenced_tables(&database),
-        Err(LookupError::InvalidObjectName { object_name, .. }) if object_name == "a.b"
+        Err(LookupError::InvalidSetting { written_token }) if written_token == "."
     ));
 }
 
