@@ -94,10 +94,10 @@ pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
 pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{
-    AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, ExcludedSet, GrantArm,
+    AntiJoin, ArmCondition, CalledArm, CallerGate, CapOperand, Correlation, ExcludedSet, GrantArm,
     GrantedTo, GranteeSet, HelperArm, HelperSet, JoinedRow, LiteralSet, ParentArm,
     RequestNormalization, Restriction, Returned, RowCap, SettingComparison, TimeBound,
-    TimeComparison, WalkArm, WalkDirection,
+    TimeComparison, UnsetSetting, WalkArm, WalkDirection,
 };
 pub use identifier_case::IdentifierCase;
 pub use identity::{ColumnIdentity, RelationIdentity};
