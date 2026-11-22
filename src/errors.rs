@@ -937,6 +937,8 @@ pub enum UnattachablePartition {
         /// The stored column name.
         column_name: String,
     },
+    /// The table is a typed table, written `CREATE TABLE name OF type`.
+    Typed,
     /// The table lacks the partitioned table's shape.
     Shape(ChildMismatch),
     /// The table is a foreign table and the partitioned table holds a unique
@@ -961,7 +963,42 @@ impl core::fmt::Display for UnattachablePartition {
             Self::ForeignTableUnderUniqueIndex => {
                 f.write_str("it is a foreign table and the partitioned table holds a unique index")
             }
+            Self::Typed => f.write_str("it is a typed table"),
         }
+    }
+}
+
+/// What a typed table, written `CREATE TABLE name OF type`, refuses because
+/// its columns are the attributes of its type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TypedTableRefusal {
+    /// A column entry of the `CREATE TABLE` declares an identity.
+    IdentityColumn,
+    /// A column entry of the `CREATE TABLE` declares a generation expression.
+    GeneratedColumn,
+    /// `ALTER TABLE ... ADD COLUMN`.
+    AddColumn,
+    /// `ALTER TABLE ... DROP COLUMN`.
+    DropColumn,
+    /// `ALTER TABLE ... ALTER COLUMN ... TYPE`.
+    AlterColumnType,
+    /// `ALTER TABLE ... RENAME COLUMN`.
+    RenameColumn,
+    /// `ALTER TABLE ... INHERIT`.
+    ChangeInheritance,
+}
+
+impl core::fmt::Display for TypedTableRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::IdentityColumn => "identity columns are not supported on typed tables",
+            Self::GeneratedColumn => "generated columns are not supported on typed tables",
+            Self::AddColumn => "cannot add column to typed table",
+            Self::DropColumn => "cannot drop column from typed table",
+            Self::AlterColumnType => "cannot alter column type of typed table",
+            Self::RenameColumn => "cannot rename column of typed table",
+            Self::ChangeInheritance => "cannot change inheritance of typed table",
+        })
     }
 }
 
@@ -4721,6 +4758,37 @@ pub enum Error {
         array_name: String,
         /// PostgreSQL's diagnostic spelling of the array type.
         type_display: String,
+    },
+    #[error("Type `{type_name}` is not a composite type.")]
+    /// Error indicating that a `CREATE TABLE name OF type` statement names a
+    /// type that is no composite, an enum, a domain, a range, an array or a
+    /// base type.
+    TypedTableTypeNotComposite {
+        /// The stored type name.
+        type_name: String,
+        /// PostgreSQL's diagnostic spelling of the type.
+        type_display: String,
+    },
+    #[error("Type `{type_name}` is the row type of {relation_kind} `{type_name}`.")]
+    /// Error indicating that a `CREATE TABLE name OF type` statement names the
+    /// row type of a relation, where only a composite type created with
+    /// `CREATE TYPE` serves.
+    TypedTableOfRowType {
+        /// The stored type name.
+        type_name: String,
+        /// PostgreSQL's diagnostic spelling of the row type.
+        type_display: String,
+        /// Kind of relation that owns the row type.
+        relation_kind: ObjectKind,
+    },
+    #[error("Typed table `{table_name}`: {refusal}.")]
+    /// Error indicating that a statement declares or changes a column of a
+    /// typed table, or its inheritance, which follow its type alone.
+    TypedTable {
+        /// The stored name of the typed table.
+        table_name: String,
+        /// What the statement asked of it.
+        refusal: TypedTableRefusal,
     },
     #[error("Enum label `{label}` of type `{type_name}` already exists.")]
     /// Error indicating that an `ALTER TYPE ... ADD VALUE` or `RENAME VALUE`

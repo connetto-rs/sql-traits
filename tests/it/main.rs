@@ -249,6 +249,7 @@ mod type_array_identities;
 mod type_facts;
 mod type_modifiers;
 mod type_name_normalization;
+mod typed_tables;
 mod unique_key_calls;
 mod unique_key_deferral;
 mod unresolved_expressions;

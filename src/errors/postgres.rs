@@ -1,7 +1,7 @@
 //! The SQLSTATE and the message PostgreSQL reports for each error that models
 //! one of its refusals.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 pub use sqlstate::SqlState;
 use sqlstate::pg;
@@ -1303,6 +1303,32 @@ impl Error {
                 Some(PostgresError::new(
                     pg::UNDEFINED_OBJECT,
                     format!("type {} is only a shell", quoted(type_name)),
+                ))
+            }
+            Self::TypedTableTypeNotComposite { type_display, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("type {type_display} is not a composite type"),
+                ))
+            }
+            Self::TypedTableOfRowType { type_display, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("type {type_display} is the row type of another table"),
+                ))
+            }
+            Self::TypedTable { refusal, .. } => {
+                Some(PostgresError::new(
+                    match refusal {
+                        super::TypedTableRefusal::IdentityColumn
+                        | super::TypedTableRefusal::GeneratedColumn => pg::FEATURE_NOT_SUPPORTED,
+                        super::TypedTableRefusal::AddColumn
+                        | super::TypedTableRefusal::DropColumn
+                        | super::TypedTableRefusal::AlterColumnType
+                        | super::TypedTableRefusal::RenameColumn
+                        | super::TypedTableRefusal::ChangeInheritance => pg::WRONG_OBJECT_TYPE,
+                    },
+                    refusal.to_string(),
                 ))
             }
             Self::TypeDropRequiredBy {

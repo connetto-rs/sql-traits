@@ -322,6 +322,26 @@ impl TableLike for CreateTable {
         }
     }
 
+    fn of_type<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::UserDefinedType>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.require_in_database(database)?;
+        // Ingestion binds the name to the type it reached and repoints it on
+        // every rename, so it reaches that type still.
+        Ok(self.of_type.as_ref().and_then(|name| {
+            super::user_defined_type::bound_user_type(
+                database.user_defined_types(),
+                name,
+                database.identifier_case(),
+            )
+            .map(|(type_, _)| type_)
+        }))
+    }
+
     #[inline]
     fn partition_strategy(&self) -> Option<PartitionStrategy> {
         declared_strategy(self.partition_by.as_deref()?)

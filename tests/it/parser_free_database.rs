@@ -616,6 +616,16 @@ impl TableLike for MemoryTable {
         Ok(None)
     }
 
+    fn of_type<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db MemoryUserDefinedType>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(None)
+    }
+
     fn partition_strategy(&self) -> Option<PartitionStrategy> {
         None
     }

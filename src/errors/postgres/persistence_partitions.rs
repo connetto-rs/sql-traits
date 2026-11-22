@@ -262,6 +262,9 @@ pub(super) fn attachment(
         UnattachablePartition::AlreadyPartition => {
             (pg::WRONG_OBJECT_TYPE, format!("{} is already a partition", quoted(partition_name)))
         }
+        UnattachablePartition::Typed => {
+            (pg::WRONG_OBJECT_TYPE, "cannot attach a typed table as partition".into())
+        }
         UnattachablePartition::InheritanceChild => {
             (pg::WRONG_OBJECT_TYPE, "cannot attach inheritance child as partition".into())
         }
