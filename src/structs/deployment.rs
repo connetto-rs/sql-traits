@@ -2,7 +2,7 @@
 
 use alloc::{string::String, vec::Vec};
 
-use sql_values::PgTimeZone;
+use sql_values::postgres::PgTimeZone;
 use sqlparser::ast::DataType;
 
 use crate::{errors::DeploymentError, traits::DatabaseLike};

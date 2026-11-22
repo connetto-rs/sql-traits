@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::Error, prelude::*};
-use sql_values::TimeZoneError;
+use sql_values::postgres::TimeZoneError;
 use sqlparser::dialect::PostgreSqlDialect;
 
 fn parse(sql: &str) -> ParserDB {

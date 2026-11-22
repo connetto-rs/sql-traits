@@ -8,16 +8,15 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ActingRole, ColumnDefinition, ColumnPrivilege, ColumnScope, ForeignTableSource,
-        IdentifierCase, PartitionBound, ReplicaIdentity, RowSecurity, RowStatement,
-        SchemaFingerprint, TablePrivileges, VirtualTableSource,
+        ActingRole, Checks, ColumnPrivilege, ExpressionTruth, ForeignTableSource, IdentifierCase,
+        PartitionBound, ReplicaIdentity, RowSecurity, RowStatement, SchemaFingerprint,
+        TablePrivileges, VirtualTableSource,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
         ColumnGrantLike, ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, GrantLike,
         Metadata, PolicyLike, Relation, RoleLike, RuleLike, TableGrantLike, TriggerLike,
-        check_constraint::{evaluate_constant_expr, non_tautological},
-        role::privilege_holders,
+        check_constraint::non_tautological, role::privilege_holders,
     },
     utils::identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
 };
@@ -868,19 +867,24 @@ pub trait TableLike:
     where
         Self: 'db;
 
-    /// Proves a Boolean expression constant within this table's column scope.
+    /// Answers what an expression can evaluate to on the rows of this table.
     ///
-    /// `Some(true)` proves a tautology and `Some(false)` proves a negation.
+    /// The expression is read through
+    /// [`sqlparser-expr-eval`](https://docs.rs/sqlparser-expr-eval) under
+    /// what the table guarantees of every row, which is each column's type
+    /// and nullability, the checks of the domains its columns use and its
+    /// validated `CHECK` constraints. A PostgreSQL database folds with
+    /// PostgreSQL's types, casts, overflow and built-ins. Other dialects
+    /// decide comparisons of numeric and boolean columns and three-valued
+    /// logic, and a SQLite column's type constrains no value it stores.
+    /// Calls resolve through the database's functions, and whatever does not
+    /// resolve may take any outcome.
     ///
-    /// `None` covers nullable, unresolved, and unsupported expressions.
-    ///
-    /// Supports literals, equality, `NOT`, `AND`, `OR`, and nullability.
+    /// A `CHECK` admits a row when the expression is true or `NULL`, and a
+    /// policy's `USING` only when it is true, so the two ask different
+    /// questions of the same [`ExpressionTruth`].
     ///
     /// `case` controls identifier matching.
-    ///
-    /// Equality compares Booleans, numbers, and identical strings.
-    ///
-    /// Unequal numeric spellings must parse as unsigned `u128` integers.
     ///
     /// # Errors
     ///
@@ -890,20 +894,22 @@ pub trait TableLike:
     ///
     /// ```
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE invoices (id INT NOT NULL, tenant_id INT);
-    ///      CREATE POLICY public_rows ON invoices USING (NOT false)
-    ///          WITH CHECK (tenant_id IS NOT NULL);",
+    ///      CREATE POLICY public_rows ON invoices USING (id > 5 OR id <= 5)
+    ///          WITH CHECK (tenant_id > 5 OR tenant_id <= 5);",
     /// )?;
     /// let policy = db.policies().next().unwrap();
     /// let table = policy.table(&db)?;
     /// let case = IdentifierCase::AsWritten;
-    /// assert_eq!(
-    ///     table.expression_truth(&db, policy.using_expression(&db)?.unwrap(), case)?,
-    ///     Some(true),
-    /// );
-    /// assert_eq!(table.expression_truth(&db, policy.check_expression(&db)?.unwrap(), case)?, None,);
+    /// let using = table.expression_truth(&db, policy.using_expression(&db)?.unwrap(), case)?;
+    /// assert_eq!(using.outcomes, Outcomes::TRUE);
+    /// assert!(!using.may_raise);
+    /// // A `NULL` tenant_id makes both comparisons `NULL`.
+    /// let check = table.expression_truth(&db, policy.check_expression(&db)?.unwrap(), case)?;
+    /// assert_eq!(check.outcomes, Outcomes::NOT_FALSE);
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
     fn expression_truth(
@@ -911,25 +917,16 @@ pub trait TableLike:
         database: &Self::DB,
         expression: &sqlparser::ast::Expr,
         case: IdentifierCase,
-    ) -> Result<Option<bool>, LookupError> {
+    ) -> Result<ExpressionTruth, LookupError> {
         self.require_in_database(database)?;
-        let mut scope = None;
-        evaluate_constant_expr(expression, &mut |reference| {
-            if !matches!(
-                reference,
-                sqlparser::ast::Expr::Identifier(_) | sqlparser::ast::Expr::CompoundIdentifier(_)
-            ) {
-                return Ok(None);
-            }
-            let scope =
-                scope.get_or_insert_with(|| ColumnScope::for_table(self.borrow(), database, case));
-            match scope.resolve_column_definition(reference)? {
-                Some(ColumnDefinition::Base { column, .. }) => {
-                    column.is_nullable(database).map(Some)
-                }
-                _ => Ok(None),
-            }
-        })
+        crate::structs::table_truth(
+            self.borrow(),
+            database,
+            expression,
+            case,
+            None,
+            Checks::Validated,
+        )
     }
 
     /// Iterates over the columns the table declares itself.

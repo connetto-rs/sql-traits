@@ -18,7 +18,7 @@ use sqlparser::{
 
 use crate::{
     errors::LookupError,
-    structs::{IdentifierCase, WrittenCall},
+    structs::{Checks, ExpressionTruth, IdentifierCase, WrittenCall},
     traits::{
         ColumnCollation, DataTypeLike, DatabaseLike, DialectLike, Metadata, MySqlCollationPadding,
         TableLike, column::ColumnLike, function_like::FunctionLike,
@@ -32,81 +32,20 @@ fn unnested(mut expr: &Expr) -> &Expr {
     expr
 }
 
-fn literal_equality(left: &Expr, right: &Expr) -> Option<bool> {
-    let (Expr::Value(left), Expr::Value(right)) = (unnested(left), unnested(right)) else {
-        return None;
-    };
-    match (&left.value, &right.value) {
-        (Value::Boolean(left), Value::Boolean(right)) => Some(left == right),
-        (Value::Number(left, _), Value::Number(right, _)) => {
-            if left == right {
-                Some(true)
-            } else {
-                Some(left.parse::<u128>().ok()? == right.parse::<u128>().ok()?)
-            }
-        }
-        (Value::SingleQuotedString(left), Value::SingleQuotedString(right)) if left == right => {
-            Some(true)
-        }
-        _ => None,
-    }
-}
-
-pub(crate) fn evaluate_constant_expr(
-    expr: &Expr,
-    nullable: &mut impl FnMut(&Expr) -> Result<Option<bool>, LookupError>,
-) -> Result<Option<bool>, LookupError> {
-    let result = match unnested(expr) {
-        Expr::Value(value) => {
-            match value.value {
-                Value::Boolean(value) => Some(value),
-                _ => None,
-            }
-        }
-        Expr::IsNull(column) | Expr::IsNotNull(column) => {
-            match nullable(unnested(column))? {
-                Some(false) => Some(matches!(unnested(expr), Expr::IsNotNull(_))),
-                _ => None,
-            }
-        }
-        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => literal_equality(left, right),
-        Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
-            let complement = match (unnested(left), unnested(right)) {
-                (Expr::IsNull(left), Expr::IsNotNull(right))
-                | (Expr::IsNotNull(left), Expr::IsNull(right)) => {
-                    unnested(left) == unnested(right) && nullable(unnested(left))?.is_some()
-                }
-                _ => false,
-            };
-            if complement {
-                Some(true)
-            } else {
-                match (
-                    evaluate_constant_expr(left, nullable)?,
-                    evaluate_constant_expr(right, nullable)?,
-                ) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
-                }
-            }
-        }
-        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
-            match (
-                evaluate_constant_expr(left, nullable)?,
-                evaluate_constant_expr(right, nullable)?,
-            ) {
-                (Some(true), Some(true)) => Some(true),
-                (Some(false), _) | (_, Some(false)) => Some(false),
-                _ => None,
-            }
-        }
-        Expr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr } => {
-            evaluate_constant_expr(expr, nullable)?.map(|value| !value)
-        }
-        _ => None,
-    };
-    Ok(result)
+/// What `check`'s expression can evaluate to on the rows of its table, under
+/// the column types, `NOT NULL` and the domain checks alone.
+fn truth_on_its_own<C: CheckConstraintLike>(
+    check: &C,
+    database: &C::DB,
+) -> Result<ExpressionTruth, LookupError> {
+    crate::structs::table_truth(
+        check.table(database)?,
+        database,
+        check.expression(database),
+        database.identifier_case(),
+        Some(check.borrow()),
+        Checks::Ignored,
+    )
 }
 
 /// Helper to extract column names from nullability checks in an AND chain
@@ -973,6 +912,33 @@ pub trait CheckConstraintLike:
         false
     }
 
+    /// Returns whether the database checks rows against the constraint. A
+    /// check written `NOT ENFORCED` is never checked.
+    ///
+    /// Defaults to `true`, which is what every check not spelling the
+    /// attribute means.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE orders (amount INT, CHECK (amount > 0) NOT ENFORCED, CHECK (amount < 9));",
+    /// )?;
+    /// let table = db.tables().next().unwrap();
+    /// let enforced: Vec<_> = table.check_constraints(&db)?.map(|check| check.is_enforced()).collect();
+    /// assert_eq!(enforced, [false, true]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_enforced(&self) -> bool {
+        true
+    }
+
     /// Returns whether the rows the table held when the check arrived have
     /// been checked against it.
     ///
@@ -1428,22 +1394,14 @@ pub trait CheckConstraintLike:
         Ok(self.columns(database)?.any(|col| col == column))
     }
 
-    /// Returns whether the check constraint is a tautology (always true).
+    /// Returns whether the check constraint admits every row on its own,
+    /// its expression never false and never raising.
     ///
-    /// # Arguments
-    ///
-    /// * `database` - A reference to the database instance to query the table
-    ///   from.
-    ///
-    /// # Implementation Note
-    ///
-    /// This method recognizes several tautological patterns:
-    /// - `CHECK (TRUE)` - literal true
-    /// - `CHECK (1 = 1)`, `CHECK (0 = 0)` - equal constant comparisons
-    /// - `CHECK (NOT FALSE)` - negated false
-    /// - `CHECK (column IS NOT NULL)` for `NOT NULL` columns
-    /// - `CHECK (column IS NULL OR column IS NOT NULL)` - always true for any
-    ///   column
+    /// The expression is read as [`TableLike::expression_truth`] reads it,
+    /// under the column types, `NOT NULL` and the domain checks, and under
+    /// none of the table's other checks, so a check made redundant by
+    /// another is no tautology here. [`Self::truth_under_other_checks`]
+    /// answers that question.
     ///
     /// # Errors
     ///
@@ -1453,63 +1411,41 @@ pub trait CheckConstraintLike:
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE my_table (
     ///         col1 INT NOT NULL,
     ///         col2 INT,
     ///         CHECK (col1 IS NOT NULL),
-    ///         CHECK (TRUE),
-    ///         CHECK (1 = 1),
-    ///         CHECK (NOT FALSE),
-    ///         CHECK (col2 IS NOT NULL),
-    ///         CHECK (col2 IS NULL OR col2 IS NOT NULL),
-    ///         CHECK (col1 IS NULL OR col2 IS NOT NULL)
+    ///         CHECK (col2 > 5 OR col2 <= 5),
+    ///         CHECK (col2 IS NOT NULL)
     ///     );",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let check_constraints: Vec<_> = table.check_constraints(&db)?.collect();
-    /// let [cc1, cc2, cc3, cc4, cc5, cc6, cc7] = &check_constraints.as_slice() else {
-    ///     panic!("Expected seven check constraints");
-    /// };
-    /// assert!(cc1.is_tautology(&db)?); // col1 IS NOT NULL on NOT NULL column
-    /// assert!(cc2.is_tautology(&db)?); // TRUE
-    /// assert!(cc3.is_tautology(&db)?); // 1 = 1
-    /// assert!(cc4.is_tautology(&db)?); // NOT FALSE
-    /// assert!(!cc5.is_tautology(&db)?); // col2 IS NOT NULL on nullable column
-    /// assert!(cc6.is_tautology(&db)?); // IS NULL OR IS NOT NULL is always true
-    /// assert!(!cc7.is_tautology(&db)?); // mixed columns
-    /// //
+    /// let tautologies = table
+    ///     .check_constraints(&db)?
+    ///     .map(|check| check.is_tautology(&db))
+    ///     .collect::<Result<Vec<_>, _>>()?;
+    /// // A NULL col2 makes the second check NULL, which a CHECK admits.
+    /// assert_eq!(tautologies, [true, true, false]);
     /// # Ok(())
     /// # }
     /// ```
     fn is_tautology(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(self.table(database)?.expression_truth(
-            database,
-            self.expression(database),
-            database.identifier_case(),
-        )? == Some(true))
+        let truth = truth_on_its_own(self, database)?;
+        Ok(!truth.outcomes.falsity && !truth.may_raise)
     }
 
-    /// Returns whether the check constraint is a negation (always false).
+    /// Returns whether the check constraint admits no row on its own, its
+    /// expression never true and never `NULL`.
     ///
-    /// # Arguments
-    ///
-    /// * `database` - A reference to the database instance to query the table
-    ///   from.
-    ///
-    /// # Implementation Note
-    ///
-    /// This method recognizes several negation patterns:
-    /// - `CHECK (FALSE)` - literal false
-    /// - `CHECK (1 = 0)` - unequal constant comparisons
-    /// - `CHECK (NOT TRUE)` - negated true
-    /// - `CHECK (column IS NULL)` for `NOT NULL` columns
-    /// - `CHECK (len(col) < X AND len(col) > Y)` on one column where X <= Y,
-    ///   since length limits on different columns are not a contradiction
+    /// The expression is read as [`Self::is_tautology`] reads it. A check
+    /// that is never true but may be `NULL` admits the rows where it is
+    /// `NULL`, so it is no negation.
     ///
     /// # Errors
     ///
@@ -1519,85 +1455,84 @@ pub trait CheckConstraintLike:
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE my_table (
     ///         col1 INT NOT NULL,
     ///         col2 INT,
-    ///         s1 TEXT CHECK (length(s1) < 5 AND length(s1) > 10),
-    ///         s2 TEXT CHECK (length(s2) < 5 AND length(s2) > 2),
+    ///         s1 TEXT NOT NULL CHECK (length(s1) < 5 AND length(s1) > 10),
+    ///         s2 TEXT CHECK (length(s2) < 5 AND length(s2) > 10),
     ///         CHECK (col1 IS NULL),
-    ///         CHECK (FALSE),
-    ///         CHECK (1 = 0),
-    ///         CHECK (NOT TRUE),
+    ///         CHECK (col1 > 10 AND col1 < 5),
     ///         CHECK (col2 IS NULL)
     ///     );",
     /// )?;
     /// let table =
     ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let check_constraints: Vec<_> = table.check_constraints(&db)?.collect();
-    /// let [cc_s1, cc_s2, cc1, cc2, cc3, cc4, cc5] = &check_constraints.as_slice() else {
-    ///     panic!("Expected seven check constraints");
-    /// };
-    /// assert!(cc_s1.is_negation(&db)?); // len < 5 AND len > 10 is impossible
-    /// assert!(!cc_s2.is_negation(&db)?); // len < 5 AND len > 2 is possible (3, 4)
-    /// assert!(cc1.is_negation(&db)?); // col1 IS NULL on NOT NULL column
-    /// assert!(cc2.is_negation(&db)?); // FALSE
-    /// assert!(cc3.is_negation(&db)?); // 1 = 0
-    /// assert!(cc4.is_negation(&db)?); // NOT TRUE
-    /// assert!(!cc5.is_negation(&db)?); // col2 IS NULL on nullable column
-    /// //
+    /// let negations = table
+    ///     .check_constraints(&db)?
+    ///     .map(|check| check.is_negation(&db))
+    ///     .collect::<Result<Vec<_>, _>>()?;
+    /// // A NULL s2 makes its check NULL, which a CHECK admits.
+    /// assert_eq!(negations, [true, false, true, true, false]);
     /// # Ok(())
     /// # }
     /// ```
     fn is_negation(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        if self.table(database)?.expression_truth(
+        let truth = truth_on_its_own(self, database)?;
+        Ok(!truth.outcomes.truth && !truth.outcomes.null)
+    }
+
+    /// Returns what the check constraint's expression can evaluate to on the
+    /// rows every other validated check of its table admits.
+    ///
+    /// A check that is never false and never raises here is redundant
+    /// beside the others. Two checks may each be redundant beside the other,
+    /// as a check written twice is, so dropping every redundant check at once
+    /// may drop a constraint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this check constraint.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE my_table (tenant_id INT, CHECK (tenant_id > 0), CHECK (tenant_id > -5));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("my_table", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let [positive, above] = &table.check_constraints(&db)?.collect::<Vec<_>>()[..] else {
+    ///     unreachable!()
+    /// };
+    /// assert!(!above.is_tautology(&db)?);
+    /// assert_eq!(above.truth_under_other_checks(&db)?.outcomes, Outcomes::NOT_FALSE);
+    /// assert_eq!(positive.truth_under_other_checks(&db)?.outcomes, Outcomes::ANY);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn truth_under_other_checks(
+        &self,
+        database: &Self::DB,
+    ) -> Result<ExpressionTruth, LookupError> {
+        let table = self.table(database)?;
+        crate::structs::table_truth(
+            table,
             database,
             self.expression(database),
             database.identifier_case(),
-        )? == Some(false)
-        {
-            return Ok(true);
-        }
-
-        // A contradiction between length limits is a negation only when both
-        // bounds belong to one column, since the lengths of different
-        // columns are unrelated.
-        let expression = self.expression(database);
-        for column in self.columns(database)? {
-            let name = column.column_name();
-            let mut visited_cols = Vec::new();
-            let upper = check_text_length_bound_recursive(
-                database,
-                expression,
-                self,
-                Some(name),
-                &mut visited_cols,
-                BoundDirection::Upper,
-            )?;
-            let Some(upper) = upper else {
-                continue;
-            };
-            let upper = upper.limit;
-            let mut visited_cols = Vec::new();
-            let lower = check_text_length_bound_recursive(
-                database,
-                expression,
-                self,
-                Some(name),
-                &mut visited_cols,
-                BoundDirection::Lower,
-            )?;
-            // upper is the exclusive upper bound and lower the inclusive
-            // lower bound, so lower >= upper leaves no accepted length
-            if lower.is_some_and(|lower| lower.limit >= upper) {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+            Some(self.borrow()),
+            Checks::Validated,
+        )
     }
 
     /// Returns whether the check constraint is a mutual nullability constraint.

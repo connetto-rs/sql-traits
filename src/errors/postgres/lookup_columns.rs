@@ -98,10 +98,10 @@ pub(super) fn missing_column(
 /// The refusal for a date/time literal, excluding unavailable session state.
 pub(super) fn policy_literal(
     literal: &str,
-    data_type: sql_values::PgType,
-    reason: sql_values::DateTimeError,
+    data_type: sql_values::postgres::PgType,
+    reason: sql_values::postgres::DateTimeError,
 ) -> Option<PostgresError> {
-    use sql_values::DateTimeError;
+    use sql_values::postgres::DateTimeError;
 
     let sqlstate = match reason {
         DateTimeError::FieldValueOutOfRange

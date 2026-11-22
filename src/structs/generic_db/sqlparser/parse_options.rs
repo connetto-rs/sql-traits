@@ -4,7 +4,7 @@ use alloc::{string::String, vec::Vec};
 #[cfg(feature = "std")]
 use std::path::Path;
 
-use sql_values::PgTimeZone;
+use sql_values::postgres::PgTimeZone;
 use sqlparser::{ast::Statement, dialect::Dialect};
 
 use crate::{

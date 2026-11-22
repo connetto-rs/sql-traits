@@ -2,7 +2,7 @@
 
 use alloc::string::String;
 
-use sql_values::PgTimeZone;
+use sql_values::postgres::PgTimeZone;
 
 use crate::errors::Error;
 

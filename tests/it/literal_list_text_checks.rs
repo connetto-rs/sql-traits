@@ -146,8 +146,8 @@ fn listed_literals_compose_with_the_other_text_checks() -> Result<(), Error> {
 fn a_listed_literal_contradicting_a_length_check_is_a_negation() -> Result<(), Error> {
     let db = ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE grants (
-            role TEXT CHECK (role IN ('read', 'write') AND length(role) > 10),
-            verb TEXT CHECK (verb IN ('read', 'write') AND length(verb) > 4)
+            role TEXT NOT NULL CHECK (role IN ('read', 'write') AND length(role) > 10),
+            verb TEXT NOT NULL CHECK (verb IN ('read', 'write') AND length(verb) > 4)
         );",
     )?;
     let table = db.tables().next().ok_or_else(|| std::io::Error::other("no table"))?;

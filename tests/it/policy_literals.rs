@@ -10,7 +10,7 @@ use sql_traits::{
     errors::{Error, LookupError},
     prelude::*,
 };
-use sql_values::{DateTimeError, PgType};
+use sql_values::postgres::{DateTimeError, PgType};
 use sqlparser::{
     ast::Expr,
     dialect::{GenericDialect, PostgreSqlDialect},

@@ -6,7 +6,7 @@
 #![allow(clippy::expect_used)]
 
 use sql_traits::{errors::DeploymentError, prelude::*};
-use sql_values::TimeZoneError;
+use sql_values::postgres::TimeZoneError;
 use sqlparser::dialect::PostgreSqlDialect;
 
 const ROLES: &str = "CREATE ROLE l LOGIN; CREATE ROLE a NOLOGIN; GRANT a TO l;";

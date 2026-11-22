@@ -44,6 +44,11 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
         self.attribute().no_inherit
     }
 
+    #[inline]
+    fn is_enforced(&self) -> bool {
+        self.attribute().enforced != Some(false)
+    }
+
     fn is_validated(&self, database: &Self::DB) -> Result<bool, LookupError> {
         super::create_table::holds_validated(self.table(), self.attribute(), database)
     }
