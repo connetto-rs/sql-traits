@@ -29,9 +29,6 @@ statement = 'SELECT "id" FROM "docs"'
 direction = "refused"
 finding = "8, SQLite refuses a recursive policy that PostgreSQL rejects during the read"
 
-[openfga]
-refusal = "8, rls2fga refuses a recursive policy that PostgreSQL rejects during the read"
-
 [[openfga.row]]
 caller = "alice"
 row = "docs:1"
