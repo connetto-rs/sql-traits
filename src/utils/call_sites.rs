@@ -207,7 +207,7 @@ impl<B> Visitor for Sites<'_, B> {
 
 /// How many arguments a function expression passes, the ordering arguments
 /// of `WITHIN GROUP` included.
-fn argument_count(function: &Function) -> usize {
+pub(crate) fn argument_count(function: &Function) -> usize {
     let written = match &function.args {
         FunctionArguments::None => 0,
         FunctionArguments::Subquery(_) => 1,

@@ -2500,6 +2500,22 @@ fn divides<F: FunctionLike>(
     if hypothetical { collected == 2 * ordered } else { collected > ordered }
 }
 
+/// Whether PostgreSQL goes on to place the call `function` writes once it
+/// selects `called`, a function of `kind` and an aggregate of `aggregate`,
+/// which it does when the call writes no clause `ParseFuncOrColumn` refuses
+/// first and splits its arguments as `called` declares them.
+pub(crate) fn places_call<F: FunctionLike>(
+    function: &Function,
+    called: &F,
+    kind: FunctionKind,
+    aggregate: Option<AggregateKind>,
+) -> bool {
+    let Some((arguments, clauses)) = call_arguments(function) else { return false };
+    clauses.written_rule().is_none()
+        && clauses.kind_rule(kind, aggregate, arguments.len()).is_none()
+        && divides(called, aggregate, arguments.len(), clauses.within_group)
+}
+
 /// The nodes the arguments of a call come from, those it writes followed by
 /// the ordering arguments of `WITHIN GROUP`, with the clauses the call
 /// writes, or `None` for a call written with a subquery, a `*` but

@@ -140,7 +140,8 @@ fn key(
     ParserDB::validate_key_columns(constraint, table, builder, true)
 }
 
-/// Binds defaults and generated expressions in column order.
+/// Refuses what PostgreSQL refuses while transforming each default and
+/// generation expression, then validates and binds them, in column order.
 pub(super) fn expressions(
     builder: &ParserDBBuilder,
     database: Option<&ParserDB>,
@@ -149,12 +150,13 @@ pub(super) fn expressions(
 ) -> Result<(), Error> {
     let table_name = StoredTable::of(table);
     for column_index in 0..table.columns.len() {
+        for option in &table.columns[column_index].options {
+            stored_expressions::refuse_column_value(builder, table, &option.option)?;
+        }
         if let Some(database) = database {
             generated_expressions::column(database, table, &table.columns[column_index])?;
         }
         for option_index in 0..table.columns[column_index].options.len() {
-            let option = &table.columns[column_index].options[option_index].option;
-            stored_expressions::refuse_column_value(option)?;
             let column = &mut table.columns[column_index];
             if written_defaults
                 .iter()

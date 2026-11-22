@@ -11103,9 +11103,9 @@ impl ParserDB {
         stored: &StoredTable,
         option: &ColumnOptionDef,
     ) -> Result<(), crate::errors::Error> {
-        stored_expressions::refuse_in_column_option(builder, &option.option)?;
-        if is_no_inherit_check(option) && Self::stored_node(builder, stored)?.partition_by.is_some()
-        {
+        let node = Self::stored_node(builder, stored)?;
+        stored_expressions::refuse_in_column_option(builder, node, &option.option)?;
+        if is_no_inherit_check(option) && node.partition_by.is_some() {
             return Err(crate::errors::Error::NoInheritCheckOnPartitionedTable {
                 table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
             });
@@ -13696,7 +13696,7 @@ impl ParserDB {
                         None => None,
                     };
                     if matches!(dialect, SqlparserDialect::PostgreSql) {
-                        stored_expressions::refuse_table_checks(&create_table)?;
+                        stored_expressions::refuse_table_checks(&builder, &create_table)?;
                     } else {
                         refuse_no_inherit_constraints_on_partitioned(dialect, &create_table)?;
                     }
