@@ -71,6 +71,31 @@ fn defaults(database: &ParserDB, table_name: &str) -> Vec<(String, Option<String
         .collect()
 }
 
+/// The name of the `NOT NULL` each column of `target` holds.
+fn not_null_names(database: &ParserDB, target: TargetName<'_>) -> Vec<(String, Option<String>)> {
+    database
+        .table_by_target(target, IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("table exists")
+        .columns(database)
+        .expect("table is in this database")
+        .map(|column| {
+            (
+                column.column_name().to_owned(),
+                column
+                    .not_null_constraint_name(database)
+                    .expect("column is in this database")
+                    .map(std::borrow::Cow::into_owned),
+            )
+        })
+        .collect()
+}
+
+/// Pairs each column with the `NOT NULL` name it is expected to hold.
+fn named(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+    pairs.iter().map(|(column, name)| ((*column).to_owned(), name.map(str::to_owned))).collect()
+}
+
 #[test]
 fn a_copy_receives_the_columns_of_the_table_it_copies() {
     let database = database(&format!("{SOURCE} CREATE TABLE bare (LIKE src);"));
@@ -128,6 +153,118 @@ fn a_copy_receives_not_null_but_none_of_what_implied_it() {
         .expect("table exists");
     assert_eq!(source.primary_key_columns(&database).expect("in database").count(), 1);
     assert_eq!(source.check_constraints(&database).expect("in database").count(), 1);
+}
+
+#[test]
+fn a_copy_keeps_the_names_of_the_not_null_constraints_it_receives() {
+    let database = database(
+        "CREATE TABLE a (
+             x INT NOT NULL,
+             y INT CONSTRAINT named_nn NOT NULL,
+             z INT PRIMARY KEY,
+             w INT GENERATED ALWAYS AS IDENTITY,
+             v INT,
+             u INT,
+             NOT NULL v
+         );
+         CREATE TABLE b (LIKE a);
+         CREATE TABLE b2 (LIKE b);",
+    );
+    let expected = named(&[
+        ("x", Some("a_x_not_null")),
+        ("y", Some("named_nn")),
+        ("z", Some("a_z_not_null")),
+        ("w", Some("a_w_not_null")),
+        ("v", Some("a_v_not_null")),
+        ("u", None),
+    ]);
+    assert_eq!(not_null_names(&database, TargetName::new("a", false)), expected);
+    assert_eq!(not_null_names(&database, TargetName::new("b", false)), expected);
+    assert_eq!(not_null_names(&database, TargetName::new("b2", false)), expected);
+}
+
+#[test]
+fn a_copy_keeps_the_name_the_source_holds_when_the_statement_runs() {
+    // Each row was read back from `pg_constraint` on PostgreSQL 18.7.
+    for (sql, copy, expected) in [
+        (
+            "CREATE TABLE ren (x INT NOT NULL);
+             ALTER TABLE ren RENAME CONSTRAINT ren_x_not_null TO renamed_nn;
+             CREATE TABLE c (LIKE ren);",
+            TargetName::new("c", false),
+            named(&[("x", Some("renamed_nn"))]),
+        ),
+        (
+            "CREATE TABLE before (x INT NOT NULL);
+             ALTER TABLE before RENAME TO after;
+             CREATE TABLE c (LIKE after);",
+            TargetName::new("c", false),
+            named(&[("x", Some("before_x_not_null"))]),
+        ),
+        (
+            "CREATE TABLE src (x INT NOT NULL);
+             ALTER TABLE src RENAME COLUMN x TO y;
+             CREATE TABLE c (LIKE src);",
+            TargetName::new("c", false),
+            named(&[("y", Some("src_x_not_null"))]),
+        ),
+        (
+            "CREATE TABLE src (x INT);
+             ALTER TABLE src ALTER COLUMN x SET NOT NULL;
+             CREATE TABLE c (LIKE src);",
+            TargetName::new("c", false),
+            named(&[("x", Some("src_x_not_null"))]),
+        ),
+        (
+            "CREATE TABLE p (q INT NOT NULL);
+             CREATE TABLE ch (r INT NOT NULL) INHERITS (p);
+             CREATE TABLE c (LIKE ch);",
+            TargetName::new("c", false),
+            named(&[("q", Some("p_q_not_null")), ("r", Some("ch_r_not_null"))]),
+        ),
+        (
+            "CREATE TYPE pt AS (x INT);
+             CREATE TABLE t OF pt (x WITH OPTIONS NOT NULL);
+             CREATE TABLE c (LIKE t);",
+            TargetName::new("c", false),
+            named(&[("x", Some("t_x_not_null"))]),
+        ),
+        (
+            "CREATE TABLE \"Up\" (x INT NOT NULL); CREATE TABLE c (LIKE \"Up\");",
+            TargetName::new("c", false),
+            named(&[("x", Some("Up_x_not_null"))]),
+        ),
+        (
+            "CREATE SCHEMA s; CREATE TABLE s.a (x INT NOT NULL); CREATE TABLE s.c (LIKE s.a);",
+            TargetName::new("c", false).with_schema("s", false),
+            named(&[("x", Some("a_x_not_null"))]),
+        ),
+        (
+            // The copied name wins over the one the parent passes.
+            "CREATE TABLE a (x INT NOT NULL, y INT NOT NULL);
+             CREATE TABLE p (x INT NOT NULL, z INT);
+             CREATE TABLE c (LIKE a) INHERITS (p);",
+            TargetName::new("c", false),
+            named(&[("x", Some("a_x_not_null")), ("z", None), ("y", Some("a_y_not_null"))]),
+        ),
+    ] {
+        assert_eq!(not_null_names(&database(sql), copy), expected, "{sql}");
+    }
+}
+
+#[test]
+fn a_copied_not_null_name_reaches_children_until_the_requirement_is_dropped() {
+    // Read back from `pg_constraint` on PostgreSQL 18.7.
+    let database = database(
+        "CREATE TABLE a (x INT NOT NULL, y INT NOT NULL);
+         CREATE TABLE b (LIKE a);
+         CREATE TABLE g () INHERITS (b);
+         ALTER TABLE b ALTER COLUMN y DROP NOT NULL;
+         ALTER TABLE b ALTER COLUMN y SET NOT NULL;",
+    );
+    let expected = named(&[("x", Some("a_x_not_null")), ("y", Some("b_y_not_null"))]);
+    assert_eq!(not_null_names(&database, TargetName::new("b", false)), expected);
+    assert_eq!(not_null_names(&database, TargetName::new("g", false)), expected);
 }
 
 #[test]

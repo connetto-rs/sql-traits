@@ -7,10 +7,12 @@
 //!
 //! Measured against PostgreSQL 18.4 rather than read from documentation: the
 //! copy receives each column's name, type, collation and `NOT NULL`, and
-//! nothing else. A default arrives only under `INCLUDING DEFAULTS`. Primary
-//! keys, unique constraints, checks, foreign keys, identities, stored
-//! generated expressions, indexes and comments all stay with the original,
-//! while the `NOT NULL` that a primary key or an identity implied is kept.
+//! nothing else. The `NOT NULL` keeps the name it holds on the original,
+//! whichever table that name was made for. A default arrives only under
+//! `INCLUDING DEFAULTS`. Primary keys, unique constraints, checks, foreign
+//! keys, identities, stored generated expressions, indexes and comments all
+//! stay with the original, while the `NOT NULL` that a primary key or an
+//! identity implied is kept.
 //! A serial column arrives as its integer type, drawing from the original's
 //! sequence only under `INCLUDING DEFAULTS`.
 
@@ -107,6 +109,7 @@ pub(super) fn apply_like(
 
     let mut creations = Vec::new();
     let case = builder.identifier_case();
+    let not_null_names = super::constraint_names::answers(builder, copied);
     let mut columns: Vec<ColumnDef> = copied
         .columns
         .iter()
@@ -120,6 +123,21 @@ pub(super) fn apply_like(
             }) && !copy.options.iter().any(|held| matches!(held.option, ColumnOption::NotNull))
             {
                 copy.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
+            }
+            // PostgreSQL hands the copy the name the original's `NOT NULL`
+            // answers to as if the statement wrote it.
+            let source_name = not_null_names
+                .iter()
+                .find(|(slot, _)| {
+                    slot.not_null_of()
+                        .is_some_and(|held| super::case_idents_match(held, &copy.name, case))
+                })
+                .and_then(|(_, name)| name.as_deref());
+            if let (Some(name), Some(held)) = (
+                source_name,
+                copy.options.iter_mut().find(|held| matches!(held.option, ColumnOption::NotNull)),
+            ) {
+                held.name = Some(Ident::with_quote('"', name));
             }
             if let Some(creation) = creation_of(builder, copied, column) {
                 creations.push((copy.name.clone(), creation));

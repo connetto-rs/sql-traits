@@ -180,9 +180,18 @@ fn a_default_naming_no_relation_is_refused() {
 
 #[test]
 fn a_serial_column_written_not_null_keeps_one_not_null() {
-    for (sql, table) in [
-        ("CREATE TABLE t (id serial NOT NULL); DROP SEQUENCE t_id_seq CASCADE;", "t"),
-        ("CREATE TABLE u (id serial NOT NULL); CREATE TABLE t (LIKE u);", "t"),
+    // The copy writes the name its `NOT NULL` keeps from the original.
+    for (sql, table, expected) in [
+        (
+            "CREATE TABLE t (id serial NOT NULL); DROP SEQUENCE t_id_seq CASCADE;",
+            "t",
+            "CREATE TABLE t (id INTEGER NOT NULL)",
+        ),
+        (
+            "CREATE TABLE u (id serial NOT NULL); CREATE TABLE t (LIKE u);",
+            "t",
+            "CREATE TABLE t (id INTEGER CONSTRAINT \"u_id_not_null\" NOT NULL)",
+        ),
     ] {
         let db = parse(sql).expect("parses");
         let written = db
@@ -190,7 +199,7 @@ fn a_serial_column_written_not_null_keeps_one_not_null() {
             .expect("unambiguous lookup")
             .expect("table exists")
             .to_string();
-        assert_eq!(written, "CREATE TABLE t (id INTEGER NOT NULL)", "{sql}");
+        assert_eq!(written, expected, "{sql}");
     }
 }
 
