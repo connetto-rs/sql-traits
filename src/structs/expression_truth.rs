@@ -561,9 +561,6 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
         {
             return Ok(false);
         }
-        if matches!(self.source, Source::Expression) {
-            return Ok(true);
-        }
         let own = self
             .own
             .filter(|own| writes_call(own.expression(self.database), call))

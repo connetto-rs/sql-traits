@@ -407,6 +407,74 @@ fn numeric_columns_may_hold_nan_above_every_number() -> Result<(), Error> {
 }
 
 #[test]
+fn integer_columns_stay_within_their_width() -> Result<(), Error> {
+    let schema = "CREATE TABLE invoices (small SMALLINT NOT NULL, big BIGINT NOT NULL);";
+    assert_eq!(truth_in(schema, "invoices", "small <= 32767")?, never_raising(Outcomes::TRUE));
+    assert_eq!(truth_in(schema, "invoices", "small > 40000")?, never_raising(Outcomes::FALSE));
+    assert_eq!(
+        truth_in(schema, "invoices", "big > 9223372036854775807")?,
+        never_raising(Outcomes::FALSE)
+    );
+    Ok(())
+}
+
+#[test]
+fn dates_timestamps_and_arrays_parse_the_literals_they_meet() -> Result<(), Error> {
+    let schema = "CREATE TABLE invoices (
+            issued DATE NOT NULL,
+            stamped TIMESTAMP NOT NULL,
+            lines INT[] NOT NULL
+         );";
+    let raising = ExpressionTruth { outcomes: Outcomes::NONE, may_raise: true };
+    for sql in ["issued > 'nonsense'", "stamped > 'nonsense'", "lines = 'nonsense'"] {
+        assert_eq!(truth_in(schema, "invoices", sql)?, raising, "{sql}");
+    }
+    assert_eq!(truth_in(schema, "invoices", "issued = issued")?, never_raising(Outcomes::TRUE));
+    let element = truth_in(schema, "invoices", "lines[1] > 2147483647")?;
+    assert!(!element.outcomes.truth, "{element:?}");
+    Ok(())
+}
+
+#[test]
+fn catalog_functions_fold_their_constant_arguments() -> Result<(), Error> {
+    for sql in [
+        "btrim('  a ') = 'a'",
+        "octet_length('ab') = 2",
+        "abs(-3) = 3",
+        "concat('a', NULL, 'b') = 'ab'",
+        "concat_ws('-', 'a', 'b') = 'a-b'",
+    ] {
+        assert_eq!(truth(sql)?, never_raising(Outcomes::TRUE), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn stable_calls_answer_alike_within_a_statement() -> Result<(), Error> {
+    let schema = "CREATE FUNCTION stable_level() RETURNS INT LANGUAGE sql STABLE AS 'SELECT 1';
+         CREATE FUNCTION volatile_level() RETURNS INT LANGUAGE sql VOLATILE AS 'SELECT 1';
+         CREATE TABLE invoices (id INT);";
+    assert_eq!(
+        truth_in(schema, "invoices", "stable_level() IS NULL OR stable_level() IS NOT NULL")?,
+        never_raising(Outcomes::TRUE)
+    );
+    assert_eq!(
+        truth_in(schema, "invoices", "volatile_level() IS NULL OR volatile_level() IS NOT NULL")?,
+        never_raising(UNDECIDED)
+    );
+    Ok(())
+}
+
+#[test]
+fn checks_writing_coalesce_or_nullif_seed() -> Result<(), Error> {
+    for check in ["n > 0 AND coalesce(n, 1) IS NOT NULL", "n > 0 AND nullif(n, 5) IS NOT NULL"] {
+        let schema = format!("CREATE TABLE invoices (n INT NOT NULL, CHECK ({check}));");
+        assert_eq!(truth_in(&schema, "invoices", "n <= 0")?, never_raising(Outcomes::FALSE));
+    }
+    Ok(())
+}
+
+#[test]
 fn domain_checks_seed_their_columns() -> Result<(), Error> {
     let schema = "CREATE DOMAIN positive AS INT CHECK (VALUE > 0);
          CREATE DOMAIN small_positive AS positive CHECK (VALUE < 10);
@@ -435,10 +503,12 @@ fn text_comparisons_follow_the_collation() -> Result<(), Error> {
             icu_too TEXT COLLATE \"und-x-icu\" NOT NULL,
             bytes TEXT COLLATE \"C\" NOT NULL,
             custom TEXT COLLATE ci NOT NULL,
-            short VARCHAR(3) NOT NULL
+            short VARCHAR(3) NOT NULL,
+            named_default TEXT COLLATE \"default\" NOT NULL
          );";
     for sql in [
         "plain = 'a' AND plain = 'A'",
+        "named_default = 'a' AND named_default = 'A'",
         "icu = 'a' AND icu = 'A'",
         "plain < short AND short < plain",
         "icu < icu_too AND icu_too < icu",
@@ -457,10 +527,13 @@ fn text_comparisons_follow_the_collation() -> Result<(), Error> {
 
 #[test]
 fn other_dialects_keep_only_shared_semantics() -> Result<(), Error> {
-    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE invoices (id INT NOT NULL);")?;
+    let db = ParserDB::parse::<GenericDialect>(
+        "CREATE TABLE invoices (id INT NOT NULL, paid BOOLEAN NOT NULL);",
+    )?;
     let table = db.tables().next().unwrap();
     let truth = |sql| table.expression_truth(&db, &expression(sql), IdentifierCase::AsWritten);
     assert_eq!(truth("id > 5 OR id <= 5")?, never_raising(Outcomes::TRUE));
+    assert_eq!(truth("paid OR NOT paid")?, never_raising(Outcomes::TRUE));
     assert_eq!(truth("id IS NULL")?, never_raising(Outcomes::FALSE));
     let text = truth("'a' = 'A'")?;
     assert!(text.outcomes.truth && text.outcomes.falsity, "{text:?}");
