@@ -105,13 +105,15 @@ fn clauses_postgres_accepts_keep_a_view_updatable() {
          CREATE VIEW windowed AS SELECT id FROM t WINDOW win AS (ORDER BY id);
          CREATE VIEW inner_aggregate AS SELECT (SELECT max(u.id) FROM u) AS m, id FROM t;
          CREATE VIEW mixed_aggregate AS SELECT (SELECT max(u.id + t.id) FROM u) AS m, id FROM t;
+         CREATE VIEW nested_aggregate AS
+             SELECT (SELECT max((SELECT w.id FROM w WHERE w.id = u.id)) FROM u) AS m, id FROM t;
          CREATE VIEW inner_series AS SELECT (SELECT generate_series(1, 2) LIMIT 1) AS g, id FROM t;
          CREATE VIEW whole_table AS TABLE w;",
     );
     for name in ["locked", "only_parent", "parenthesized", "windowed"] {
         assert_eq!(table_columns(&db, name), ("t", vec![Some("id")]), "{name}");
     }
-    for name in ["inner_aggregate", "mixed_aggregate", "inner_series"] {
+    for name in ["inner_aggregate", "mixed_aggregate", "nested_aggregate", "inner_series"] {
         assert_eq!(table_columns(&db, name), ("t", vec![None, Some("id")]), "{name}");
     }
     assert_eq!(table_columns(&db, "whole_table"), ("w", vec![Some("id"), Some("txt")]));
@@ -140,6 +142,10 @@ fn clauses_postgres_refuses_make_a_view_read_only() {
         ("ordered_window", "SELECT id FROM t ORDER BY row_number() OVER ()"),
         ("ordered_series", "SELECT id FROM t ORDER BY generate_series(1, 2)"),
         ("outer_aggregate", "SELECT (SELECT max(t.x) FROM u) AS m FROM t"),
+        (
+            "nested_outer_aggregate",
+            "SELECT (SELECT max((SELECT t.x FROM w LIMIT 1)) FROM u) AS m FROM t",
+        ),
         ("sampled", "SELECT id FROM t TABLESAMPLE SYSTEM (50)"),
         ("snapshot", "SELECT id FROM mv"),
         ("sequence", "SELECT last_value FROM s"),
@@ -159,8 +165,10 @@ fn a_view_over_a_view_writes_the_inner_view_by_output_position() {
     let db = postgres(
         "CREATE VIEW plain AS SELECT id, x AS renamed, y + 1 AS computed FROM t;
          CREATE VIEW distinct_ids AS SELECT DISTINCT id FROM t;
+         CREATE VIEW whole_table AS TABLE w;
          CREATE VIEW over_plain AS SELECT computed, id, renamed AS again FROM plain;
-         CREATE VIEW over_distinct AS SELECT id AS b FROM distinct_ids;",
+         CREATE VIEW over_distinct AS SELECT id AS b FROM distinct_ids;
+         CREATE VIEW over_whole_table AS SELECT * FROM whole_table;",
     );
     let Some(UpdatableViewBase::View { view, columns }) = base(&db, "over_plain") else {
         panic!("over_plain writes a view");
@@ -170,6 +178,10 @@ fn a_view_over_a_view_writes_the_inner_view_by_output_position() {
         panic!("over_distinct writes a view");
     };
     assert_eq!((view.view_name(), columns), ("distinct_ids", vec![Some(0)]));
+    let Some(UpdatableViewBase::View { view, columns }) = base(&db, "over_whole_table") else {
+        panic!("over_whole_table writes a view");
+    };
+    assert_eq!((view.view_name(), columns), ("whole_table", vec![Some(0), Some(1)]));
 }
 
 #[test]
