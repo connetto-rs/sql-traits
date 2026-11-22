@@ -234,10 +234,8 @@ impl<'scope> ColumnBinding<'scope> {
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE a(k INT, v INT); CREATE TABLE b(k INT, w INT);",
     /// )?;
-    /// let sql = "SELECT k FROM a JOIN b USING (k)";
-    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
-    ///     unreachable!()
-    /// };
+    /// let parsed = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT k FROM a JOIN b USING (k)")?;
+    /// let Statement::Query(query) = &parsed[0] else { unreachable!() };
     /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
     /// let (_, binding) =
     ///     scope.resolve_column_binding(&Expr::Identifier(Ident::new("k")))?.expect("k resolves");
