@@ -4079,6 +4079,15 @@ pub enum Error {
         /// The token rejected by PostgreSQL.
         written_token: String,
     },
+    /// `ALTER FOREIGN TABLE` writes `RENAME CONSTRAINT`, `ATTACH PARTITION` or
+    /// `DETACH PARTITION`, which its grammar lacks.
+    #[error("`ALTER FOREIGN TABLE` has no `{command}` form.")]
+    ForeignTableCommandUnavailable {
+        /// The command as PostgreSQL's grammar spells it.
+        command: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
+    },
     /// The target schema already holds the relation or its type.
     #[error("Object `{object_name}` already exists in schema `{schema_name}`.")]
     SetSchemaNameCollision {

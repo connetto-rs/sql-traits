@@ -212,6 +212,11 @@ fn refusals() {
             "42601",
             "syntax error at or near \"SCHEMA\"",
         ),
+        (
+            "CREATE TABLE p (id INT); alter table p add column x int, set schema o",
+            "42601",
+            "syntax error at or near \"schema\"",
+        ),
     ] {
         let error = ParserDB::parse::<PostgreSqlDialect>(sql).expect_err(sql);
         assert_refusal(&error, state, message);

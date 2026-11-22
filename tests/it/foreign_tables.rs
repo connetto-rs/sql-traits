@@ -1243,3 +1243,38 @@ fn a_foreign_partition_is_refused_where_postgresql_refuses_it() {
         "an absent parent was accepted"
     );
 }
+
+/// `ALTER FOREIGN TABLE` has no `RENAME CONSTRAINT`, `ATTACH PARTITION` or
+/// `DETACH PARTITION` form, so PostgreSQL refuses each as a syntax error
+/// whatever the name holds.
+#[test]
+fn alter_foreign_table_refuses_commands_its_grammar_lacks() {
+    let setup =
+        "CREATE FOREIGN TABLE remote (id INT, CONSTRAINT positive CHECK (id > 0)) SERVER warehouse;
+         CREATE TABLE ranged (id INT) PARTITION BY RANGE (id);
+         CREATE TABLE part (id INT);";
+    for (command, token) in [
+        ("RENAME CONSTRAINT positive TO renamed", "CONSTRAINT"),
+        ("rename constraint positive to renamed", "constraint"),
+        ("ATTACH PARTITION part FOR VALUES FROM (1) TO (2)", "ATTACH"),
+        ("DETACH PARTITION part", "DETACH"),
+        ("DETACH PARTITION part CONCURRENTLY", "DETACH"),
+    ] {
+        for target in ["remote", "ranged", "ONLY remote", "IF EXISTS missing"] {
+            let statement = format!("{setup} ALTER FOREIGN TABLE {target} {command};");
+            let error = refusal(&statement);
+            assert!(
+                matches!(&error, Error::ForeignTableCommandUnavailable { written_token, .. }
+                    if written_token == token),
+                "{statement} got {error:?}"
+            );
+            let postgres = error.postgres_error().expect("syntax diagnostic");
+            assert_eq!(postgres.sqlstate().to_string(), "42601", "{statement}");
+            assert_eq!(
+                postgres.message(),
+                format!("syntax error at or near \"{token}\""),
+                "{statement}"
+            );
+        }
+    }
+}

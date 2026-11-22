@@ -321,6 +321,30 @@ pub(super) fn standalone(operation: &AlterTableOperation) -> Option<Standalone> 
     }
 }
 
+/// Refuses an `ALTER FOREIGN TABLE` opening with a command its grammar lacks,
+/// which PostgreSQL reports at the command's own keyword before it looks at
+/// the relation or at any later command.
+pub(super) fn require_foreign_table_grammar(
+    builder: &ParserDBBuilder,
+    statement: &AlterTable,
+) -> Result<(), Error> {
+    if !matches!(builder.dialect(), super::SqlparserDialect::PostgreSql)
+        || statement.table_type != Some(AlterTableType::Foreign)
+    {
+        return Ok(());
+    }
+    let (command, keyword) = match statement.operations.first() {
+        Some(AlterTableOperation::RenameConstraint { .. }) => ("RENAME CONSTRAINT", "CONSTRAINT"),
+        Some(AlterTableOperation::AttachPartitionOf { .. }) => ("ATTACH PARTITION", "ATTACH"),
+        Some(AlterTableOperation::DetachPartitionOf { .. }) => ("DETACH PARTITION", "DETACH"),
+        _ => return Ok(()),
+    };
+    Err(Error::ForeignTableCommandUnavailable {
+        command: command.to_string(),
+        written_token: keyword.to_string(),
+    })
+}
+
 /// Refuses combined standalone commands at their first invalid token.
 pub(super) fn require_standalone(
     builder: &ParserDBBuilder,
@@ -338,26 +362,13 @@ pub(super) fn require_standalone(
     else {
         return Ok(());
     };
-    let operation = &statement.operations[position];
-    let keyword = match operation {
+    let keyword = match &statement.operations[position] {
         AlterTableOperation::SetSchema { .. } => "SCHEMA",
         AlterTableOperation::AttachPartitionOf { .. } => "ATTACH",
         AlterTableOperation::DetachPartitionOf { .. } => "DETACH",
-        AlterTableOperation::RenameConstraint { .. }
-            if position == 0 && statement.table_type == Some(AlterTableType::Foreign) =>
-        {
-            "CONSTRAINT"
-        }
         _ => "RENAME",
     };
-    let foreign_refusal = statement.table_type == Some(AlterTableType::Foreign)
-        && matches!(
-            operation,
-            AlterTableOperation::RenameConstraint { .. }
-                | AlterTableOperation::AttachPartitionOf { .. }
-                | AlterTableOperation::DetachPartitionOf { .. }
-        );
-    let written_token = if position == 0 && !foreign_refusal { "," } else { keyword }.to_string();
+    let written_token = if position == 0 { "," } else { keyword }.to_string();
     Err(match kind {
         Standalone::Rename => {
             Error::RenameCommandNotAlone {
