@@ -1205,6 +1205,7 @@ pub trait TableLike:
     /// ```rust
     /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TYPE point2 AS (x INT, y INT);
     ///      CREATE TABLE points OF point2 (x WITH OPTIONS NOT NULL);",
