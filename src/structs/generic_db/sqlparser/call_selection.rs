@@ -33,9 +33,12 @@ use sqlparser::ast::{
     TableFactor, Visit, Visitor,
 };
 
-use super::{ParserDB, ParserDBBuilder, PostgresCatalogOperator, constraint_names, partition_keys};
+use super::{
+    ParserDB, ParserDBBuilder, PostgresCatalogOperator, constraint_names, partition_keys,
+    stored_expressions,
+};
 use crate::{
-    errors::Error,
+    errors::{Error, RefusedCall},
     structs::{
         ArraySource, CallApplication, CallRefusal, CallResolution, ExpressionContext,
         ExpressionScope, IdentifierCase, Operand, OperandEvidence, OperandType, OperatorResolution,
@@ -45,7 +48,9 @@ use crate::{
             for_each_operator_node,
         },
     },
-    traits::{DatabaseLike, OperatorLike, PolicyLike, Relation, RuleLike, TriggerLike},
+    traits::{
+        DatabaseLike, FunctionLike, OperatorLike, PolicyLike, Relation, RuleLike, TriggerLike,
+    },
     utils::{
         call_sites::for_each_call,
         call_typing::{reached_by_name, written_argument_names},
@@ -74,6 +79,10 @@ struct Selections {
     /// name it calls, which a function expression and a function in `FROM`
     /// both hold.
     refused_calls: BTreeMap<usize, Error>,
+    /// What each call whose argument types select an aggregate, a window or
+    /// a set-returning function computes, by the address of the name it
+    /// calls.
+    placements: BTreeMap<usize, RefusedCall>,
     /// What the text each expression a type change parsed again was
     /// deparsed into writes, by the address of the expression.
     written: BTreeMap<usize, WrittenPins>,
@@ -251,6 +260,9 @@ impl ParserDBBuilder {
     /// for the first expression refused.
     pub(super) fn settle_calls(&mut self, database: &ParserDB, refuse: bool) -> Result<(), Error> {
         let mut selections = self.selections(database);
+        if refuse {
+            stored_expressions::refuse_selected_calls(self, &selections.placements)?;
+        }
         let selections = &mut selections;
         for (check, metadata) in self.check_constraints_mut() {
             settle(metadata.calls_mut(), &*check.attribute().expr, selections, refuse)?;
@@ -308,8 +320,14 @@ impl ParserDBBuilder {
     fn selections(&self, database: &ParserDB) -> Selections {
         let mut selections = Selections::default();
         let case = self.identifier_case();
-        let mut select =
-            Select { database, case, selections: &mut selections, pins: None, deparsed: None };
+        let mut select = Select {
+            database,
+            case,
+            selections: &mut selections,
+            pins: None,
+            deparsed: None,
+            stored: true,
+        };
         for (check, metadata) in self.check_constraints() {
             let expression = &check.attribute().expr;
             let scope = ExpressionScope::Table(TableAttribute::table(check));
@@ -343,6 +361,35 @@ impl ParserDBBuilder {
                 select.roots(unique_key.attribute(), &scope);
             });
         }
+        for (trigger, metadata) in self.triggers() {
+            // A trigger on a view sees rows the typing scopes do not describe,
+            // as a rule on one does.
+            if let (true, Ok(Relation::Table(table) | Relation::ForeignTable(table))) =
+                (is_waiting(metadata.calls()), trigger.relation(database))
+            {
+                select.roots(&trigger.condition, &ExpressionScope::Trigger(table));
+            }
+        }
+        for (domain, metadata) in self.domains() {
+            if is_waiting(metadata.calls()) {
+                select.roots(&domain.default, &ExpressionScope::Empty);
+                select.roots(&domain.constraints, &ExpressionScope::DomainValue(&domain.data_type));
+            }
+        }
+        for (table, metadata, _) in self.tables() {
+            let scope = ExpressionScope::Table(table.as_ref());
+            if let (true, Some(entries)) =
+                (is_waiting(metadata.partition_key_calls()), partition_keys::key_entries(table))
+            {
+                select.roots(entries, &scope);
+            }
+            for (exclusion, calls) in
+                constraint_names::exclusions(table).zip(metadata.exclusion_calls())
+            {
+                select.typed(exclusion, calls, |select| select.roots(exclusion, &scope));
+            }
+        }
+        select.stored = false;
         for (view, metadata, _) in self.views() {
             if is_waiting(metadata.calls()) {
                 select.query(view.declaration().query());
@@ -370,38 +417,10 @@ impl ParserDBBuilder {
                 select.roots(&**rule, &ExpressionScope::Rule { table, event: rule.event });
             }
         }
-        for (trigger, metadata) in self.triggers() {
-            // A trigger on a view sees rows the typing scopes do not describe,
-            // as a rule on one does.
-            if let (true, Ok(Relation::Table(table) | Relation::ForeignTable(table))) =
-                (is_waiting(metadata.calls()), trigger.relation(database))
-            {
-                select.roots(&trigger.condition, &ExpressionScope::Trigger(table));
-            }
-        }
         for (function, metadata) in self.functions() {
             if is_waiting(metadata.body_calls()) {
                 let scope = ExpressionScope::FunctionBody(function.as_ref());
                 select.roots(&function.function_body, &scope);
-            }
-        }
-        for (domain, metadata) in self.domains() {
-            if is_waiting(metadata.calls()) {
-                select.roots(&domain.default, &ExpressionScope::Empty);
-                select.roots(&domain.constraints, &ExpressionScope::DomainValue(&domain.data_type));
-            }
-        }
-        for (table, metadata, _) in self.tables() {
-            let scope = ExpressionScope::Table(table.as_ref());
-            if let (true, Some(entries)) =
-                (is_waiting(metadata.partition_key_calls()), partition_keys::key_entries(table))
-            {
-                select.roots(entries, &scope);
-            }
-            for (exclusion, calls) in
-                constraint_names::exclusions(table).zip(metadata.exclusion_calls())
-            {
-                select.typed(exclusion, calls, |select| select.roots(exclusion, &scope));
             }
         }
         selections
@@ -426,6 +445,10 @@ struct Select<'s> {
     /// Where the pins the typing reads are written, instead of recording
     /// selections.
     deparsed: Option<&'s mut Deparsed>,
+    /// Whether the expressions handed to it are stored and evaluated one row
+    /// at a time, which refuses an aggregate, a window or a set-returning
+    /// call.
+    stored: bool,
 }
 
 impl<'s> Select<'s> {
@@ -446,6 +469,7 @@ impl<'s> Select<'s> {
                 selections: &mut *self.selections,
                 pins: Some(&recorded),
                 deparsed: Some(&mut deparsed),
+                stored: self.stored,
             });
             roots(&mut Select {
                 database: self.database,
@@ -453,6 +477,7 @@ impl<'s> Select<'s> {
                 selections: &mut *self.selections,
                 pins: Some(&deparsed),
                 deparsed: None,
+                stored: self.stored,
             });
             let written = deparsed.into_written(&recorded.positions);
             self.selections.written.insert(root_address(node), written);
@@ -508,6 +533,7 @@ impl<'s> Select<'s> {
             case: self.case,
             selections: self.selections,
             deparsed: self.deparsed.as_deref_mut(),
+            stored: self.stored,
         };
         let ControlFlow::Continue(()) = walk(node, &mut nodes);
     }
@@ -560,14 +586,19 @@ struct Nodes<'c, 'q, 'db> {
     case: IdentifierCase,
     selections: &'c mut Selections,
     deparsed: Option<&'c mut Deparsed>,
+    /// Whether the expression typed is stored and evaluated one row at a
+    /// time.
+    stored: bool,
 }
 
 impl Nodes<'_, '_, '_> {
     /// Records what the call of `name`, applied as `application`, chooses,
-    /// or the refusal PostgreSQL gives it.
+    /// what the expression `function` writing it computes that a stored
+    /// expression refuses, or the refusal PostgreSQL gives it.
     fn select_call(
         &mut self,
         name: &ObjectName,
+        function: Option<&Function>,
         application: Option<CallApplication<'_, '_, ParserDB>>,
     ) {
         let choice = match application.as_ref().map(CallApplication::resolution) {
@@ -579,6 +610,17 @@ impl Nodes<'_, '_, '_> {
         };
         if let Some(choice) = choice {
             self.selections.calls.insert(address(name), choice);
+        }
+        if let (true, Some(function), Some(CallResolution::Selected(selected))) =
+            (self.stored, function, application.as_ref().map(CallApplication::resolution))
+        {
+            let called = selected.function();
+            if let (Ok(kind), Ok(aggregate)) =
+                (called.kind(self.database), called.aggregate_kind(self.database))
+                && let Some(call) = stored_expressions::placement(function, called, kind, aggregate)
+            {
+                self.selections.placements.insert(address(name), call);
+            }
         }
         let Some((called, refusal, arguments)) =
             application.and_then(CallApplication::into_refusal)
@@ -687,7 +729,7 @@ impl Visitor for Nodes<'_, '_, '_> {
         if let Expr::Function(function) = expression
             && let Ok(application) = self.context.call(expression)
         {
-            self.select_call(&function.name, application);
+            self.select_call(&function.name, Some(function), application);
         }
         if applies_operators(expression) {
             self.select_operators(expression);
@@ -701,7 +743,7 @@ impl Visitor for Nodes<'_, '_, '_> {
             && let TableFactor::Table { name, .. } | TableFactor::Function { name, .. } = factor
             && let Ok(application) = self.context.relation_call(factor)
         {
-            self.select_call(name, application);
+            self.select_call(name, None, application);
         }
         ControlFlow::Continue(())
     }

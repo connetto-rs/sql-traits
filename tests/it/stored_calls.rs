@@ -412,6 +412,10 @@ fn a_call_postgresql_places_or_refuses_for_its_clauses_is_not_refused_for_its_pl
             "CREATE TABLE d (i INT CHECK (min(i) WITHIN GROUP (ORDER BY i) > 0));",
             "function min(integer, integer) does not exist",
         ),
+        (
+            "CREATE TABLE d (i INT CHECK (now() FILTER (WHERE (SELECT true)) IS NOT NULL));",
+            "FILTER specified, but now is not an aggregate function",
+        ),
     ];
     for (sql, message) in refused {
         let refusal = parse(sql)
@@ -432,4 +436,85 @@ fn a_call_postgresql_places_or_refuses_for_its_clauses_is_not_refused_for_its_pl
         let result = parse(sql);
         assert!(result.is_ok(), "{sql}: {result:?}");
     }
+}
+
+const MAX_TEXT: &str =
+    "CREATE FUNCTION max(TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS 'SELECT $1';";
+
+/// A call whose name and argument count reach functions of different kinds
+/// is placed as the function its argument types and the search path select.
+#[test]
+fn a_call_reaching_functions_of_different_kinds_is_placed_as_the_one_selected() {
+    let refused = [
+        (
+            "CREATE FUNCTION min(TEXT) RETURNS SETOF TEXT LANGUAGE sql AS 'SELECT $1';
+             CREATE TABLE d (a TEXT CHECK (min(a) IS NOT NULL));"
+                .to_string(),
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE TABLE d (a INT CHECK (max(a) > 0));"),
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE TABLE d (a TEXT CHECK (max(a) > ''));"),
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            format!(
+                "{MAX_TEXT} CREATE TABLE d (a INT, g INT GENERATED ALWAYS AS (max(a)) STORED);"
+            ),
+            "aggregate functions are not allowed in column generation expressions",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE TABLE d (a INT DEFAULT max(1));"),
+            "aggregate functions are not allowed in DEFAULT expressions",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE TABLE d (a INT); CREATE INDEX ON d ((max(a)));"),
+            "aggregate functions are not allowed in index expressions",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE TABLE d (a INT); CREATE INDEX ON d (a) WHERE max(a) > 0;"),
+            "aggregate functions are not allowed in index predicates",
+        ),
+        (
+            format!(
+                "{MAX_TEXT} {TRIGGER_FUNCTION} CREATE TABLE d (a INT); CREATE INDEX ON d (a);
+                 CREATE TRIGGER t BEFORE INSERT ON d FOR EACH ROW WHEN (max(NEW.a) > 0) \
+                 EXECUTE FUNCTION trg();"
+            ),
+            "aggregate functions are not allowed in trigger WHEN conditions",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE DOMAIN dm AS INT CHECK (max(VALUE) > 0);"),
+            "aggregate functions are not allowed in check constraints",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE DOMAIN dm AS INT DEFAULT max(1);"),
+            "aggregate functions are not allowed in DEFAULT expressions",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE TABLE d (a INT) PARTITION BY RANGE ((max(a)));"),
+            "aggregate functions are not allowed in partition key expressions",
+        ),
+        (
+            format!("{MAX_TEXT} CREATE TABLE d (a INT, EXCLUDE USING btree ((max(a)) WITH =));"),
+            "aggregate functions are not allowed in index expressions",
+        ),
+    ];
+    for (sql, message) in refused {
+        let refusal = parse(&sql)
+            .map(|_| ())
+            .expect_err(&sql)
+            .postgres_error()
+            .expect("PostgreSQL refuses the call");
+        assert_eq!(refusal.message(), message, "{sql}");
+    }
+    let selected_plain = "CREATE SCHEMA s;
+        CREATE FUNCTION s.min(INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+        SET search_path = s, pg_catalog;
+        CREATE TABLE d (a INT CHECK (min(a) > 0));";
+    let result = parse(selected_plain);
+    assert!(result.is_ok(), "{selected_plain}: {result:?}");
 }
