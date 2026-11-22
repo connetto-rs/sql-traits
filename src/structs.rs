@@ -87,8 +87,8 @@ pub(crate) use expression_context::{
     declared_type_named, places_call, plain_arguments, row_of,
 };
 pub use expression_scope::ExpressionScope;
-pub use expression_truth::ExpressionTruth;
-pub(crate) use expression_truth::{Checks, table_truth};
+pub use expression_truth::{Assumption, ExpressionTruth, Raising};
+pub(crate) use expression_truth::{table_truth, validated_checks};
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;

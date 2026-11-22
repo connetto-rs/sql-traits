@@ -2,7 +2,12 @@
 //! `sqlparser-expr-eval` over the table's columns and the database's
 //! functions.
 
-use alloc::{format, string::String, sync::Arc, vec::Vec};
+use alloc::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::{
     cell::RefCell,
     ops::{Bound, ControlFlow},
@@ -50,27 +55,90 @@ use crate::{
 /// when it is never false, never `NULL` and never raises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpressionTruth {
-    /// Which of true, false and `NULL` the expression may evaluate to.
+    /// Which of true, false and `NULL` the expression may evaluate to, its
+    /// values read as booleans.
     pub outcomes: Outcomes,
-    /// Whether evaluating the expression may raise an error.
-    pub may_raise: bool,
+    /// On which rows evaluating the expression raises an error.
+    pub raising: Raising,
+}
+
+/// On which rows evaluating an expression raises an error, whatever the
+/// type of its values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Raising {
+    /// On none.
+    Never,
+    /// On some rows, or on rows the evaluation cannot tell apart.
+    Sometimes,
+    /// On every row, so it neither takes a value nor is `NULL`.
+    Always,
 }
 
 impl From<&Evaluation> for ExpressionTruth {
     fn from(evaluation: &Evaluation) -> Self {
-        Self { outcomes: evaluation.outcomes(), may_raise: evaluation.may_raise() }
+        let raising = if evaluation.always_raises() {
+            Raising::Always
+        } else if evaluation.may_raise() {
+            Raising::Sometimes
+        } else {
+            Raising::Never
+        };
+        Self { outcomes: evaluation.outcomes(), raising }
     }
 }
 
-/// Whether the table's `CHECK` constraints seed the guarantees an expression
-/// is read under.
-#[derive(Clone, Copy)]
-pub(crate) enum Checks {
-    /// None of them do, so a check is judged on its own.
-    Ignored,
-    /// Every validated and enforced one the table's inheritors share does,
-    /// but the check whose expression is read.
-    Validated,
+/// What an expression is read under beside the guarantees of its table's
+/// column types, `NOT NULL`, domain checks and generated columns.
+pub enum Assumption<'a, DB: DatabaseLike> {
+    /// A check of the table, true or `NULL` on every row as PostgreSQL
+    /// enforces it. A check calling a SQL value function such as
+    /// `CURRENT_TIMESTAMP`, a function that is not immutable, or one that the
+    /// database's search path or the read check's path resolves to other
+    /// functions than the check's own path, assumes nothing.
+    Check(&'a DB::CheckConstraint),
+    /// An expression taking one of `outcomes` on every row, its calls
+    /// resolved under the database's search path. An expression whose calls
+    /// the read check's path resolves to other functions assumes nothing.
+    Expression {
+        /// The expression assumed.
+        expression: &'a Expr,
+        /// The outcomes it is assumed to take.
+        outcomes: Outcomes,
+    },
+}
+
+#[expect(clippy::expl_impl_clone_on_copy, reason = "derive would require DB: Clone")]
+impl<DB: DatabaseLike> Clone for Assumption<'_, DB> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<DB: DatabaseLike> Copy for Assumption<'_, DB> {}
+
+/// Every validated and enforced check of `table` its inheritors share, as
+/// assumptions, but `except`.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+/// hold `table`.
+pub(crate) fn validated_checks<'a, DB: DatabaseLike>(
+    table: &'a DB::Table,
+    database: &'a DB,
+    except: Option<&DB::CheckConstraint>,
+) -> Result<Vec<Assumption<'a, DB>>, LookupError> {
+    let mut checks = Vec::new();
+    for check in table.check_constraints(database)? {
+        if except.is_none_or(|except| !ptr::eq(check, except))
+            && check.is_enforced()
+            && !check.no_inherit()
+            && check.is_validated(database)?
+        {
+            checks.push(Assumption::Check(check));
+        }
+    }
+    Ok(checks)
 }
 
 /// The engine whose semantics an expression is read with.
@@ -100,20 +168,21 @@ impl Engine {
 
 /// What `expression` evaluates to on the rows of `table`, under the
 /// guarantees the column types, `NOT NULL`, the domain checks, the generated
-/// columns and the `checks` hold. `own` is the check `expression` belongs
-/// to, which seeds nothing and resolves its calls under the path it was
-/// created with.
+/// columns and the `assumptions` hold. `own` is the check `expression`
+/// belongs to, which resolves its calls under the path it was created with.
 ///
 /// # Errors
 ///
-/// Returns the lookup errors resolving a column, a call or a check raises.
-pub(crate) fn table_truth<DB: DatabaseLike>(
-    table: &DB::Table,
-    database: &DB,
+/// Returns [`LookupError::CheckNotOfTable`] when an assumed check is not one
+/// of `table`'s, and the lookup errors resolving a column, a call or a check
+/// raises.
+pub(crate) fn table_truth<'a, DB: DatabaseLike>(
+    table: &'a DB::Table,
+    database: &'a DB,
     expression: &Expr,
     case: IdentifierCase,
-    own: Option<&DB::CheckConstraint>,
-    checks: Checks,
+    own: Option<&'a DB::CheckConstraint>,
+    assumptions: &[Assumption<'a, DB>],
 ) -> Result<ExpressionTruth, LookupError> {
     let engine = Engine::of(database);
     let context = TableContext {
@@ -136,22 +205,22 @@ pub(crate) fn table_truth<DB: DatabaseLike>(
                 &PostgreSqlOptions::default(),
                 context,
                 expression,
-                checks,
+                assumptions,
             )
         }
         Engine::Sqlite | Engine::Other => {
-            truth_under(&GenericDialect {}, &(), context, expression, checks)
+            truth_under(&GenericDialect {}, &(), context, expression, assumptions)
         }
     }
 }
 
 /// [`table_truth`] under `dialect` and its `options`.
-fn truth_under<D: EvalDialect, DB: DatabaseLike>(
+fn truth_under<'a, D: EvalDialect, DB: DatabaseLike>(
     dialect: &D,
     options: &D::Options,
-    mut context: TableContext<'_, DB>,
+    mut context: TableContext<'a, DB>,
     expression: &Expr,
-    checks: Checks,
+    assumptions: &[Assumption<'a, DB>],
 ) -> Result<ExpressionTruth, LookupError> {
     let (table, database) = (context.table, context.database);
     let mut guarantees = Guarantees::new();
@@ -186,21 +255,28 @@ fn truth_under<D: EvalDialect, DB: DatabaseLike>(
         }
     }
     let mut seeding = Vec::new();
-    if let Checks::Validated = checks {
-        for check in table.check_constraints(database)? {
-            if context.own.is_none_or(|own| !ptr::eq(check, own))
-                && check.is_enforced()
-                && !check.no_inherit()
-                && check.is_validated(database)?
-            {
+    for assumption in assumptions {
+        let holds = match *assumption {
+            Assumption::Check(check) => {
+                if !table.check_constraints(database)?.any(|own| ptr::eq(own, check)) {
+                    return Err(LookupError::CheckNotOfTable {
+                        check: check.expression(database).to_string(),
+                        table: table.table_name().into(),
+                    });
+                }
                 context.source = Source::Check(check);
-                if context.holds_across_statements(
+                context.holds_across_statements(
                     check.expression(database),
                     TableContext::runs_immutable_alike,
-                )? {
-                    seeding.push(check);
-                }
+                )?
             }
+            Assumption::Expression { expression, .. } => {
+                context.source = Source::Expression;
+                context.every_call(expression, TableContext::resolves_alike)?
+            }
+        };
+        if holds {
+            seeding.push(*assumption);
         }
     }
     // A check or a generated column may narrow a column only once another
@@ -214,16 +290,19 @@ fn truth_under<D: EvalDialect, DB: DatabaseLike>(
             let held = context.generated(column, evaluation)?;
             guarantees.restrict(Subject::Reference(ptr::from_ref(column).addr()), held);
         }
-        for check in &seeding {
-            context.source = Source::Check(*check);
-            guarantees = implied(
-                check.expression(database),
-                Outcomes::NOT_FALSE,
-                dialect,
-                options,
-                &mut context,
-                &guarantees,
-            )?;
+        for assumption in &seeding {
+            let (expression, outcomes) = match *assumption {
+                Assumption::Check(check) => {
+                    context.source = Source::Check(check);
+                    (check.expression(database), Outcomes::NOT_FALSE)
+                }
+                Assumption::Expression { expression, outcomes } => {
+                    context.source = Source::Expression;
+                    (expression, outcomes)
+                }
+            };
+            guarantees =
+                implied(expression, outcomes, dialect, options, &mut context, &guarantees)?;
         }
         if guarantees == before || guarantees.is_impossible() {
             break;
@@ -231,7 +310,7 @@ fn truth_under<D: EvalDialect, DB: DatabaseLike>(
     }
     // No row satisfies every guarantee, so the expression meets no row.
     if guarantees.is_impossible() {
-        return Ok(ExpressionTruth { outcomes: Outcomes::NONE, may_raise: false });
+        return Ok(ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Never });
     }
     context.source = context.own.map_or(Source::Expression, Source::Check);
     let evaluation = evaluate(expression, dialect, options, &mut context, &guarantees)?;
@@ -619,20 +698,34 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
         expression: &Expr,
         runs: fn(&mut Self, &Function) -> Result<bool, LookupError>,
     ) -> Result<bool, LookupError> {
+        let value_function = walk_expressions(expression, |node| {
+            match node {
+                Expr::Function(call)
+                    if matches!(expression_form(&call.name), Some(ExpressionForm::Value(_))) =>
+                {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        })
+        .is_break();
+        Ok(!value_function && self.every_call(expression, runs)?)
+    }
+
+    /// Whether every call `expression` writes that may run a function
+    /// passes `passes`.
+    fn every_call(
+        &mut self,
+        expression: &Expr,
+        passes: fn(&mut Self, &Function) -> Result<bool, LookupError>,
+    ) -> Result<bool, LookupError> {
         let mut answer = Ok(true);
         let _ = walk_expressions(expression, |node| {
             let Expr::Function(call) = node else { return ControlFlow::Continue(()) };
-            match expression_form(&call.name) {
-                Some(ExpressionForm::Value(_)) => {
-                    answer = Ok(false);
-                    return ControlFlow::Break(());
-                }
-                Some(ExpressionForm::CommonType | ExpressionForm::NullIf) => {
-                    return ControlFlow::Continue(());
-                }
-                None => {}
+            if expression_form(&call.name).is_some() {
+                return ControlFlow::Continue(());
             }
-            match runs(self, call) {
+            match passes(self, call) {
                 Ok(true) => ControlFlow::Continue(()),
                 Ok(false) => {
                     answer = Ok(false);
@@ -653,19 +746,21 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
         Ok(all_immutable(&self.runnable(call)?))
     }
 
-    /// Whether `call` runs only immutable functions, the same ones under
-    /// the path it was written with as under the database's search path and,
-    /// when the check being read writes the same call, under that check's
-    /// path.
-    ///
-    /// The guarantees a check seeds name its calls as written, so a call the
-    /// database's search path resolves to other functions than the check's
-    /// own path would carry them to calls of other functions.
+    /// Whether `call` runs only immutable functions, as
+    /// [`Self::resolves_alike`] resolves it.
     fn runs_immutable_alike(&mut self, call: &Function) -> Result<bool, LookupError> {
+        Ok(all_immutable(&self.runnable(call)?) && self.resolves_alike(call)?)
+    }
+
+    /// Whether `call` runs the same functions under the path it was written
+    /// with as under the database's search path and, when the check being
+    /// read writes the same call, under that check's path.
+    ///
+    /// The guarantees an assumption seeds name its calls as written, so a
+    /// call another path resolves to other functions would carry them to
+    /// calls of other functions.
+    fn resolves_alike(&mut self, call: &Function) -> Result<bool, LookupError> {
         let written = self.runnable(call)?;
-        if !all_immutable(&written) {
-            return Ok(false);
-        }
         let own = self
             .own
             .filter(|own| writes_call(own.expression(self.database), call))

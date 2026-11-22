@@ -128,11 +128,11 @@ fn length_resolves_the_overload_its_argument_selects() {
     // comparisons raise nothing.
     for sql in ["length(a) < length(b)", "length(s) < length(r)"] {
         let resolved = truth(sql);
-        assert!(!resolved.may_raise, "{sql}: {resolved:?}");
+        assert_eq!(resolved.raising, Raising::Never, "{sql}: {resolved:?}");
     }
     // No overload takes `code`, so both calls keep an unknown type, whose
     // comparison may raise.
     let unresolved = truth("length(c) < length(d)");
     assert!(unresolved.outcomes.truth && unresolved.outcomes.falsity, "{unresolved:?}");
-    assert!(unresolved.may_raise, "{unresolved:?}");
+    assert_eq!(unresolved.raising, Raising::Sometimes, "{unresolved:?}");
 }

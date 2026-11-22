@@ -18,7 +18,7 @@ use sqlparser::{
 
 use crate::{
     errors::LookupError,
-    structs::{Checks, ExpressionTruth, IdentifierCase, WrittenCall},
+    structs::{Assumption, ExpressionTruth, IdentifierCase, Raising, WrittenCall},
     traits::{
         ColumnCollation, DataTypeLike, DatabaseLike, DialectLike, Metadata, MySqlCollationPadding,
         TableLike, column::ColumnLike, function_like::FunctionLike,
@@ -30,23 +30,6 @@ fn unnested(mut expr: &Expr) -> &Expr {
         expr = inner;
     }
     expr
-}
-
-/// What `check`'s expression can evaluate to on the rows of its table, under
-/// the column types, `NOT NULL`, the domain checks and the generated columns
-/// alone.
-fn truth_on_its_own<C: CheckConstraintLike>(
-    check: &C,
-    database: &C::DB,
-) -> Result<ExpressionTruth, LookupError> {
-    crate::structs::table_truth(
-        check.table(database)?,
-        database,
-        check.expression(database),
-        database.identifier_case(),
-        Some(check.borrow()),
-        Checks::Ignored,
-    )
 }
 
 /// Helper to extract column names from nullability checks in an AND chain
@@ -1398,10 +1381,8 @@ pub trait CheckConstraintLike:
     /// Returns whether the check constraint admits every row on its own,
     /// its expression never false and never raising.
     ///
-    /// The expression is read as [`TableLike::expression_truth`] reads it,
-    /// under the column types, `NOT NULL`, the domain checks and the generated
-    /// columns, and under none of the table's other checks, so a check made
-    /// redundant by another is no tautology here.
+    /// The expression is read as [`Self::truth_under`] reads it under no
+    /// assumption, so a check made redundant by another is no tautology here.
     /// [`Self::truth_under_other_checks`] answers that question.
     ///
     /// # Errors
@@ -1437,8 +1418,8 @@ pub trait CheckConstraintLike:
     /// # }
     /// ```
     fn is_tautology(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        let truth = truth_on_its_own(self, database)?;
-        Ok(!truth.outcomes.falsity && !truth.may_raise)
+        let truth = self.truth_under(database, &[])?;
+        Ok(!truth.outcomes.falsity && truth.raising == Raising::Never)
     }
 
     /// Returns whether the check constraint admits no row on its own, its
@@ -1483,12 +1464,67 @@ pub trait CheckConstraintLike:
     /// # }
     /// ```
     fn is_negation(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        let truth = truth_on_its_own(self, database)?;
+        let truth = self.truth_under(database, &[])?;
         Ok(!truth.outcomes.truth && !truth.outcomes.null)
     }
 
     /// Returns what the check constraint's expression can evaluate to on the
-    /// rows every other validated check of its table admits.
+    /// rows of its table, under `assumptions` beside the column types,
+    /// `NOT NULL`, the domain checks and the generated columns.
+    ///
+    /// The expression is read as [`TableLike::expression_truth`] reads it,
+    /// its calls resolved under the path the check was created with. Under
+    /// no assumption it answers what the check does on its own. Assumptions
+    /// that admit no row together leave no outcome and no error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this check constraint, and [`LookupError::CheckNotOfTable`] when
+    /// an assumed check is not one of its table's.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE u (y INT, CHECK (1 / 0 = 1), CHECK (y > 0), CHECK (y < 0));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("u", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let &[raising, positive, negative] = &table.check_constraints(&db)?.collect::<Vec<_>>()[..]
+    /// else {
+    ///     unreachable!()
+    /// };
+    /// let on_its_own = raising.truth_under(&db, &[])?;
+    /// assert_eq!(on_its_own, ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Always });
+    /// // A NULL y satisfies both y > 0 and y < 0.
+    /// let beside = positive.truth_under(&db, &[Assumption::Check(negative)])?;
+    /// assert_eq!(beside, ExpressionTruth { outcomes: Outcomes::NOT_TRUE, raising: Raising::Never });
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn truth_under(
+        &self,
+        database: &Self::DB,
+        assumptions: &[Assumption<'_, Self::DB>],
+    ) -> Result<ExpressionTruth, LookupError> {
+        crate::structs::table_truth(
+            self.table(database)?,
+            database,
+            self.expression(database),
+            database.identifier_case(),
+            Some(self.borrow()),
+            assumptions,
+        )
+    }
+
+    /// Returns what the check constraint's expression can evaluate to on the
+    /// rows every other validated check of its table admits, which is
+    /// [`Self::truth_under`] those checks.
     ///
     /// A check that is never false and never raises here is redundant
     /// beside the others. Two checks may each be redundant beside the other,
@@ -1525,15 +1561,9 @@ pub trait CheckConstraintLike:
         &self,
         database: &Self::DB,
     ) -> Result<ExpressionTruth, LookupError> {
-        let table = self.table(database)?;
-        crate::structs::table_truth(
-            table,
-            database,
-            self.expression(database),
-            database.identifier_case(),
-            Some(self.borrow()),
-            Checks::Validated,
-        )
+        let others =
+            crate::structs::validated_checks(self.table(database)?, database, Some(self.borrow()))?;
+        self.truth_under(database, &others)
     }
 
     /// Returns whether the check constraint is a mutual nullability constraint.
