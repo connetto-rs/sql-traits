@@ -311,7 +311,7 @@ fn exposed_by(
 /// reference would read, exactly as the table lookup beside it does. Comparing
 /// the written qualifier against the stored one instead would miss every view
 /// the path placed in a schema other than the default.
-fn plain_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<usize> {
+pub(super) fn plain_view_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<usize> {
     let key = stored_view_key(
         builder.namespaces(),
         builder.resolve_view_object_name(name).ok()??,
@@ -544,6 +544,9 @@ pub(super) fn alter_view(
     catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     match operation {
+        AlterTableOperation::SetSchema { schema_name } => {
+            super::set_schema::move_relation(builder, name, schema_name, false, arrays, catalog)
+        }
         AlterTableOperation::RenameTable { table_name } => {
             let (RenameTableNameKind::As(new_name) | RenameTableNameKind::To(new_name)) =
                 table_name;
@@ -588,16 +591,12 @@ pub(super) fn alter_view(
 /// accepts only against a view of the kind the statement spells, except that
 /// either renames a column of any relation.
 ///
-/// `SET SCHEMA` and MySQL's `ALTER VIEW ... AS`, which redefines the view, are
-/// refused, since the model can apply neither and discarding either would
-/// leave it wrong.
-///
 /// # Errors
 ///
 /// Returns [`Error::RelationKindMismatch`] when another kind of relation holds
 /// the name, [`Error::RelationNotFound`] when nothing does and the statement
-/// wrote no `IF EXISTS`, [`Error::UnsupportedAlterTableOperation`] for the two
-/// operations refused above, [`Error::AlterActionUnsupportedOnRelation`] for
+/// wrote no `IF EXISTS`, [`Error::UnsupportedAlterTableOperation`] for view
+/// replacement, [`Error::AlterActionUnsupportedOnRelation`] for
 /// a materialized view's column default, the errors of [`alter_view`] for the
 /// operations it shares with `ALTER TABLE`, and those of
 /// [`rename_column_of_other_kind`].
@@ -608,6 +607,9 @@ pub(super) fn apply_alter_view(
     catalog: &mut Arc<PostgresCatalog>,
 ) -> Result<ParserDBBuilder, Error> {
     let AlterView { materialized, name, if_exists, operation } = statement;
+    if matches!(operation, AlterViewOperation::SetSchema { .. }) {
+        super::set_schema::require_dialect(&builder)?;
+    }
     let (kind, held) = if *materialized {
         (ObjectKind::MaterializedView, materialized_view_position(&builder, name))
     } else {
@@ -676,7 +678,17 @@ pub(super) fn apply_alter_view(
         AlterViewOperation::AlterColumn { column_name, .. } => {
             require_view_column(builder, name, column_name)
         }
-        AlterViewOperation::SetSchema { .. } | AlterViewOperation::As { .. } => {
+        AlterViewOperation::SetSchema { schema_name } => {
+            super::set_schema::move_relation(
+                builder,
+                name,
+                schema_name,
+                *if_exists,
+                arrays,
+                catalog,
+            )
+        }
+        AlterViewOperation::As { .. } => {
             Err(Error::UnsupportedAlterTableOperation {
                 table_name: builder.dialect().stored_object_name(name),
                 operation: operation.to_string(),
@@ -1184,7 +1196,7 @@ fn view_ident<V: ViewLike>(view: &V) -> Ident {
 
 /// Gives the view stored at `position` the name `ident`, in `schema` when the
 /// view moves, and carries every view, body, rule and grant naming it along.
-fn retarget_view(
+pub(super) fn retarget_view(
     mut builder: ParserDBBuilder,
     kind: ObjectKind,
     position: usize,

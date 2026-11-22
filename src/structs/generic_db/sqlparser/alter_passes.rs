@@ -3,8 +3,8 @@
 use alloc::{collections::VecDeque, string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, Ident,
-    ObjectName, TableConstraint,
+    AlterColumnOperation, AlterTable, AlterTableOperation, AlterTableType, ColumnDef, ColumnOption,
+    ColumnOptionDef, Ident, ObjectName, TableConstraint,
 };
 
 use super::{
@@ -305,6 +305,7 @@ pub(super) fn transform_constraint(
 pub(super) enum Standalone {
     Rename,
     Partition,
+    SetSchema,
 }
 
 /// Classifies commands whose syntax has no comma-separated form.
@@ -315,8 +316,63 @@ pub(super) fn standalone(operation: &AlterTableOperation) -> Option<Standalone> 
         | AlterTableOperation::RenameConstraint { .. } => Some(Standalone::Rename),
         AlterTableOperation::AttachPartitionOf { .. }
         | AlterTableOperation::DetachPartitionOf { .. } => Some(Standalone::Partition),
+        AlterTableOperation::SetSchema { .. } => Some(Standalone::SetSchema),
         _ => None,
     }
+}
+
+/// Refuses combined standalone commands at their first invalid token.
+pub(super) fn require_standalone(
+    builder: &ParserDBBuilder,
+    statement: &AlterTable,
+) -> Result<(), Error> {
+    if statement.operations.len() < 2 {
+        return Ok(());
+    }
+    let postgres = matches!(builder.dialect(), super::SqlparserDialect::PostgreSql);
+    let Some((position, kind)) =
+        statement.operations.iter().enumerate().find_map(|(position, operation)| {
+            let kind = standalone(operation)?;
+            (postgres || kind == Standalone::Partition).then_some((position, kind))
+        })
+    else {
+        return Ok(());
+    };
+    let operation = &statement.operations[position];
+    let keyword = match operation {
+        AlterTableOperation::SetSchema { .. } => "SCHEMA",
+        AlterTableOperation::AttachPartitionOf { .. } => "ATTACH",
+        AlterTableOperation::DetachPartitionOf { .. } => "DETACH",
+        AlterTableOperation::RenameConstraint { .. }
+            if position == 0 && statement.table_type == Some(AlterTableType::Foreign) =>
+        {
+            "CONSTRAINT"
+        }
+        _ => "RENAME",
+    };
+    let foreign_refusal = statement.table_type == Some(AlterTableType::Foreign)
+        && matches!(
+            operation,
+            AlterTableOperation::RenameConstraint { .. }
+                | AlterTableOperation::AttachPartitionOf { .. }
+                | AlterTableOperation::DetachPartitionOf { .. }
+        );
+    let written_token = if position == 0 && !foreign_refusal { "," } else { keyword }.to_string();
+    Err(match kind {
+        Standalone::Rename => {
+            Error::RenameCommandNotAlone {
+                relation_name: builder.dialect().stored_object_name(&statement.name),
+                written_token,
+            }
+        }
+        Standalone::Partition => {
+            Error::PartitionCommandNotAlone {
+                table_name: builder.dialect().stored_object_name_last(&statement.name),
+                written_token,
+            }
+        }
+        Standalone::SetSchema => Error::SetSchemaCommandNotAlone { written_token },
+    })
 }
 
 /// Whether a relation kind refuses an alteration operation.

@@ -144,6 +144,7 @@ mod routine_privileges;
 mod rules;
 mod schema_usage;
 mod sequences;
+mod set_schema;
 mod signature_types;
 mod sqlite_autoindex;
 mod sqlite_databases;
@@ -7296,46 +7297,15 @@ impl ParserDB {
         if let Some((previous, current)) = array_move {
             Arc::make_mut(catalog).rename_type_identity(&previous, current);
         }
-        let readers = view_rewrites::readers(&builder, &[&key]);
-
-        // Collected before the rename, while the old name is still the key.
-        // A self-reference is not in here: the renamed node rewrites its own.
-        let hosts: Vec<StoredTable> = builder
-            .tables()
-            .iter()
-            .map(|(table, _, _)| table.as_ref())
-            .filter(|table| {
-                !renamed.matches(table, builder.identifier_case())
-                    && (table_references(table, &renamed)
-                        || inheritance::names_parent(table, &renamed))
-            })
-            .map(StoredTable::of)
-            .collect();
-
-        builder = Self::replace_table_node(builder, &renamed, |_, node| {
-            node.name = target.name.clone();
-            rewrite_foreign_key_targets(node, &renamed, &target);
-            inheritance::rewrite_parent_names(node, &renamed, &target);
-            Ok(())
-        })?;
-
-        for host in &hosts {
-            builder = Self::replace_table_node(builder, host, |_, node| {
-                rewrite_foreign_key_targets(node, &renamed, &target);
-                inheritance::rewrite_parent_names(node, &renamed, &target);
-                Ok(())
-            })?;
+        if changing_schema && let Some(name) = object_name_last_identifier(&target.name) {
+            validate_relation_schema(
+                &builder,
+                qualifier_of(&target.name).named(),
+                ObjectKind::Table,
+                (&name.value, name.quote_style.is_some()),
+            )?;
         }
-
-        builder.rewrite_table_references(&renamed, &target);
-
-        builder = user_defined_types::repoint_type_references(builder, &original, &target.name)?;
-        if let Some(readers) = readers
-            && object_name_last_identifier(&target.name).is_some()
-        {
-            let followed = [view_rewrites::Rename::Relation { key, to: target.name.clone() }];
-            view_rewrites::follow_renames(&mut builder, readers, &followed)?;
-        }
+        builder = Self::retarget_table(builder, &renamed, key, &original, &target)?;
 
         if !changing_schema
             && let Some((previous, current)) =
@@ -7344,6 +7314,51 @@ impl ParserDB {
             Arc::make_mut(catalog).rename_type_identity(&previous, current);
         }
         Arc::make_mut(catalog).rename_type_identity(&original, &target.name);
+        Ok(builder)
+    }
+
+    /// Retargets a table and its references after destination validation.
+    fn retarget_table(
+        mut builder: ParserDBBuilder,
+        renamed: &StoredTable,
+        key: RelationKey,
+        original: &ObjectName,
+        target: &RenameTarget,
+    ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let readers = view_rewrites::readers(&builder, &[&key]);
+        let hosts: Vec<StoredTable> = builder
+            .tables()
+            .iter()
+            .map(|(table, _, _)| table.as_ref())
+            .filter(|table| {
+                !renamed.matches(table, builder.identifier_case())
+                    && (table_references(table, renamed)
+                        || inheritance::names_parent(table, renamed))
+            })
+            .map(StoredTable::of)
+            .collect();
+
+        builder = Self::replace_table_node(builder, renamed, |_, node| {
+            node.name = target.name.clone();
+            rewrite_foreign_key_targets(node, renamed, target);
+            inheritance::rewrite_parent_names(node, renamed, target);
+            Ok(())
+        })?;
+        for host in &hosts {
+            builder = Self::replace_table_node(builder, host, |_, node| {
+                rewrite_foreign_key_targets(node, renamed, target);
+                inheritance::rewrite_parent_names(node, renamed, target);
+                Ok(())
+            })?;
+        }
+        builder.rewrite_table_references(renamed, target);
+        builder = user_defined_types::repoint_type_references(builder, original, &target.name)?;
+        if let Some(readers) = readers
+            && object_name_last_identifier(&target.name).is_some()
+        {
+            let followed = [view_rewrites::Rename::Relation { key, to: target.name.clone() }];
+            view_rewrites::follow_renames(&mut builder, readers, &followed)?;
+        }
         Ok(builder)
     }
 
@@ -7530,16 +7545,6 @@ impl ParserDB {
         let mut replacement = (*previous_node).clone();
         edit(&previous_node, &mut replacement)?;
         record_implied_not_null(&mut replacement, *builder.dialect(), builder.identifier_case());
-        // A table keeping its schema stays where it was declared even while a
-        // schema rename has taken the old name, so only a move is checked.
-        if !schema_qualifiers_match(
-            builder.namespaces(),
-            table_schema_qualifier(&previous_node),
-            table_schema_qualifier(&replacement),
-            builder.identifier_case(),
-        ) {
-            validate_table_schema(&builder, &replacement)?;
-        }
 
         let mut metadata = Self::carried_table_metadata(
             &mut previous_metadata,
@@ -10531,42 +10536,26 @@ impl ParserDB {
         let mut persistence_before_change = None;
         let mut replica_identities = Vec::new();
         let postgres = matches!(dialect, SqlparserDialect::PostgreSql);
+        if alter_table.operations.iter().any(|operation| {
+            alter_passes::standalone(operation) == Some(alter_passes::Standalone::SetSchema)
+        }) {
+            set_schema::require_dialect(&builder)?;
+        }
+        alter_passes::require_standalone(&builder, &alter_table)?;
         if postgres {
             alter_passes::grammar(&builder, &alter_table.name, &alter_table.operations)?;
         }
         if alter_table.table_type == Some(AlterTableType::Foreign) {
             refuse_alter_foreign_table_of_other_kind(&builder, &alter_table)?;
         }
-        if matches!(dialect, SqlparserDialect::PostgreSql)
-            && alter_table.operations.len() > 1
-            && let Some(position) = alter_table.operations.iter().position(|operation| {
-                alter_passes::standalone(operation) == Some(alter_passes::Standalone::Rename)
-            })
-        {
-            return Err(crate::errors::Error::RenameCommandNotAlone {
-                relation_name: dialect.stored_object_name(&alter_table.name),
-                written_token: if position == 0 { "," } else { "RENAME" }.to_string(),
-            });
-        }
-        if alter_table.operations.len() > 1
-            && let Some(position) = alter_table.operations.iter().position(|operation| {
-                alter_passes::standalone(operation) == Some(alter_passes::Standalone::Partition)
-            })
-        {
-            let keyword = match alter_table.operations[position] {
-                AlterTableOperation::DetachPartitionOf { .. } => "DETACH",
-                _ => "ATTACH",
-            };
-            return Err(crate::errors::Error::PartitionCommandNotAlone {
-                table_name: dialect.stored_object_name_last(&alter_table.name),
-                written_token: if position == 0 { "," } else { keyword }.to_string(),
-            });
-        }
-        // Rename handlers retain their operation-specific missing-name errors.
+        // Standalone handlers resolve their own relation kinds.
         if postgres
             && views::holds_view(&builder, &alter_table.name).is_none()
             && !alter_table.operations.first().is_some_and(|operation| {
-                alter_passes::standalone(operation) == Some(alter_passes::Standalone::Rename)
+                matches!(
+                    alter_passes::standalone(operation),
+                    Some(alter_passes::Standalone::Rename | alter_passes::Standalone::SetSchema)
+                )
             })
         {
             for operation in &mut alter_table.operations {
@@ -10633,6 +10622,16 @@ impl ParserDB {
                 }
             }
             match operation {
+                AlterTableOperation::SetSchema { schema_name } => {
+                    builder = set_schema::move_relation(
+                        builder,
+                        &alter_table.name,
+                        &schema_name,
+                        alter_table.if_exists,
+                        type_arrays,
+                        active_postgres_catalog,
+                    )?;
+                }
                 AlterTableOperation::EnableRowLevelSecurity => {
                     builder = Self::alter_table_metadata(
                         builder,

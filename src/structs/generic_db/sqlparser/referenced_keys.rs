@@ -380,9 +380,7 @@ pub(super) fn removed_keys(
     Ok(removed)
 }
 
-/// Gives each primary key and unique constraint of `node` holding no identity
-/// yet a fresh one, the primary key before the others, which is the order
-/// PostgreSQL creates the indexes of one statement in.
+/// Gives each constraint-backed index a creation identity, primary keys first.
 pub(super) fn settle_key_creations(
     builder: &mut ParserDBBuilder,
     node: &CreateTable,
@@ -399,8 +397,9 @@ pub(super) fn settle_key_creations(
                     ..
                 } | Slot::Table(_, TableConstraint::PrimaryKey(_))
             );
-            (slot.is_unique_key() && !creations.iter().any(|held| held.slot == key))
-                .then_some((primary, key))
+            (constraint_names::backed_by_index(slot)
+                && !creations.iter().any(|held| held.slot == key))
+            .then_some((primary, key))
         })
         .collect();
     arriving.sort_by_key(|(primary, _)| !primary);

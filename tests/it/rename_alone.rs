@@ -29,6 +29,11 @@ fn rename_cannot_precede_another_action() {
     );
 }
 
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "Unexpected variants and missing diagnostics fail this test."
+)]
 #[test]
 fn combined_rename_forms_are_refused() {
     for form in [
@@ -46,7 +51,7 @@ fn combined_rename_forms_are_refused() {
                 "DROP COLUMN spare",
                 "ATTACH PARTITION child FOR VALUES FROM (0) TO (10)",
             ] {
-                for operations in [format!("{form}, {companion}"), format!("{companion}, {form}")] {
+                for (first, second) in [(form, companion), (companion, form)] {
                     for (relation, setup) in [
                         ("TABLE", SETUP),
                         (
@@ -54,13 +59,56 @@ fn combined_rename_forms_are_refused() {
                             "CREATE FOREIGN TABLE probe (value int, spare int, CONSTRAINT positive CHECK (value > 0)) SERVER warehouse;",
                         ),
                     ] {
-                        let statement = format!("ALTER {relation} {qualifier}probe {operations};");
+                        let statement =
+                            format!("ALTER {relation} {qualifier}probe {first}, {second};");
                         if Parser::parse_sql(&PostgreSqlDialect {}, &statement).is_ok() {
-                            let result = ParserDB::parse::<PostgreSqlDialect>(&format!(
+                            let error = ParserDB::parse::<PostgreSqlDialect>(&format!(
                                 "{setup} {statement}"
-                            ));
-                            assert!(
-                                matches!(result, Err(Error::RenameCommandNotAlone { relation_name, .. }) if relation_name == "probe"),
+                            ))
+                            .expect_err(&statement);
+                            let first_is_standalone = first.starts_with("RENAME")
+                                || first.starts_with("SET SCHEMA")
+                                || first.starts_with("ATTACH");
+                            let standalone = if first_is_standalone { first } else { second };
+                            let expected_token = if relation == "FOREIGN TABLE"
+                                && first.starts_with("RENAME CONSTRAINT")
+                            {
+                                "CONSTRAINT"
+                            } else if relation == "FOREIGN TABLE" && first.starts_with("ATTACH") {
+                                "ATTACH"
+                            } else if first_is_standalone {
+                                ","
+                            } else if standalone.starts_with("SET SCHEMA") {
+                                "SCHEMA"
+                            } else {
+                                "RENAME"
+                            };
+                            let written_token = match &error {
+                                Error::SetSchemaCommandNotAlone { written_token }
+                                    if standalone.starts_with("SET SCHEMA") =>
+                                {
+                                    written_token
+                                }
+                                Error::RenameCommandNotAlone { relation_name, written_token }
+                                    if standalone.starts_with("RENAME")
+                                        && relation_name == "probe" =>
+                                {
+                                    written_token
+                                }
+                                Error::PartitionCommandNotAlone { table_name, written_token }
+                                    if standalone.starts_with("ATTACH")
+                                        && table_name == "probe" =>
+                                {
+                                    written_token
+                                }
+                                other => panic!("{statement} got {other:?}"),
+                            };
+                            assert_eq!(written_token, expected_token, "{statement}");
+                            let postgres = error.postgres_error().expect("syntax diagnostic");
+                            assert_eq!(postgres.sqlstate().to_string(), "42601", "{statement}");
+                            assert_eq!(
+                                postgres.message(),
+                                format!("syntax error at or near \"{expected_token}\""),
                                 "{statement}"
                             );
                         }

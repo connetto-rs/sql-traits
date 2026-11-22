@@ -682,20 +682,17 @@ fn a_view_column_default_is_accepted_for_a_column_the_view_exposes() {
     }
 }
 
+/// A view can move to another declared schema.
 #[test]
-fn alter_view_refuses_what_the_model_cannot_apply() {
-    let error = parse(
+fn alter_view_moves_between_schemas() {
+    let database = parse(
         "CREATE SCHEMA s;
          CREATE TABLE t (id INT);
          CREATE VIEW v AS SELECT id FROM t;
          ALTER VIEW v SET SCHEMA s;",
     )
-    .expect_err("the model does not move a view between schemas");
-    assert!(
-        matches!(&error, Error::UnsupportedAlterTableOperation { operation, .. }
-            if operation == "SET SCHEMA s"),
-        "got {error:?}"
-    );
+    .expect("view moves");
+    assert_eq!(database.views().next().expect("view").view_schema(), Some("s"));
 }
 
 #[test]
