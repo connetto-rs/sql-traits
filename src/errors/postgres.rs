@@ -2462,6 +2462,7 @@ impl LookupError {
                 lookup_columns::policy_literal(literal, *data_type, *reason)
             }
             Self::InvalidObjectName { .. }
+            | Self::CheckNotOfTable { .. }
             | Self::TableLookupConflict { same_stored_identity: false, .. }
             | Self::ObjectNotInDatabase { .. }
             | Self::CallNotInExpression { .. }

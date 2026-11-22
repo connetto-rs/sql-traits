@@ -1243,6 +1243,14 @@ pub enum LookupError {
         /// declaring table.
         object: String,
     },
+    /// A check assumed of a table's rows is not one of the table's checks.
+    #[error("Check `{check}` is not a check of table `{table}`.")]
+    CheckNotOfTable {
+        /// The check's expression as rendered by sqlparser.
+        check: String,
+        /// Stored name of the table the check was assumed of.
+        table: String,
+    },
     /// A column named by a constraint is not declared by the table that
     /// constraint resolves it against.
     #[error("Column `{column_name}` is not declared by table `{table_name}`.")]

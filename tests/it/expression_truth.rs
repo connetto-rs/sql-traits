@@ -17,7 +17,7 @@ fn expression(sql: &str) -> Expr {
 }
 
 const fn never_raising(outcomes: Outcomes) -> ExpressionTruth {
-    ExpressionTruth { outcomes, may_raise: false }
+    ExpressionTruth { outcomes, raising: Raising::Never }
 }
 
 const UNDECIDED: Outcomes = Outcomes { truth: true, falsity: true, null: false };
@@ -125,7 +125,7 @@ fn null_outcomes_are_told_apart() -> Result<(), Error> {
 fn overflow_always_raises() -> Result<(), Error> {
     assert_eq!(
         truth("2147483647 + 1 > 0")?,
-        ExpressionTruth { outcomes: Outcomes::NONE, may_raise: true },
+        ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Always },
     );
     Ok(())
 }
@@ -425,7 +425,7 @@ fn dates_timestamps_and_arrays_parse_the_literals_they_meet() -> Result<(), Erro
             stamped TIMESTAMP NOT NULL,
             lines INT[] NOT NULL
          );";
-    let raising = ExpressionTruth { outcomes: Outcomes::NONE, may_raise: true };
+    let raising = ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Always };
     for sql in ["issued > 'nonsense'", "stamped > 'nonsense'", "lines = 'nonsense'"] {
         assert_eq!(truth_in(schema, "invoices", sql)?, raising, "{sql}");
     }
@@ -551,9 +551,9 @@ fn the_c_collation_is_the_one_current_user_carries() -> Result<(), Error> {
             posix TEXT COLLATE \"POSIX\" NOT NULL,
             icu TEXT COLLATE \"und-x-icu\" NOT NULL
          );";
-    assert!(!truth_in(schema, "notes", "bytes = current_user")?.may_raise);
+    assert_eq!(truth_in(schema, "notes", "bytes = current_user")?.raising, Raising::Never);
     for sql in ["posix = current_user", "icu = current_user"] {
-        assert!(truth_in(schema, "notes", sql)?.may_raise, "{sql}");
+        assert_ne!(truth_in(schema, "notes", sql)?.raising, Raising::Never, "{sql}");
     }
     Ok(())
 }
@@ -718,7 +718,7 @@ fn enum_columns_narrow_to_the_labels_their_table_admits() -> Result<(), Error> {
     ] {
         assert_eq!(truth_in(schema, table, sql)?, never_raising(outcomes), "{table}: {sql}");
     }
-    assert!(truth_in(schema, "listed", "kind = 'bogus'")?.may_raise);
+    assert_ne!(truth_in(schema, "listed", "kind = 'bogus'")?.raising, Raising::Never);
     Ok(())
 }
 
@@ -768,5 +768,129 @@ fn check_truth_analysis_reports_absent_constraint_metadata() -> Result<(), Error
             matches!(result, Err(sql_traits::errors::LookupError::ObjectNotInDatabase { .. }),)
         );
     }
+    Ok(())
+}
+
+#[test]
+fn raising_on_every_row_is_told_from_raising_on_some() -> Result<(), Error> {
+    let schema = "CREATE TABLE t (
+            x INT NOT NULL,
+            next INT GENERATED ALWAYS AS (x + 1) STORED,
+            CHECK (x > 0)
+         );
+         CREATE TABLE v (z INT NOT NULL, w INT GENERATED ALWAYS AS (5 + 0 * z::int2) STORED);";
+    for (table, sql, raising) in [
+        ("t", "1 / 0", Raising::Always),
+        ("t", "1 / 0 = 1", Raising::Always),
+        ("t", "5", Raising::Never),
+        ("t", "x + 1", Raising::Sometimes),
+        ("v", "5 + 0 * z::int2", Raising::Sometimes),
+    ] {
+        assert_eq!(truth_in(schema, table, sql)?.raising, raising, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_check_under_no_assumption_is_read_on_its_own() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE u (y INT, CHECK (1 / 0 = 1), CHECK (y > 0 AND y < 0));",
+    )?;
+    let table = db.tables().next().unwrap();
+    let [raising, empty] = &table.check_constraints(&db)?.collect::<Vec<_>>()[..] else {
+        unreachable!()
+    };
+    assert_eq!(
+        raising.truth_under(&db, &[])?,
+        ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Always }
+    );
+    // A `NULL` y makes the check `NULL`, which a CHECK admits.
+    assert_eq!(empty.truth_under(&db, &[])?, never_raising(Outcomes::NOT_TRUE));
+    // The raising check admits no row, so the other takes no outcome beside
+    // it, while it still raises on the rows where y is `NULL`.
+    assert_eq!(empty.truth_under_other_checks(&db)?, never_raising(Outcomes::NONE));
+    assert_eq!(
+        raising.truth_under_other_checks(&db)?,
+        ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Always }
+    );
+    Ok(())
+}
+
+#[test]
+fn assumptions_narrow_the_rows_an_expression_is_read_on() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE u (y INT, CHECK (y > 0), CHECK (y < 0));",
+    )?;
+    let table = db.tables().next().unwrap();
+    let &[positive, negative] = &table.check_constraints(&db)?.collect::<Vec<_>>()[..] else {
+        unreachable!()
+    };
+    let case = IdentifierCase::AsWritten;
+    let (is_null, not_null) = (expression("y IS NULL"), expression("y IS NOT NULL"));
+    let both = [Assumption::Check(positive), Assumption::Check(negative)];
+    assert_eq!(table.truth_under(&db, &is_null, case, &[])?, never_raising(UNDECIDED));
+    assert_eq!(table.truth_under(&db, &is_null, case, &both)?, never_raising(Outcomes::TRUE));
+    let contradicted = [
+        both[0],
+        both[1],
+        Assumption::Expression { expression: &not_null, outcomes: Outcomes::TRUE },
+    ];
+    assert_eq!(
+        table.truth_under(&db, &is_null, case, &contradicted)?,
+        never_raising(Outcomes::NONE)
+    );
+    let at_most_zero = expression("y <= 0");
+    let above_zero =
+        [Assumption::Expression { expression: &at_most_zero, outcomes: Outcomes::FALSE }];
+    assert_eq!(
+        table.truth_under(&db, &expression("y > 0"), case, &above_zero)?,
+        never_raising(Outcomes::TRUE)
+    );
+    assert_eq!(positive.truth_under(&db, &[])?, never_raising(Outcomes::ANY));
+    assert_eq!(
+        positive.truth_under(&db, &[Assumption::Check(negative)])?,
+        never_raising(Outcomes::NOT_TRUE)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_check_of_another_table_is_no_assumption() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE a (y INT, CHECK (y > 0)); CREATE TABLE b (y INT, CHECK (y < 0));",
+    )?;
+    let [a, b] = &db.tables().collect::<Vec<_>>()[..] else { unreachable!() };
+    let (own, foreign) =
+        (a.check_constraints(&db)?.next().unwrap(), b.check_constraints(&db)?.next().unwrap());
+    let assumptions = [Assumption::Check(foreign)];
+    for result in [
+        a.truth_under(&db, &expression("y > 0"), IdentifierCase::AsWritten, &assumptions),
+        own.truth_under(&db, &assumptions),
+    ] {
+        assert!(matches!(result, Err(sql_traits::errors::LookupError::CheckNotOfTable { .. })));
+    }
+    Ok(())
+}
+
+#[test]
+fn assumed_expressions_whose_calls_the_read_check_resolves_otherwise_seed_nothing()
+-> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA pinned;
+         CREATE FUNCTION public.f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+         CREATE FUNCTION pinned.f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 0';
+         SET search_path = pinned, public;
+         CREATE TABLE public.invoices (n INT, CHECK (f() > 0));
+         SET search_path = public;",
+    )?;
+    let table = db.tables().next().unwrap();
+    let check = table.check_constraints(&db)?.next().unwrap();
+    let positive = expression("f() > 0");
+    let assumptions = [Assumption::Expression { expression: &positive, outcomes: Outcomes::TRUE }];
+    assert_eq!(
+        table.truth_under(&db, &positive, IdentifierCase::AsWritten, &assumptions)?,
+        never_raising(Outcomes::TRUE)
+    );
+    assert_eq!(check.truth_under(&db, &assumptions)?, never_raising(Outcomes::ANY));
     Ok(())
 }

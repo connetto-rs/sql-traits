@@ -8,9 +8,9 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ActingRole, Checks, ColumnPrivilege, ExpressionTruth, ForeignTableSource, IdentifierCase,
-        PartitionBound, ReplicaIdentity, RowSecurity, RowStatement, SchemaFingerprint,
-        TablePrivileges, VirtualTableSource,
+        ActingRole, Assumption, ColumnPrivilege, ExpressionTruth, ForeignTableSource,
+        IdentifierCase, PartitionBound, ReplicaIdentity, RowSecurity, RowStatement,
+        SchemaFingerprint, TablePrivileges, VirtualTableSource,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
@@ -907,7 +907,7 @@ pub trait TableLike:
     /// let case = IdentifierCase::AsWritten;
     /// let using = table.expression_truth(&db, policy.using_expression(&db)?.unwrap(), case)?;
     /// assert_eq!(using.outcomes, Outcomes::TRUE);
-    /// assert!(!using.may_raise);
+    /// assert_eq!(using.raising, Raising::Never);
     /// // A `NULL` tenant_id makes both comparisons `NULL`.
     /// let check = table.expression_truth(&db, policy.check_expression(&db)?.unwrap(), case)?;
     /// assert_eq!(check.outcomes, Outcomes::NOT_FALSE);
@@ -920,14 +920,62 @@ pub trait TableLike:
         case: IdentifierCase,
     ) -> Result<ExpressionTruth, LookupError> {
         self.require_in_database(database)?;
-        crate::structs::table_truth(
-            self.borrow(),
-            database,
-            expression,
-            case,
-            None,
-            Checks::Validated,
-        )
+        let checks = crate::structs::validated_checks(self.borrow(), database, None)?;
+        self.truth_under(database, expression, case, &checks)
+    }
+
+    /// Answers what an expression can evaluate to on the rows of this table,
+    /// under `assumptions` beside the column types, `NOT NULL`, the domain
+    /// checks and the generated columns.
+    ///
+    /// The expression is read as [`Self::expression_truth`] reads it, which
+    /// is this method under the table's validated checks. Assumptions that
+    /// admit no row together leave no outcome and no error.
+    ///
+    /// `case` controls identifier matching in `expression` and in the
+    /// assumed expressions.
+    ///
+    /// # Errors
+    ///
+    /// Returns membership, resolution, and nullability lookup errors, and
+    /// [`LookupError::CheckNotOfTable`] when an assumed check is not one of
+    /// this table's.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE u (y INT, CHECK (y > 0), CHECK (y < 0));",
+    /// )?;
+    /// let table = db.tables().next().unwrap();
+    /// let &[positive, negative] = &table.check_constraints(&db)?.collect::<Vec<_>>()[..] else {
+    ///     unreachable!()
+    /// };
+    /// let parse = |sql| Parser::new(&PostgreSqlDialect {}).try_with_sql(sql)?.parse_expr();
+    /// let (is_null, not_null) = (parse("y IS NULL")?, parse("y IS NOT NULL")?);
+    /// let case = IdentifierCase::AsWritten;
+    /// // Only a NULL y satisfies both checks.
+    /// let both = [Assumption::Check(positive), Assumption::Check(negative)];
+    /// let truth = table.truth_under(&db, &is_null, case, &both)?;
+    /// assert_eq!(truth, ExpressionTruth { outcomes: Outcomes::TRUE, raising: Raising::Never });
+    /// // Assuming y is not NULL as well leaves no row.
+    /// let not_null = Assumption::Expression { expression: &not_null, outcomes: Outcomes::TRUE };
+    /// let truth = table.truth_under(&db, &is_null, case, &[both[0], both[1], not_null])?;
+    /// assert_eq!(truth, ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Never });
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    fn truth_under(
+        &self,
+        database: &Self::DB,
+        expression: &sqlparser::ast::Expr,
+        case: IdentifierCase,
+        assumptions: &[Assumption<'_, Self::DB>],
+    ) -> Result<ExpressionTruth, LookupError> {
+        self.require_in_database(database)?;
+        crate::structs::table_truth(self.borrow(), database, expression, case, None, assumptions)
     }
 
     /// Iterates over the columns the table declares itself.
