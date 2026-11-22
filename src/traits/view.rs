@@ -7,7 +7,7 @@ use sqlparser::ast::Query;
 
 use crate::{
     errors::LookupError,
-    structs::TargetName,
+    structs::{TargetName, UpdatableViewBase},
     traits::{DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
         identifier_resolution::{is_temporary_schema, stored_identifier},
@@ -421,6 +421,76 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
                     Ok(Relation::View(view)) if view.target_name() == target
                 )
         })
+    }
+
+    /// Returns the relation PostgreSQL rewrites an `INSERT`, `UPDATE`,
+    /// `DELETE` or `MERGE` targeting this view onto, with what each output
+    /// column writes there, or `None` when PostgreSQL does not make the view
+    /// [automatically updatable](https://www.postgresql.org/docs/18/sql-createview.html#SQL-CREATEVIEW-UPDATABLE-VIEWS).
+    ///
+    /// The view is automatically updatable when its definition reads exactly
+    /// one table, foreign table or plain view, without `TABLESAMPLE`, with no
+    /// `WITH`, `DISTINCT`, `GROUP BY`, `HAVING`, `LIMIT`, `OFFSET`, `FETCH` or
+    /// set operation at the top level and no aggregate, window function or
+    /// set-returning function computed over its rows. An output column writes
+    /// the column of that relation it is a simple reference to, whatever the
+    /// declaration names it, and is `None` otherwise. A view none of whose
+    /// columns PostgreSQL can write still answers, since a `DELETE` goes
+    /// through it.
+    ///
+    /// One call follows one level. A view over a view answers with the inner
+    /// view, whatever its own definition. An `INSTEAD OF` trigger or an
+    /// `INSTEAD` rule on a view takes a write to it before this rewriting
+    /// does, which the caller checks against the triggers and rules in force.
+    ///
+    /// A materialized view takes no write, and neither does a view under
+    /// SQLite, so both answer `None`.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance holding the
+    ///   relations the definition reads, whose names it reads as bound when the
+    ///   view was created.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup errors resolving the definition's relation and
+    /// column names runs into.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE invitations (id INT PRIMARY KEY, email TEXT, accepted_by_id INT);
+    ///      CREATE VIEW open_invitations AS
+    ///        SELECT id, lower(email) AS email, accepted_by_id AS acceptor FROM invitations
+    ///        WHERE accepted_by_id IS NULL;",
+    /// )?;
+    /// let view = db
+    ///     .view_by_target(TargetName::new("open_invitations", false), IdentifierCase::Folded)?
+    ///     .expect("the view is recorded");
+    /// let Some(UpdatableViewBase::Table { table, columns }) = view.updatable_base(&db)? else {
+    ///     unreachable!("the view writes one table")
+    /// };
+    /// assert_eq!(table.table_name(), "invitations");
+    /// let written: Vec<_> =
+    ///     columns.iter().map(|column| column.map(ColumnLike::column_name)).collect();
+    /// assert_eq!(written, [Some("id"), None, Some("accepted_by_id")]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn updatable_base<'db>(
+        &self,
+        database: &'db Self::DB,
+    ) -> Result<Option<UpdatableViewBase<'db, Self::DB>>, LookupError> {
+        if self.is_materialized() {
+            return Ok(None);
+        }
+        UpdatableViewBase::of_definition(self.definition(), database)
     }
 
     /// Returns the column names the declaration wrote, each with its quote

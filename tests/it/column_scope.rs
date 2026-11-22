@@ -92,6 +92,17 @@ fn bare_reference_over_one_table_resolves() {
 }
 
 #[test]
+fn bare_reference_over_a_foreign_table_resolves() {
+    let db = ParserDB::parse::<GenericDialect>(
+        "CREATE FOREIGN DATA WRAPPER wrapper; CREATE SERVER server FOREIGN DATA WRAPPER wrapper;
+         CREATE FOREIGN TABLE remote (payload TEXT) SERVER server;",
+    )
+    .expect("schema parses");
+    let resolved = resolve_projection("SELECT payload FROM remote", &db).expect("resolves");
+    assert_eq!(resolved.as_deref(), Some("remote"));
+}
+
+#[test]
 fn alias_qualifier_resolves_to_the_aliased_table() {
     let db = schema_db();
     let resolved = resolve_projection("SELECT x.payload FROM a AS x", &db).expect("resolves");
