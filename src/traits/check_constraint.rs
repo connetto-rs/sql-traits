@@ -927,9 +927,10 @@ pub trait CheckConstraintLike:
     /// been checked against it.
     ///
     /// False for a check added `NOT VALID` until `ALTER TABLE ... VALIDATE
-    /// CONSTRAINT` runs, matching `pg_constraint.convalidated`. New rows are
-    /// checked either way. Defaults to `true`, which is what every check not
-    /// added `NOT VALID` means.
+    /// CONSTRAINT` runs, and always false for a check written `NOT
+    /// ENFORCED`, matching `pg_constraint.convalidated`. New rows are checked
+    /// only when the check is enforced. Defaults to `true`, which is what
+    /// every check neither added `NOT VALID` nor written `NOT ENFORCED` means.
     ///
     /// # Errors
     ///

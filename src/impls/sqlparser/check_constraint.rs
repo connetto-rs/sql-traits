@@ -46,11 +46,12 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
 
     #[inline]
     fn is_enforced(&self) -> bool {
-        self.attribute().enforced != Some(false)
+        check_enforced(self.attribute())
     }
 
     fn is_validated(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        super::create_table::holds_validated(self.table(), self.attribute(), database)
+        Ok(super::create_table::holds_validated(self.table(), self.attribute(), database)?
+            && self.is_enforced())
     }
 
     fn constraint_name<'db>(
@@ -101,4 +102,10 @@ impl CheckConstraintLike for TableAttribute<CreateTable, CheckConstraint> {
             .reached_by(self.expression(database), call)
             .ok_or_else(|| LookupError::CallNotInExpression { call: call.to_string() })
     }
+}
+
+/// Whether the database checks rows against `check`, which only `NOT
+/// ENFORCED` turns off.
+pub(crate) fn check_enforced(check: &CheckConstraint) -> bool {
+    check.enforced != Some(false)
 }

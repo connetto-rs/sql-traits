@@ -27,7 +27,7 @@ use super::{
 };
 use crate::{
     errors::{Error, InheritedChange, KeyConstraint},
-    impls::SqlparserDialect,
+    impls::{SqlparserDialect, check_enforced, foreign_key_enforced},
 };
 
 /// Whether the kind can be added `NOT VALID` and validated afterwards.
@@ -158,15 +158,17 @@ pub(super) fn merged_copy_validated(
 /// constraints written on its columns after, as `DROP CONSTRAINT` does. One
 /// written on a column was checked when the column arrived, so it is already
 /// validated, and only a key, which never carries the state at all, is
-/// refused.
+/// refused. A check or foreign key written `NOT ENFORCED` is refused wherever
+/// it was written, before its state is read.
 ///
 /// # Errors
 ///
 /// Returns [`Error::AlterTableNotFound`] for an absent table without `IF
 /// EXISTS`, [`Error::ValidateConstraintNotFound`] for a name the table does
-/// not hold, [`Error::ConstraintNotValidatable`] for a key, and
-/// [`Error::OnlyRefusedWithChildren`] when `ONLY` would leave an unvalidated
-/// check's copies below unread.
+/// not hold, [`Error::ConstraintNotValidatable`] for a key,
+/// [`Error::NotEnforcedNotValidatable`] for a `NOT ENFORCED` check or foreign
+/// key, and [`Error::OnlyRefusedWithChildren`] when `ONLY` would leave an
+/// unvalidated check's copies below unread.
 pub(super) fn validate_constraint(
     builder: ParserDBBuilder,
     table_name: &ObjectName,
@@ -183,6 +185,12 @@ pub(super) fn validate_constraint(
             constraint_name: builder.dialect().stored_name(name),
         }
     };
+    let not_enforced = || {
+        Error::NotEnforcedNotValidatable {
+            table_name: builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+            constraint_name: builder.dialect().stored_name(name),
+        }
+    };
 
     let located = constraint_names::locate(
         node,
@@ -194,6 +202,14 @@ pub(super) fn validate_constraint(
         let held = &node.constraints[position];
         if !takes_validation(held) {
             return Err(not_validatable());
+        }
+        let enforced = match held {
+            TableConstraint::Check(check) => check_enforced(check),
+            TableConstraint::ForeignKey(key) => foreign_key_enforced(key),
+            _ => true,
+        };
+        if !enforced {
+            return Err(not_enforced());
         }
         if is_validated(&builder, &stored, held) {
             return Ok(builder);
@@ -220,7 +236,9 @@ pub(super) fn validate_constraint(
     }
 
     if let Some(Position::Column(column, option)) = located {
-        return match node.columns[column].options[option].option {
+        return match &node.columns[column].options[option].option {
+            ColumnOption::Check(check) if !check_enforced(check) => Err(not_enforced()),
+            ColumnOption::ForeignKey(key) if !foreign_key_enforced(key) => Err(not_enforced()),
             ColumnOption::Check(_) | ColumnOption::ForeignKey(_) | ColumnOption::NotNull => {
                 Ok(builder)
             }

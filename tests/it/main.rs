@@ -131,6 +131,7 @@ mod materialized_view_indexes;
 mod multiple_primary_keys;
 mod names_outside_this_catalog;
 mod negated_length_checks;
+mod not_enforced_constraints;
 mod object_kind_reporting;
 mod only_drop_partition_keys;
 mod open_world_access;

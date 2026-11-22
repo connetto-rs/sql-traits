@@ -36,13 +36,14 @@ mod user_defined_type;
 mod value_flow;
 mod view;
 
+pub(crate) use check_constraint::check_enforced;
 pub(crate) use column_def::{foreign_options_of, generation_storage, serial_sequence_type};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub(crate) use create_table::parameter_value;
 pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;
 pub(crate) use dynamic_sites::{BodyNames, SiteKey, SiteSource};
-pub(crate) use foreign_key_constraint::foreign_keys_stored_alike;
+pub(crate) use foreign_key_constraint::{foreign_key_enforced, foreign_keys_stored_alike};
 pub(crate) use function_body::{
     atomic_statements, body_calls, body_expression, body_reads, body_site_source,
     body_unqualified_names,
