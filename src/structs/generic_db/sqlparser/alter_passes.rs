@@ -432,6 +432,7 @@ pub(super) fn prepare(
             action: views::alter_action(operation, object_kind),
         });
     }
+    super::typed_tables::refuse_alteration(builder, node, operation)?;
     match operation {
         AlterTableOperation::AlterColumn {
             column_name,

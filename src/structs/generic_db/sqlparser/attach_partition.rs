@@ -273,6 +273,9 @@ fn refuse_unattachable(
     if partition_node.partition_of.is_some() {
         return refuse(UnattachablePartition::AlreadyPartition);
     }
+    if partition_node.of_type.is_some() {
+        return refuse(UnattachablePartition::Typed);
+    }
     if partition_node.inherits.as_ref().is_some_and(|parents| !parents.is_empty()) {
         return refuse(UnattachablePartition::InheritanceChild);
     }

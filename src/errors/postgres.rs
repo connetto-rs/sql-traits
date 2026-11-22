@@ -1305,6 +1305,32 @@ impl Error {
                     format!("type {} is only a shell", quoted(type_name)),
                 ))
             }
+            Self::TypedTableTypeNotComposite { type_display, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("type {type_display} is not a composite type"),
+                ))
+            }
+            Self::TypedTableOfRowType { type_display, .. } => {
+                Some(PostgresError::new(
+                    pg::WRONG_OBJECT_TYPE,
+                    format!("type {type_display} is the row type of another table"),
+                ))
+            }
+            Self::TypedTable { refusal, .. } => {
+                Some(PostgresError::new(
+                    match refusal {
+                        super::TypedTableRefusal::IdentityColumn
+                        | super::TypedTableRefusal::GeneratedColumn => pg::FEATURE_NOT_SUPPORTED,
+                        super::TypedTableRefusal::AddColumn
+                        | super::TypedTableRefusal::DropColumn
+                        | super::TypedTableRefusal::AlterColumnType
+                        | super::TypedTableRefusal::RenameColumn
+                        | super::TypedTableRefusal::ChangeInheritance => pg::WRONG_OBJECT_TYPE,
+                    },
+                    refusal.to_string(),
+                ))
+            }
             Self::TypeDropRequiredBy {
                 type_display: type_name,
                 requiring_kind,

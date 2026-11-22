@@ -440,7 +440,7 @@ fn domain_qualifier(domain: &CreateDomain) -> Option<Ident> {
 }
 
 /// The qualifier a name binding to the user-defined type `type_` takes.
-fn user_type_qualifier(type_: &UserDefinedType) -> Option<Ident> {
+pub(super) fn user_type_qualifier(type_: &UserDefinedType) -> Option<Ident> {
     type_.schema().map(|schema| schema_ident(schema, type_.schema_is_quoted()))
 }
 

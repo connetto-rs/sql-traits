@@ -1183,6 +1183,47 @@ pub trait TableLike:
     where
         Self: 'db;
 
+    /// Returns the composite type a typed table, written
+    /// `CREATE TABLE name OF type`, takes its columns from.
+    ///
+    /// The table keeps one column per attribute of the type for as long as it
+    /// stays typed. A partition of a typed table, an `INHERITS` child of one
+    /// and a table created `LIKE` one are not typed.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance to which the table
+    ///   belongs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use sql_traits::prelude::*;
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TYPE point2 AS (x INT, y INT);
+    ///      CREATE TABLE points OF point2 (x WITH OPTIONS NOT NULL);",
+    /// )?;
+    /// let points =
+    ///     db.table_by_target(TargetName::new("points", false), IdentifierCase::AsWritten)?.unwrap();
+    /// assert_eq!(points.of_type(&db)?.map(|type_| type_.name()), Some("point2"));
+    /// let columns: Vec<&str> = points.columns(&db)?.map(|column| column.column_name()).collect();
+    /// assert_eq!(columns, ["x", "y"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn of_type<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::UserDefinedType>, LookupError>
+    where
+        Self: 'db;
+
     /// Returns how this table routes rows to its partitions, or [`None`] when
     /// it is not partitioned.
     ///
@@ -5235,6 +5276,16 @@ where
         Self: 'db,
     {
         T::partition_root(self, database)
+    }
+
+    fn of_type<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::UserDefinedType>, LookupError>
+    where
+        Self: 'db,
+    {
+        T::of_type(self, database)
     }
 
     fn partition_strategy(&self) -> Option<PartitionStrategy> {

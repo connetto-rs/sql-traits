@@ -39,7 +39,7 @@ use super::{
     SchemaQualifier, bind_reference, collation_resolution_for_name,
     domains::{
         DropSpelling, Reached, bind_type, custom_name, custom_name_mut, reach_in_schema,
-        reach_type, require_existing_type,
+        reach_type, require_existing_type, user_type_qualifier,
     },
     object_name_last_identifier, place_relation,
     postgres_catalog::{CatalogDependent, PostgresCatalog},
@@ -714,7 +714,15 @@ fn declared_type_reaches_doomed(
     data_type: &DataType,
     doomed: &[Doomed],
 ) -> Option<Doomed> {
-    let name = custom_name(data_type)?;
+    name_reaches_doomed(builder, custom_name(data_type)?, doomed)
+}
+
+/// The doomed type a stored type name reaches, if one is doomed.
+fn name_reaches_doomed(
+    builder: &ParserDBBuilder,
+    name: &ObjectName,
+    doomed: &[Doomed],
+) -> Option<Doomed> {
     let Ok((schema, ident)) = object_name_identifiers(name) else {
         return None;
     };
@@ -812,9 +820,9 @@ fn doomed_type_identities(
 /// multirange of a range, the array of a type, or the row type of a relation,
 /// one naming a type of the database system, and one naming nothing without
 /// `IF EXISTS`. Once a name resolves to a droppable type, without `CASCADE` it
-/// refuses a type a column, a composite attribute, a domain, a range or a base
-/// type's element uses, and a type, its stored array, or a range's multirange
-/// that `dependent_holding` names. With it, those go too.
+/// refuses a type a typed table, a column, a composite attribute, a domain, a
+/// range or a base type's element uses, and a type, its stored array, or a
+/// range's multirange that `dependent_holding` names. With it, those go too.
 pub(super) fn drop_types(
     builder: ParserDBBuilder,
     names: &[ObjectName],
@@ -1092,16 +1100,30 @@ fn extend_doomed_by_dependents(
     Ok(())
 }
 
-/// Refuses columns and composite attributes that depend on a doomed type.
-fn refuse_dependent_attributes(builder: &ParserDBBuilder, doomed: &[Doomed]) -> Result<(), Error> {
-    let columns = builder
+/// Refuses a drop without `CASCADE` that a table typed by a doomed type, or a
+/// column or attribute of a doomed type or multirange, holds in place.
+fn refuse_doomed_users(builder: &ParserDBBuilder, doomed: &[Doomed]) -> Result<(), Error> {
+    let tables = builder
         .tables()
         .iter()
         .enumerate()
         .filter(|(position, _)| !doomed.contains(&Doomed::RowType(*position)))
-        .flat_map(|(_, (table, _, _))| {
-            table.columns.iter().map(|column| (&table.name, &column.name, &column.data_type))
-        });
+        .map(|(_, (table, _, _))| table);
+    for table in tables.clone() {
+        if let Some(used) =
+            table.of_type.as_ref().and_then(|name| name_reaches_doomed(builder, name, doomed))
+        {
+            return Err(dependents_error(
+                builder,
+                &used,
+                ObjectKind::Table,
+                builder.dialect().stored_object_name(&table.name),
+            ));
+        }
+    }
+    let columns = tables.flat_map(|table| {
+        table.columns.iter().map(|column| (&table.name, &column.name, &column.data_type))
+    });
     let attributes = builder.user_defined_types().iter().flat_map(|(type_, _)| {
         type_
             .composite_attributes()
@@ -1122,8 +1144,10 @@ fn refuse_dependent_attributes(builder: &ParserDBBuilder, doomed: &[Doomed]) -> 
     Ok(())
 }
 
-/// Drops types and their dependents, leaving row-type owners and their
-/// identities to the caller.
+/// Drops types and their dependents, refusing what uses them unless
+/// `cascade`, in which case the typed tables, columns, composite attributes,
+/// domains, ranges and functions using them go too, leaving row-type owners
+/// and their identities to the caller.
 ///
 /// # Errors
 ///
@@ -1143,10 +1167,8 @@ pub(super) fn drop_positions(
     let mut doomed_owned: Vec<Doomed> = doomed.to_vec();
     extend_doomed_by_dependents(&builder, &mut doomed_owned, cascade)?;
 
-    // Without `CASCADE` a column or attribute of a doomed type or multirange
-    // blocks the drop.
     if !cascade {
-        refuse_dependent_attributes(&builder, &doomed_owned)?;
+        refuse_doomed_users(&builder, &doomed_owned)?;
     }
 
     let mut removed = if cascade {
@@ -1218,14 +1240,33 @@ pub(super) fn drop_positions(
     Ok((builder, removed))
 }
 
-/// Drops the columns and composite attributes that use the doomed types, for a
-/// cascading drop, the columns each taking what dropping a column takes.
+/// Drops the typed tables, columns and composite attributes that use the
+/// doomed types, for a cascading drop, each typed table taking what a
+/// cascading `DROP TABLE` takes and each column what dropping a column takes.
 fn drop_dependents_cascade(
     mut builder: ParserDBBuilder,
     doomed: &[Doomed],
     arrays: &mut Arc<TypeArrays>,
 ) -> Result<(ParserDBBuilder, TypeDrop), Error> {
     let mut removed = TypeDrop::default();
+    let typed_tables: Vec<super::StoredTable> = builder
+        .tables()
+        .iter()
+        .filter(|(table, _, _)| {
+            table
+                .of_type
+                .as_ref()
+                .is_some_and(|name| name_reaches_doomed(&builder, name, doomed).is_some())
+        })
+        .map(|(table, _, _)| super::StoredTable::of(table))
+        .collect();
+    if !typed_tables.is_empty() {
+        let (next, tables) =
+            ParserDB::drop_tables(builder, typed_tables, ObjectKind::Table, None, arrays)?;
+        builder = next;
+        removed.types.extend(tables.types);
+        removed.functions.extend(tables.functions);
+    }
     // An inherited column leaves with the parent's, so only declared columns
     // are dropped.
     loop {
@@ -1384,28 +1425,34 @@ pub(super) fn repoint_type_references(
     let (from_schema, from_schema_quoted) = schema.map_or((DEFAULT_SCHEMA, false), ident_parts);
     let case = builder.identifier_case();
     let from = (from_name, from_name_quoted);
-    // Every table whose a column names the type, rebuilt.
-    let hosts: Vec<super::StoredTable> = builder
-        .tables()
-        .iter()
-        .filter(|(table, _, _)| {
-            table.columns.iter().any(|column| {
-                column_renames_type(
-                    &column.data_type,
-                    (from_name, from_name_quoted),
-                    (from_schema, from_schema_quoted),
-                    case,
-                )
+    // Every table whose a column names the type, or typed by it, rebuilt.
+    let hosts: Vec<super::StoredTable> =
+        builder
+            .tables()
+            .iter()
+            .filter(|(table, _, _)| {
+                table.of_type.as_ref().is_some_and(|name| {
+                    names_type(name, from, (from_schema, from_schema_quoted), case)
+                }) || table.columns.iter().any(|column| {
+                    column_renames_type(
+                        &column.data_type,
+                        (from_name, from_name_quoted),
+                        (from_schema, from_schema_quoted),
+                        case,
+                    )
+                })
             })
-        })
-        .map(|(table, _, _)| super::StoredTable::of(table))
-        .collect();
+            .map(|(table, _, _)| super::StoredTable::of(table))
+            .collect();
     for host in &hosts {
         builder = ParserDB::replace_table_node(builder, host, |_, node| {
-            for column in &mut node.columns {
-                if let Some(name) = custom_name_mut(&mut column.data_type) {
-                    retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case);
-                }
+            for name in node
+                .columns
+                .iter_mut()
+                .filter_map(|column| custom_name_mut(&mut column.data_type))
+                .chain(node.of_type.as_mut())
+            {
+                retarget_type_name(name, from, (from_schema, from_schema_quoted), to, case);
             }
             Ok(())
         })?;
@@ -1568,6 +1615,75 @@ fn resolve_named_type(
         }
         Some(Reached::Catalog) | None => {
             Err(Error::TypeNotFound { type_name: builder.dialect().stored_object_name(name) })
+        }
+    }
+}
+
+/// The composite a `CREATE TABLE name OF type` statement takes its columns
+/// from, found as PostgreSQL looks the name up in `pg_type`, with `name`
+/// bound to it.
+///
+/// # Errors
+///
+/// Refuses a schema or a type the input never creates, a grammar alias such
+/// as `int` that names no row of `pg_type`, a shell, the row type of a
+/// relation, and every type that is no composite.
+pub(super) fn typed_table_composite<'builder>(
+    builder: &'builder ParserDBBuilder,
+    name: &mut ObjectName,
+    arrays: &TypeArrays,
+) -> Result<&'builder UserDefinedType, Error> {
+    let not_composite = |name: &ObjectName, type_display: String| {
+        Err(Error::TypedTableTypeNotComposite {
+            type_name: builder.dialect().stored_object_name(name),
+            type_display,
+        })
+    };
+    if let Some(element) = arrays.element(builder, name) {
+        return not_composite(name, format!("{}[]", diagnostic_target(builder, &element)));
+    }
+    let (schema, ident) = object_name_identifiers(name)?;
+    let grammar_alias = schema.is_none()
+        && ident.quote_style.is_none()
+        && matches!(
+            crate::utils::postgres_types::PgType::parse(&name.to_string()),
+            Some(crate::utils::postgres_types::PgType::Catalog(catalog_name))
+                if catalog_name != builder.dialect().stored_name(ident)
+        );
+    let reached = match (grammar_alias, schema) {
+        (true, _) => None,
+        (false, Some(schema)) => reach_in_schema(builder, ident, ident_parts(schema)),
+        (false, None) => reach_type(builder, ident),
+    };
+    match reached {
+        None => {
+            Err(super::missing_schema::missing_schema_name(builder, name).map_or_else(
+                || Error::TypeNotFound { type_name: builder.dialect().stored_object_name(name) },
+                |schema_name| Error::SchemaNotFound { schema_name },
+            ))
+        }
+        Some(Reached::RowType(relation_kind)) => {
+            Err(Error::TypedTableOfRowType {
+                type_name: builder.dialect().stored_object_name(name),
+                type_display: diagnostic_type(builder, name),
+                relation_kind,
+            })
+        }
+        Some(Reached::Catalog | Reached::Domain(_)) => {
+            not_composite(name, diagnostic_type(builder, name))
+        }
+        Some(Reached::UserType(position, is_multirange)) => {
+            let type_ = &builder.user_defined_types()[position].0;
+            if type_.is_shell() {
+                return Err(Error::TypeIsOnlyShell {
+                    type_name: builder.dialect().stored_object_name(&type_.name),
+                });
+            }
+            if is_multirange || type_.composite_attributes().is_none() {
+                return not_composite(name, diagnostic_type(builder, name));
+            }
+            bind_reference(name, user_type_qualifier(type_));
+            Ok(type_)
         }
     }
 }
@@ -1890,19 +2006,23 @@ pub(super) fn follow_schema_rename(
         .tables()
         .iter()
         .filter(|(table, _, _)| {
-            table
-                .columns
-                .iter()
-                .any(|column| custom_name(&column.data_type).is_some_and(reaches_moved))
+            table.of_type.as_ref().is_some_and(reaches_moved)
+                || table
+                    .columns
+                    .iter()
+                    .any(|column| custom_name(&column.data_type).is_some_and(reaches_moved))
         })
         .map(|(table, _, _)| super::StoredTable::of(table))
         .collect();
     for host in &hosts {
         builder = ParserDB::replace_table_node(builder, host, |_, node| {
-            for column in &mut node.columns {
-                if let Some(name) = custom_name_mut(&mut column.data_type) {
-                    retarget(name);
-                }
+            for name in node
+                .columns
+                .iter_mut()
+                .filter_map(|column| custom_name_mut(&mut column.data_type))
+                .chain(node.of_type.as_mut())
+            {
+                retarget(name);
             }
             Ok(())
         })?;

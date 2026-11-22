@@ -151,6 +151,16 @@ impl<P: EmptyKinds> TableLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn of_type<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<Option<&'db <Self::DB as DatabaseLike>::UserDefinedType>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreach()
+    }
+
     fn partition_strategy(&self) -> Option<PartitionStrategy> {
         self.unreach()
     }

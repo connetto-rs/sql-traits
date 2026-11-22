@@ -170,6 +170,7 @@ mod transactions;
 mod triggers;
 mod type_arrays;
 mod type_facts;
+mod typed_tables;
 mod user_defined_types;
 mod view_rewrites;
 mod views;
@@ -10666,6 +10667,8 @@ impl ParserDB {
                 )?;
             }
             if let Some(table) = builder.resolve_table_object_name(&alter_table.name)? {
+                // A standalone `RENAME COLUMN` skips the preparation pass.
+                typed_tables::refuse_alteration(&builder, table, &operation)?;
                 let object_kind = builder.stored_table_kind(table);
                 if alter_passes::refuses(object_kind, &operation) {
                     return Err(crate::errors::Error::AlterActionUnsupportedOnRelation {
@@ -13481,6 +13484,7 @@ impl ParserDB {
                     }
                 }
                 Statement::CreateTable(mut create_table) => {
+                    typed_tables::require_dialect(&builder, &create_table)?;
                     let documentation = source.map_or_else(TableDocumentation::default, |source| {
                         TableDocumentation::from_source(&create_table, source)
                     });
@@ -13571,6 +13575,7 @@ impl ParserDB {
                         Arc::make_mut(&mut active_postgres_catalog)
                             .rename_type_identity(&previous, current);
                     }
+                    typed_tables::expand(&builder, &mut create_table, &type_arrays)?;
                     let mut transformed_columns = if matches!(dialect, SqlparserDialect::PostgreSql)
                     {
                         create_table_transform::columns(
