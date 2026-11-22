@@ -123,6 +123,7 @@ pub(crate) fn table_truth<DB: DatabaseLike>(
         source: Source::Expression,
         own,
         collations: Vec::new(),
+        reached: Vec::new(),
     };
     match engine {
         Engine::PostgreSql => {
@@ -227,6 +228,26 @@ enum Source<'a, DB: DatabaseLike> {
     Domain(&'a DB::Domain),
 }
 
+impl<DB: DatabaseLike> Source<'_, DB> {
+    /// The address of the check or domain, zero for the caller's expression.
+    fn address(&self) -> usize {
+        match self {
+            Source::Expression => 0,
+            Source::Check(check) => ptr::from_ref(*check).addr(),
+            Source::Domain(domain) => ptr::from_ref(*domain).addr(),
+        }
+    }
+}
+
+/// The functions a call resolved to, by the address of where it was written
+/// and of the column `VALUE` stood for.
+struct Reached<'a, F> {
+    source: usize,
+    value: usize,
+    call: Function,
+    functions: Vec<&'a F>,
+}
+
 /// The table's columns and the database's functions, as the evaluator asks
 /// for them.
 struct TableContext<'a, DB: DatabaseLike> {
@@ -244,6 +265,9 @@ struct TableContext<'a, DB: DatabaseLike> {
     own: Option<&'a DB::CheckConstraint>,
     /// The collations met so far, each named by its position.
     collations: Vec<ColumnCollation<'static>>,
+    /// The calls resolved so far, as overload resolution is costly and the
+    /// evaluator asks for the same call many times.
+    reached: Vec<Reached<'a, DB::Function>>,
 }
 
 impl Engine {
@@ -403,6 +427,25 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
     /// where it was written, or none when it names no known function or
     /// PostgreSQL reads it as a cast.
     fn runnable(&mut self, call: &Function) -> Result<Vec<&'a DB::Function>, LookupError> {
+        let source = self.source.address();
+        let value = self.value.map_or(0, |column| ptr::from_ref(column).addr());
+        if let Some(reached) = self.reached.iter().find(|reached| {
+            reached.source == source && reached.value == value && reached.call == *call
+        }) {
+            return Ok(reached.functions.clone());
+        }
+        let functions = self.resolve(call)?;
+        self.reached.push(Reached {
+            source,
+            value,
+            call: call.clone(),
+            functions: functions.clone(),
+        });
+        Ok(functions)
+    }
+
+    /// [`Self::runnable`] without looking up the calls already resolved.
+    fn resolve(&mut self, call: &Function) -> Result<Vec<&'a DB::Function>, LookupError> {
         let (database, case) = (self.database, self.case);
         let reached = match &self.source {
             Source::Expression => database.functions_reached_by(call, case).map(Iterator::collect),
