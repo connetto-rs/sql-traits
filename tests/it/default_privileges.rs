@@ -1117,3 +1117,12 @@ fn missing_grantee_precedes_default_column_privileges() {
         assert_eq!(error.message(), "role \"missing_role\" does not exist");
     }
 }
+
+/// An open world takes an undeclared grantee on trust and still refuses
+/// the columns.
+#[test]
+fn open_world_still_refuses_default_column_privileges() {
+    let refused =
+        open_world("ALTER DEFAULT PRIVILEGES GRANT SELECT (id) ON TABLES TO undeclared_role;");
+    assert!(matches!(refused, Err(Error::DefaultPrivilegesForColumns)), "{refused:?}");
+}
