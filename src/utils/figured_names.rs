@@ -32,6 +32,17 @@ impl Figure {
     fn ident(ident: &Ident) -> Self {
         Self::Strong(ident.value.clone(), ident.quote_style.is_some())
     }
+
+    /// The name an output column written without an alias takes, `?column?`
+    /// for an expression PostgreSQL names nothing, or `None` when the name is
+    /// not modeled.
+    pub(crate) fn output_name(self) -> Option<(String, bool)> {
+        match self {
+            Self::Strong(name, quoted) | Self::Weak(name, quoted) => Some((name, quoted)),
+            Self::Unnamed => Some(("?column?".to_owned(), true)),
+            Self::Unknown => None,
+        }
+    }
 }
 
 /// Mirrors PostgreSQL's `FigureColname`, answering [`Figure::Unknown`] where
@@ -127,13 +138,9 @@ fn first_output_figure(body: &SetExpr) -> Figure {
             match select.projection.first() {
                 Some(SelectItem::ExprWithAlias { alias, .. }) => Figure::ident(alias),
                 Some(SelectItem::UnnamedExpr(expression)) => {
-                    match figure(expression) {
-                        Figure::Strong(name, quoted) | Figure::Weak(name, quoted) => {
-                            Figure::Strong(name, quoted)
-                        }
-                        Figure::Unnamed => Figure::strong("?column?"),
-                        Figure::Unknown => Figure::Unknown,
-                    }
+                    figure(expression)
+                        .output_name()
+                        .map_or(Figure::Unknown, |(name, quoted)| Figure::Strong(name, quoted))
                 }
                 _ => Figure::Unknown,
             }

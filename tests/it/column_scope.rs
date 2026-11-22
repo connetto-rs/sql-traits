@@ -163,24 +163,43 @@ fn cte_reference_resolves_through_its_projection() {
 }
 
 #[test]
-fn unnamed_computed_projection_still_poisons_a_bare_reference() {
+fn unnamed_computed_projection_takes_its_figured_name() {
     let db = schema_db();
-    // `count(*)` written without an alias has no output name this resolver
-    // models, so the subquery's columns stay unknown.
+    // `count(*)` written without an alias is the column `count`, so a bare
+    // `payload` reaches only `b`.
     let bare =
         resolve_projection("SELECT payload FROM (SELECT count(*) FROM b) s JOIN b ON true", &db)
             .expect("resolves");
-    assert_eq!(bare, None);
-    let qualified =
-        resolve_projection("SELECT b.payload FROM (SELECT count(*) FROM b) s JOIN b ON true", &db)
-            .expect("resolves");
-    assert_eq!(qualified.as_deref(), Some("b"));
+    assert_eq!(bare.as_deref(), Some("b"));
     let cte_bare = resolve_projection(
         "WITH t AS (SELECT count(*) FROM b) SELECT payload FROM t JOIN b ON true",
         &db,
     )
     .expect("resolves");
-    assert_eq!(cte_bare, None);
+    assert_eq!(cte_bare.as_deref(), Some("b"));
+    let computed =
+        resolve_projection("SELECT count FROM (SELECT count(*) FROM b) s JOIN b ON true", &db)
+            .expect("resolves");
+    assert_eq!(computed, None);
+}
+
+#[test]
+fn unmodeled_projection_name_still_poisons_a_bare_reference() {
+    let db = schema_db();
+    // A cast to a type whose name is not modeled leaves the subquery's
+    // columns unknown.
+    let bare = resolve_projection(
+        "SELECT payload FROM (SELECT '1'::nvarchar FROM b) s JOIN b ON true",
+        &db,
+    )
+    .expect("resolves");
+    assert_eq!(bare, None);
+    let qualified = resolve_projection(
+        "SELECT b.payload FROM (SELECT '1'::nvarchar FROM b) s JOIN b ON true",
+        &db,
+    )
+    .expect("resolves");
+    assert_eq!(qualified.as_deref(), Some("b"));
 }
 
 #[test]

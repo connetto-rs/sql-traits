@@ -297,13 +297,14 @@ fn a_view_follows_a_renamed_view_and_view_column() {
         "px",
         "SELECT y AS a FROM pm",
     );
-    // An unaliased computed column leaves `pv` opaque to the resolver.
+    // The unaliased computed column of `pv` is `?column?`, which leaves `c`
+    // resolvable through `pv`.
     let computed = "CREATE TABLE p (a INT, c INT);
                     CREATE VIEW pv AS SELECT a + 1, c FROM p;
                     CREATE VIEW pw AS SELECT c FROM pv;
                     ALTER TABLE pv RENAME COLUMN c TO z;";
     assert_definition(computed, "pv", "SELECT a + 1, c AS z FROM p");
-    assert_definition(computed, "pw", "SELECT c FROM pv AS pv (\"?column?\", c)");
+    assert_definition(computed, "pw", "SELECT z AS c FROM pv");
     assert_definition(
         &format!("{computed} ALTER TABLE pv RENAME COLUMN \"?column?\" TO n;"),
         "pv",
