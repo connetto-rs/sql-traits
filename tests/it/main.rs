@@ -12,6 +12,7 @@ mod absent_table_alterations;
 mod aggregate_null;
 mod aggregate_window_from_calls;
 mod alter_table_error_passes;
+mod alter_table_set_schema;
 mod altered_policies;
 mod array_column_types;
 mod array_vector_interval_types;

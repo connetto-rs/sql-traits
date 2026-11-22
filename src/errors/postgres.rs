@@ -822,10 +822,50 @@ impl Error {
             }
             Self::TemporaryMaterializedView { written_token, .. }
             | Self::PartitionCommandNotAlone { written_token, .. }
+            | Self::SetSchemaCommandNotAlone { written_token }
             | Self::RenameCommandNotAlone { written_token, .. } => {
                 Some(PostgresError::new(
                     pg::SYNTAX_ERROR,
                     format!("syntax error at or near {}", quoted(written_token)),
+                ))
+            }
+            Self::SetSchemaNameCollision { object_name, schema_name, type_collision } => {
+                let (state, kind) = if *type_collision {
+                    (pg::DUPLICATE_OBJECT, "type")
+                } else {
+                    (pg::DUPLICATE_TABLE, "relation")
+                };
+                Some(PostgresError::new(
+                    state,
+                    format!(
+                        "{kind} {} already exists in schema {}",
+                        quoted(object_name),
+                        quoted(schema_name)
+                    ),
+                ))
+            }
+            Self::SetSchemaWrongKind { relation_name, object_kind } => {
+                let message = if *object_kind == super::ObjectKind::Index {
+                    format!("cannot change schema of index {}", quoted(relation_name))
+                } else {
+                    format!("{} is a composite type", quoted(relation_name))
+                };
+                Some(PostgresError::new(pg::WRONG_OBJECT_TYPE, message))
+            }
+            Self::SetSchemaRestrictedNamespace { toast } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    if *toast {
+                        "cannot move objects into or out of TOAST schema"
+                    } else {
+                        "cannot move objects into or out of temporary schemas"
+                    },
+                ))
+            }
+            Self::SetSchemaOwnedSequence { .. } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    "cannot move an owned sequence into another schema",
                 ))
             }
             Self::MaterializedViewReadsTemporaryRelation { .. } => {

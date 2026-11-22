@@ -4073,6 +4073,44 @@ pub enum Error {
         /// The token PostgreSQL reports the syntax error at, as written.
         written_token: String,
     },
+    /// A schema move must be its statement's only action.
+    #[error("A schema move must be the only action of its statement.")]
+    SetSchemaCommandNotAlone {
+        /// The token rejected by PostgreSQL.
+        written_token: String,
+    },
+    /// The target schema already holds the relation or its type.
+    #[error("Object `{object_name}` already exists in schema `{schema_name}`.")]
+    SetSchemaNameCollision {
+        /// The conflicting local name.
+        object_name: String,
+        /// The destination schema.
+        schema_name: String,
+        /// Whether the collision belongs to the type namespace.
+        type_collision: bool,
+    },
+    /// An index or composite relation cannot move through `ALTER TABLE`.
+    #[error("Relation `{relation_name}` cannot change schema through ALTER TABLE.")]
+    SetSchemaWrongKind {
+        /// The stored relation name.
+        relation_name: String,
+        /// The relation kind.
+        object_kind: ObjectKind,
+    },
+    /// Temporary and TOAST namespaces prohibit relation moves.
+    #[error("Cannot move objects into or out of this schema.")]
+    SetSchemaRestrictedNamespace {
+        /// Whether the restricted namespace is TOAST.
+        toast: bool,
+    },
+    /// An owned sequence moves only with its owning relation.
+    #[error("Cannot move an owned sequence into another schema.")]
+    SetSchemaOwnedSequence {
+        /// The stored sequence name.
+        sequence_name: String,
+        /// The owning relation name.
+        table_name: String,
+    },
     #[error("Table `{table_name}` cannot inherit from partition `{parent_name}`.")]
     /// Error indicating that `INHERITS` names a partition, whose columns
     /// belong to the partitioned table it is part of.
