@@ -12,6 +12,7 @@ mod dynamic_execution;
 mod embedded_sql;
 mod expression_context;
 mod expression_scope;
+mod expression_truth;
 pub(crate) mod fingerprint;
 mod foreign_table_source;
 pub mod generic_db;
@@ -86,6 +87,8 @@ pub(crate) use expression_context::{
     declared_type_named, plain_arguments, row_of,
 };
 pub use expression_scope::ExpressionScope;
+pub use expression_truth::ExpressionTruth;
+pub(crate) use expression_truth::{Checks, table_truth};
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
@@ -132,6 +135,7 @@ pub use sequence::Sequence;
 pub(crate) use sequence::StoredSequenceOwner;
 pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use sqlite_index_column::{SqliteIndexColumn, SqliteIndexed};
+pub use sqlparser_expr_eval::Outcomes;
 pub use table_privileges::{ColumnPrivilege, TablePrivileges};
 pub use target_name::TargetName;
 pub use trigger_enablement::TriggerEnablement;

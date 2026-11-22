@@ -2,7 +2,7 @@
 
 use alloc::{boxed::Box, string::String, sync::Arc};
 
-use sql_values::{DateTimeError, PgType};
+use sql_values::postgres::{DateTimeError, PgType};
 use sqlparser::ast::Expr;
 
 use super::ExpressionCalls;

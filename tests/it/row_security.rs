@@ -9,7 +9,7 @@ use sql_traits::{
     errors::{LookupError, RowSecurityError},
     prelude::*,
 };
-use sql_values::{DateTimeError, PgType};
+use sql_values::postgres::{DateTimeError, PgType};
 use sqlparser::dialect::PostgreSqlDialect;
 
 fn parse(sql: &str) -> ParserDB {

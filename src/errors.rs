@@ -1332,9 +1332,9 @@ pub enum LookupError {
         /// The literal's text, as written.
         literal: String,
         /// The type PostgreSQL reads the literal as.
-        data_type: sql_values::PgType,
+        data_type: sql_values::postgres::PgType,
         /// What reading the literal needed or refused.
-        reason: sql_values::DateTimeError,
+        reason: sql_values::postgres::DateTimeError,
     },
 }
 
@@ -1443,7 +1443,7 @@ pub enum DeploymentError {
         zone: String,
         /// Why PostgreSQL refuses it.
         #[source]
-        reason: sql_values::TimeZoneError,
+        reason: sql_values::postgres::TimeZoneError,
     },
     /// The role is not one the deployment acts as.
     #[error("role `{role}` is not an acting role of the deployment")]
@@ -4384,7 +4384,7 @@ pub enum Error {
         value: String,
         /// Why PostgreSQL refuses it.
         #[source]
-        reason: sql_values::TimeZoneError,
+        reason: sql_values::postgres::TimeZoneError,
     },
     #[error("`{statement}` names the role the session runs as, which the input never names.")]
     /// Error indicating that `ALTER ROLE CURRENT_USER`, `CURRENT_ROLE` or

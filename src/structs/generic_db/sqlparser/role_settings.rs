@@ -12,7 +12,7 @@ use alloc::{
     vec::Vec,
 };
 
-use sql_values::PgTimeZone;
+use sql_values::postgres::PgTimeZone;
 use sqlparser::ast::{
     AlterRoleOperation, ContextModifier, DiscardObject, Expr, Ident, ObjectName, ObjectNamePart,
     Reset, ResetConfig, ResetStatement, Set, SetConfigValue, Statement,

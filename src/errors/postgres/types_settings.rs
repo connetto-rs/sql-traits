@@ -119,8 +119,8 @@ pub(super) fn relation_missing(
     PostgresError::new(state, format!("{kind} {} does not exist", quoted(name)))
 }
 
-pub(super) fn timezone(value: &str, reason: sql_values::TimeZoneError) -> PostgresError {
-    use sql_values::{IntervalError, TimeZoneError};
+pub(super) fn timezone(value: &str, reason: sql_values::postgres::TimeZoneError) -> PostgresError {
+    use sql_values::postgres::{IntervalError, TimeZoneError};
     match reason {
         TimeZoneError::LeapSeconds => {
             PostgresError::new(

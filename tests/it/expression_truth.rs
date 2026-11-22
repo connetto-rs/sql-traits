@@ -6,13 +6,30 @@
 )]
 
 use sql_traits::{errors::Error, prelude::*};
-use sqlparser::{ast::Expr, dialect::PostgreSqlDialect, parser::Parser};
+use sqlparser::{
+    ast::Expr,
+    dialect::{GenericDialect, PostgreSqlDialect},
+    parser::Parser,
+};
 
 fn expression(sql: &str) -> Expr {
     Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap()
 }
 
-fn truth(sql: &str) -> Result<Option<bool>, Error> {
+const fn never_raising(outcomes: Outcomes) -> ExpressionTruth {
+    ExpressionTruth { outcomes, may_raise: false }
+}
+
+const UNDECIDED: Outcomes = Outcomes { truth: true, falsity: true, null: false };
+
+fn truth_in(schema: &str, table: &str, sql: &str) -> Result<ExpressionTruth, Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
+    let table =
+        db.table_by_target(TargetName::new(table, false), IdentifierCase::AsWritten)?.unwrap();
+    Ok(table.expression_truth(&db, &expression(sql), IdentifierCase::AsWritten)?)
+}
+
+fn truth(sql: &str) -> Result<ExpressionTruth, Error> {
     let db = ParserDB::parse::<PostgreSqlDialect>(
         "CREATE SCHEMA app;
          CREATE TABLE app.invoices (id INT NOT NULL, tenant_id INT, \"ID\" INT);
@@ -28,60 +45,21 @@ fn truth(sql: &str) -> Result<Option<bool>, Error> {
 }
 
 #[test]
-fn proven_truths_and_negations() -> Result<(), Error> {
+fn proven_truths() -> Result<(), Error> {
     for sql in [
         "true",
         "NOT false",
         "1 = 1",
+        "1.0 = 1",
         "01 = 1",
+        "1 = 1.0",
+        "'1' = 1",
         "true = true",
         "'tenant' = 'tenant'",
         "false OR true",
         "true AND true",
-    ] {
-        assert_eq!(truth(sql)?, Some(true), "{sql}");
-    }
-    for sql in ["false", "NOT true", "1 = 0", "true = false", "false OR false", "true AND false"] {
-        assert_eq!(truth(sql)?, Some(false), "{sql}");
-    }
-    Ok(())
-}
-
-#[test]
-fn nulls_mixed_literals_and_collation_sensitive_comparisons_are_unknown() -> Result<(), Error> {
-    for sql in [
-        "NULL",
-        "NULL = NULL",
-        "NULL = 1",
-        "1 = NULL",
-        "NOT (NULL = NULL)",
-        "1 = 1.0",
-        "'a' = 'A'",
-        "'1' = 1",
-        "tenant_id = 7",
-        "tenant_id > 7",
-        "tenant_id IS NULL",
-        "tenant_id IS NOT NULL",
-        "unknown_column IS NOT NULL",
-        "\"ID\" IS NOT NULL",
-        "elsewhere.id IS NOT NULL",
-        "other.invoices.id IS NOT NULL",
-        "random() IS NULL OR random() IS NOT NULL",
-        "missing IS NULL OR missing IS NOT NULL",
-        "elsewhere.id IS NULL OR elsewhere.id IS NOT NULL",
-    ] {
-        assert_eq!(truth(sql)?, None, "{sql}");
-    }
-    assert_eq!(truth("NULL OR true")?, Some(true));
-    assert_eq!(truth("NULL AND false")?, Some(false));
-    assert_eq!(truth("NULL OR false")?, None);
-    assert_eq!(truth("NULL AND true")?, None);
-    Ok(())
-}
-
-#[test]
-fn nullability_respects_the_table_and_written_identifiers() -> Result<(), Error> {
-    for sql in [
+        "NULL OR true",
+        "id > 5 OR id <= 5",
         "id IS NOT NULL",
         "ID IS NOT NULL",
         "(id) IS NOT NULL",
@@ -89,11 +67,134 @@ fn nullability_respects_the_table_and_written_identifiers() -> Result<(), Error>
         "app.invoices.id IS NOT NULL",
         "tenant_id IS NULL OR tenant_id IS NOT NULL",
         "tenant_id IS NOT NULL OR tenant_id IS NULL",
+        "NOT (tenant_id = 7 AND false)",
+        "(tenant_id = 7 OR true) AND id IS NOT NULL",
+        "NOT NOT ((tenant_id) IS NULL OR tenant_id IS NOT NULL)",
     ] {
-        assert_eq!(truth(sql)?, Some(true), "{sql}");
+        assert_eq!(truth(sql)?, never_raising(Outcomes::TRUE), "{sql}");
     }
-    assert_eq!(truth("id IS NULL")?, Some(false));
-    assert_eq!(truth("NOT (id IS NOT NULL)")?, Some(false));
+    Ok(())
+}
+
+#[test]
+fn proven_falsities() -> Result<(), Error> {
+    for sql in [
+        "false",
+        "NOT true",
+        "1 = 0",
+        "true = false",
+        "false OR false",
+        "true AND false",
+        "NULL AND false",
+        "'a' = 'A'",
+        "id IS NULL",
+        "NOT (id IS NOT NULL)",
+        "id > 10 AND id < 5",
+        "id BETWEEN 1 AND 10 AND id IN (20, 30)",
+        "id IS NOT NULL AND id <> id",
+    ] {
+        assert_eq!(truth(sql)?, never_raising(Outcomes::FALSE), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn null_outcomes_are_told_apart() -> Result<(), Error> {
+    for sql in [
+        "NULL",
+        "NULL = NULL",
+        "NULL = 1",
+        "1 = NULL",
+        "NOT (NULL = NULL)",
+        "NULL AND true",
+        "NULL OR false",
+    ] {
+        assert_eq!(truth(sql)?, never_raising(Outcomes::NULL), "{sql}");
+    }
+    assert_eq!(truth("id NOT IN (1, NULL)")?, never_raising(Outcomes::NOT_TRUE));
+    // A `CHECK` admits every row this answers, a policy only those where
+    // `tenant_id` is not `NULL`.
+    assert_eq!(truth("tenant_id > 5 OR tenant_id <= 5")?, never_raising(Outcomes::NOT_FALSE));
+    for sql in ["tenant_id = 7", "tenant_id > 7"] {
+        assert_eq!(truth(sql)?, never_raising(Outcomes::ANY), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn overflow_always_raises() -> Result<(), Error> {
+    assert_eq!(
+        truth("2147483647 + 1 > 0")?,
+        ExpressionTruth { outcomes: Outcomes::NONE, may_raise: true },
+    );
+    Ok(())
+}
+
+#[test]
+fn unresolved_and_nullable_references_stay_undecided() -> Result<(), Error> {
+    for sql in [
+        "tenant_id IS NULL",
+        "tenant_id IS NOT NULL",
+        "unknown_column IS NOT NULL",
+        "\"ID\" IS NOT NULL",
+        "elsewhere.id IS NOT NULL",
+        "other.invoices.id IS NOT NULL",
+        "missing IS NULL OR missing IS NOT NULL",
+        "elsewhere.id IS NULL OR elsewhere.id IS NOT NULL",
+        "NOT (tenant_id IS NOT NULL OR false)",
+        "id IS NULL OR tenant_id IS NOT NULL",
+        "tenant_id IS NULL OR \"ID\" IS NOT NULL",
+    ] {
+        let truth = truth(sql)?;
+        assert!(truth.outcomes.truth && truth.outcomes.falsity, "{sql}: {truth:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn numeric_literals_keep_their_precision() -> Result<(), Error> {
+    let max = u128::MAX;
+    assert_eq!(truth(&format!("0{max} = {max}"))?, never_raising(Outcomes::TRUE));
+    assert_eq!(truth(&format!("{max} = {}", max - 1))?, never_raising(Outcomes::FALSE));
+    for sql in [
+        "0 = 340282366920938463463374607431768211456",
+        "340282366920938463463374607431768211456 = 0",
+    ] {
+        assert_eq!(truth(sql)?, never_raising(Outcomes::FALSE), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn volatile_calls_that_may_return_null_stay_undecided() -> Result<(), Error> {
+    assert_eq!(truth("random() IS NULL OR random() IS NOT NULL")?, never_raising(UNDECIDED));
+    Ok(())
+}
+
+#[test]
+fn calls_in_checks_resolve_where_the_evaluator_reads_copies() -> Result<(), Error> {
+    let domain = "CREATE DOMAIN short AS TEXT CHECK (length(VALUE) BETWEEN 1 AND 50);
+         CREATE TABLE invoices (code short NOT NULL);";
+    assert_eq!(truth_in(domain, "invoices", "length(code) > 0")?, never_raising(Outcomes::TRUE));
+    let table = "CREATE TABLE invoices (code TEXT NOT NULL, CHECK (length(code) BETWEEN 1 AND 5));";
+    assert_eq!(truth_in(table, "invoices", "length(code) > 0")?, never_raising(Outcomes::TRUE));
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE invoices (code TEXT NOT NULL, CHECK (length(code) BETWEEN 1 AND 5 AND code <> ''));",
+    )?;
+    let check = db.tables().next().unwrap().check_constraints(&db)?.next().unwrap();
+    assert!(!check.is_tautology(&db)?);
+    assert!(!check.is_negation(&db)?);
+    Ok(())
+}
+
+#[test]
+fn calls_on_a_domain_run_the_overload_declared_for_it() -> Result<(), Error> {
+    let schema = "CREATE DOMAIN email AS TEXT;
+         CREATE FUNCTION label(email) RETURNS TEXT LANGUAGE sql IMMUTABLE CALLED ON NULL INPUT AS 'SELECT ''none''';
+         CREATE FUNCTION label(TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE STRICT AS 'SELECT $1';
+         CREATE TABLE invoices (contact email);";
+    let truth = truth_in(schema, "invoices", "label(contact) IS NULL OR contact IS NOT NULL")?;
+    assert!(truth.outcomes.falsity, "{truth:?}");
     Ok(())
 }
 
@@ -113,18 +214,20 @@ fn policy_expressions_can_be_analyzed_independently() -> Result<(), Error> {
         let using = policy
             .using_expression(&db)?
             .map(|expr| table.expression_truth(&db, expr, IdentifierCase::AsWritten))
-            .transpose()?;
+            .transpose()?
+            .map(|truth| truth.outcomes);
         let check = policy
             .check_expression(&db)?
             .map(|expr| table.expression_truth(&db, expr, IdentifierCase::AsWritten))
-            .transpose()?;
+            .transpose()?
+            .map(|truth| truth.outcomes);
         let expected = match policy.name() {
-            "public_rows" => (Some(Some(true)), None),
-            "tenant_rows" => (Some(None), None),
-            "unchecked_writes" => (Some(None), Some(Some(true))),
-            "denied" => (Some(Some(false)), None),
-            "only_check" => (None, Some(Some(true))),
-            "nullable_writes" => (Some(Some(true)), Some(None)),
+            "public_rows" => (Some(Outcomes::TRUE), None),
+            "tenant_rows" => (Some(Outcomes::ANY), None),
+            "unchecked_writes" => (Some(Outcomes::ANY), Some(Outcomes::TRUE)),
+            "denied" => (Some(Outcomes::FALSE), None),
+            "only_check" => (None, Some(Outcomes::TRUE)),
+            "nullable_writes" => (Some(Outcomes::TRUE), Some(UNDECIDED)),
             _ => unreachable!(),
         };
         assert_eq!((using, check), expected, "{}", policy.name());
@@ -133,12 +236,14 @@ fn policy_expressions_can_be_analyzed_independently() -> Result<(), Error> {
 }
 
 #[test]
-fn checks_share_sound_null_and_literal_analysis() -> Result<(), Error> {
+fn checks_are_judged_by_the_rows_they_admit() -> Result<(), Error> {
     let db = ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE invoices (
             id INT NOT NULL,
+            tenant_id INT,
             CHECK (NULL = NULL), CHECK (1 = 1.0), CHECK (NOT false),
-            CHECK (invoices.id IS NOT NULL)
+            CHECK (invoices.id IS NOT NULL), CHECK (2147483647 + id > 0),
+            CHECK (tenant_id < 0 AND tenant_id > 0), CHECK (id < 0 AND id > 0)
          );",
     )?;
     let table = db.tables().next().unwrap();
@@ -146,7 +251,219 @@ fn checks_share_sound_null_and_literal_analysis() -> Result<(), Error> {
         .check_constraints(&db)?
         .map(|check| Ok((check.is_tautology(&db)?, check.is_negation(&db)?)))
         .collect::<Result<Vec<_>, Error>>()?;
-    assert_eq!(results, [(false, false), (false, false), (true, false), (true, false)]);
+    assert_eq!(
+        results,
+        [
+            (true, false),
+            (true, false),
+            (true, false),
+            (true, false),
+            (false, false),
+            (false, false),
+            (false, true),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn table_checks_seed_expressions_but_not_each_other() -> Result<(), Error> {
+    let schema = "CREATE TABLE invoices (tenant_id INT, CHECK (tenant_id > 0));";
+    assert_eq!(truth_in(schema, "invoices", "tenant_id < 0")?, never_raising(Outcomes::NOT_TRUE));
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE invoices (id INT NOT NULL, CHECK (id > 0), CHECK (id < 0));",
+    )?;
+    let table = db.tables().next().unwrap();
+    let checks: Vec<_> = table.check_constraints(&db)?.collect();
+    for check in &checks {
+        assert!(!check.is_negation(&db)?, "{}", check.expression(&db));
+        assert_eq!(check.truth_under_other_checks(&db)?, never_raising(Outcomes::FALSE));
+    }
+    // The two checks together admit no row, so no expression takes an
+    // outcome on one.
+    assert_eq!(
+        table.expression_truth(&db, &expression("id = 1"), IdentifierCase::AsWritten)?,
+        never_raising(Outcomes::NONE)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_check_written_twice_is_redundant_beside_its_twin_only() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE invoices (tenant_id INT, CHECK (tenant_id > 0), CHECK (tenant_id > 0));",
+    )?;
+    let table = db.tables().next().unwrap();
+    for check in table.check_constraints(&db)? {
+        assert!(!check.is_tautology(&db)?);
+        assert_eq!(check.truth_under_other_checks(&db)?, never_raising(Outcomes::NOT_FALSE));
+    }
+    Ok(())
+}
+
+#[test]
+fn checks_postgresql_does_not_enforce_on_every_row_seed_nothing() -> Result<(), Error> {
+    for schema in [
+        "CREATE TABLE invoices (tenant_id INT);
+         ALTER TABLE invoices ADD CONSTRAINT positive CHECK (tenant_id > 0) NOT VALID;",
+        "CREATE TABLE invoices (tenant_id INT, CHECK (tenant_id > 0) NOT ENFORCED);",
+        "CREATE TABLE invoices (tenant_id INT, CHECK (tenant_id > 0) NO INHERIT);",
+    ] {
+        assert_eq!(
+            truth_in(schema, "invoices", "tenant_id < 0")?,
+            never_raising(Outcomes::ANY),
+            "{schema}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn checks_that_may_answer_differently_later_seed_nothing() -> Result<(), Error> {
+    let functions =
+        "CREATE FUNCTION fixed() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE FUNCTION today() RETURNS boolean LANGUAGE sql STABLE AS 'SELECT true';";
+    let seeded = format!(
+        "{functions} CREATE TABLE invoices (tenant_id INT, CHECK (tenant_id > 0 AND fixed()));"
+    );
+    assert_eq!(truth_in(&seeded, "invoices", "tenant_id < 0")?, never_raising(Outcomes::NOT_TRUE));
+    for check in [
+        "tenant_id > 0 AND today()",
+        "tenant_id > 0 AND random() < 2",
+        "tenant_id > 0 AND CURRENT_DATE IS NOT NULL",
+    ] {
+        let table = format!("{functions} CREATE TABLE invoices (tenant_id INT, CHECK ({check}));");
+        assert_eq!(
+            truth_in(&table, "invoices", "tenant_id < 0")?,
+            never_raising(Outcomes::ANY),
+            "{check}"
+        );
+        let domain = format!(
+            "{functions} CREATE DOMAIN positive AS INT CHECK ({});
+             CREATE TABLE invoices (tenant_id positive);",
+            check.replace("tenant_id", "VALUE")
+        );
+        assert_eq!(
+            truth_in(&domain, "invoices", "tenant_id < 0")?,
+            never_raising(Outcomes::ANY),
+            "{check}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn check_calls_resolve_under_the_path_the_check_was_created_with() -> Result<(), Error> {
+    let schema = "CREATE SCHEMA pinned;
+         CREATE FUNCTION pinned.ok() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE FUNCTION public.ok() RETURNS boolean LANGUAGE sql VOLATILE AS 'SELECT true';
+         SET search_path = pinned, public;
+         CREATE TABLE public.invoices (tenant_id INT, CHECK (ok() IS NULL OR ok() IS NOT NULL));
+         SET search_path = public;";
+    let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
+    let check = db.tables().next().unwrap().check_constraints(&db)?.next().unwrap();
+    assert!(check.is_tautology(&db)?);
+    Ok(())
+}
+
+#[test]
+fn checks_whose_calls_the_database_path_reads_otherwise_seed_nothing() -> Result<(), Error> {
+    let schema = "CREATE SCHEMA pinned;
+         CREATE FUNCTION pinned.ok() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         CREATE FUNCTION public.ok() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true';
+         SET search_path = pinned, public;
+         CREATE TABLE public.invoices (tenant_id INT, CHECK (tenant_id > 0 AND ok()));
+         SET search_path = public;";
+    for sql in ["tenant_id > 0 AND ok()", "tenant_id < 0"] {
+        assert_eq!(truth_in(schema, "invoices", sql)?, never_raising(Outcomes::ANY), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn checks_whose_calls_the_read_check_resolves_otherwise_seed_nothing() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE SCHEMA pinned;
+         CREATE FUNCTION public.f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+         CREATE FUNCTION pinned.f() RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 0';
+         CREATE TABLE public.invoices (n INT, CONSTRAINT public_positive CHECK (f() > 0));
+         SET search_path = pinned, public;
+         ALTER TABLE public.invoices ADD CONSTRAINT pinned_positive CHECK (f() > 0);
+         SET search_path = public;",
+    )?;
+    let table = db.tables().next().unwrap();
+    for check in table.check_constraints(&db)? {
+        assert_eq!(check.truth_under_other_checks(&db)?, never_raising(Outcomes::ANY));
+    }
+    Ok(())
+}
+
+#[test]
+fn numeric_columns_may_hold_nan_above_every_number() -> Result<(), Error> {
+    let schema = "CREATE TABLE invoices (amount NUMERIC(3, 1) NOT NULL);";
+    assert_eq!(truth_in(schema, "invoices", "amount > -100")?, never_raising(Outcomes::TRUE));
+    assert_eq!(truth_in(schema, "invoices", "amount < 100")?, never_raising(UNDECIDED));
+    Ok(())
+}
+
+#[test]
+fn domain_checks_seed_their_columns() -> Result<(), Error> {
+    let schema = "CREATE DOMAIN positive AS INT CHECK (VALUE > 0);
+         CREATE DOMAIN small_positive AS positive CHECK (VALUE < 10);
+         CREATE TABLE invoices (amount positive, required small_positive NOT NULL);";
+    assert_eq!(truth_in(schema, "invoices", "amount <= 0")?, never_raising(Outcomes::NOT_TRUE));
+    assert_eq!(
+        truth_in(schema, "invoices", "required BETWEEN 1 AND 9")?,
+        never_raising(Outcomes::TRUE)
+    );
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE DOMAIN positive AS INT CHECK (VALUE > 0);
+         CREATE TABLE invoices (amount positive NOT NULL, CHECK (amount > 0));",
+    )?;
+    let check = db.tables().next().unwrap().check_constraints(&db)?.next().unwrap();
+    assert!(check.is_tautology(&db)?);
+    Ok(())
+}
+
+#[test]
+fn text_comparisons_follow_the_collation() -> Result<(), Error> {
+    let schema =
+        "CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+         CREATE TABLE notes (
+            plain TEXT NOT NULL,
+            icu TEXT COLLATE \"und-x-icu\" NOT NULL,
+            icu_too TEXT COLLATE \"und-x-icu\" NOT NULL,
+            bytes TEXT COLLATE \"C\" NOT NULL,
+            custom TEXT COLLATE ci NOT NULL,
+            short VARCHAR(3) NOT NULL
+         );";
+    for sql in [
+        "plain = 'a' AND plain = 'A'",
+        "icu = 'a' AND icu = 'A'",
+        "plain < short AND short < plain",
+        "icu < icu_too AND icu_too < icu",
+        "icu < plain AND plain < icu",
+        "bytes = 'a' AND bytes < 'B'",
+    ] {
+        assert_eq!(truth_in(schema, "notes", sql)?, never_raising(Outcomes::FALSE), "{sql}");
+    }
+    for sql in ["custom = 'a' AND custom = 'A'", "plain = 'a' AND plain < 'B'"] {
+        let undecided = truth_in(schema, "notes", sql)?;
+        assert!(undecided.outcomes.falsity && undecided.outcomes.truth, "{sql}: {undecided:?}");
+    }
+    assert_eq!(truth_in(schema, "notes", "length(short) > 3")?, never_raising(Outcomes::FALSE));
+    Ok(())
+}
+
+#[test]
+fn other_dialects_keep_only_shared_semantics() -> Result<(), Error> {
+    let db = ParserDB::parse::<GenericDialect>("CREATE TABLE invoices (id INT NOT NULL);")?;
+    let table = db.tables().next().unwrap();
+    let truth = |sql| table.expression_truth(&db, &expression(sql), IdentifierCase::AsWritten);
+    assert_eq!(truth("id > 5 OR id <= 5")?, never_raising(Outcomes::TRUE));
+    assert_eq!(truth("id IS NULL")?, never_raising(Outcomes::FALSE));
+    let text = truth("'a' = 'A'")?;
+    assert!(text.outcomes.truth && text.outcomes.falsity, "{text:?}");
     Ok(())
 }
 
@@ -155,28 +472,18 @@ fn callers_choose_identifier_comparison() -> Result<(), Error> {
     let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (\"ID\" INT NOT NULL);")?;
     let table = db.tables().next().unwrap();
     let expr = expression("id IS NOT NULL");
-    assert_eq!(table.expression_truth(&db, &expr, IdentifierCase::AsWritten)?, None);
-    assert_eq!(table.expression_truth(&db, &expr, IdentifierCase::Folded)?, Some(true));
-    assert_eq!(table.expression_truth(&db, &expr, IdentifierCase::Exact)?, None);
+    let truth = |case| table.expression_truth(&db, &expr, case).map(|truth| truth.outcomes);
+    assert_eq!(truth(IdentifierCase::AsWritten)?, UNDECIDED);
+    assert_eq!(truth(IdentifierCase::Folded)?, Outcomes::TRUE);
+    assert_eq!(truth(IdentifierCase::Exact)?, UNDECIDED);
     Ok(())
 }
 
 #[test]
 fn inherited_columns_keep_their_nullability() -> Result<(), Error> {
-    let db = ParserDB::parse::<PostgreSqlDialect>(
-        "CREATE TABLE parent (id INT NOT NULL);
-         CREATE TABLE child (tenant_id INT) INHERITS (parent);",
-    )?;
-    let child =
-        db.table_by_target(TargetName::new("child", false), IdentifierCase::AsWritten)?.unwrap();
-    assert_eq!(
-        child.expression_truth(
-            &db,
-            &expression("child.id IS NOT NULL"),
-            IdentifierCase::AsWritten
-        )?,
-        Some(true),
-    );
+    let schema = "CREATE TABLE parent (id INT NOT NULL);
+         CREATE TABLE child (tenant_id INT) INHERITS (parent);";
+    assert_eq!(truth_in(schema, "child", "child.id IS NOT NULL")?, never_raising(Outcomes::TRUE));
     Ok(())
 }
 
@@ -193,40 +500,17 @@ fn an_absent_table_is_an_error_even_for_a_literal() -> Result<(), Error> {
 }
 
 #[test]
-fn integer_proofs_preserve_precision_and_refuse_either_unrepresentable_operand() -> Result<(), Error>
-{
-    let max = u128::MAX;
-    assert_eq!(truth(&format!("0{max} = {max}"))?, Some(true));
-    assert_eq!(truth(&format!("{max} = {}", max - 1))?, Some(false));
-    assert_eq!(truth("0 = 340282366920938463463374607431768211456")?, None);
-    assert_eq!(truth("340282366920938463463374607431768211456 = 0")?, None);
-    assert_eq!(truth("1.0 = 1")?, None);
-    Ok(())
-}
-
-#[test]
-fn nested_predicates_preserve_unknowns_and_absorbing_booleans() -> Result<(), Error> {
-    for (sql, expected) in [
-        ("NOT (tenant_id = 7 AND false)", Some(true)),
-        ("(tenant_id = 7 OR true) AND id IS NOT NULL", Some(true)),
-        ("NOT (tenant_id IS NOT NULL OR false)", None),
-        ("NOT NOT ((tenant_id) IS NULL OR tenant_id IS NOT NULL)", Some(true)),
-        ("id IS NULL OR tenant_id IS NOT NULL", None),
-        ("tenant_id IS NULL OR \"ID\" IS NOT NULL", None),
-    ] {
-        assert_eq!(truth(sql)?, expected, "{sql}");
-    }
-    Ok(())
-}
-
-#[test]
 fn check_truth_analysis_reports_absent_constraint_metadata() -> Result<(), Error> {
     let owned =
         ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (id INT, CHECK (NOT false));")?;
     let elsewhere = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (id INT);")?;
     let table = owned.tables().next().unwrap();
     let check = table.check_constraints(&owned)?.next().unwrap();
-    for result in [check.is_tautology(&elsewhere), check.is_negation(&elsewhere)] {
+    for result in [
+        check.is_tautology(&elsewhere),
+        check.is_negation(&elsewhere),
+        check.truth_under_other_checks(&elsewhere).map(|truth| truth.outcomes.truth),
+    ] {
         assert!(
             matches!(result, Err(sql_traits::errors::LookupError::ObjectNotInDatabase { .. }),)
         );

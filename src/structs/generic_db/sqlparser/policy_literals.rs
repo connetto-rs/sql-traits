@@ -14,7 +14,7 @@ use alloc::{
 };
 use core::ops::ControlFlow;
 
-use sql_values::{
+use sql_values::postgres::{
     DateOrder, DateTimeError, InputContext, PgDate, PgTime, PgTimeTz, PgTimeZone, PgTimestamp,
     PgTimestampTz, PgType,
 };

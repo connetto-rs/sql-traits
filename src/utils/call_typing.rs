@@ -1177,6 +1177,55 @@ pub(crate) fn resolve_call<'a, D: DatabaseLike>(
     }))
 }
 
+/// The functions among `reached` PostgreSQL may run for `call`, given the
+/// type each argument it writes has, [`None`] where the caller does not know
+/// it. Answers every one of `reached` when the types settle nothing, and
+/// [`None`] when PostgreSQL may read the call as a cast, which runs no
+/// function.
+///
+/// # Errors
+///
+/// Returns [`LookupError::InvalidObjectName`] for a called name no static
+/// reader resolves.
+pub(crate) fn runnable_among<'db, D: DatabaseLike>(
+    database: &D,
+    call: &Function,
+    reached: Vec<&'db D::Function>,
+    argument_types: &[Option<&str>],
+) -> Result<Option<Vec<&'db D::Function>>, LookupError> {
+    let Some(written) = written_argument_names(call) else { return Ok(Some(reached)) };
+    if written.len() != argument_types.len() {
+        return Ok(Some(reached));
+    }
+    let actuals = actuals(database, argument_types);
+    let matched: Vec<(usize, Matched)> = reached
+        .iter()
+        .enumerate()
+        .filter_map(|(position, function)| {
+            declared_at_call(*function, database, &written).map(|matched| (position, matched))
+        })
+        .collect();
+    if let ([None], [Some(input)]) = (written.as_slice(), actuals.as_slice()) {
+        let candidates = matched.iter().map(|(_, matched)| matched);
+        let reading = cast_reading(database, &called_name(call)?, candidates, Some(&input.pg_type));
+        if !matches!(reading, Ok(None)) {
+            return Ok(None);
+        }
+    }
+    let bound: Vec<(usize, Binding<'_>)> = matched
+        .into_iter()
+        .filter_map(|(position, matched)| {
+            bind(database, matched.declared, &actuals).map(|binding| (position, binding))
+        })
+        .collect();
+    let kept = match select(database, &bound, &actuals) {
+        Selection::Chosen(position) => vec![position],
+        Selection::Undetermined(positions) if !positions.is_empty() => positions,
+        Selection::Refused | Selection::Undetermined(_) => return Ok(Some(reached)),
+    };
+    Ok(Some(kept.into_iter().map(|position| reached[position]).collect()))
+}
+
 /// The type an operand or argument has, [`None`] when the caller does not
 /// know it or names no type.
 pub(crate) fn typed_input(

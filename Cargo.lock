@@ -977,6 +977,7 @@ dependencies = [
  "sql-values",
  "sqlparser",
  "sqlparser-canonicalize",
+ "sqlparser-expr-eval",
  "sqlparser-plpgsql",
  "sqlstate",
  "tempfile",
@@ -987,9 +988,8 @@ dependencies = [
 
 [[package]]
 name = "sql-values"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa63391be723434747b0c2ffc2e7270f4a7a476d083b55cdda961c4773d1d5e4"
+version = "0.6.0"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#bee0f26da9575f1f0ab38550e3188cb25590058e"
 dependencies = [
  "jiff",
  "thiserror",
@@ -1014,6 +1014,15 @@ dependencies = [
  "seahash",
  "sqlparser",
  "thiserror",
+]
+
+[[package]]
+name = "sqlparser-expr-eval"
+version = "0.1.0"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#d5834dd38bb66289d7e9f1d4d00eca716d528626"
+dependencies = [
+ "sql-values",
+ "sqlparser",
 ]
 
 [[package]]
