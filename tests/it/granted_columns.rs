@@ -185,3 +185,73 @@ fn a_granted_column_reads_back_under_the_folding_rule() {
         .collect();
     assert_eq!(granted, ["id"]);
 }
+
+#[test]
+fn column_privileges_require_relation_targets() {
+    let mut failures = Vec::new();
+    for target in [
+        "SEQUENCE s",
+        "SCHEMA public",
+        "DATABASE postgres",
+        "ALL SEQUENCES IN SCHEMA public",
+        "FUNCTION f()",
+        "PROCEDURE p()",
+        "ROUTINE f()",
+        "ALL FUNCTIONS IN SCHEMA public",
+        "ALL PROCEDURES IN SCHEMA public",
+        "ALL ROUTINES IN SCHEMA public",
+    ] {
+        for action in ["SELECT", "INSERT", "UPDATE", "REFERENCES"] {
+            for (operation, preposition) in [("GRANT", "TO"), ("REVOKE", "FROM")] {
+                let sql = format!(
+                    "CREATE SEQUENCE s;
+                     CREATE FUNCTION f() RETURNS int LANGUAGE SQL AS 'SELECT 1';
+                     CREATE PROCEDURE p() LANGUAGE SQL AS 'SELECT 1';
+                     {operation} {action} (id) ON {target} {preposition} PUBLIC;"
+                );
+                match parse(&sql).err().and_then(|error| error.postgres_error()) {
+                    Some(error)
+                        if error.sqlstate().to_string() == "0LP01"
+                            && error.message()
+                                == "column privileges are only valid for relations" => {}
+                    result => {
+                        failures.push(format!("{operation} {action} ON {target}: {result:?}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn empty_sequence_schema_still_refuses_column_privileges() {
+    for (operation, preposition) in [("GRANT", "TO"), ("REVOKE", "FROM")] {
+        let error = parse(&format!(
+            "{operation} SELECT (id) ON ALL SEQUENCES IN SCHEMA public {preposition} PUBLIC;"
+        ))
+        .expect_err("column privileges require relations")
+        .postgres_error()
+        .expect("PostgreSQL diagnostic");
+        assert_eq!(error.sqlstate().to_string(), "0LP01");
+        assert_eq!(error.message(), "column privileges are only valid for relations");
+    }
+}
+
+#[test]
+fn resolved_targets_and_grantees_precede_column_privilege_checks() {
+    for (operation, preposition) in [("GRANT", "TO"), ("REVOKE", "FROM")] {
+        for (target, grantee, state, message) in [
+            ("FUNCTION missing()", "PUBLIC", "42883", "function missing() does not exist"),
+            ("SCHEMA public", "missing", "42704", "role \"missing\" does not exist"),
+        ] {
+            let error =
+                parse(&format!("{operation} SELECT (id) ON {target} {preposition} {grantee};"))
+                    .expect_err("resolution must precede column validation")
+                    .postgres_error()
+                    .expect("PostgreSQL diagnostic");
+            assert_eq!(error.sqlstate().to_string(), state);
+            assert_eq!(error.message(), message);
+        }
+    }
+}

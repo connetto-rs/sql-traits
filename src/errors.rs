@@ -4535,6 +4535,9 @@ pub enum Error {
         /// The object type, as PostgreSQL spells it.
         object_type: String,
     },
+    #[error("Default privileges cannot be set for columns.")]
+    /// Error indicating that `ALTER DEFAULT PRIVILEGES` names columns.
+    DefaultPrivilegesForColumns,
     #[error("Schema `{schema_name}` already exists.")]
     /// Error indicating that a CREATE SCHEMA statement tries to create a schema
     /// that already exists.

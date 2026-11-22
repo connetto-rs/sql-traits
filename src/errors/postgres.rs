@@ -1245,6 +1245,12 @@ impl Error {
             Self::InvalidDefaultPrivilege { privilege, object_type } => {
                 Some(types_settings::default_privilege(privilege, object_type))
             }
+            Self::DefaultPrivilegesForColumns => {
+                Some(PostgresError::new(
+                    pg::INVALID_GRANT_OPERATION,
+                    "default privileges cannot be set for columns",
+                ))
+            }
             Self::SchemaAlreadyExists { schema_name } => {
                 Some(PostgresError::new(
                     pg::DUPLICATE_SCHEMA,
