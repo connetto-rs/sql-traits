@@ -326,7 +326,8 @@ impl core::fmt::Display for KeyConstraint {
 }
 
 /// A place PostgreSQL stores an expression it evaluates without running a
-/// query, and so refuses a subquery in.
+/// query, and so refuses a subquery and an aggregate, window or
+/// set-returning call in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpressionPlace {
     /// A `CHECK` constraint of a table or a domain.
@@ -361,6 +362,47 @@ impl core::fmt::Display for ExpressionPlace {
             Self::PartitionBound => "partition bound",
             Self::Transform => "transform expression",
             Self::TriggerWhen => "trigger WHEN condition",
+        })
+    }
+}
+
+impl ExpressionPlace {
+    /// The place as PostgreSQL names it when refusing an aggregate, window or
+    /// set-returning call there, in the plural but for a partition bound.
+    #[must_use]
+    pub(crate) const fn in_call_refusal(self) -> &'static str {
+        match self {
+            Self::CheckConstraint => "check constraints",
+            Self::Default => "DEFAULT expressions",
+            Self::Generation => "column generation expressions",
+            Self::IndexExpression => "index expressions",
+            Self::IndexPredicate => "index predicates",
+            Self::PartitionKey => "partition key expressions",
+            Self::PartitionBound => "partition bound",
+            Self::Transform => "transform expressions",
+            Self::TriggerWhen => "trigger WHEN conditions",
+        }
+    }
+}
+
+/// What a call computes that keeps PostgreSQL from storing it in an
+/// [`ExpressionPlace`], which evaluates one row at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefusedCall {
+    /// An aggregate called without `OVER`, folding rows into one value.
+    Aggregate,
+    /// A window function, or an aggregate called with `OVER`.
+    Window,
+    /// A function returning a set of rows.
+    SetReturning,
+}
+
+impl core::fmt::Display for RefusedCall {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Aggregate => "aggregate functions",
+            Self::Window => "window functions",
+            Self::SetReturning => "set-returning functions",
         })
     }
 }
@@ -3254,6 +3296,16 @@ pub enum Error {
     /// Error indicating that an expression PostgreSQL stores and evaluates
     /// without running a query holds a subquery.
     SubqueryInExpression {
+        /// Where the expression is stored.
+        place: ExpressionPlace,
+    },
+    #[error("{call} are not allowed in {}", .place.in_call_refusal())]
+    /// Error indicating that an expression PostgreSQL stores and evaluates
+    /// one row at a time calls an aggregate, a window or a set-returning
+    /// function.
+    CallInExpression {
+        /// What the call computes.
+        call: RefusedCall,
         /// Where the expression is stored.
         place: ExpressionPlace,
     },

@@ -539,6 +539,17 @@ impl Error {
                     format!("cannot use subquery in {place}"),
                 ))
             }
+            Self::CallInExpression { call, place } => {
+                let sqlstate = match call {
+                    super::RefusedCall::Aggregate => pg::GROUPING_ERROR,
+                    super::RefusedCall::Window => pg::WINDOWING_ERROR,
+                    super::RefusedCall::SetReturning => pg::FEATURE_NOT_SUPPORTED,
+                };
+                Some(PostgresError::new(
+                    sqlstate,
+                    format!("{call} are not allowed in {}", place.in_call_refusal()),
+                ))
+            }
             Self::ColumnReferenceInDefault { .. } => {
                 Some(PostgresError::new(
                     pg::FEATURE_NOT_SUPPORTED,

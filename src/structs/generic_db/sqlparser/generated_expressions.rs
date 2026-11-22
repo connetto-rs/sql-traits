@@ -11,7 +11,7 @@ use sqlparser::ast::{
 use super::{
     AccessResolution, DefaultPrivileges, ParserDB, ParserDBBuilder, ParserIngestion,
     PostgresCatalog, SessionRoles, SessionSettings, TypeArrays, case_idents_match,
-    stored_expressions, type_facts::type_facts,
+    type_facts::type_facts,
 };
 use crate::{
     errors::Error,
@@ -69,7 +69,9 @@ pub(super) fn defaults(
     Ok(())
 }
 
-/// Validates a generated column against the completed table declaration.
+/// Validates a generated column against the completed table declaration,
+/// once [`super::stored_expressions`] has refused what PostgreSQL refuses
+/// while transforming the expression.
 pub(super) fn column(
     database: &ParserDB,
     table: &CreateTable,
@@ -87,7 +89,6 @@ pub(super) fn column(
         else {
             continue;
         };
-        stored_expressions::refuse_column_value(&option.option)?;
         references_in(
             *database.dialect(),
             database.catalog_name(),
@@ -165,10 +166,7 @@ fn references_in(
             if system_name(case, name, "tableoid") {
                 return true;
             }
-            if let Some(system) = ["ctid", "xmin", "xmax", "cmin", "cmax"]
-                .into_iter()
-                .find(|system| system_name(case, name, system))
-            {
+            if let Some(system) = forbidden_system_column(case, name) {
                 if refused.is_none() {
                     refused =
                         Some(Error::GeneratedSystemColumnReference { column: system.to_string() });
@@ -184,6 +182,51 @@ fn references_in(
 /// Compares a system column's unquoted catalog name.
 fn system_name(case: crate::structs::IdentifierCase, name: &Ident, system: &str) -> bool {
     case.identifiers_match(system, false, &name.value, name.quote_style.is_some())
+}
+
+/// The system column `name` reads that a generation expression may not.
+fn forbidden_system_column(
+    case: crate::structs::IdentifierCase,
+    name: &Ident,
+) -> Option<&'static str> {
+    ["ctid", "xmin", "xmax", "cmin", "cmax"]
+        .into_iter()
+        .find(|system| system_name(case, name, system))
+}
+
+/// The system columns PostgreSQL refuses that `expression`, the generation
+/// expression of a column of `table`, reads outside its subqueries, each
+/// with the address of the name reading it.
+///
+/// A reference to another table is left for [`references`] to refuse, and
+/// the names past it are not read.
+pub(super) fn system_columns(
+    builder: &ParserDBBuilder,
+    table: &CreateTable,
+    expression: &Expr,
+) -> Vec<(usize, &'static str)> {
+    let case = builder.identifier_case();
+    let mut found = Vec::new();
+    let foreign = visit_columns(
+        expression,
+        builder.catalog_name(),
+        &target_name_of_object_name(&table.name),
+        case,
+        *builder.dialect(),
+        |name| {
+            let held =
+                table.columns.iter().any(|column| case_idents_match(&column.name, name, case));
+            if let Some(system) = forbidden_system_column(case, name).filter(|_| !held) {
+                found.push((core::ptr::from_ref(name).addr(), system));
+            }
+            true
+        },
+    );
+    debug_assert!(
+        foreign.is_ok() || matches!(foreign, Err(Error::ForeignColumnReference { .. })),
+        "every name resolves, so only a reference to another table stops the walk"
+    );
+    found
 }
 
 /// Stops the expression walk at its first refusal.

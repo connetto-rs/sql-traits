@@ -83,7 +83,7 @@ pub use expression_context::{
 };
 pub(crate) use expression_context::{
     CallRefusal, ReparsePins, Site, applies_operators, array_of, column_type, declared_type,
-    declared_type_named, plain_arguments, row_of,
+    declared_type_named, places_call, plain_arguments, row_of,
 };
 pub use expression_scope::ExpressionScope;
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
