@@ -224,6 +224,29 @@ fn column_privileges_require_relation_targets() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// A column privilege on a sequence, a schema or a database names the
+/// object type it was written on.
+#[test]
+fn column_privilege_refusal_names_the_target_type() {
+    for (target, object_type) in [
+        ("SEQUENCE s", "SEQUENCE"),
+        ("ALL SEQUENCES IN SCHEMA public", "SEQUENCE"),
+        ("SCHEMA public", "SCHEMA"),
+        ("DATABASE postgres", "DATABASE"),
+    ] {
+        let refused =
+            parse(&format!("CREATE SEQUENCE s; GRANT UPDATE (id) ON {target} TO PUBLIC;"));
+        assert!(
+            matches!(
+                &refused,
+                Err(Error::ColumnPrivilegeOnNonRelation { privilege, object_type: refused_type })
+                    if privilege == "UPDATE (id)" && refused_type == object_type
+            ),
+            "{target}: {refused:?}"
+        );
+    }
+}
+
 #[test]
 fn empty_sequence_schema_still_refuses_column_privileges() {
     for (operation, preposition) in [("GRANT", "TO"), ("REVOKE", "FROM")] {

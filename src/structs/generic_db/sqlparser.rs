@@ -3566,24 +3566,18 @@ fn validate_column_privilege_target(
     privileges: &Privileges,
     objects: Option<&GrantObjects>,
 ) -> Result<(), crate::errors::Error> {
-    if !matches!(
-        objects,
-        Some(
-            GrantObjects::Sequences(_)
-                | GrantObjects::Schemas(_)
-                | GrantObjects::Databases(_)
-                | GrantObjects::AllSequencesInSchema { .. }
-        )
-    ) {
-        return Ok(());
-    }
+    let object_type = match objects {
+        Some(GrantObjects::Sequences(_) | GrantObjects::AllSequencesInSchema { .. }) => "SEQUENCE",
+        Some(GrantObjects::Schemas(_)) => "SCHEMA",
+        Some(GrantObjects::Databases(_)) => "DATABASE",
+        _ => return Ok(()),
+    };
     if let Privileges::Actions(actions) = privileges
         && let Some(action) = actions.iter().find(|action| action_columns(action).is_some())
     {
-        return Err(crate::errors::Error::InvalidFunctionPrivilege {
+        return Err(crate::errors::Error::ColumnPrivilegeOnNonRelation {
             privilege: action.to_string(),
-            routine: crate::errors::RoutineKeyword::Function,
-            columns: true,
+            object_type: object_type.to_string(),
         });
     }
     Ok(())

@@ -1251,6 +1251,12 @@ impl Error {
                     "default privileges cannot be set for columns",
                 ))
             }
+            Self::ColumnPrivilegeOnNonRelation { .. } => {
+                Some(PostgresError::new(
+                    pg::INVALID_GRANT_OPERATION,
+                    "column privileges are only valid for relations",
+                ))
+            }
             Self::SchemaAlreadyExists { schema_name } => {
                 Some(PostgresError::new(
                     pg::DUPLICATE_SCHEMA,

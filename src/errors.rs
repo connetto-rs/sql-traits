@@ -4538,6 +4538,15 @@ pub enum Error {
     #[error("Default privileges cannot be set for columns.")]
     /// Error indicating that `ALTER DEFAULT PRIVILEGES` names columns.
     DefaultPrivilegesForColumns,
+    #[error("Privilege `{privilege}` names columns, but {object_type} is no relation.")]
+    /// Error indicating that a grant or a revoke names columns on a sequence,
+    /// a schema or a database, where PostgreSQL keeps no column privileges.
+    ColumnPrivilegeOnNonRelation {
+        /// The privilege as the statement spelled it.
+        privilege: String,
+        /// The object type, as PostgreSQL spells it.
+        object_type: String,
+    },
     #[error("Schema `{schema_name}` already exists.")]
     /// Error indicating that a CREATE SCHEMA statement tries to create a schema
     /// that already exists.
