@@ -14,8 +14,9 @@ use crate::{
     errors::{LookupError, ObjectKind},
     impls::SqlparserDialect,
     structs::{
-        ConstraintObject, IndexKey, ParserDB, SqliteIndexColumn, TableAttribute, WrittenCall,
-        generic_db::constraint_index_record, metadata::UniqueIndexMetadata,
+        ConstraintDeferral, ConstraintObject, IndexKey, ParserDB, SqliteIndexColumn,
+        TableAttribute, WrittenCall, generic_db::constraint_index_record,
+        metadata::UniqueIndexMetadata,
     },
     traits::{DatabaseLike, IndexLike, Metadata, Relation, TableIndexLike, TableLike},
 };
@@ -186,6 +187,11 @@ impl TableIndexLike for TableAttribute<CreateTable, UniqueConstraint> {
         Self: 'db,
     {
         self.table()
+    }
+
+    #[inline]
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        ConstraintDeferral::of(self.attribute().characteristics)
     }
 
     #[inline]

@@ -8,7 +8,7 @@ use sqlparser::ast::{Expr, IndexType};
 
 use crate::{
     errors::LookupError,
-    structs::{IndexKey, SqliteIndexColumn, TargetName, WrittenCall},
+    structs::{ConstraintDeferral, IndexKey, SqliteIndexColumn, TargetName, WrittenCall},
     traits::{DatabaseLike, Metadata, Relation, TableLike},
     utils::columns_in_expression::columns_in_expression,
 };
@@ -601,6 +601,41 @@ pub trait TableIndexLike: IndexLike {
     fn table<'db>(&'db self, database: &'db Self::DB) -> &'db <Self::DB as DatabaseLike>::Table
     where
         Self: 'db;
+
+    /// Returns when the constraint this index backs is checked within a
+    /// transaction, matching `pg_constraint.condeferrable` and
+    /// `pg_constraint.condeferred`. An index backing no constraint answers
+    /// [`ConstraintDeferral::NotDeferrable`].
+    ///
+    /// A deferrable index may hold duplicate keys until its check runs, so
+    /// only a [`ConstraintDeferral::NotDeferrable`] unique index proves its
+    /// columns unique within a transaction, as `pg_index.indimmediate`
+    /// records.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// for (clause, deferral) in [
+    ///     ("", ConstraintDeferral::NotDeferrable),
+    ///     ("DEFERRABLE", ConstraintDeferral::InitiallyImmediate),
+    ///     ("INITIALLY DEFERRED", ConstraintDeferral::InitiallyDeferred),
+    /// ] {
+    ///     let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+    ///         "CREATE TABLE teams (id INT UNIQUE {clause});"
+    ///     ))?;
+    ///     let teams =
+    ///         db.table_by_target(TargetName::new("teams", false), IdentifierCase::AsWritten)?;
+    ///     let key = teams.unwrap().unique_indices(&db)?.next().unwrap();
+    ///     assert_eq!(key.deferral(&db), deferral);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn deferral(&self, database: &Self::DB) -> ConstraintDeferral;
 
     /// Returns the columns which appear in the index.
     ///
