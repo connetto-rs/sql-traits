@@ -990,6 +990,10 @@ impl TableIndexLike for MemoryIndex {
             .find(|table| table.name == self.table_name)
             .expect("every index of this catalog belongs to one of its tables")
     }
+
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        ConstraintDeferral::NotDeferrable
+    }
 }
 
 impl IndexLike for MemoryUniqueIndex {
@@ -1046,6 +1050,10 @@ impl TableIndexLike for MemoryUniqueIndex {
         Self: 'db,
     {
         TableIndexLike::table(&self.0, database)
+    }
+
+    fn deferral(&self, database: &Self::DB) -> ConstraintDeferral {
+        self.0.deferral(database)
     }
 }
 

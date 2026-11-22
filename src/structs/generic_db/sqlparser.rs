@@ -7813,7 +7813,7 @@ impl ParserDB {
                         }],
                         include: vec![],
                         index_options: vec![],
-                        characteristics: None,
+                        characteristics: primary_key.characteristics,
                         nulls_distinct: sqlparser::ast::NullsDistinctOption::None,
                         on_conflict: primary_key.on_conflict.or(conflict_clause),
                     };

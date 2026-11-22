@@ -12,8 +12,8 @@ use crate::{
     errors::{LookupError, ObjectKind},
     impls::SqlparserDialect,
     structs::{
-        IndexKey, MaterializedViewIndex, ParserDB, SqliteIndexColumn, TableAttribute, WrittenCall,
-        generic_db::created_index_record, metadata::IndexMetadata,
+        ConstraintDeferral, IndexKey, MaterializedViewIndex, ParserDB, SqliteIndexColumn,
+        TableAttribute, WrittenCall, generic_db::created_index_record, metadata::IndexMetadata,
     },
     traits::{DatabaseLike, IndexLike, Metadata, Relation, TableIndexLike, TableLike},
     utils::object_name::{object_name_last_part, qualifier_of},
@@ -162,6 +162,13 @@ impl TableIndexLike for TableAttribute<CreateTable, CreateIndex> {
         Self: 'db,
     {
         self.table()
+    }
+
+    /// Always [`ConstraintDeferral::NotDeferrable`], since `CREATE INDEX`
+    /// builds an index backing no constraint.
+    #[inline]
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        ConstraintDeferral::NotDeferrable
     }
 
     #[inline]

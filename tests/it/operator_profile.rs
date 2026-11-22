@@ -470,6 +470,10 @@ impl<P: EmptyKinds> TableIndexLike for NoneKind<P> {
     {
         self.unreach()
     }
+
+    fn deferral(&self, _database: &Self::DB) -> ConstraintDeferral {
+        self.unreach()
+    }
 }
 
 impl<P: EmptyKinds> ForeignKeyLike for NoneKind<P> {
