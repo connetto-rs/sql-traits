@@ -57,7 +57,14 @@ pub enum UpdatableViewBase<'db, DB: DatabaseLike> {
 /// The one relation a view definition reads, as its `FROM` list names it.
 struct Source<'query, 'db, DB: DatabaseLike> {
     factor: &'query TableFactor,
-    relation: Relation<'db, DB>,
+    relation: Written<'db, DB>,
+}
+
+/// A relation of a kind a write through a view lands on.
+enum Written<'db, DB: DatabaseLike> {
+    Table(&'db DB::Table),
+    ForeignTable(&'db DB::Table),
+    View(&'db DB::View),
 }
 
 impl<'db, DB: DatabaseLike> UpdatableViewBase<'db, DB> {
@@ -100,14 +107,13 @@ impl<'db, DB: DatabaseLike> UpdatableViewBase<'db, DB> {
             return Ok(None);
         };
         Ok(Some(match source.relation {
-            Relation::Table(table) => {
+            Written::Table(table) => {
                 Self::Table { table, columns: table_columns(table, &positions, database)? }
             }
-            Relation::ForeignTable(table) => {
+            Written::ForeignTable(table) => {
                 Self::ForeignTable { table, columns: table_columns(table, &positions, database)? }
             }
-            Relation::View(view) => Self::View { view, columns: positions },
-            Relation::MaterializedView(_) | Relation::Sequence(_) => return Ok(None),
+            Written::View(view) => Self::View { view, columns: positions },
         }))
     }
 }
@@ -165,10 +171,13 @@ fn single_source<'query, 'db, DB: DatabaseLike>(
     else {
         return Ok(None);
     };
-    Ok(resolve_bound_relation_object_name(name, database)?.and_then(|relation| {
-        matches!(relation, Relation::Table(_) | Relation::ForeignTable(_) | Relation::View(_))
-            .then_some(Source { factor, relation })
-    }))
+    let relation = match resolve_bound_relation_object_name(name, database)? {
+        Some(Relation::Table(table)) => Written::Table(table),
+        Some(Relation::ForeignTable(table)) => Written::ForeignTable(table),
+        Some(Relation::View(view)) => Written::View(view),
+        Some(Relation::MaterializedView(_) | Relation::Sequence(_)) | None => return Ok(None),
+    };
+    Ok(Some(Source { factor, relation }))
 }
 
 /// Whether `expression`, a select-list item or `ORDER BY` key of the view's
@@ -340,7 +349,7 @@ fn output_positions<DB: DatabaseLike>(
                 SelectItemQualifiedWildcardKind::ObjectName(_),
                 options,
             ) if *options == WildcardAdditionalOptions::default() => {
-                let Some(count) = source_width(source.relation, database)? else {
+                let Some(count) = source_width(&source.relation, database)? else {
                     return Ok(None);
                 };
                 positions.extend((0..count).map(Some));
@@ -371,30 +380,22 @@ fn referenced_position<DB: DatabaseLike>(
 /// How many columns a wildcard over `relation` reaches, or `None` when the
 /// output of a view cannot be enumerated.
 fn source_width<DB: DatabaseLike>(
-    relation: Relation<'_, DB>,
+    relation: &Written<'_, DB>,
     database: &DB,
 ) -> Result<Option<usize>, LookupError> {
     match relation {
-        Relation::Table(table) | Relation::ForeignTable(table) => {
+        Written::Table(table) | Written::ForeignTable(table) => {
             Ok(Some(table.columns(database)?.count()))
         }
-        Relation::View(view) => {
+        Written::View(view) => {
             let definition = view.definition();
             let scope = ColumnScope::for_stored_definition(definition, database)?;
-            let Some(outputs) = scope.scope_for_query(definition).map(|query| query.outputs())
-            else {
-                return Ok(None);
-            };
-            let mut count = 0;
-            for output in outputs {
-                if matches!(output, QueryOutput::Unexpanded) {
-                    return Ok(None);
-                }
-                count += 1;
-            }
-            Ok(Some(count))
+            Ok(scope.scope_for_query(definition).and_then(|query| {
+                query.outputs().try_fold(0, |count, output| {
+                    (!matches!(output, QueryOutput::Unexpanded)).then_some(count + 1)
+                })
+            }))
         }
-        Relation::MaterializedView(_) | Relation::Sequence(_) => Ok(None),
     }
 }
 
@@ -413,46 +414,116 @@ fn table_columns<'db, DB: DatabaseLike>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::{boxed::Box, vec::Vec};
+
     use sqlparser::{
-        ast::{Query, Statement},
-        dialect::PostgreSqlDialect,
+        ast::Query,
+        dialect::{GenericDialect, PostgreSqlDialect},
         parser::Parser,
     };
 
     use super::UpdatableViewBase;
-    use crate::{structs::ParserDB, traits::ColumnLike};
+    use crate::{
+        structs::ParserDB,
+        traits::{ColumnLike, TableLike},
+    };
 
-    fn definition(sql: &str) -> Query {
-        match Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("query parses").remove(0) {
-            Statement::Query(query) => *query,
-            other => panic!("expected a query, got {other:?}"),
-        }
+    const SCHEMA: &str = "
+        CREATE TABLE t (id INT, x INT);
+        CREATE TABLE u (id INT);
+        CREATE VIEW inner_view AS SELECT x, id, id + 1 AS next FROM t;
+        CREATE VIEW whole_table AS TABLE t;
+        CREATE VIEW opaque AS SELECT * FROM t, generate_series(1, 2) AS g;
+    ";
+
+    fn definition(sql: &str) -> Box<Query> {
+        Parser::new(&GenericDialect {})
+            .try_with_sql(sql)
+            .and_then(|mut parser| parser.parse_query())
+            .expect("query parses")
+    }
+
+    fn of_definition<'db>(
+        sql: &str,
+        db: &'db ParserDB,
+    ) -> Option<UpdatableViewBase<'db, ParserDB>> {
+        UpdatableViewBase::of_definition(&definition(sql), db).expect("resolves")
+    }
+
+    fn names<'db, C: ColumnLike + 'db>(columns: &[Option<&'db C>]) -> Vec<Option<&'db str>> {
+        columns.iter().map(|column| column.map(ColumnLike::column_name)).collect()
     }
 
     /// A definition that still holds its wildcards, as a catalog other than
     /// [`ParserDB`] may store it, writes every column the wildcard reaches.
     #[test]
     fn a_wildcard_writes_every_column_it_reaches() {
-        let db = ParserDB::parse::<PostgreSqlDialect>(
-            "CREATE TABLE t (id INT, x INT);
-             CREATE VIEW inner_view AS SELECT x, id, id + 1 AS next FROM t;",
-        )
-        .expect("schema parses");
-        let starred = definition("SELECT *, x AS again FROM t");
-        let Some(UpdatableViewBase::Table { columns, .. }) =
-            UpdatableViewBase::of_definition(&starred, &db).expect("resolves")
-        else {
-            panic!("the definition writes a table");
-        };
-        let names: Vec<_> =
-            columns.iter().map(|column| column.map(ColumnLike::column_name)).collect();
-        assert_eq!(names, [Some("id"), Some("x"), Some("x")]);
-        let qualified = definition("SELECT v.* FROM inner_view AS v");
-        let Some(UpdatableViewBase::View { columns, .. }) =
-            UpdatableViewBase::of_definition(&qualified, &db).expect("resolves")
-        else {
-            panic!("the definition writes a view");
-        };
-        assert_eq!(columns, [Some(0), Some(1), Some(2)]);
+        let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
+        let starred = of_definition("SELECT *, x AS again FROM t", &db);
+        assert!(
+            matches!(
+                &starred,
+                Some(UpdatableViewBase::Table { table, columns })
+                    if table.table_name() == "t"
+                        && names(columns) == [Some("id"), Some("x"), Some("x")]
+            ),
+            "{starred:?}"
+        );
+        let qualified = of_definition("SELECT v.* FROM inner_view AS v", &db);
+        assert!(
+            matches!(
+                &qualified,
+                Some(UpdatableViewBase::View { columns, .. })
+                    if columns == &[Some(0), Some(1), Some(2)]
+            ),
+            "{qualified:?}"
+        );
+        let whole = of_definition("SELECT * FROM whole_table", &db);
+        assert!(
+            matches!(
+                &whole,
+                Some(UpdatableViewBase::View { columns, .. }) if columns == &[Some(0), Some(1)]
+            ),
+            "{whole:?}"
+        );
+    }
+
+    /// A wildcard over a view whose output width is unknown leaves the
+    /// columns after it without a position, so no column list answers.
+    #[test]
+    fn a_wildcard_over_columns_of_unknown_width_answers_nothing() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
+        assert!(of_definition("SELECT * FROM opaque", &db).is_none());
+    }
+
+    /// A wildcard modifier another dialect accepts, such as `EXCLUDE`, drops
+    /// or reorders the columns the wildcard reaches, so no column list
+    /// answers.
+    #[test]
+    fn a_modified_wildcard_answers_nothing() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
+        assert!(of_definition("SELECT * EXCLUDE (x) FROM t", &db).is_none());
+    }
+
+    /// `GROUP BY ALL`, which PostgreSQL does not accept and other dialects
+    /// read as grouping by every output without an aggregate, collapses rows
+    /// like any grouping.
+    #[test]
+    fn grouping_by_all_outputs_makes_a_view_read_only() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
+        assert!(of_definition("SELECT id FROM t GROUP BY ALL", &db).is_none());
+    }
+
+    /// A reference in an aggregate's arguments that the definition cannot
+    /// resolve is a lookup error, never a guess at the aggregate's level,
+    /// even where only the walk over those arguments meets it.
+    #[test]
+    fn an_unresolvable_aggregate_argument_is_an_error() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
+        let ambiguous = definition(
+            "SELECT (SELECT max((SELECT 1 FROM u, u AS u2 WHERE id = 1)) FROM u) AS m FROM t",
+        );
+        let resolved = UpdatableViewBase::of_definition(&ambiguous, &db);
+        assert!(resolved.is_err(), "{resolved:?}");
     }
 }
