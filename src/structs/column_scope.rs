@@ -4,6 +4,7 @@ use core::fmt;
 
 use sqlparser::ast::{
     DataType, Expr, FunctionArg, ObjectName, Query, Select, SetOperator, TableFactor,
+    TableWithJoins,
 };
 
 use crate::{
@@ -165,6 +166,7 @@ pub struct ColumnBinding<'scope> {
     exposed: Option<(&'scope str, bool)>,
     origin: ColumnOrigin,
     entry: Option<RangeTableEntry<'scope>>,
+    merge: Option<MergedColumn<'scope>>,
 }
 
 impl<'scope> ColumnBinding<'scope> {
@@ -173,8 +175,9 @@ impl<'scope> ColumnBinding<'scope> {
         exposed: Option<(&'scope str, bool)>,
         origin: ColumnOrigin,
         entry: Option<RangeTableEntry<'scope>>,
+        merge: Option<MergedColumn<'scope>>,
     ) -> Self {
-        Self { relation, exposed, origin, entry }
+        Self { relation, exposed, origin, entry, merge }
     }
 
     /// The `FROM` item and column the binding reached.
@@ -183,8 +186,9 @@ impl<'scope> ColumnBinding<'scope> {
     }
 
     /// Returns the `FROM` item and column the reference reached, or `None`
-    /// for a column a `USING` or `NATURAL` join merged, a select-list output
-    /// a clause key named, and an uncertain binding.
+    /// for a column a `USING` or `NATURAL` join merged, which [`Self::merge`]
+    /// names, a select-list output a clause key named, and an uncertain
+    /// binding.
     ///
     /// # Examples
     ///
@@ -211,6 +215,41 @@ impl<'scope> ColumnBinding<'scope> {
     #[must_use]
     pub fn entry(&self) -> Option<RangeTableEntry<'scope>> {
         self.entry
+    }
+
+    /// Returns the join and column of a column a `USING` or `NATURAL` join
+    /// merged, reached unqualified or through the alias `USING (…) AS` gives
+    /// the join, or `None` for every other binding.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Expr, Ident, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE a(k INT, v INT); CREATE TABLE b(k INT, w INT);",
+    /// )?;
+    /// let sql = "SELECT k FROM a JOIN b USING (k)";
+    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::Folded)?;
+    /// let (_, binding) =
+    ///     scope.resolve_column_binding(&Expr::Identifier(Ident::new("k")))?.expect("k resolves");
+    /// let merge = binding.merge().expect("k is merged");
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// assert!(core::ptr::eq(merge.from(), &select.from[0]));
+    /// assert_eq!((merge.join(), merge.ordinal()), (0, 0));
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    #[must_use]
+    pub fn merge(&self) -> Option<MergedColumn<'scope>> {
+        self.merge
     }
 
     /// Returns the relation name, or `None` for a merged, anonymous or opaque
@@ -312,6 +351,58 @@ impl PartialEq for RangeTableEntry<'_> {
 }
 
 impl Eq for RangeTableEntry<'_> {}
+
+/// One column a `USING` or `NATURAL` join merged, what PostgreSQL's `Var`
+/// names by the join's range-table index and attribute number.
+///
+/// Two merged columns are equal when they name the same column of the same
+/// join of the same join tree, so a name the subquery's own `FROM` merges
+/// stays apart from the one the outer `FROM` merges.
+#[derive(Debug, Clone, Copy)]
+pub struct MergedColumn<'scope> {
+    from: &'scope TableWithJoins,
+    join: usize,
+    ordinal: usize,
+}
+
+impl<'scope> MergedColumn<'scope> {
+    pub(crate) fn new(from: &'scope TableWithJoins, join: usize, ordinal: usize) -> Self {
+        Self { from, join, ordinal }
+    }
+
+    /// Returns the join tree holding the join, a `FROM` item or the inside
+    /// of a parenthesized join, borrowed from the query or from the
+    /// definition of a view it reads.
+    #[must_use]
+    pub fn from(&self) -> &'scope TableWithJoins {
+        self.from
+    }
+
+    /// Returns the position of the join that merged the column among the
+    /// joins of [`Self::from`], the latest of them to merge the name.
+    #[must_use]
+    pub fn join(&self) -> usize {
+        self.join
+    }
+
+    /// Returns the position of the column among the columns the join merged,
+    /// in the order its `USING` list names them or, for `NATURAL`, the order
+    /// of the left side's columns, which leads the join's output columns.
+    #[must_use]
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+}
+
+impl PartialEq for MergedColumn<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        core::ptr::eq(self.from, other.from)
+            && self.join == other.join
+            && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for MergedColumn<'_> {}
 
 /// The relation a qualifier with no column, such as a qualified wildcard's,
 /// matched.

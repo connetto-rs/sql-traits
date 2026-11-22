@@ -7,7 +7,7 @@ use sqlparser::ast::{CreateRuleEvent, Expr, Query, Statement};
 
 use super::{
     AstRef, DerivationProfile, DerivedColumn, DerivedRelationRef, DerivedShape, Deriving,
-    RelationKey,
+    RelationKey, RelationOrigin,
     definition_graph::{DefinitionDerivation, DefinitionGraph, ScopeCursor, ScopeId},
     index_nested_query_scopes,
     modifying::index_nested,
@@ -141,7 +141,7 @@ fn push_parameters<'db, DB: DatabaseLike>(
         shape: DerivedShape { columns, row_preserving: false },
         nullable: false,
         entry_index: data.from_entry_count,
-        factor: 0,
+        origin: RelationOrigin::Parameters,
     });
     data.from_entry_count += 1;
 }

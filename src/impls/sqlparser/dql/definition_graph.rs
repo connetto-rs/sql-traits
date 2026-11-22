@@ -9,7 +9,7 @@ use sqlparser::ast::{
 use super::{
     BaseColumnRef, ColumnOrigin, CteShape, DerivationProfile, DerivedShape, Deriving, FromScope,
     LookupOutcome, OutputNameSource, RelationKey, ResolvedColumn, ResultColumnType, WildcardEntry,
-    derive_query_shape, factor_address,
+    derive_query_shape, factor_address, join_tree_address,
     modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
     scoped_roots::is_input,
@@ -18,7 +18,7 @@ use crate::{
     errors::LookupError,
     structs::{
         ColumnBinding, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionRef,
-        ColumnDefinitionScope, FunctionResultType, IdentifierCase, RangeTableEntry,
+        ColumnDefinitionScope, FunctionResultType, IdentifierCase, MergedColumn, RangeTableEntry,
         RelationBinding, plain_arguments,
     },
     traits::{ColumnLike, CreatedFromQuery, DataTypeLike, DatabaseLike, FunctionLike, TableLike},
@@ -189,19 +189,14 @@ fn select_address(select: &Select) -> usize {
     core::ptr::from_ref(select).addr()
 }
 
-/// Calls `found` with every `FROM` item of `tables`, those inside
-/// parenthesized joins included.
-fn each_from_item<'a>(tables: &'a [TableWithJoins], found: &mut impl FnMut(&'a TableFactor)) {
-    for table in tables {
-        let factors =
-            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation));
-        for factor in factors {
-            found(factor);
-            if let TableFactor::NestedJoin { table_with_joins, .. } = factor {
-                each_from_item(slice::from_ref(table_with_joins.as_ref()), found);
-            }
-        }
-    }
+/// The items of the join tree `tree`, its first `FROM` item and the item of
+/// each of its joins.
+fn join_tree_items<'query, 'db>(
+    tree: AstRef<'query, 'db, TableWithJoins>,
+) -> impl Iterator<Item = AstRef<'query, 'db, TableFactor>> {
+    core::iter::once(tree.map(|tree| &tree.relation)).chain(
+        tree.map(|tree| tree.joins.as_slice()).iter().map(|join| join.map(|join| &join.relation)),
+    )
 }
 
 pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
@@ -211,6 +206,9 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// Every `FROM` item of every scope, which a binding's origin names by
     /// address.
     from_items: Vec<AstRef<'query, 'db, TableFactor>>,
+    /// Every join tree of every scope, those inside parenthesized joins
+    /// included, which the origin of a merged column names by address.
+    join_trees: Vec<AstRef<'query, 'db, TableWithJoins>>,
     queries: Vec<QueryNode<'query, 'db>>,
     /// The scopes the clauses of every data-modifying statement resolve in,
     /// by the statement's address.
@@ -403,18 +401,28 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         &'scope self,
         resolved: &ResolvedColumn<'scope, 'db, DB, DefinitionId>,
     ) -> Bound<'scope, 'query, 'db, DB> {
-        let entry = match resolved.origin {
+        let (entry, merge) = match resolved.origin {
             ColumnOrigin::Entry { factor, ordinal } => {
-                self.from_items
+                let entry = self
+                    .from_items
                     .iter()
                     .find(|item| factor_address(item.get()) == factor)
-                    .map(|item| RangeTableEntry::new(item.get(), ordinal))
+                    .map(|item| RangeTableEntry::new(item.get(), ordinal));
+                (entry, None)
             }
-            ColumnOrigin::Merged | ColumnOrigin::Output | ColumnOrigin::Unknown => None,
+            ColumnOrigin::Merged { join, ordinal } => {
+                let merge = self
+                    .join_trees
+                    .iter()
+                    .find(|tree| join_tree_address(tree.get()) == join.tree)
+                    .map(|tree| MergedColumn::new(tree.get(), join.join, ordinal));
+                (None, merge)
+            }
+            ColumnOrigin::Parameter | ColumnOrigin::Output | ColumnOrigin::Unknown => (None, None),
         };
         (
             self.definition(resolved.definition),
-            ColumnBinding::new(resolved.relation, resolved.exposed, resolved.origin, entry),
+            ColumnBinding::new(resolved.relation, resolved.exposed, resolved.origin, entry, merge),
         )
     }
 
@@ -698,6 +706,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 scopes: Vec::new(),
                 select_index: Vec::new(),
                 from_items: Vec::new(),
+                join_trees: Vec::new(),
                 queries: Vec::new(),
                 modifying: Vec::new(),
                 joins: Vec::new(),
@@ -796,20 +805,39 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
         scope
     }
 
-    /// Records the `FROM` items of a data-modifying statement, which a
-    /// binding's origin names.
+    /// Records the `FROM` items of a data-modifying statement and their join
+    /// trees, which a binding's origin names.
     pub(super) fn record_from_items(&mut self, tables: &'query [TableWithJoins]) {
-        each_from_item(tables, &mut |item| self.graph.from_items.push(AstRef::Query(item)));
+        self.record_join_trees(AstRef::Query(tables));
     }
 
-    /// Records a `MERGE` target or source, and the items inside a
-    /// parenthesized join source, which a binding's origin names.
+    /// Records a `MERGE` target or source, and the items and join trees
+    /// inside a parenthesized join source, which a binding's origin names.
     pub(super) fn record_factor(&mut self, factor: &'query TableFactor) {
-        self.graph.from_items.push(AstRef::Query(factor));
-        if let TableFactor::NestedJoin { table_with_joins, .. } = factor {
-            each_from_item(slice::from_ref(table_with_joins.as_ref()), &mut |item| {
-                self.graph.from_items.push(AstRef::Query(item));
-            });
+        self.record_item(AstRef::Query(factor));
+    }
+
+    /// Records the join trees `tables` lists and everything inside them.
+    fn record_join_trees(&mut self, tables: AstRef<'query, 'db, [TableWithJoins]>) {
+        for tree in tables.iter() {
+            self.graph.join_trees.push(tree);
+            for item in join_tree_items(tree) {
+                self.record_item(item);
+            }
+        }
+    }
+
+    /// Records the `FROM` item `item` and, for a parenthesized join, the join
+    /// tree inside it.
+    fn record_item(&mut self, item: AstRef<'query, 'db, TableFactor>) {
+        self.graph.from_items.push(item);
+        if let Some(tree) = item.try_map(|item| {
+            match item {
+                TableFactor::NestedJoin { table_with_joins, .. } => Some(table_with_joins.as_ref()),
+                _ => None,
+            }
+        }) {
+            self.record_join_trees(tree.map(slice::from_ref));
         }
     }
 
@@ -931,18 +959,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             outputs: Vec::new(),
         });
         self.graph.select_index.push(SelectIndex { address: select_address(select.get()), scope });
-        match select {
-            AstRef::Query(select) => {
-                each_from_item(&select.from, &mut |item| {
-                    self.graph.from_items.push(AstRef::Query(item));
-                });
-            }
-            AstRef::Database(select) => {
-                each_from_item(&select.from, &mut |item| {
-                    self.graph.from_items.push(AstRef::Database(item));
-                });
-            }
-        }
+        self.record_join_trees(select.map(|select| select.from.as_slice()));
         scope
     }
 

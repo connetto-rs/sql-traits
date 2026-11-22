@@ -409,13 +409,19 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             OutputMatch::Found { definition, name, quoted } => {
                 Some((
                     self.definition(definition),
-                    ColumnBinding::new(None, Some((name, quoted)), ColumnOrigin::Output, None),
+                    ColumnBinding::new(
+                        None,
+                        Some((name, quoted)),
+                        ColumnOrigin::Output,
+                        None,
+                        None,
+                    ),
                 ))
             }
             OutputMatch::Uncertain => {
                 Some((
                     ColumnDefinition::Opaque,
-                    ColumnBinding::new(None, None, ColumnOrigin::Unknown, None),
+                    ColumnBinding::new(None, None, ColumnOrigin::Unknown, None, None),
                 ))
             }
             OutputMatch::Absent => None,

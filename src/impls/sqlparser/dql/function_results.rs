@@ -15,9 +15,9 @@ use sqlparser::ast::{ArgMode, DataType, FunctionArg, TableAlias, TableFactor};
 
 use super::{
     AstRef, DerivationProfile, DerivedColumn, DerivedRelationRef, DerivedShape, Deriving,
-    DerivingView, FactorContribution, RelationContribution, alias_key, apply_alias_columns,
-    derive_view_shape, derived_column_names, factor_address, factor_alias, factor_name,
-    object_name_key,
+    DerivingView, FactorContribution, RelationContribution, RelationOrigin, alias_key,
+    apply_alias_columns, derive_view_shape, derived_column_names, factor_address, factor_alias,
+    factor_name, object_name_key,
 };
 use crate::{
     errors::LookupError,
@@ -135,7 +135,7 @@ where
             shape,
             nullable: false,
             entry_index: 0,
-            factor: factor_address(factor.get()),
+            origin: RelationOrigin::Factor(factor_address(factor.get())),
         }),
         names: Some(names),
     }))

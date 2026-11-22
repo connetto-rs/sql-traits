@@ -323,9 +323,20 @@ struct DerivedRelationRef<'query, 'db, DB: DatabaseLike, D: Copy> {
     shape: DerivedShape<'query, 'db, DB, D>,
     nullable: bool,
     entry_index: usize,
-    /// The address of the `FROM` item, see [`factor_address`], or zero for
-    /// the relation a `USING (...) AS alias` join names, which no item is.
-    factor: usize,
+    /// What the relation's columns are read from.
+    origin: RelationOrigin,
+}
+
+/// What the columns of a derived relation are read from.
+#[derive(Clone, Copy)]
+enum RelationOrigin {
+    /// The `FROM` item at this address, see [`factor_address`].
+    Factor(usize),
+    /// The merged columns of the join a `USING (...) AS alias` names, which
+    /// no `FROM` item is.
+    Merge(JoinSite),
+    /// The input parameters of the function whose body is resolved.
+    Parameters,
 }
 
 /// Where a `FROM` item sits in memory, which identifies it among the items
@@ -339,6 +350,20 @@ fn join_address(join: &Join) -> usize {
     core::ptr::from_ref(join).addr()
 }
 
+/// Where a join tree, a `FROM` item with the joins it carries, sits in
+/// memory, on the terms of [`factor_address`].
+fn join_tree_address(tree: &TableWithJoins) -> usize {
+    core::ptr::from_ref(tree).addr()
+}
+
+/// One join of a join tree, by the address of the tree, see
+/// [`join_tree_address`], and the join's position among its joins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct JoinSite {
+    tree: usize,
+    join: usize,
+}
+
 /// What a resolved column reference or clause key reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ColumnOrigin {
@@ -350,9 +375,16 @@ pub(crate) enum ColumnOrigin {
         /// The position of the column among the item's output columns.
         ordinal: usize,
     },
-    /// A column a `USING` or `NATURAL` join merged, reached unqualified or
-    /// through the join's alias.
-    Merged,
+    /// Column `ordinal` of the columns the `USING` or `NATURAL` join `join`
+    /// merged, reached unqualified or through the join's alias.
+    Merged {
+        /// The join whose merge the column is.
+        join: JoinSite,
+        /// The position of the column among the join's merged columns.
+        ordinal: usize,
+    },
+    /// An input parameter of the function whose body holds the reference.
+    Parameter,
     /// A select-list output a clause key named.
     Output,
     /// Nothing certain, because an opaque relation could have answered or the
@@ -484,6 +516,10 @@ struct MergedName {
     quoted: bool,
     start: usize,
     subsumed: usize,
+    /// The join that merged the name.
+    join: JoinSite,
+    /// The position of the name among the names that join merged.
+    ordinal: usize,
 }
 
 /// One output position of a `FROM` item's join chain as a `*` projection
@@ -499,6 +535,10 @@ enum WildcardEntry {
         /// The name of the relation the value is read from, as a qualifier
         /// spells it, when one side of the join provides it.
         provider: Option<(String, bool)>,
+        /// The join that merged the column.
+        join: JoinSite,
+        /// The position of the column among the columns that join merged.
+        ordinal: usize,
     },
 }
 
@@ -1001,7 +1041,9 @@ where
         profile,
     )?;
     let (mut accumulated, mut plan) = left.unzip();
-    for join in table.map(|table| table.joins.as_slice()).iter() {
+    let tree = join_tree_address(table.get());
+    for (position, join) in table.map(|table| table.joins.as_slice()).iter().enumerate() {
+        let site = JoinSite { tree, join: position };
         let (bases_before, derived_before) = {
             let data = profile.scope(scope);
             (data.bases.len(), data.derived.len())
@@ -1038,15 +1080,15 @@ where
             right_names.as_deref(),
             data.case,
         ) {
-            merged = record_merge(data, join.get(), names, entry_start);
+            merged = record_merge(data, join.get(), site, names, entry_start);
         } else {
             data.unqualified_poison = true;
         }
         if let Some(alias) = join.try_map(|join| using_alias(&join.join_operator)) {
             let entry_index = data.from_entry_count - 1;
-            data.derived.push(using_alias_relation(alias, &merged, opaque, entry_index));
+            data.derived.push(using_alias_relation(alias, &merged, site, opaque, entry_index));
         }
-        plan = merge_plans(plan, right_entries, &merged, &join.get().join_operator, data);
+        plan = merge_plans(plan, right_entries, &merged, site, &join.get().join_operator, data);
         accumulated = merge_output_names(accumulated, right_names, &merged, data.case);
     }
     Ok(accumulated.zip(plan))
@@ -1166,8 +1208,8 @@ fn push_unseen(names: &mut Vec<(String, bool)>, value: &str, quoted: bool, case:
 }
 
 /// The wildcard plan after one join, in PostgreSQL's join output order: the
-/// merged columns (in list order), then the accumulated plan's entries that
-/// are not an earlier `Merged` entry of the same name, then the joined
+/// columns `join` merged (in list order), then the accumulated plan's entries
+/// that are not an earlier `Merged` entry of the same name, then the joined
 /// relation's. A re-merge of a name therefore drops the older merged entry
 /// and re-prepends it at the latest join's position. A poisoned side poisons
 /// the item's whole plan.
@@ -1179,6 +1221,7 @@ fn merge_plans<DB: DatabaseLike, D: Copy>(
     left: Option<Vec<WildcardEntry>>,
     right: Option<Vec<WildcardEntry>>,
     merged: &[(String, bool)],
+    join: JoinSite,
     operator: &JoinOperator,
     data: &FromScope<'_, '_, DB, D>,
 ) -> Option<Vec<WildcardEntry>> {
@@ -1191,11 +1234,14 @@ fn merge_plans<DB: DatabaseLike, D: Copy>(
     };
     let mut next: Vec<WildcardEntry> = merged
         .iter()
-        .map(|(name, quoted)| {
+        .enumerate()
+        .map(|(ordinal, (name, quoted))| {
             WildcardEntry::Merged {
                 name: name.clone(),
                 quoted: *quoted,
                 provider: source.and_then(|entries| merged_provider(entries, data, name, *quoted)),
+                join,
+                ordinal,
             }
         })
         .collect();
@@ -1239,7 +1285,7 @@ fn merged_provider<DB: DatabaseLike, D: Copy>(
                     .flatten()
                     .map(|key| (key.value.get().to_owned(), key.quoted))
             }
-            WildcardEntry::Merged { name: merged, quoted: merged_quoted, provider } => {
+            WildcardEntry::Merged { name: merged, quoted: merged_quoted, provider, .. } => {
                 case.identifiers_match(merged, *merged_quoted, name, quoted)
                     .then(|| provider.clone())
                     .flatten()
@@ -1312,13 +1358,14 @@ fn using_alias(operator: &JoinOperator) -> Option<&Ident> {
 }
 
 /// The relation a `USING (...) AS alias` join names. It exposes only the
-/// merged columns, each coalesced from both sides and therefore sourceless,
-/// and shares the joined relation's entry index so it is visible exactly
-/// where the join is. Naming the merged columns leaves the join's rows as
-/// they are, so the relation is row-preserving.
+/// columns `join` merged, each coalesced from both sides and therefore
+/// sourceless, and shares the joined relation's entry index so it is visible
+/// exactly where the join is. Naming the merged columns leaves the join's rows
+/// as they are, so the relation is row-preserving.
 fn using_alias_relation<'query, 'db, DB: DatabaseLike, D: Copy>(
     alias: AstRef<'query, 'db, Ident>,
     merged: &[(String, bool)],
+    join: JoinSite,
     opaque: D,
     entry_index: usize,
 ) -> DerivedRelationRef<'query, 'db, DB, D> {
@@ -1341,22 +1388,31 @@ fn using_alias_relation<'query, 'db, DB: DatabaseLike, D: Copy>(
         shape: DerivedShape { columns, row_preserving: true },
         nullable: false,
         entry_index,
-        factor: 0,
+        origin: RelationOrigin::Merge(join),
     }
 }
 
-/// Records the names a join whose tree starts at entry `start` merged,
+/// Records the names `join`, whose tree starts at entry `start`, merged,
 /// remembering the ones a `NATURAL` join merged so the join can be spelled
 /// out, and hands them back.
 fn record_merge<DB: DatabaseLike, D: Copy>(
     data: &mut FromScope<'_, '_, DB, D>,
     join: &Join,
+    site: JoinSite,
     names: Vec<(String, bool)>,
     start: usize,
 ) -> Vec<(String, bool)> {
     let subsumed = data.from_entry_count;
-    for (name, quoted) in &names {
-        merge_name(&mut data.merged, name.clone(), *quoted, start..subsumed, data.case);
+    for (ordinal, (name, quoted)) in names.iter().enumerate() {
+        let name = MergedName {
+            name: name.clone(),
+            quoted: *quoted,
+            start,
+            subsumed,
+            join: site,
+            ordinal,
+        };
+        merge_name(&mut data.merged, name, data.case);
     }
     if matches!(join_constraint(&join.join_operator), Some(JoinConstraint::Natural)) {
         data.natural_merges.push((join_address(join), names.clone()));
@@ -1364,20 +1420,14 @@ fn record_merge<DB: DatabaseLike, D: Copy>(
     names
 }
 
-/// Records a merged name over the entries `range`, replacing the merges of
-/// that name it covers, as a chained join merging the name again does.
-fn merge_name(
-    merged: &mut Vec<MergedName>,
-    name: String,
-    quoted: bool,
-    range: core::ops::Range<usize>,
-    case: IdentifierCase,
-) {
+/// Records a merged name, replacing the merges of that name it covers, as a
+/// chained join merging the name again does.
+fn merge_name(merged: &mut Vec<MergedName>, name: MergedName, case: IdentifierCase) {
     merged.retain(|merged| {
-        merged.start < range.start
-            || !case.identifiers_match(&merged.name, merged.quoted, &name, quoted)
+        merged.start < name.start
+            || !case.identifiers_match(&merged.name, merged.quoted, &name.name, name.quoted)
     });
-    merged.push(MergedName { name, quoted, start: range.start, subsumed: range.end });
+    merged.push(name);
 }
 
 /// Whether the merge `merged` absorbs the copy of its name the relation at
@@ -1837,7 +1887,7 @@ where
 enum WildcardColumn<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
     Base(&'scope FromTableRef<'query, 'db, DB, D>, usize),
     Derived(&'scope DerivedRelationRef<'query, 'db, DB, D>, usize),
-    Merged(&'scope str, bool),
+    Merged { name: &'scope str, quoted: bool, join: JoinSite, ordinal: usize },
 }
 
 /// Calls `visit` with each column a `*` over `scope` lists, materializing
@@ -1870,8 +1920,13 @@ fn each_wildcard_column<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
                     }
                 }
             }
-            WildcardEntry::Merged { name, quoted, .. } => {
-                visit(WildcardColumn::Merged(name, *quoted));
+            WildcardEntry::Merged { name, quoted, join, ordinal, .. } => {
+                visit(WildcardColumn::Merged {
+                    name,
+                    quoted: *quoted,
+                    join: *join,
+                    ordinal: *ordinal,
+                });
             }
         }
     }
@@ -1887,7 +1942,7 @@ fn push_wildcard_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
         columns.push(match column {
             WildcardColumn::Base(base, ordinal) => base_column(base, ordinal),
             WildcardColumn::Derived(relation, ordinal) => relation.shape.columns[ordinal].clone(),
-            WildcardColumn::Merged(name, quoted) => {
+            WildcardColumn::Merged { name, quoted, .. } => {
                 DerivedColumn {
                     name: name.to_owned(),
                     quoted,
@@ -1912,7 +1967,7 @@ fn wildcard_origins<DB: DatabaseLike, D: Copy>(
                 ColumnOrigin::Entry { factor: base.factor, ordinal }
             }
             WildcardColumn::Derived(relation, ordinal) => derived_origin(relation, ordinal),
-            WildcardColumn::Merged(..) => ColumnOrigin::Merged,
+            WildcardColumn::Merged { join, ordinal, .. } => ColumnOrigin::Merged { join, ordinal },
         });
     });
     origins
@@ -3830,17 +3885,17 @@ fn find_derived_column<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     Some(DerivedMatch::Column(position, first))
 }
 
-/// The origin of a column a derived relation answered, which is its `FROM`
-/// item, or a merge when the relation is the one a `USING (...) AS alias`
-/// join names.
+/// The origin of column `ordinal` of a derived relation, which is its `FROM`
+/// item, the join whose merged columns a `USING (...) AS alias` names, or a
+/// parameter of the function whose body is resolved.
 fn derived_origin<DB: DatabaseLike, D: Copy>(
     relation: &DerivedRelationRef<'_, '_, DB, D>,
     ordinal: usize,
 ) -> ColumnOrigin {
-    if relation.factor == 0 {
-        ColumnOrigin::Merged
-    } else {
-        ColumnOrigin::Entry { factor: relation.factor, ordinal }
+    match relation.origin {
+        RelationOrigin::Factor(factor) => ColumnOrigin::Entry { factor, ordinal },
+        RelationOrigin::Merge(join) => ColumnOrigin::Merged { join, ordinal },
+        RelationOrigin::Parameters => ColumnOrigin::Parameter,
     }
 }
 
@@ -3985,7 +4040,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
             definition: opaque,
             relation: None,
             exposed: Some((merged.name.as_str(), merged.quoted)),
-            origin: ColumnOrigin::Merged,
+            origin: ColumnOrigin::Merged { join: merged.join, ordinal: merged.ordinal },
         });
     }
     let exposed = |entry_index: usize| {
@@ -4353,7 +4408,7 @@ where
             shape,
             nullable: false,
             entry_index: 0,
-            factor,
+            origin: RelationOrigin::Factor(factor),
         }),
         names: Some(names),
     })
@@ -4596,7 +4651,7 @@ where
                 shape,
                 nullable: false,
                 entry_index: 0,
-                factor: address,
+                origin: RelationOrigin::Factor(address),
             }),
             names: Some(names),
         });
@@ -4798,7 +4853,7 @@ where
             shape,
             nullable: false,
             entry_index: 0,
-            factor: factor_address(factor.get()),
+            origin: RelationOrigin::Factor(factor_address(factor.get())),
         }),
         names: Some(names),
     }))
@@ -4856,7 +4911,7 @@ where
                     shape,
                     nullable: false,
                     entry_index: 0,
-                    factor: factor_address(factor.get()),
+                    origin: RelationOrigin::Factor(factor_address(factor.get())),
                 }),
                 names: Some(names),
             })
@@ -4936,7 +4991,7 @@ where
             shape,
             nullable: false,
             entry_index: 0,
-            factor: factor_address(join.factor.get()),
+            origin: RelationOrigin::Factor(factor_address(join.factor.get())),
         }),
         names: Some(names),
     })

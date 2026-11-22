@@ -67,8 +67,8 @@ pub use absent::Absent;
 pub use call_resolution::{ArgumentEvidence, CallResolution, SelectedFunction};
 pub use column_scope::{
     ColumnBinding, ColumnDefinition, ColumnDefinitionList, ColumnDefinitionRef,
-    ColumnDefinitionScope, ColumnQueryScope, ColumnScope, FunctionResultType, QueryOutput,
-    RangeTableEntry, RelationBinding,
+    ColumnDefinitionScope, ColumnQueryScope, ColumnScope, FunctionResultType, MergedColumn,
+    QueryOutput, RangeTableEntry, RelationBinding,
 };
 pub use constraint_deferral::ConstraintDeferral;
 pub use declared_virtual_table::{DeclaredColumn, DeclaredVirtualTable};
