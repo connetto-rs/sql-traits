@@ -656,9 +656,9 @@ fn numeric_bound<DB: DatabaseLike>(data_type: &DB::DataType, database: &DB) -> O
     10_i64.checked_pow(u32::try_from(digits).ok()?)
 }
 
-/// What a column's collation lets the evaluator decide about its text, with
-/// `known` holding the collations already given an identity, one per
-/// distinct PostgreSQL rule.
+/// What a column's collation, an implicit one, lets the evaluator decide about
+/// its text, with `known` holding the collations already given an identity,
+/// one per distinct PostgreSQL rule.
 fn text_rules(
     collation: ColumnCollation<'_>,
     known: &mut Vec<ColumnCollation<'static>>,
@@ -678,11 +678,15 @@ fn text_rules(
     if collation.is_same_rule(PG, &collation) != CollationMatch::Same {
         return TextRules::UNKNOWN;
     }
-    let byte_order = ["C", "POSIX"].into_iter().any(|name| {
+    let in_catalog = |name| {
         let catalog = TargetName::new(name, true).with_schema("pg_catalog", false);
         let catalog = ColumnCollation::Named(NamedColumnCollation::new(catalog));
         collation.is_same_rule(PG, &catalog) == CollationMatch::Same
-    });
+    };
+    if in_catalog("C") {
+        return TextRules::C;
+    }
+    let byte_order = in_catalog("POSIX");
     let identity_equality = byte_order
         || (named.postgres_deterministic() == Some(true)
             && named.mysql_padding() != Some(MySqlCollationPadding::PadSpace));
@@ -693,7 +697,12 @@ fn text_rules(
         known.len() - 1
     });
     let Ok(identity) = u32::try_from(position) else { return TextRules::UNKNOWN };
-    TextRules { identity_equality, byte_order, collation: Collation::Named(identity) }
+    TextRules {
+        identity_equality,
+        byte_order,
+        collation: Collation::Named(identity),
+        explicit: false,
+    }
 }
 
 /// The built-in a `pg_catalog` function folds as.
