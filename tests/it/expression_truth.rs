@@ -696,6 +696,51 @@ fn generated_calls_resolve_under_the_path_the_column_was_created_with() -> Resul
 }
 
 #[test]
+fn enum_columns_narrow_to_the_labels_their_table_admits() -> Result<(), Error> {
+    let schema = "CREATE SCHEMA authz;
+         CREATE TYPE authz.resource_kind AS ENUM ('project', 'note', 'folder');
+         CREATE TABLE generated (
+             kind authz.resource_kind GENERATED ALWAYS AS ('note'::authz.resource_kind) STORED
+         );
+         CREATE TABLE checked (kind authz.resource_kind NOT NULL CHECK (kind = 'project'));
+         CREATE TABLE listed (
+             kind authz.resource_kind NOT NULL CHECK (kind IN ('project', 'folder'))
+         );";
+    for (table, sql, outcomes) in [
+        ("generated", "kind = 'note'", Outcomes::TRUE),
+        ("generated", "kind = 'project'", Outcomes::FALSE),
+        ("generated", "kind = 'folder'", Outcomes::FALSE),
+        ("checked", "kind = 'project'", Outcomes::TRUE),
+        ("checked", "kind = 'note'", Outcomes::FALSE),
+        ("listed", "kind = 'note'", Outcomes::FALSE),
+        ("listed", "kind = 'folder'", UNDECIDED),
+        ("checked", "kind < 'folder'", Outcomes::TRUE),
+    ] {
+        assert_eq!(truth_in(schema, table, sql)?, never_raising(outcomes), "{table}: {sql}");
+    }
+    assert!(truth_in(schema, "listed", "kind = 'bogus'")?.may_raise);
+    Ok(())
+}
+
+#[test]
+fn an_enum_is_one_type_however_its_name_is_written() -> Result<(), Error> {
+    let schema = "CREATE SCHEMA authz;
+         CREATE TYPE authz.resource_kind AS ENUM ('project', 'note');
+         SET search_path TO authz, public;
+         CREATE TABLE public.generated (
+             kind authz.resource_kind GENERATED ALWAYS AS ('note'::resource_kind) STORED
+         );";
+    for (sql, outcomes) in [
+        ("kind = 'project'", Outcomes::FALSE),
+        ("kind = 'note'::authz.resource_kind", Outcomes::TRUE),
+        ("kind = 'note'::resource_kind", Outcomes::TRUE),
+    ] {
+        assert_eq!(truth_in(schema, "generated", sql)?, never_raising(outcomes), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
 fn an_absent_table_is_an_error_even_for_a_literal() -> Result<(), Error> {
     let owned = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (id INT);")?;
     let elsewhere = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE other (id INT);")?;

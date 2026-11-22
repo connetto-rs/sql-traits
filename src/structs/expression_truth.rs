@@ -2,20 +2,21 @@
 //! `sqlparser-expr-eval` over the table's columns and the database's
 //! functions.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::{
+    cell::RefCell,
     ops::{Bound, ControlFlow},
     ptr,
 };
 
 use sqlparser::{
-    ast::{ArgMode, Expr, Function, FunctionBehavior},
+    ast::{ArgMode, DataType, Expr, Function, FunctionBehavior},
     dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect},
 };
 use sqlparser_expr_eval::{
-    ArrayElement, Builtin, Callee, CalleeKind, Collation, Context, EvalDialect, Evaluation,
-    Guarantees, Interval, NullInput, Outcomes, PostgreSqlOptions, Resolved, ScalarType, Subject,
-    TextRules, Unlisted, Values, Volatility, evaluate, implied,
+    ArrayElement, Builtin, Callee, CalleeKind, Collation, Context, EnumType, EvalDialect,
+    Evaluation, Guarantees, Interval, NullInput, Outcomes, PostgreSqlOptions, Resolved, ScalarType,
+    Subject, TextRules, Unlisted, Values, Volatility, evaluate, implied,
     sql_values::postgres::{IntegerType, PgNumeric},
 };
 
@@ -28,12 +29,13 @@ use crate::{
     },
     traits::{
         CheckConstraintLike, CollationMatch, ColumnCollation, ColumnLike, DataTypeLike,
-        DatabaseLike, DialectLike, DomainLike, FunctionLike, MySqlCollationPadding,
-        NamedColumnCollation, TableLike, TypeModifier,
+        DatabaseLike, DialectLike, DomainLike, EnumerationKind, EnumerationMember, FunctionLike,
+        MySqlCollationPadding, NamedColumnCollation, TableLike, TypeModifier, UserDefinedTypeLike,
     },
     utils::{
         call_sites::{ExpressionForm, expression_form},
         call_typing::runnable_among,
+        coercion::canonical,
         postgres_types::PgType,
         scalar_family::ScalarFamily,
         walk::walk_expressions,
@@ -124,6 +126,7 @@ pub(crate) fn table_truth<DB: DatabaseLike>(
         source: Source::Expression,
         own,
         collations: Vec::new(),
+        enums: Enums::default(),
         reached: Vec::new(),
     };
     match engine {
@@ -289,10 +292,60 @@ struct TableContext<'a, DB: DatabaseLike> {
     own: Option<&'a DB::CheckConstraint>,
     /// The collations met so far, each named by its position.
     collations: Vec<ColumnCollation<'static>>,
+    /// The enum types met so far.
+    enums: Enums,
     /// The calls resolved so far, as overload resolution is costly and the
     /// evaluator asks for the same call many times.
     reached: Vec<Reached<'a, DB::Function>>,
 }
+
+/// The enum types met so far, by the address of the type declaring each, so
+/// that every column and cast of one type reads as the same type.
+#[derive(Default)]
+struct Enums(RefCell<Vec<(usize, Arc<EnumType>)>>);
+
+impl Enums {
+    /// The enum type `pg_type` names in `database`, found through the type
+    /// search path.
+    fn named<DB: DatabaseLike>(&self, database: &DB, pg_type: &PgType) -> Option<ScalarType> {
+        let PgType::Named(target) = &*canonical(database, pg_type) else { return None };
+        let schema = target.schema()?;
+        let case = database.identifier_case();
+        let declared = database.user_defined_types().find(|declared| {
+            case.identifiers_match(
+                declared.name(),
+                declared.name_is_quoted(),
+                target.name(),
+                target.name_is_quoted(),
+            ) && case.identifiers_match(
+                declared.schema().unwrap_or(DEFAULT_SCHEMA),
+                declared.schema_is_quoted(),
+                schema,
+                target.schema_is_quoted(),
+            )
+        })?;
+        let address = ptr::from_ref(declared).addr();
+        let mut known = self.0.borrow_mut();
+        if let Some((_, enum_type)) = known.iter().find(|(known, _)| *known == address) {
+            return Some(ScalarType::Enum(Arc::clone(enum_type)));
+        }
+        let enumeration = declared.enumeration()?;
+        if enumeration.kind() != EnumerationKind::Enum {
+            return None;
+        }
+        let name = format!(
+            "{}.{}",
+            declared.stored_schema().as_deref().unwrap_or(DEFAULT_SCHEMA),
+            declared.stored_name()
+        );
+        let labels = enumeration.into_members().map(EnumerationMember::label);
+        let enum_type = Arc::new(EnumType::new(name, labels));
+        known.push((address, Arc::clone(&enum_type)));
+        Some(ScalarType::Enum(enum_type))
+    }
+}
+
+const DEFAULT_SCHEMA: &str = "public";
 
 impl Engine {
     /// What `column` holds before any guarantee narrows it, its collation
@@ -302,11 +355,12 @@ impl Engine {
         column: &DB::Column,
         database: &DB,
         collations: &mut Vec<ColumnCollation<'static>>,
+        enums: &Enums,
     ) -> Result<Resolved<usize>, LookupError> {
         let data_type = column.data_type(database);
         let base = data_type.base_type(database).unwrap_or(data_type);
         let rules = text_rules(column.collation(database)?, collations);
-        let scalar_type = self.scalar_type(base, database, rules);
+        let scalar_type = self.scalar_type(base, database, rules, enums);
         let mut values = Unlisted::any();
         if scalar_type.is_text()
             && let Some(longest) = base.max_character_length(database)
@@ -336,11 +390,13 @@ impl Engine {
         data_type: &DB::DataType,
         database: &DB,
         rules: TextRules,
+        enums: &Enums,
     ) -> ScalarType {
         match self {
             Engine::PostgreSql => {
-                PgType::parse(&data_type.name(database))
-                    .map_or(ScalarType::Other, |pg_type| postgres_scalar_type(&pg_type, rules))
+                PgType::parse(&data_type.name(database)).map_or(ScalarType::Other, |pg_type| {
+                    postgres_scalar_type(&pg_type, rules, database, enums)
+                })
             }
             Engine::Sqlite => ScalarType::Other,
             Engine::Other => {
@@ -360,6 +416,7 @@ impl Engine {
         self,
         function: &DB::Function,
         database: &DB,
+        enums: &Enums,
     ) -> Result<Callee, LookupError> {
         let inputs = function.argument_modes().filter(|mode| !matches!(mode, ArgMode::Out)).count();
         let nulling: Vec<usize> = (0..inputs)
@@ -386,7 +443,7 @@ impl Engine {
                     .return_type_name(database)
                     .and_then(|name| PgType::parse(name.strip_prefix("SETOF ").unwrap_or(&name)))
                     .map_or(ScalarType::Other, |pg_type| {
-                        postgres_scalar_type(&pg_type, TextRules::DEFAULT)
+                        postgres_scalar_type(&pg_type, TextRules::DEFAULT, database, enums)
                     })
             }
             Engine::Sqlite | Engine::Other => ScalarType::Other,
@@ -413,7 +470,10 @@ impl<DB: DatabaseLike> Context for TableContext<'_, DB> {
             && name.quote_style.is_none()
             && name.value.eq_ignore_ascii_case("value")
         {
-            return self.engine.column(column, self.database, &mut self.collations).map(Some);
+            return self
+                .engine
+                .column(column, self.database, &mut self.collations, &self.enums)
+                .map(Some);
         }
         if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
             return Ok(None);
@@ -422,7 +482,7 @@ impl<DB: DatabaseLike> Context for TableContext<'_, DB> {
         let scope = self.scope.get_or_insert_with(|| ColumnScope::for_table(table, database, case));
         match scope.resolve_column_definition(expression)? {
             Some(ColumnDefinition::Base { column, database, .. }) => {
-                engine.column(column, database, &mut self.collations).map(Some)
+                engine.column(column, database, &mut self.collations, &self.enums).map(Some)
             }
             _ => Ok(None),
         }
@@ -433,7 +493,7 @@ impl<DB: DatabaseLike> Context for TableContext<'_, DB> {
         let mut callees = self
             .runnable(call)?
             .into_iter()
-            .map(|function| engine.callee(function, database))
+            .map(|function| engine.callee(function, database, &self.enums))
             .collect::<Result<Vec<_>, _>>()?;
         // The evaluator reads the call's type from its first callee, so
         // overloads returning different types leave the type unknown.
@@ -443,6 +503,15 @@ impl<DB: DatabaseLike> Context for TableContext<'_, DB> {
             }
         }
         Ok(callees)
+    }
+
+    fn data_type(&self, data_type: &DataType) -> ScalarType {
+        if self.engine == Engine::PostgreSql
+            && let Some(enum_type) = self.enums.named(self.database, &PgType::of(data_type))
+        {
+            return enum_type;
+        }
+        ScalarType::of(data_type)
     }
 }
 
@@ -627,15 +696,19 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
         evaluation: Evaluation,
     ) -> Result<Evaluation, LookupError> {
         let database = self.database;
-        let own = self.engine.column(column, database, &mut self.collations)?.evaluation;
+        let own =
+            self.engine.column(column, database, &mut self.collations, &self.enums)?.evaluation;
         let data_type = column.data_type(database);
         let base = data_type.base_type(database).unwrap_or(data_type);
         let modified = base.typmod(database) != Some(TypeModifier::Unmodified);
         let carried = self.engine == Engine::PostgreSql
             && match (own.ty(), evaluation.ty()) {
                 (ScalarType::Text(_), ScalarType::Text(_) | ScalarType::UnknownLiteral)
-                | (ScalarType::Integer(_), ScalarType::Integer(_)) => true,
-                (ScalarType::Boolean | ScalarType::Date, ty) => ty == own.ty(),
+                | (ScalarType::Integer(_), ScalarType::Integer(_))
+                | (ScalarType::Enum(_), ScalarType::UnknownLiteral) => true,
+                (ScalarType::Boolean | ScalarType::Date | ScalarType::Enum(_), ty) => {
+                    ty == own.ty()
+                }
                 (ScalarType::Numeric | ScalarType::Timestamp, ty) => ty == own.ty() && !modified,
                 _ => false,
             };
@@ -650,7 +723,7 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
                 Values::Unlisted(_) => !modified,
                 _ => false,
             };
-        let held = evaluation.with_type(own.ty()).with_error(false);
+        let held = evaluation.with_type(own.ty().clone()).with_error(false);
         Ok(if stated { held } else { held.with_values(Values::Unlisted(Unlisted::any())) })
     }
 }
@@ -706,11 +779,19 @@ fn reached_in<'a, 'e, F>(
     equal.unwrap_or_else(|| reach(call))
 }
 
-/// The scalar type a PostgreSQL type reads as, text under `rules`.
-fn postgres_scalar_type(pg_type: &PgType, rules: TextRules) -> ScalarType {
+/// The scalar type a PostgreSQL type reads as, text under `rules` and an
+/// enum among the `enums` of `database`.
+fn postgres_scalar_type<DB: DatabaseLike>(
+    pg_type: &PgType,
+    rules: TextRules,
+    database: &DB,
+    enums: &Enums,
+) -> ScalarType {
     match pg_type {
         PgType::Array(element) => {
-            ScalarType::Array(ArrayElement::of(postgres_scalar_type(element, rules)))
+            ScalarType::Array(ArrayElement::of(&postgres_scalar_type(
+                element, rules, database, enums,
+            )))
         }
         PgType::Catalog(name) => {
             match *name {
@@ -726,7 +807,8 @@ fn postgres_scalar_type(pg_type: &PgType, rules: TextRules) -> ScalarType {
                 _ => ScalarType::Other,
             }
         }
-        PgType::Named(_) | PgType::Other(_) => ScalarType::Other,
+        PgType::Named(_) => enums.named(database, pg_type).unwrap_or(ScalarType::Other),
+        PgType::Other(_) => ScalarType::Other,
     }
 }
 
