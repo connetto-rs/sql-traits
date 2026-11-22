@@ -36,6 +36,8 @@ pub trait DQLLike<DB: DatabaseLike>: DataStatementLike<DB> {
     ///   tables inherit from through `INHERITS`, whose rows join the table's
     ///   own without its keys (partitions share their root's keys, so a
     ///   partitioned table still answers),
+    /// - the projection draws from a foreign table, whose rows live behind its
+    ///   server,
     /// - any projected item is a computed expression (arithmetic, a function
     ///   call, an aggregate, a scalar subquery, `CASE`, ...) rather than a
     ///   pass-through column or wildcard,

@@ -9,7 +9,7 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     impls::dql::{
-        ColumnOrigin, build_definition_graph,
+        ColumnOrigin, build_definition_graph, build_stored_definition_graph,
         definition_graph::{
             DefinitionGraph, DefinitionId, QueryId, ScopeCursor,
             reference_sites::{SiteRule, SiteRules},
@@ -1134,6 +1134,24 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
         let (graph, root) = build_definition_graph(query, database, case)?;
+        Ok(Self { graph, root })
+    }
+
+    /// Builds the scopes of `query`, the definition of a view `database`
+    /// stores, reading its relation names as bound when the view was created
+    /// and comparing names under the catalog's
+    /// [`DatabaseLike::identifier_case`].
+    ///
+    /// # Errors
+    ///
+    /// Returns relation-name lookup errors and
+    /// [`LookupError::AmbiguousTableLookup`] when a modeled relation lookup is
+    /// ambiguous.
+    pub(crate) fn for_stored_definition(
+        query: &'query Query,
+        database: &'db DB,
+    ) -> Result<Self, LookupError> {
+        let (graph, root) = build_stored_definition_graph(query, database)?;
         Ok(Self { graph, root })
     }
 

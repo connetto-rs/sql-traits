@@ -434,6 +434,24 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         Ok(Self::assemble(query, scope, sites, database, case, Vec::new(), None))
     }
 
+    /// Builds the context of `query`, the definition of a view `database`
+    /// stores, its relation names read as bound when the view was created and
+    /// its identifiers compared under the catalog's
+    /// [`DatabaseLike::identifier_case`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup errors [`ColumnScope::from_query`] returns.
+    pub(crate) fn for_stored_definition(
+        query: &'query Query,
+        database: &'db DB,
+    ) -> Result<Self, LookupError> {
+        let scope = ColumnScope::for_stored_definition(query, database)?;
+        let sites = scope.site_rules(query);
+        let case = database.identifier_case();
+        Ok(Self::assemble(query, scope, sites, database, case, Vec::new(), None))
+    }
+
     /// Builds the context of `expression`, written outside a query, over
     /// `database`, its column references reaching what `scope` names and the
     /// relations of the queries it holds, comparing identifiers under

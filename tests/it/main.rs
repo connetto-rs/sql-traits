@@ -249,6 +249,7 @@ mod type_modifiers;
 mod type_name_normalization;
 mod unique_key_calls;
 mod unresolved_expressions;
+mod updatable_view_base;
 mod user_defined_types;
 mod view_identifier_case;
 mod view_options;

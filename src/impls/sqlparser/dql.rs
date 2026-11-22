@@ -38,13 +38,13 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     structs::{IdentifierCase, TargetName},
-    traits::{ColumnLike, DQLLike, DatabaseLike, FunctionLike, TableLike, ViewLike},
+    traits::{ColumnLike, DQLLike, DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
     utils::{
         call_sites::call_reaches,
         object_name::{
             Namespaces, PG_CATALOG, Qualifier, object_name_last_part, qualifier_of,
-            render_table_candidate, resolve_bound_table, resolve_object_name,
-            target_name_from_object_name,
+            render_table_candidate, resolve_bound_table_or_foreign_table,
+            resolve_relation_object_name, target_name_from_object_name,
         },
         walk::walk,
     },
@@ -127,6 +127,9 @@ struct Deriving<'s, 'db, DB: DatabaseLike> {
     case: IdentifierCase,
     /// The innermost view being derived right now, if any.
     views: Option<&'s DerivingFrame<'s, 'db, DB>>,
+    /// Whether written relation names were bound when a stored definition
+    /// was created, so they resolve with no search path.
+    bound: bool,
 }
 
 impl<DB: DatabaseLike> Copy for Deriving<'_, '_, DB> {}
@@ -135,7 +138,13 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
     /// A derivation of `database` that is inside no view, comparing written
     /// names under `case`.
     fn of(database: &'db DB, case: IdentifierCase) -> Self {
-        Self { database, case, views: None }
+        Self { database, case, views: None, bound: false }
+    }
+
+    /// A derivation of a stored view definition `database` holds, reading
+    /// its names as bound at creation under the catalog's comparison.
+    fn stored(database: &'db DB) -> Self {
+        Self { database, case: database.identifier_case(), views: None, bound: true }
     }
 
     /// Whether a reference to `view` would close a cycle.
@@ -153,24 +162,26 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
         false
     }
 
-    /// The base table a written relation name denotes here.
+    /// The base table or foreign table a written relation name denotes here.
     ///
     /// A query handed in by a caller resolves through the session's search
     /// path. A stored view's definition was bound when the view was created,
     /// so inside one the name is read with no search path instead, which
     /// keeps it on the relation it reached then.
     fn table(&self, name: &ObjectName) -> Result<Option<&'db DB::Table>, LookupError> {
-        if self.views.is_some() {
-            resolve_bound_table(name, self.database)
-        } else {
-            resolve_object_name(name, self.database, self.case)
+        if self.bound {
+            return resolve_bound_table_or_foreign_table(name, self.database);
         }
+        Ok(match resolve_relation_object_name(name, self.database, self.case)? {
+            Some(Relation::Table(table) | Relation::ForeignTable(table)) => Some(table),
+            _ => None,
+        })
     }
 
     /// The plain view a written name denotes here, read the way
     /// [`Self::table`] reads a table.
     fn view(&self, target: TargetName<'_>) -> Result<Option<&'db DB::View>, LookupError> {
-        if self.views.is_some() {
+        if self.bound {
             self.database.view_by_target(target, self.case)
         } else {
             self.database.resolve_target_view(target, self.case)
@@ -183,7 +194,7 @@ impl<'db, DB: DatabaseLike> Deriving<'_, 'db, DB> {
         &self,
         target: TargetName<'_>,
     ) -> Result<Option<&'db DB::MaterializedView>, LookupError> {
-        if self.views.is_some() {
+        if self.bound {
             self.database.materialized_view_by_target(target, self.case)
         } else {
             self.database.resolve_target_materialized_view(target, self.case)
@@ -4369,11 +4380,7 @@ where
         DerivingView::Materialized(view) => (view.definition(), view.declared_column_names()),
     };
     let frame = DerivingFrame { view, parent: deriving.views };
-    let inner = Deriving {
-        database: deriving.database,
-        case: deriving.database.identifier_case(),
-        views: Some(&frame),
-    };
+    let inner = Deriving { views: Some(&frame), ..Deriving::stored(deriving.database) };
     let output_names = (!declared.is_empty()).then_some(OutputNameSource::Declared(declared));
     let parent = profile.no_parent();
     let Some(mut shape) = derive_query_shape(
@@ -4972,8 +4979,23 @@ pub(crate) fn build_definition_graph<'query, 'db, DB: DatabaseLike>(
     database: &'db DB,
     case: IdentifierCase,
 ) -> Result<(definition_graph::DefinitionGraph<'query, 'db, DB>, ScopeCursor), LookupError> {
-    let deriving = Deriving::of(database, case);
-    let mut profile = DefinitionDerivation::new(database, case);
+    build_graph(query, Deriving::of(database, case))
+}
+
+/// Builds the graph of `query`, the definition of a view `database` stores,
+/// reading its relation names as bound when the view was created.
+pub(crate) fn build_stored_definition_graph<'query, 'db, DB: DatabaseLike>(
+    query: &'query Query,
+    database: &'db DB,
+) -> Result<(definition_graph::DefinitionGraph<'query, 'db, DB>, ScopeCursor), LookupError> {
+    build_graph(query, Deriving::stored(database))
+}
+
+fn build_graph<'query, 'db, DB: DatabaseLike>(
+    query: &'query Query,
+    deriving: Deriving<'_, 'db, DB>,
+) -> Result<(definition_graph::DefinitionGraph<'query, 'db, DB>, ScopeCursor), LookupError> {
+    let mut profile = DefinitionDerivation::new(deriving.database, deriving.case);
     let parent = profile.no_parent();
     let root =
         index_nested_query_scopes(AstRef::Query(query), &[], deriving, parent, &mut profile)?;
@@ -5081,7 +5103,11 @@ impl<DB: DatabaseLike> DQLLike<DB> for Query {
             }
         }
 
-        Ok(source)
+        // A foreign table's rows live behind its server.
+        match source {
+            Some(table) if table.is_foreign(database)? => Ok(None),
+            source => Ok(source),
+        }
     }
 }
 
@@ -5148,6 +5174,19 @@ mod tests {
             .projection_source_table(db)
             .expect("projection_source_table succeeds")
             .map(|table| table.table_name().to_string())
+    }
+
+    /// A foreign table's rows live behind its server, so they are no rows of
+    /// a base table even though its columns resolve.
+    #[test]
+    fn a_foreign_table_is_no_projection_source() {
+        let db = ParserDB::parse::<GenericDialect>(
+            "CREATE FOREIGN DATA WRAPPER wrapper; CREATE SERVER server FOREIGN DATA WRAPPER wrapper;
+             CREATE FOREIGN TABLE remote (id INT) SERVER server;",
+        )
+        .expect("schema parses");
+        assert_eq!(source_name("SELECT id FROM remote", &db), None);
+        assert_eq!(source_name("SELECT * FROM remote", &db), None);
     }
 
     fn nested_recursive_cte_body(depth: usize) -> String {
