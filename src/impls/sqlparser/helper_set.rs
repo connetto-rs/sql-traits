@@ -26,11 +26,12 @@ use super::{
 use crate::{
     errors::{AccessorRefusal, HelperSetError, LookupError},
     structs::{
-        AntiJoin, CalledArm, CallerGate, CapLift, CapOperand, Correlation, Deployment, ExcludedSet,
-        FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm, HelperSet, IdentifierCase,
-        JoinedRow, LiteralSet, ParentArm, RequestNormalization, Restriction, Returned, RowCap,
-        RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison, SettingContent,
-        SettingValue, TargetName, TimeBound, TimeComparison, WalkArm, WalkDirection,
+        AntiJoin, ArmCondition, CalledArm, CallerGate, CapOperand, Correlation, Deployment,
+        ExcludedSet, FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm, HelperSet,
+        IdentifierCase, JoinedRow, LiteralSet, ParentArm, RequestNormalization, Restriction,
+        Returned, RowCap, RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison,
+        SettingContent, SettingValue, TargetName, TimeBound, TimeComparison, UnsetSetting, WalkArm,
+        WalkDirection,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, EnumerationKind, EnumerationMember, ForeignKeyLike,
@@ -51,18 +52,23 @@ use crate::{
     },
 };
 
-/// See [`FunctionLike::helper_set`] and
-/// [`FunctionLike::helper_set_with_exclusions`], which `reads_exclusions`
-/// chooses between.
+/// See [`FunctionLike::helper_set`], `conditions` naming the conditions read
+/// rather than refused.
 pub(crate) fn helper_set<'db, DB: DatabaseLike>(
     function: &'db DB::Function,
     arguments: &[Value],
     deployment: &'db Deployment,
     database: &'db DB,
-    reads_exclusions: bool,
+    conditions: &[ArmCondition],
 ) -> Result<HelperSet<'db, DB>, HelperSetError> {
-    Reader { deployment, database, reads_exclusions, answering: Vec::new() }
-        .answer(function, arguments)
+    Reader {
+        deployment,
+        database,
+        reads_exclusions: conditions.contains(&ArmCondition::Exclusion),
+        reads_unset_settings: conditions.contains(&ArmCondition::UnsetSetting),
+        answering: Vec::new(),
+    }
+    .answer(function, arguments)
 }
 
 /// A literal the body compares, as far as comparing it goes.
@@ -722,6 +728,22 @@ struct Joining<'q, 'db, DB: DatabaseLike> {
 /// `None` where one of them keeps no row.
 type JoinedConditions<'q, 'db, DB> = (Vec<&'q Expr>, Option<Vec<JoinedRow<'db, DB>>>);
 
+/// The conjuncts of a grant arm on its own table, each read as what it
+/// writes, the comparisons with a helper's set left until the grantee is
+/// known.
+struct ArmConjuncts<'q, 'db, DB: DatabaseLike> {
+    grantees: Option<Vec<Grantee<'db, DB>>>,
+    gates: Gates<'db>,
+    unset_settings: Vec<UnsetSetting<'db>>,
+    /// `None` in the place of each of [`memberships`](Self::memberships).
+    caps: Vec<Option<RowCap<'db, DB>>>,
+    /// Each `<column> IN (<subquery>)` capping no key, beside its place in
+    /// [`caps`](Self::caps).
+    memberships: Vec<(usize, &'q Expr, &'q Query)>,
+    exclusions: Vec<ExcludedSet<'db, DB>>,
+    conditions: Vec<&'q Expr>,
+}
+
 /// A helper body's arms, with the term walking down a tree under them where
 /// the body writes `WITH RECURSIVE`.
 struct Body<'q> {
@@ -746,6 +768,9 @@ struct Reader<'db, DB: DatabaseLike> {
     /// Whether a grant arm's exclusions are read rather than refused, in
     /// every helper answered.
     reads_exclusions: bool,
+    /// Whether a grant arm's settings required unset are read rather than
+    /// refused, in every helper answered.
+    reads_unset_settings: bool,
     /// The helpers being answered, outermost first.
     answering: Vec<&'db DB::Function>,
 }
@@ -1193,14 +1218,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(caps.then_some(column))
     }
 
-    /// The cap `<key> IN (SELECT <helper>(<arguments>))` or `<key> IN
-    /// (SELECT * FROM <helper>(<arguments>))` writes on the arm's own key.
-    fn key_cap(
+    /// The cap `<column> IN (SELECT <helper>(<arguments>))` or `<column> IN
+    /// (SELECT * FROM <helper>(<arguments>))` writes on a column of the arm's
+    /// own table.
+    fn column_cap(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         rows: &[ArmTable<'_, 'db, DB>],
-        key: &'db DB::Column,
+        column: &'db DB::Column,
         subquery: &Query,
     ) -> Result<RowCap<'db, DB>, HelperSetError> {
         let call = selected_call(subquery)
@@ -1208,7 +1234,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             .ok_or_else(|| scope.arm_shape(select))?;
         let Called { function, arguments, set } = self.called_set(scope, select, rows, &call, 1)?;
         Ok(RowCap {
-            operands: vec![CapOperand::Column(key)],
+            operands: vec![CapOperand::Column(column)],
             function,
             arguments,
             set: Box::new(set),
@@ -1929,14 +1955,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
 
     /// Reads a grant arm returning `returned`, answering one arm per grantee
     /// an `IN` list naming the request lists and none where its conditions
-    /// keep no row, each as an `A`. An arm returning a row of `child` from a
-    /// helper's set is a parent arm where
-    /// [`parent_comparison`](Self::parent_comparison) reads it as one, which
-    /// takes no other condition, so such a set beside one is refused unless
-    /// [`capping_key`](Self::capping_key) reads it as a cap. `rows` holds
-    /// the arm's table and then each table it joins. `reached` is the
-    /// conjunct of a walk's final query keeping the keys the walk reached,
-    /// which is no condition of the arm.
+    /// keep no row, each as an `A`. Beside a grantee the request names, a
+    /// comparison of a column with a helper's set caps the arm. An arm
+    /// returning a row of `child` from a helper's set is otherwise a parent
+    /// arm where [`parent_comparison`](Self::parent_comparison) reads it as
+    /// one, which takes no other condition, so such a set beside one is
+    /// refused unless [`capping_key`](Self::capping_key) reads it as a cap.
+    /// `rows` holds the arm's table and then each table it joins. `reached`
+    /// is the conjunct of a walk's final query keeping the keys the walk
+    /// reached, which is no condition of the arm.
     fn grant_arm<A: From<GrantArm<'db, DB>>>(
         &mut self,
         scope: &Scope<'db, DB>,
@@ -1949,59 +1976,30 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let shape = || scope.arm_shape(select);
         let table = rows.first().ok_or_else(shape)?;
         let (own, joined_rows) = self.joined_rows(scope, select, rows, reached)?;
-        let mut grantees = None;
-        let mut gates = Gates::default();
-        let mut caps = Vec::new();
-        let mut exclusions = Vec::new();
-        let mut conditions = Vec::new();
-        for conjunct in own {
-            if let Some(cap) = self.cap(scope, select, rows, conjunct)? {
-                caps.push(cap);
-                continue;
+        let ArmConjuncts {
+            mut grantees,
+            gates,
+            unset_settings,
+            mut caps,
+            memberships,
+            exclusions,
+            conditions,
+        } = self.arm_conjuncts(scope, select, rows, returned, own)?;
+        if grantees.is_some() {
+            for (index, compared, called) in memberships {
+                let column = table.column(compared).ok_or_else(shape)?;
+                caps[index] = Some(self.column_cap(scope, select, rows, column, called)?);
             }
-            if let Some(exclusion) = self.exclusion(scope, select, table, conjunct)? {
-                // `NOT IN` an empty set holds for every row, `NULL` too.
-                if !exclusion.set.arms.is_empty() {
-                    exclusions.push(exclusion);
-                }
-                continue;
-            }
-            let named = if let Some(request) = self.setting_comparison(scope, table, conjunct)? {
-                Some(vec![(GrantedTo::Request(request), Kept::All)])
-            } else if let Some(listed) = self.request_list(scope, table, conjunct)? {
-                Some(listed)
-            } else if let Expr::In {
-                expr,
-                target: InTarget::Subquery(called),
-                negated: false,
-                ..
-            } = unnest(conjunct)
+        } else if let [(_, compared, called)] = memberships[..] {
+            if let (Some(child), [Returned::Read(column)]) = (child, returned)
+                && self.parent_comparison(table, column, child, compared)?
             {
-                if let Some(key) = self.capping_key(table, returned, expr)? {
-                    caps.push(self.key_cap(scope, select, rows, key, called)?);
-                    continue;
-                }
-                if let (Some(child), [Returned::Read(column)]) = (child, returned)
-                    && self.parent_comparison(table, column, child, expr)?
-                {
-                    return Err(shape());
-                }
-                let grantees = self.grantee_set(scope, select, table, expr, called)?;
-                Some(vec![(GrantedTo::Set(grantees), Kept::All)])
-            } else {
-                None
-            };
-            if let Some(named) = named {
-                if grantees.replace(named).is_some() {
-                    return Err(shape());
-                }
-            } else if let Some(read) = self.gate(scope, table, conjunct)? {
-                if !gates.add(read) {
-                    return Err(shape());
-                }
-            } else {
-                conditions.push(conjunct);
+                return Err(shape());
             }
+            let set = self.grantee_set(scope, select, table, compared, called)?;
+            grantees = Some(vec![(GrantedTo::Set(set), Kept::All)]);
+        } else if !memberships.is_empty() {
+            return Err(shape());
         }
         let mut anti_joins = Vec::new();
         let mut filters = Vec::new();
@@ -2018,7 +2016,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Ok(Vec::new());
         };
         let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
-        let caps: Arc<[RowCap<'db, DB>]> = caps.into();
+        let caps: Arc<[RowCap<'db, DB>]> = caps.into_iter().flatten().collect();
+        let unset_settings: Arc<[UnsetSetting<'db>]> = unset_settings.into();
         let anti_joins: Arc<[AntiJoin<'db, DB>]> = anti_joins.into();
         let exclusions: Arc<[ExcludedSet<'db, DB>]> = exclusions.into();
         let joined_rows: Arc<[JoinedRow<'db, DB>]> = joined_rows.into();
@@ -2032,6 +2031,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 returned: returned.to_vec(),
                 granted_to,
                 gate,
+                unset_settings: Arc::clone(&unset_settings),
                 restrictions,
                 time_bounds,
                 caps: Arc::clone(&caps),
@@ -2048,6 +2048,75 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         arms.extend(last.and_then(|last| grant(last, kept, gates.gate, time_bounds)));
         Ok(arms)
+    }
+
+    /// Reads each of `own`, the conjuncts of a grant arm returning `returned`
+    /// on its own table, as what it writes. `rows` holds the arm's table and
+    /// then each table it joins.
+    fn arm_conjuncts<'q>(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        rows: &[ArmTable<'_, 'db, DB>],
+        returned: &[Returned<&'db DB::Column>],
+        own: Vec<&'q Expr>,
+    ) -> Result<ArmConjuncts<'q, 'db, DB>, HelperSetError> {
+        let shape = || scope.arm_shape(select);
+        let table = rows.first().ok_or_else(shape)?;
+        let mut read = ArmConjuncts {
+            grantees: None,
+            gates: Gates::default(),
+            unset_settings: Vec::new(),
+            caps: Vec::new(),
+            memberships: Vec::new(),
+            exclusions: Vec::new(),
+            conditions: Vec::new(),
+        };
+        for conjunct in own {
+            if let Some(cap) = self.cap(scope, select, rows, conjunct)? {
+                read.caps.push(Some(cap));
+                continue;
+            }
+            if let Some(exclusion) = self.exclusion(scope, select, table, conjunct)? {
+                // `NOT IN` an empty set holds for every row, `NULL` too.
+                if !exclusion.set.arms.is_empty() {
+                    read.exclusions.push(exclusion);
+                }
+                continue;
+            }
+            let named = match self.setting_comparison(scope, table, conjunct)? {
+                Some(request) => Some(vec![(GrantedTo::Request(request), Kept::All)]),
+                None => self.request_list(scope, table, conjunct)?,
+            };
+            if let Some(named) = named {
+                if read.grantees.replace(named).is_some() {
+                    return Err(shape());
+                }
+            } else if let Expr::In {
+                expr,
+                target: InTarget::Subquery(called),
+                negated: false,
+                ..
+            } = unnest(conjunct)
+            {
+                if let Some(key) = self.capping_key(table, returned, expr)? {
+                    read.caps.push(Some(self.column_cap(scope, select, rows, key, called)?));
+                } else {
+                    read.memberships.push((read.caps.len(), expr.as_ref(), called.as_ref()));
+                    read.caps.push(None);
+                }
+            } else if let Some(gate) = self.gate(scope, table, conjunct)? {
+                if !read.gates.add(gate) {
+                    return Err(shape());
+                }
+            } else if let Some(unset) = self.unset_setting(scope, table, conjunct)? {
+                self.require_read(scope, conjunct, ArmCondition::UnsetSetting)?;
+                read.unset_settings.push(unset);
+            } else {
+                read.conditions.push(conjunct);
+            }
+        }
+        Ok(read)
     }
 
     /// The exclusion `conjunct` writes on a column of the arm's `table`, if
@@ -2069,15 +2138,32 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if self.set_elements(scope, subquery)?.is_some() {
             return Ok(None);
         }
-        if !self.reads_exclusions {
-            return Err(HelperSetError::UnreadExclusion {
-                function: scope.name.clone(),
-                condition: conjunct.to_string(),
-            });
-        }
+        self.require_read(scope, conjunct, ArmCondition::Exclusion)?;
         let Called { function, arguments, set } =
             self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
         Ok(Some(ExcludedSet { column, function, arguments, set: Box::new(set) }))
+    }
+
+    /// Refuses `conjunct`, a condition read as `kind`, where the consumer
+    /// leaves such conditions unread.
+    fn require_read(
+        &self,
+        scope: &Scope<'db, DB>,
+        conjunct: &Expr,
+        kind: ArmCondition,
+    ) -> Result<(), HelperSetError> {
+        let reads = match kind {
+            ArmCondition::Exclusion => self.reads_exclusions,
+            ArmCondition::UnsetSetting => self.reads_unset_settings,
+        };
+        if reads {
+            return Ok(());
+        }
+        Err(HelperSetError::UnreadCondition {
+            function: scope.name.clone(),
+            condition: conjunct.to_string(),
+            kind,
+        })
     }
 
     /// Splits the conditions of an arm reading `rows`, its table and then
@@ -2358,7 +2444,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let (table, joined) = rows.split_first().ok_or_else(shape)?;
         let lift = match lifted {
             Some(lifted) => {
-                let Some(lift) = self.lift(scope, table, lifted)? else { return Ok(None) };
+                let Some(lift) = self.unset_setting(scope, table, lifted)? else {
+                    return Ok(None);
+                };
                 Some(lift)
             }
             None => None,
@@ -2398,15 +2486,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(Some(RowCap { operands, function, arguments, set: Box::new(set), lift }))
     }
 
-    /// The lift `expression` writes on a cap, if it writes one,
-    /// `current_setting(<setting>) IS NULL`, the read optionally cast to the
-    /// type the setting is declared in.
-    fn lift(
+    /// The `current_setting(<setting>) IS NULL` `expression` writes, if it
+    /// writes one, the read optionally cast to the type the setting is
+    /// declared in.
+    fn unset_setting(
         &self,
         scope: &Scope<'db, DB>,
         table: &ArmTable<'_, 'db, DB>,
         expression: &Expr,
-    ) -> Result<Option<CapLift<'db>>, HelperSetError> {
+    ) -> Result<Option<UnsetSetting<'db>>, HelperSetError> {
         let Expr::IsNull(read) = unnest(expression) else { return Ok(None) };
         let Operand::Setting { read, cast } = self.operand(scope, table, read)? else {
             return Ok(None);
@@ -2424,10 +2512,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 cast: cast.to_string(),
             });
         }
-        Ok(Some(CapLift {
+        Ok(Some(UnsetSetting {
             setting,
             raises_when_unset: read.raises_when_unset,
-            lifts_on_empty: read.empty_as_null,
+            reads_empty_as_unset: read.empty_as_null,
         }))
     }
 
@@ -3654,6 +3742,7 @@ fn reads_walk(query: &Query, walk: &Walk<'_>) -> bool {
 fn keeps_every_row<DB: DatabaseLike>(arm: &GrantArm<'_, DB>) -> bool {
     matches!(arm.granted_to, GrantedTo::Anyone)
         && arm.gate.is_none()
+        && arm.unset_settings.is_empty()
         && arm.restrictions.is_empty()
         && arm.time_bounds.is_empty()
         && arm.caps.is_empty()

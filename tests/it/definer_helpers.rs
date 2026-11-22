@@ -289,7 +289,7 @@ fn answer<'db>(
     name: &str,
     arguments: &[Value],
 ) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
-    function(database, schema, name).helper_set(arguments, deployment, database)
+    function(database, schema, name).helper_set(arguments, deployment, database, &[])
 }
 
 /// The condition naming the grantee of a grant arm, `None` for anyone.
@@ -352,7 +352,7 @@ fn render_cap(cap: &RowCap<'_, ParserDB>, joined: &[JoinedRow<'_, ParserDB>]) ->
     );
     match cap.lift() {
         Some(lift) => {
-            let unset = if lift.lifts_on_empty() { "UNSET" } else { "NULL" };
+            let unset = if lift.reads_empty_as_unset() { "UNSET" } else { "NULL" };
             format!("({} IS {unset} OR {membership})", lift.setting().name())
         }
         None => membership,
@@ -375,6 +375,10 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
             gated.push(format!("{name} IS NOT NULL"));
         }
         gated.join(" AND ")
+    });
+    let unset_settings = grant.unset_settings().iter().map(|unset| {
+        let unset_as = if unset.reads_empty_as_unset() { "UNSET" } else { "NULL" };
+        format!("{} IS {unset_as}", unset.setting().name())
     });
     let restrictions = grant.restrictions().iter().map(render_restriction);
     let bounds = grant.time_bounds().iter().map(render_bound);
@@ -413,6 +417,7 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
     let conditions: Vec<String> = granted_to
         .into_iter()
         .chain(gate)
+        .chain(unset_settings)
         .chain(restrictions)
         .chain(bounds)
         .chain(joins)
@@ -635,12 +640,12 @@ fn holds(value: &Value, cell: &str) -> bool {
     }
 }
 
-/// Whether `lift` lifts its cap for `request`, which carries the setting it
-/// reads as a scalar.
-fn lifted(lift: &CapLift<'_>, request: Request) -> bool {
-    match request.values(lift.setting().name()) {
+/// Whether `request` leaves the setting `unset` reads unset, carrying it as
+/// a scalar where it sets it.
+fn left_unset(unset: &UnsetSetting<'_>, request: Request) -> bool {
+    match request.values(unset.setting().name()) {
         None => true,
-        Some(&[value]) => value.is_empty() && lift.lifts_on_empty(),
+        Some(&[value]) => value.is_empty() && unset.reads_empty_as_unset(),
         Some(values) => panic!("a scalar holds one value, not {values:?}"),
     }
 }
@@ -721,7 +726,7 @@ fn grant_rows(
                 && gate.excluded().iter().all(|value| !holds(value, caller))
         })
     });
-    if !gated {
+    if !gated || !grant.unset_settings().iter().all(|unset| left_unset(unset, request)) {
         return;
     }
     let grantees = match grant.granted_to() {
@@ -733,7 +738,7 @@ fn grant_rows(
         .caps()
         .iter()
         .map(|cap| {
-            (!cap.lift().is_some_and(|lift| lifted(lift, request)))
+            (!cap.lift().is_some_and(|lift| left_unset(lift, request)))
                 .then(|| cap_rows(cap, request, fixture))
         })
         .collect();
@@ -1738,7 +1743,6 @@ fn a_null_test_requires_a_column_to_hold_no_value_or_any_value() {
         "role IS NULL OR role = 'admin'",
         "role IS NULL OR doc_id IS NULL",
         "upper(role) IS NULL",
-        "current_setting('app.user_id', true) IS NULL",
         "NOT role IS NULL",
     ] {
         assert!(
@@ -3449,11 +3453,30 @@ fn a_grant_arm_compares_its_grantee_with_every_grantee_the_caller_is() {
         }
     }
 
-    let twice = GRANTEES.replace(
+    let beside_caller = GRANTEES.replace(
         "AND (pg.role = 'admin' OR min_role = 'read')",
         "AND pg.grantee_id = current_setting('app.user_id', true)",
     );
-    assert_ne!(twice, GRANTEES, "the condition is replaced");
+    assert_ne!(beside_caller, GRANTEES, "the condition is replaced");
+    let capped = answer(
+        &postgres(&beside_caller),
+        &deployment,
+        "authz",
+        "projects_granted",
+        &[text("read")],
+    )
+    .map(|set| render(&set));
+    assert!(
+        capped.as_deref().is_ok_and(|capped| capped.starts_with(
+            "project_grants.project_id WHERE grantee_id = app.user_id AND (grantee_id) IN authz.caller_grantees() {"
+        )),
+        "{capped:?}"
+    );
+    let twice = beside_caller.replace(
+        "pg.grantee_id IN (SELECT authz.caller_grantees())",
+        "pg.project_id = current_setting('app.user_id', true)",
+    );
+    assert_ne!(twice, beside_caller, "the condition is replaced");
     assert!(
         matches!(
             answer(&postgres(&twice), &deployment, "authz", "projects_granted", &[text("read")]),
@@ -5080,7 +5103,7 @@ fn a_lift_records_whether_reading_its_setting_raises_when_unset() {
         let lift = cap.lift().expect("a lifted cap");
         assert_eq!(lift.setting().name(), setting);
         assert_eq!(lift.raises_when_unset(), raises, "{read}");
-        assert!(!lift.lifts_on_empty(), "{read}");
+        assert!(!lift.reads_empty_as_unset(), "{read}");
     }
 }
 
@@ -5097,6 +5120,126 @@ fn every_arm_an_in_list_of_principals_answers_keeps_the_caps() {
     assert!(arms[0].starts_with("resources.id WHERE owner_id = app.user_id AND "), "{answer}");
     assert!(arms[1].starts_with("resources.id WHERE owner_id IN ('nobody') AND "), "{answer}");
     assert!(arms.iter().all(|arm| arm.contains(cap)), "{answer}");
+}
+
+const CALLER_CONDITIONS: &str = "
+CREATE FUNCTION authz.member_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id FROM public.resources resource
+  WHERE resource.organization_id IN (SELECT authz.member_organizations())
+    AND resource.owner_id = NULLIF(current_setting('app.user_id', true), '')
+$$;
+CREATE FUNCTION authz.personal_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id FROM public.resources resource
+  WHERE resource.owner_id = NULLIF(current_setting('app.user_id', true), '')
+    AND NULLIF(current_setting('app.installation_id', true), '') IS NULL
+$$;
+CREATE FUNCTION authz.unpooled_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT resource.id FROM public.resources resource
+  WHERE resource.owner_id = NULLIF(current_setting('app.user_id', true), '')
+    AND current_setting('app.installation_id', true) IS NULL
+$$;
+ALTER FUNCTION authz.member_resources() OWNER TO authz_owner;
+ALTER FUNCTION authz.personal_resources() OWNER TO authz_owner;
+ALTER FUNCTION authz.unpooled_resources() OWNER TO authz_owner;
+";
+
+/// What PostgreSQL 18.7 returns for `(helper, request, returned)` over
+/// [`CAP_ROWS`], the helpers of [`CALLER_CONDITIONS`] declared after
+/// [`CAPS`].
+const CALLER_CONDITIONS_MEASURED: &[(&str, Request, &[&str])] = &[
+    ("member_resources", ALICE, &["r1", "r2", "r3", "r4"]),
+    ("member_resources", ALICE_EMPTY, &["r1", "r2", "r3", "r4"]),
+    ("member_resources", ALICE_I1, &["r1", "r2"]),
+    ("member_resources", ALICE_I2, &["r3", "r4"]),
+    ("member_resources", ALICE_IX, &[]),
+    ("member_resources", BOB_I1, &["r5"]),
+    ("member_resources", BOB_I2, &[]),
+    ("personal_resources", ALICE, &["r1", "r2", "r3", "r4"]),
+    ("personal_resources", ALICE_EMPTY, &["r1", "r2", "r3", "r4"]),
+    ("personal_resources", ALICE_I1, &[]),
+    ("personal_resources", BOB_I1, &[]),
+    ("unpooled_resources", ALICE, &["r1", "r2", "r3", "r4"]),
+    ("unpooled_resources", ALICE_EMPTY, &[]),
+    ("unpooled_resources", ALICE_I1, &[]),
+];
+
+/// [`CAPS`] and [`CALLER_CONDITIONS`], the condition of `member_resources`
+/// replaced by `condition` where one is given.
+fn caller_conditions(condition: Option<&str>) -> ParserDB {
+    let mut sql = format!("{CAPS}{CALLER_CONDITIONS}");
+    if let Some(condition) = condition {
+        let written = "WHERE resource.organization_id IN (SELECT authz.member_organizations())\n    AND resource.owner_id = NULLIF(current_setting('app.user_id', true), '')";
+        assert!(sql.contains(written), "the condition is replaced");
+        sql = sql.replace(written, &format!("WHERE {condition}"));
+    }
+    postgres(&sql)
+}
+
+fn read_unset<'db>(
+    database: &'db ParserDB,
+    deployment: &'db Deployment,
+    name: &str,
+) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    function(database, "authz", name).helper_set(
+        &[],
+        deployment,
+        database,
+        &[ArmCondition::UnsetSetting],
+    )
+}
+
+#[test]
+fn a_set_beside_a_grantee_the_request_names_caps_the_arm() {
+    let deployment = installation_deployment();
+    let member_organizations = "authz.member_organizations() {memberships.organization_id WHERE user_id = app.user_id AND (app.installation_id IS UNSET OR (organization_id, 'organization') IN authz.capped_kinds('reader') {installation_permissions.(organization_id, kind) WHERE installation_id = app.installation_id AND max_role IN ('admin', 'reader')})}";
+    let expected = format!(
+        "resources.id WHERE owner_id = app.user_id AND (organization_id) IN {member_organizations}"
+    );
+    let owner = "resource.owner_id = NULLIF(current_setting('app.user_id', true), '')";
+    let member = "resource.organization_id IN (SELECT authz.member_organizations())";
+    for condition in [None, Some(format!("{owner} AND {member}"))] {
+        let database = caller_conditions(condition.as_deref());
+        let set =
+            answer(&database, &deployment, "authz", "member_resources", &[]).expect("answered");
+        assert_eq!(render(&set), expected, "{condition:?}");
+    }
+    let database = caller_conditions(None);
+    for &(helper, request, expected) in CALLER_CONDITIONS_MEASURED {
+        let set = read_unset(&database, &deployment, helper).expect("answered");
+        let returned: Vec<_> = evaluate(&set, request, CAP_ROWS).into_iter().collect();
+        assert_eq!(returned, expected, "{helper}() for {:?}", request.values);
+    }
+    // Two sets beside no grantee the request names leave the grantee open.
+    let database = caller_conditions(Some(&format!(
+        "{member} AND resource.owner_id IN (SELECT authz.member_organizations())"
+    )));
+    let answered = answer(&database, &deployment, "authz", "member_resources", &[]);
+    assert!(matches!(answered, Err(HelperSetError::ArmShape { .. })), "{answered:?}");
+}
+
+#[test]
+fn a_setting_required_unset_keeps_the_arm_only_for_a_request_leaving_it_unset() {
+    let database = caller_conditions(None);
+    let deployment = installation_deployment();
+    for (helper, unset) in [("personal_resources", "UNSET"), ("unpooled_resources", "NULL")] {
+        let set = read_unset(&database, &deployment, helper).expect("answered");
+        assert_eq!(
+            render(&set),
+            format!("resources.id WHERE owner_id = app.user_id AND app.installation_id IS {unset}")
+        );
+        let refused = answer(&database, &deployment, "authz", helper, &[]);
+        assert!(
+            matches!(
+                &refused,
+                Err(HelperSetError::UnreadCondition { function, kind: ArmCondition::UnsetSetting, .. })
+                    if function == &format!("authz.{helper}")
+            ),
+            "{refused:?}"
+        );
+    }
 }
 
 /// Grants a membership takes away once deactivated, and objects whose
@@ -5378,7 +5521,12 @@ fn excluding<'db>(
     deployment: &'db Deployment,
     name: &str,
 ) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
-    function(database, "public", name).helper_set_with_exclusions(&[], deployment, database)
+    function(database, "public", name).helper_set(
+        &[],
+        deployment,
+        database,
+        &[ArmCondition::Exclusion],
+    )
 }
 
 #[test]
@@ -5415,12 +5563,9 @@ fn excluded_as(condition: &str, reads_exclusions: bool) -> Result<String, Helper
         Deployment::new("app", ["app"], [caller, blocked]).expect("a valid deployment");
     let database = postgres(&sql);
     let visible = function(&database, "public", "visible_projects");
-    let answered = if reads_exclusions {
-        visible.helper_set_with_exclusions(&[], &deployment, &database)
-    } else {
-        visible.helper_set(&[], &deployment, &database)
-    };
-    answered.map(|set| render(&set))
+    let conditions: &[ArmCondition] =
+        if reads_exclusions { &[ArmCondition::Exclusion] } else { &[] };
+    visible.helper_set(&[], &deployment, &database, conditions).map(|set| render(&set))
 }
 
 #[test]
@@ -5445,7 +5590,7 @@ fn a_reading_leaving_exclusions_unread_refuses_one() {
     assert!(
         matches!(
             &refused,
-            Err(HelperSetError::UnreadExclusion { function, condition })
+            Err(HelperSetError::UnreadCondition { function, condition, kind: ArmCondition::Exclusion })
                 if function == "visible_projects"
                     && condition == "project.id NOT IN (SELECT public.blocked_projects())"
         ),
@@ -5465,7 +5610,7 @@ fn a_reading_leaving_exclusions_unread_refuses_one() {
     assert!(
         matches!(
             &teams,
-            Err(HelperSetError::UnreadExclusion { function, .. })
+            Err(HelperSetError::UnreadCondition { function, kind: ArmCondition::Exclusion, .. })
                 if function == "visible_projects"
         ),
         "{teams:?}"

@@ -5,7 +5,7 @@ use alloc::{boxed::Box, format, string::String, vec::Vec};
 use sqlparser::{ast::FunctionBehavior, parser::ParserError};
 
 use crate::{
-    structs::{FunctionKind, IdentifierCase, RequestNormalization, SequenceType},
+    structs::{ArmCondition, FunctionKind, IdentifierCase, RequestNormalization, SequenceType},
     traits::PartitionStrategy,
 };
 
@@ -1886,17 +1886,18 @@ pub enum HelperSetError {
         /// The condition, as written.
         condition: String,
     },
-    /// A grant arm keeps only the rows outside the set another helper
-    /// returns, read where the reading leaves exclusions unread (see
-    /// [`FunctionLike::helper_set_with_exclusions`](crate::traits::FunctionLike::helper_set_with_exclusions)).
+    /// A grant arm writes a condition read only where the consumer names it
+    /// (see [`ArmCondition`]), and the consumer does not.
     #[error(
-        "helper `{function}` excludes a helper's set by `{condition}`, which this reading leaves unread"
+        "helper `{function}` filters by `{condition}`, which only a reading naming `ArmCondition::{kind:?}` reads"
     )]
-    UnreadExclusion {
+    UnreadCondition {
         /// The helper.
         function: String,
         /// The condition, as written.
         condition: String,
+        /// What the condition reads as.
+        kind: ArmCondition,
     },
     /// The body is not a `UNION` of grant arms and parent arms, alone or
     /// walked along a tree by a `WITH RECURSIVE` term.

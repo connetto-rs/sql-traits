@@ -15,8 +15,8 @@ use crate::{
         body_unqualified_names, helper_set,
     },
     structs::{
-        AggregateKind, Deployment, DynamicExecutionSites, FunctionBody, FunctionKind, HelperSet,
-        PlPgSqlSites, PrivilegeHolder, TargetName, UnqualifiedName,
+        AggregateKind, ArmCondition, Deployment, DynamicExecutionSites, FunctionBody, FunctionKind,
+        HelperSet, PlPgSqlSites, PrivilegeHolder, TargetName, UnqualifiedName,
     },
     traits::{DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
@@ -2156,56 +2156,64 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   lets through. A cap, `(<operands>) IN (SELECT * FROM
     ///   <helper>(<arguments>))`, optionally behind `<setting> IS NULL OR`,
     ///   keeps the rows whose operands are a row the helper returns, the helper
-    ///   answered in turn (see [`RowCap`](crate::structs::RowCap)). Conditions
-    ///   `current_setting('<setting>') <> <text>` and
+    ///   answered in turn (see [`RowCap`](crate::structs::RowCap)). In an arm
+    ///   naming its grantee by a value of the request, `<column> IN (SELECT
+    ///   <helper>(<arguments>))` on a column of its table is a cap of one
+    ///   operand. Conditions `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
-    ///   [`CallerGate`](crate::structs::CallerGate)). The body may cast a read
-    ///   of one value to its declared type, and a set to an array of its
-    ///   declared element type or each element to that type, and any other cast
-    ///   refuses the answer. It may read any setting through
-    ///   `NULLIF(current_setting(...), '')`, which reads `''` as `NULL` and so
-    ///   maps both states of an unset setting to `NULL`. Wherever it reads a
-    ///   setting it may call an accessor instead, a zero-argument `sql`
-    ///   function written as a string whose body selects one such read, cast or
-    ///   not, and returns its type, and wherever it builds the array of a set
-    ///   it may call an accessor whose body selects that array and returns its
-    ///   array type. The accessor's body resolves on its own path or, where it
-    ///   pins none, on the caller's, as the role it runs as, and an accessor
-    ///   that is `IMMUTABLE` or sets the setting it reads refuses the answer. A
-    ///   time bound is a conjunct `<column> <comparison> now()`, a
-    ///   `timestamptz` column of the table compared with `<`, `<=`, `>` or `>=`
-    ///   either way round, optionally `OR <column> IS NULL`, and the arm
-    ///   answers it as a [`TimeBound`](crate::structs::TimeBound).
-    ///   `CURRENT_TIMESTAMP` and `transaction_timestamp()` read the same
-    ///   statement time as `now()`. An anti-join is a conjunct `NOT EXISTS
-    ///   (SELECT 1 FROM <table> WHERE <conditions>)` whose conditions equal
-    ///   columns of `<table>` with columns of the arm's table and otherwise
-    ///   read `<table>` alone, and the arm answers it as an
-    ///   [`AntiJoin`](crate::structs::AntiJoin). An exclusion, a conjunct
-    ///   `<column> NOT IN (SELECT <helper>(<arguments>))` or another spelling
-    ///   of it, refuses the answer here, and
-    ///   [`helper_set_with_exclusions`](Self::helper_set_with_exclusions) reads
-    ///   it. The rest, the arguments substituted, reduce to `TRUE`, to `FALSE`
-    ///   or `NULL`, or to what columns have to hold, literal values, a
-    ///   `boolean` column alone holding `TRUE`, `<column> IS NULL` or `<column>
-    ///   IS NOT NULL` (see [`Restriction`](crate::structs::Restriction)). A
-    ///   column of an enum type compared with a label by `<`, `<=`, `>` or
-    ///   `>=`, either way round, holds the labels on the kept side of it in the
-    ///   order the type declares them, `ALTER TYPE ... ADD VALUE` applied. The
-    ///   table may be followed by `[INNER] JOIN <table> ON <condition>` for
-    ///   each row it names through a foreign key, the conditions in `ON` read
-    ///   as those in `WHERE`. Each column of the key equated with the column it
-    ///   references joins the row, and the conditions on that row alone reduce
-    ///   to a [`JoinedRow`](crate::structs::JoinedRow), the grantee and the
-    ///   returned columns staying on the arm's own table. A cap may take
-    ///   operands from the joined rows as well. The arm's table's primary key,
-    ///   returned by the arm and referencing no table through a single-column
-    ///   foreign key, compared by `<key> IN (SELECT <helper>(<arguments>))` or
-    ///   `<key> IN (SELECT * FROM <helper>(<arguments>))`, is a cap of one
-    ///   operand, keeping the rows whose key the helper returns. Any other arm
-    ///   comparing a helper's set while returning a key it would return as a
-    ///   parent arm is one, so it takes no other condition and joins no row.
+    ///   [`CallerGate`](crate::structs::CallerGate)). A condition
+    ///   `current_setting('<setting>') IS NULL` on any declared setting keeps
+    ///   the arm's rows only for a request leaving it unset (see
+    ///   [`UnsetSetting`](crate::structs::UnsetSetting)), read where
+    ///   `conditions` names [`ArmCondition::UnsetSetting`] and refusing the
+    ///   answer otherwise. The body may cast a read of one value to its
+    ///   declared type, and a set to an array of its declared element type or
+    ///   each element to that type, and any other cast refuses the answer. It
+    ///   may read any setting through `NULLIF(current_setting(...), '')`, which
+    ///   reads `''` as `NULL` and so maps both states of an unset setting to
+    ///   `NULL`. Wherever it reads a setting it may call an accessor instead, a
+    ///   zero-argument `sql` function written as a string whose body selects
+    ///   one such read, cast or not, and returns its type, and wherever it
+    ///   builds the array of a set it may call an accessor whose body selects
+    ///   that array and returns its array type. The accessor's body resolves on
+    ///   its own path or, where it pins none, on the caller's, as the role it
+    ///   runs as, and an accessor that is `IMMUTABLE` or sets the setting it
+    ///   reads refuses the answer. A time bound is a conjunct `<column>
+    ///   <comparison> now()`, a `timestamptz` column of the table compared with
+    ///   `<`, `<=`, `>` or `>=` either way round, optionally `OR <column> IS
+    ///   NULL`, and the arm answers it as a
+    ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
+    ///   `transaction_timestamp()` read the same statement time as `now()`. An
+    ///   anti-join is a conjunct `NOT EXISTS (SELECT 1 FROM <table> WHERE
+    ///   <conditions>)` whose conditions equal columns of `<table>` with
+    ///   columns of the arm's table and otherwise read `<table>` alone, and the
+    ///   arm answers it as an [`AntiJoin`](crate::structs::AntiJoin). An
+    ///   exclusion, a conjunct `<column> NOT IN (SELECT <helper>(<arguments>))`
+    ///   or another spelling of it, is read where `conditions` names
+    ///   [`ArmCondition::Exclusion`] and refuses the answer otherwise (see
+    ///   [`ExcludedSet`](crate::structs::ExcludedSet)). The rest, the arguments
+    ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to what
+    ///   columns have to hold, literal values, a `boolean` column alone holding
+    ///   `TRUE`, `<column> IS NULL` or `<column> IS NOT NULL` (see
+    ///   [`Restriction`](crate::structs::Restriction)). A column of an enum
+    ///   type compared with a label by `<`, `<=`, `>` or `>=`, either way
+    ///   round, holds the labels on the kept side of it in the order the type
+    ///   declares them, `ALTER TYPE ... ADD VALUE` applied. The table may be
+    ///   followed by `[INNER] JOIN <table> ON <condition>` for each row it
+    ///   names through a foreign key, the conditions in `ON` read as those in
+    ///   `WHERE`. Each column of the key equated with the column it references
+    ///   joins the row, and the conditions on that row alone reduce to a
+    ///   [`JoinedRow`](crate::structs::JoinedRow), the grantee and the returned
+    ///   columns staying on the arm's own table. A cap may take operands from
+    ///   the joined rows as well. The arm's table's primary key, returned by
+    ///   the arm and referencing no table through a single-column foreign key,
+    ///   compared by `<key> IN (SELECT <helper>(<arguments>))` or `<key> IN
+    ///   (SELECT * FROM <helper>(<arguments>))`, is a cap of one operand,
+    ///   keeping the rows whose key the helper returns. Any other arm naming no
+    ///   grantee by a value of the request and comparing a helper's set while
+    ///   returning a key it would return as a parent arm is one, so it takes no
+    ///   other condition and joins no row.
     /// - A parent arm, `SELECT <key> FROM <table> WHERE <column> IN (SELECT
     ///   <helper>(<arguments>))`, each argument a parameter or a literal, the
     ///   helper called answered in turn for the arguments it receives. `<key>`
@@ -2257,17 +2265,24 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// schemas on the path the owner cannot use, as PostgreSQL leaves them out
     /// of the owner's path.
     ///
+    /// An arm writing a condition `conditions` does not name refuses the
+    /// answer, so a consumer ignoring such conditions never keeps a row they
+    /// take away. Every helper the body calls is read with the same
+    /// `conditions`.
+    ///
     /// # Arguments
     ///
     /// * `arguments` - One literal per input parameter.
     /// * `deployment` - The deployment declaring the settings the arms compare
     ///   with.
     /// * `database` - The database the helper belongs to.
+    /// * `conditions` - The conditions the consumer reads beside those every
+    ///   answer carries, each of which it applies or refuses.
     ///
     /// # Errors
     ///
-    /// Returns the [`HelperSetError`] naming why the helper, or a helper a
-    /// parent arm calls, refuses to answer.
+    /// Returns the [`HelperSetError`] naming why the helper, or a helper its
+    /// body calls, refuses to answer.
     ///
     /// # Example
     ///
@@ -2299,8 +2314,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     .function_by_target(TargetName::new("docs_with", false), IdentifierCase::AsWritten)?
     ///     .expect("the helper exists");
     ///
-    /// let set =
-    ///     docs_with.helper_set(&[Value::SingleQuotedString("write".into())], &deployment, &db)?;
+    /// let set = docs_with.helper_set(
+    ///     &[Value::SingleQuotedString("write".into())],
+    ///     &deployment,
+    ///     &db,
+    ///     &[],
+    /// )?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
     /// let [Returned::Read(doc)] = grant.returned() else { panic!("the helper returns one column") };
     /// assert_eq!(doc.column_name(), "doc_id");
@@ -2316,41 +2335,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # Ok(())
     /// # }
     /// ```
-    #[inline]
-    fn helper_set<'db>(
-        &'db self,
-        arguments: &[Value],
-        deployment: &'db Deployment,
-        database: &'db Self::DB,
-    ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
-        helper_set(self, arguments, deployment, database, false)
-    }
-
-    /// What this helper returns for a request of `deployment`, called with
-    /// `arguments`, as [`helper_set`](Self::helper_set) answers it, a grant
-    /// arm also keeping only the rows whose column stays outside the set
-    /// another helper returns (see [`ExcludedSet`](crate::structs::ExcludedSet)
-    /// and [`GrantArm::exclusions`](crate::structs::GrantArm::exclusions)).
-    /// Every helper the body calls is read the same way.
     ///
-    /// [`helper_set`](Self::helper_set) refuses such an arm, so a consumer
-    /// ignoring exclusions never keeps a row the helper leaves out. A
-    /// consumer calls this one where it subtracts every exclusion of an
-    /// answer, or refuses the ones it cannot.
-    ///
-    /// # Arguments
-    ///
-    /// * `arguments` - One literal per input parameter.
-    /// * `deployment` - The deployment declaring the settings the arms compare
-    ///   with.
-    /// * `database` - The database the helper belongs to.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`HelperSetError`] naming why the helper, or a helper its
-    /// body calls, refuses to answer.
-    ///
-    /// # Example
+    /// An exclusion is read only for a consumer naming it:
     ///
     /// ```rust
     /// use sql_traits::{errors::HelperSetError, prelude::*};
@@ -2386,10 +2372,10 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///     .expect("the helper exists");
     ///
     /// assert!(matches!(
-    ///     visible.helper_set(&[], &deployment, &db),
-    ///     Err(HelperSetError::UnreadExclusion { .. })
+    ///     visible.helper_set(&[], &deployment, &db, &[]),
+    ///     Err(HelperSetError::UnreadCondition { kind: ArmCondition::Exclusion, .. })
     /// ));
-    /// let set = visible.helper_set_with_exclusions(&[], &deployment, &db)?;
+    /// let set = visible.helper_set(&[], &deployment, &db, &[ArmCondition::Exclusion])?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
     /// let [blocked] = grant.exclusions() else { panic!("the arm excludes one set") };
     /// assert_eq!(blocked.column().column_name(), "id");
@@ -2401,13 +2387,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// # }
     /// ```
     #[inline]
-    fn helper_set_with_exclusions<'db>(
+    fn helper_set<'db>(
         &'db self,
         arguments: &[Value],
         deployment: &'db Deployment,
         database: &'db Self::DB,
+        conditions: &[ArmCondition],
     ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
-        helper_set(self, arguments, deployment, database, true)
+        helper_set(self, arguments, deployment, database, conditions)
     }
 
     /// Returns the normalized return type name of the function as a string.

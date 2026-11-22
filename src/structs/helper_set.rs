@@ -12,6 +12,20 @@ use crate::{
     traits::DatabaseLike,
 };
 
+/// A condition of a grant arm that
+/// [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
+/// reads only where its consumer names it, refusing an arm writing it
+/// otherwise, so a consumer never keeps a row such a condition takes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArmCondition {
+    /// The sets of other helpers a row has to stay outside (see
+    /// [`GrantArm::exclusions`]).
+    Exclusion,
+    /// The settings a request has to leave unset (see
+    /// [`GrantArm::unset_settings`]).
+    UnsetSetting,
+}
+
 /// The set a helper returns, the union of its arms kept to the rows its
 /// [`selection`](Self::selection) keeps.
 ///
@@ -110,16 +124,19 @@ pub enum Returned<S> {
 
 /// `SELECT <columns> FROM <table> [JOIN <joined table> ON <key>]... [WHERE
 /// <conditions>]`, the rows the conditions keep for the grantee they name,
-/// the caller gate they write, the restrictions and bounds the rest of them
-/// reduce to, the caps they write, the rows of other tables each row has to
-/// name, the rows of other tables whose existence takes a row away, and the
-/// sets of other helpers a row has to stay outside.
+/// the caller gate they write, the settings they require unset, the
+/// restrictions and bounds the rest of them reduce to, the caps they write,
+/// the rows of other tables each row has to name, the rows of other tables
+/// whose existence takes a row away, and the sets of other helpers a row
+/// has to stay outside.
 #[derive(Debug)]
 pub struct GrantArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
     pub(crate) returned: Vec<Returned<&'db DB::Column>>,
     pub(crate) granted_to: GrantedTo<'db, DB>,
     pub(crate) gate: Option<CallerGate<'db>>,
+    /// Shared as [`caps`](Self::caps) is.
+    pub(crate) unset_settings: Arc<[UnsetSetting<'db>]>,
     pub(crate) restrictions: Vec<Restriction<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
     /// Shared by the arms an `IN` list of request values splits one
@@ -162,6 +179,15 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
         self.gate.as_ref()
     }
 
+    /// The settings the request has to leave unset for the arm to keep any
+    /// row, every one of them, in the order the condition writes them. Empty
+    /// in every answer whose reading leaves [`ArmCondition::UnsetSetting`]
+    /// unread, which refuses an arm writing one.
+    #[must_use]
+    pub fn unset_settings(&self) -> &[UnsetSetting<'db>] {
+        &self.unset_settings
+    }
+
     /// What columns have to hold, one restriction per column, all of them
     /// holding at once, in the order the condition first names the columns.
     /// Empty where the condition is absent or holds for every row.
@@ -195,11 +221,8 @@ impl<'db, DB: DatabaseLike> GrantArm<'db, DB> {
     /// The sets of other helpers a row's column has to stay outside, every
     /// one of them, in the order the condition writes them. An exclusion of
     /// a set holding no arm takes no row away and is left out. Empty in every
-    /// answer of [`FunctionLike::helper_set`], which refuses an arm writing
-    /// one (see [`FunctionLike::helper_set_with_exclusions`]).
-    ///
-    /// [`FunctionLike::helper_set`]: crate::traits::FunctionLike::helper_set
-    /// [`FunctionLike::helper_set_with_exclusions`]: crate::traits::FunctionLike::helper_set_with_exclusions
+    /// answer whose reading leaves [`ArmCondition::Exclusion`] unread, which
+    /// refuses an arm writing one.
     #[must_use]
     pub fn exclusions(&self) -> &[ExcludedSet<'db, DB>] {
         &self.exclusions
@@ -391,8 +414,10 @@ impl<'db, DB: DatabaseLike> ExcludedSet<'db, DB> {
 /// may then compare with `(SELECT <function>(<arguments>))` as well. Without
 /// it, a single operand is a cap only where it is the primary key of the
 /// arm's table, which the arm returns and which references no table through
-/// a single-column foreign key, since otherwise the conjunct names the
-/// arm's grantee (see [`GrantedTo::Set`]) or its parent (see [`ParentArm`]).
+/// a single-column foreign key, or where it is a column of the arm's table
+/// in an arm naming its grantee by a value of the request (see
+/// [`GrantedTo::Request`]), since otherwise the conjunct names the arm's
+/// grantee (see [`GrantedTo::Set`]) or its parent (see [`ParentArm`]).
 /// Each operand is a column of the arm's table or of a row it joins (see
 /// [`GrantArm::joined_rows`]), or a literal or an argument, plain or cast to
 /// the type the helper declares the column it pairs with in. An operand
@@ -404,7 +429,7 @@ pub struct RowCap<'db, DB: DatabaseLike> {
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
     pub(crate) set: Box<HelperSet<'db, DB>>,
-    pub(crate) lift: Option<CapLift<'db>>,
+    pub(crate) lift: Option<UnsetSetting<'db>>,
 }
 
 impl<'db, DB: DatabaseLike> RowCap<'db, DB> {
@@ -438,7 +463,7 @@ impl<'db, DB: DatabaseLike> RowCap<'db, DB> {
     /// The `<setting> IS NULL` lifting the cap, or `None` where the cap
     /// holds for every request.
     #[must_use]
-    pub fn lift(&self) -> Option<&CapLift<'db>> {
+    pub fn lift(&self) -> Option<&UnsetSetting<'db>> {
         self.lift.as_ref()
     }
 }
@@ -460,23 +485,25 @@ pub enum CapOperand<'db, DB: DatabaseLike> {
     Value(Value),
 }
 
-/// `current_setting(<setting>) IS NULL`, lifting a [`RowCap`] for a request
-/// leaving the setting unset. The body may cast the read to the type the
+/// `current_setting(<setting>) IS NULL`, holding for a request leaving the
+/// setting unset, which lifts a [`RowCap`] or, as a conjunct of its own,
+/// keeps a grant arm's rows only for such a request (see
+/// [`GrantArm::unset_settings`]). The body may cast the read to the type the
 /// deployment declares the setting in, and may read it through
 /// `NULLIF(<read>, '')`, which reads `''` as `NULL`.
 ///
 /// A custom setting set for one transaction reads `''` once the
-/// transaction ends, so a read without `NULLIF` keeps the cap on a pooled
+/// transaction ends, so a read without `NULLIF` fails on a pooled
 /// connection that once carried the setting (see
-/// [`lifts_on_empty`](Self::lifts_on_empty)).
+/// [`reads_empty_as_unset`](Self::reads_empty_as_unset)).
 #[derive(Debug)]
-pub struct CapLift<'db> {
+pub struct UnsetSetting<'db> {
     pub(crate) setting: &'db SessionSetting,
     pub(crate) raises_when_unset: bool,
-    pub(crate) lifts_on_empty: bool,
+    pub(crate) reads_empty_as_unset: bool,
 }
 
-impl<'db> CapLift<'db> {
+impl<'db> UnsetSetting<'db> {
     /// The setting read, as the deployment declares it.
     #[must_use]
     pub fn setting(&self) -> &'db SessionSetting {
@@ -490,12 +517,12 @@ impl<'db> CapLift<'db> {
         self.raises_when_unset
     }
 
-    /// Whether the setting reading `''` lifts the cap, the body reading it
+    /// Whether the setting reading `''` holds as unset, the body reading it
     /// through `NULLIF(<read>, '')`. A read cast to a type `''` is not a
     /// value of, such as `uuid`, raises `22P02` on `''` otherwise.
     #[must_use]
-    pub fn lifts_on_empty(&self) -> bool {
-        self.lifts_on_empty
+    pub fn reads_empty_as_unset(&self) -> bool {
+        self.reads_empty_as_unset
     }
 }
 
