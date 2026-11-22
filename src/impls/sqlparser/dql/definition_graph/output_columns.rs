@@ -40,13 +40,7 @@ impl OutputName {
 
     /// The name a select-list entry without an alias takes.
     fn figured(figure: Figure) -> Self {
-        match figure {
-            Figure::Strong(name, quoted) | Figure::Weak(name, quoted) => {
-                Self::Known { name, quoted }
-            }
-            Figure::Unnamed => Self::exact("?column?"),
-            Figure::Unknown => Self::Unknown,
-        }
+        figure.output_name().map_or(Self::Unknown, |(name, quoted)| Self::Known { name, quoted })
     }
 }
 

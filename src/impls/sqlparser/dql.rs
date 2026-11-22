@@ -10,8 +10,8 @@
 //! re-executing rows against the source table is never handed a computed or
 //! collapsed row. It is deliberately strict: anything it cannot prove comes
 //! from a single base table yields `Ok(None)`, and a table function, an
-//! unresolvable name, or a body whose columns cannot be enumerated (an
-//! unnamed computed projection item, a nested join) stays opaque.
+//! unresolvable name, or a body whose columns cannot be enumerated (a
+//! projection item whose name is not modeled, a nested join) stays opaque.
 
 use alloc::{
     borrow::ToOwned,
@@ -41,6 +41,7 @@ use crate::{
     traits::{ColumnLike, DQLLike, DatabaseLike, FunctionLike, Relation, TableLike, ViewLike},
     utils::{
         call_sites::call_reaches,
+        figured_names::figure,
         object_name::{
             Namespaces, PG_CATALOG, Qualifier, object_name_last_part, qualifier_of,
             render_table_candidate, resolve_bound_table_or_foreign_table,
@@ -2003,6 +2004,8 @@ fn wildcard_replaces_values(options: &WildcardAdditionalOptions) -> bool {
     options.opt_replace.is_some()
 }
 
+/// The name PostgreSQL gives an unaliased projection, with a declared name
+/// standing in where that name is not modeled.
 fn projection_output_name<DB: DatabaseLike, D: Copy>(
     expr: &Expr,
     bases: &[FromTableRef<'_, '_, DB, D>],
@@ -2010,9 +2013,13 @@ fn projection_output_name<DB: DatabaseLike, D: Copy>(
     ordinal: usize,
     case: IdentifierCase,
 ) -> Option<(String, bool)> {
-    projected_column_name(expr)
-        .or_else(|| three_part_output_name(expr, bases, case))
-        .or_else(|| output_names.and_then(|names| names.get(ordinal)))
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() > 2 => {
+            three_part_output_name(parts, bases, case)
+        }
+        _ => figure(expr).output_name(),
+    }
+    .or_else(|| output_names.and_then(|names| names.get(ordinal)))
 }
 
 fn projection_definition<'query, 'db, DB, P>(
@@ -3570,49 +3577,30 @@ where
     Ok(Some(DerivedShape { columns, row_preserving }))
 }
 
-/// The output name and quoting a pass-through column projection writes, or
-/// `None` for an expression that is not a column reference.
-fn projected_column_name(expr: &Expr) -> Option<(String, bool)> {
-    match expr {
-        Expr::Identifier(ident) => Some((ident.value.clone(), ident.quote_style.is_some())),
-        // Only the two-part `qualifier.column` shape names a pass-through
-        // column outright. A three-part `schema.table.column` reference is
-        // named separately, once its schema is checked against a base
-        // table, and anything longer has no name derived here.
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let last = &parts[1];
-            Some((last.value.clone(), last.quote_style.is_some()))
-        }
-        _ => None,
-    }
-}
-
 /// The output name a `schema.table.column` projection writes: PostgreSQL
 /// labels such a column with the trailing name, but only when the reference
 /// names a base table in that schema. An unresolvable reference belongs to a
 /// statement PostgreSQL would reject, so it yields no name and the body
-/// stays opaque rather than inventing an output column.
+/// stays opaque rather than inventing an output column. A longer reference
+/// has no name derived here.
 fn three_part_output_name<DB: DatabaseLike, D: Copy>(
-    expr: &Expr,
+    parts: &[Ident],
     bases: &[FromTableRef<'_, '_, DB, D>],
     case: IdentifierCase,
 ) -> Option<(String, bool)> {
-    let Expr::CompoundIdentifier(parts) = expr else {
+    let [schema, table, column] = parts else {
         return None;
     };
-    if parts.len() != 3 {
-        return None;
-    }
     let base = base_for_qualified_name(
         bases,
-        (parts[0].value.as_str(), parts[0].quote_style.is_some()),
-        (parts[1].value.as_str(), parts[1].quote_style.is_some()),
+        (schema.value.as_str(), schema.quote_style.is_some()),
+        (table.value.as_str(), table.quote_style.is_some()),
         false,
         usize::MAX,
         case,
     )?;
-    base_exposes_column(base, &parts[2], case)
-        .then(|| (parts[2].value.clone(), parts[2].quote_style.is_some()))
+    base_exposes_column(base, column, case)
+        .then(|| (column.value.clone(), column.quote_style.is_some()))
 }
 
 /// Every column a qualified wildcard over a base relation reaches, as a

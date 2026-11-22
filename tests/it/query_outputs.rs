@@ -317,6 +317,45 @@ fn unexpanded_wildcards_and_unmodeled_names_stay_unknown() {
     assert_eq!(names("SELECT '1'::nvarchar FROM b"), ["?"]);
 }
 
+// PostgreSQL names an unaliased select-list entry of a derived table, a CTE
+// or a view the way it names a top-level output, `?column?` for one it names
+// nothing, so a wildcard over that relation lists every column it holds.
+#[test]
+fn unaliased_derived_columns_take_the_names_postgresql_figures() {
+    let sql = "SELECT * FROM (SELECT id + 2, lower('x'), id::text, CASE WHEN true THEN 1 END, 7 \
+               FROM a) AS t";
+    assert_eq!(names(sql), ["\"?column?\"", "lower", "id", "\"case\"", "\"?column?\""]);
+    assert_eq!(
+        outputs(sql),
+        [
+            "expression id + 2",
+            "expression lower('x')",
+            "expression id::TEXT",
+            "expression CASE WHEN true THEN 1 END",
+            "expression 7",
+        ]
+    );
+    assert_eq!(names("WITH c AS (SELECT id + 2 FROM a) SELECT * FROM c"), ["\"?column?\""]);
+    assert_eq!(
+        outputs("SELECT t.\"?column?\" FROM (SELECT id + 2 FROM a) AS t"),
+        ["expression id + 2"]
+    );
+    assert_eq!(
+        outputs("SELECT t.lower FROM (SELECT lower('x') FROM a) AS t"),
+        ["expression lower('x')"]
+    );
+    let database = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE a(id INT); CREATE VIEW v AS SELECT id + 2 FROM a;",
+    )
+    .expect("schema parses");
+    assert_eq!(outputs_in(&database, "SELECT * FROM v", |query| query), ["expression id + 2"]);
+}
+
+#[test]
+fn a_derived_column_whose_name_is_not_modeled_leaves_the_wildcard_unexpanded() {
+    assert_eq!(names("SELECT * FROM (SELECT id + 2, '1'::nvarchar FROM b) AS t"), ["*"]);
+}
+
 #[test]
 fn in_table_and_unnest_outputs_have_unnamed_expression_names() {
     use sqlparser::dialect::SQLiteDialect;
