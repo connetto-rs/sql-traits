@@ -14,16 +14,11 @@ autotests = false
 
 [features]
 default = ["std"]
-# Re-enables the standard library and the I/O surface that needs it:
-# filesystem-backed `ParserDB::from_path*` and the
-# `Error::IoError`/`SqlParserError.file` PathBuf carriers.
-# Also forwards `sqlparser/recursive-protection`, which is itself
-# `std`-only — keeping the stack-overflow guard for deeply nested parse
-# trees in std builds, and dropping it (along with the `recursive` →
-# `stacker` → `psm` → `libc` chain) for no_std consumers.
+# The standard library, filesystem-backed construction and the `std`-only stack-overflow guards.
 std = [
     "sqlparser/std",
     "sqlparser/recursive-protection",
+    "dep:recursive",
     "geometric-traits/std",
     "thiserror/std",
     "sqlparser-plpgsql/std",
@@ -50,6 +45,7 @@ parity-fixtures = ["std", "serde", "dep:serde_json", "dep:toml"]
 
 [dependencies]
 sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
+recursive = { version = "0.1.1", optional = true }
 geometric-traits = { version = "0.2.3", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0", default-features = false }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", default-features = false, features = ["body-parse"] }
