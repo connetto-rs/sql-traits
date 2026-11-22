@@ -101,6 +101,8 @@ pub(super) enum Doomed {
     Domain(usize),
     /// The user-defined type at this position.
     UserType(usize),
+    /// The row type of the table at this position.
+    RowType(usize),
 }
 
 /// Whether `doomed` holds the domain at `position`.
@@ -647,6 +649,9 @@ fn doomed_type_name(builder: &ParserDBBuilder, doomed: &Doomed) -> String {
         Doomed::UserType(position) => {
             builder.dialect().stored_object_name(&builder.user_defined_types()[*position].0.name)
         }
+        Doomed::RowType(position) => {
+            builder.dialect().stored_object_name(&builder.tables()[*position].0.name)
+        }
     }
 }
 
@@ -658,12 +663,28 @@ fn dependents_error(
     dependent_kind: ObjectKind,
     dependent_name: String,
 ) -> Error {
+    if let Doomed::RowType(position) = used {
+        let table = builder.tables()[*position].0.as_ref();
+        let key = super::stored_table_key(builder.namespaces(), table, IdentifierCase::AsWritten);
+        return Error::RelationHasDependents {
+            object_kind: if builder.is_foreign_table(table) {
+                ObjectKind::ForeignTable
+            } else {
+                ObjectKind::Table
+            },
+            schema_name: super::views::relation_schema_for_error(builder, &key),
+            object_name: key.name,
+            dependent_kind,
+            dependent_name,
+        };
+    }
     let name = doomed_type_name(builder, used);
     let type_display = diagnostic_type(
         builder,
         match used {
             Doomed::Domain(position) => &builder.domains()[*position].0.name,
             Doomed::UserType(position) => &builder.user_defined_types()[*position].0.name,
+            Doomed::RowType(position) => &builder.tables()[*position].0.name,
         },
     );
     match used {
@@ -675,7 +696,7 @@ fn dependents_error(
                 dependent_name,
             }
         }
-        Doomed::UserType(_) => {
+        Doomed::UserType(_) | Doomed::RowType(_) => {
             Error::TypeHasDependents {
                 type_name: name,
                 type_display,
@@ -707,6 +728,13 @@ fn declared_type_reaches_doomed(
         }
         Some(Reached::UserType(position, _)) if doomed_user_type(doomed, position) => {
             Some(Doomed::UserType(position))
+        }
+        Some(Reached::RowType(ObjectKind::Table | ObjectKind::ForeignTable)) => {
+            let table = builder.resolve_table_object_name(name).ok().flatten()?;
+            doomed.iter().copied().find(|candidate| {
+                matches!(candidate, Doomed::RowType(position)
+                    if core::ptr::eq(builder.tables()[*position].0.as_ref(), table))
+            })
         }
         _ => None,
     }
@@ -751,6 +779,7 @@ fn held_type_identities(
             let type_ = &builder.user_defined_types()[position].0;
             type_identities(arrays, &type_.name, type_.multirange_name.as_ref())
         }
+        Doomed::RowType(_) => Vec::new(),
     }
 }
 
@@ -1063,14 +1092,50 @@ fn extend_doomed_by_dependents(
     Ok(())
 }
 
-/// Drops the objects at `doomed`, refusing what uses them unless `cascade`,
-/// in which case the columns, composite attributes, domains, ranges and
-/// functions using them go too.
+/// Refuses columns and composite attributes that depend on a doomed type.
+fn refuse_dependent_attributes(builder: &ParserDBBuilder, doomed: &[Doomed]) -> Result<(), Error> {
+    for (position, (table, _, _)) in builder.tables().iter().enumerate() {
+        if doomed.contains(&Doomed::RowType(position)) {
+            continue;
+        }
+        for column in &table.columns {
+            if let Some(used) = declared_type_reaches_doomed(builder, &column.data_type, doomed) {
+                return Err(dependents_error(
+                    builder,
+                    &used,
+                    ObjectKind::Column,
+                    stored_attribute_name(builder, &table.name, &column.name),
+                ));
+            }
+        }
+    }
+    for (type_, _) in builder.user_defined_types() {
+        let Some(attributes) = type_.composite_attributes() else {
+            continue;
+        };
+        for attribute in attributes {
+            if let Some(used) = declared_type_reaches_doomed(builder, &attribute.data_type, doomed)
+            {
+                return Err(dependents_error(
+                    builder,
+                    &used,
+                    ObjectKind::Column,
+                    stored_attribute_name(builder, &type_.name, &attribute.name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drops types and their dependents, leaving row-type owners and their
+/// identities to the caller.
 ///
-/// Returns the builder alongside the identities the doomed types hold, each
-/// with its stored array, and the functions the drop removes, read before the
-/// removal, whose own dependents are left for the caller to take.
-fn drop_positions(
+/// # Errors
+///
+/// Returns dependency refusals without `CASCADE` and errors dropping dependent
+/// columns.
+pub(super) fn drop_positions(
     mut builder: ParserDBBuilder,
     doomed: &[Doomed],
     cascade: bool,
@@ -1087,37 +1152,7 @@ fn drop_positions(
     // Without `CASCADE` a column or attribute of a doomed type or multirange
     // blocks the drop.
     if !cascade {
-        for (table, _, _) in builder.tables() {
-            for column in &table.columns {
-                if let Some(used) =
-                    declared_type_reaches_doomed(&builder, &column.data_type, &doomed_owned)
-                {
-                    return Err(dependents_error(
-                        &builder,
-                        &used,
-                        ObjectKind::Column,
-                        stored_attribute_name(&builder, &table.name, &column.name),
-                    ));
-                }
-            }
-        }
-        for (type_, _) in builder.user_defined_types() {
-            let Some(attributes) = type_.composite_attributes() else {
-                continue;
-            };
-            for attribute in attributes {
-                if let Some(used) =
-                    declared_type_reaches_doomed(&builder, &attribute.data_type, &doomed_owned)
-                {
-                    return Err(dependents_error(
-                        &builder,
-                        &used,
-                        ObjectKind::Column,
-                        stored_attribute_name(&builder, &type_.name, &attribute.name),
-                    ));
-                }
-            }
-        }
+        refuse_dependent_attributes(&builder, &doomed_owned)?;
     }
 
     let mut removed = if cascade {
@@ -1200,7 +1235,10 @@ fn drop_dependents_cascade(
     // An inherited column leaves with the parent's, so only declared columns
     // are dropped.
     loop {
-        let next = builder.tables().iter().find_map(|(table, _, _)| {
+        let next = builder.tables().iter().enumerate().find_map(|(position, (table, _, _))| {
+            if doomed.contains(&Doomed::RowType(position)) {
+                return None;
+            }
             table
                 .columns
                 .iter()
@@ -1491,12 +1529,20 @@ pub(super) fn alter_type(
     }
 }
 
+/// A domain or user-defined type that can be altered independently.
+enum NamedType {
+    /// The position among stored domains.
+    Domain(usize),
+    /// The position among stored user-defined types.
+    UserType(usize),
+}
+
 /// The type a rename or enum alteration names, or the refusal that name does
 /// not reach.
 fn resolve_named_type(
     builder: &ParserDBBuilder,
     name: &ObjectName,
-) -> Result<(Doomed, bool), Error> {
+) -> Result<(NamedType, bool), Error> {
     let (schema, ident) = object_name_identifiers(name)?;
     let reached = match schema {
         Some(schema) => reach_in_schema(builder, ident, ident_parts(schema)),
@@ -1508,7 +1554,7 @@ fn resolve_named_type(
         return Err(Error::SchemaNotFound { schema_name });
     }
     match reached {
-        Some(Reached::Domain(position)) => Ok((Doomed::Domain(position), false)),
+        Some(Reached::Domain(position)) => Ok((NamedType::Domain(position), false)),
         Some(Reached::UserType(position, is_multirange)) => {
             if builder.user_defined_types()[position].0.is_shell() {
                 return Err(Error::TypeIsOnlyShell {
@@ -1517,7 +1563,7 @@ fn resolve_named_type(
                         .stored_object_name(&builder.user_defined_types()[position].0.name),
                 });
             }
-            Ok((Doomed::UserType(position), is_multirange))
+            Ok((NamedType::UserType(position), is_multirange))
         }
         Some(Reached::RowType(kind)) => {
             Err(Error::TypeIsRowType {
@@ -1554,8 +1600,8 @@ fn alter_type_rename(
     }
     let (target, is_multirange) = resolve_named_type(&builder, name)?;
     let old_name = match target {
-        Doomed::Domain(position) => builder.domains()[position].0.name.clone(),
-        Doomed::UserType(position) => {
+        NamedType::Domain(position) => builder.domains()[position].0.name.clone(),
+        NamedType::UserType(position) => {
             let type_ = &builder.user_defined_types()[position].0;
             if is_multirange {
                 type_.multirange_name.clone().ok_or_else(|| {
@@ -1569,10 +1615,10 @@ fn alter_type_rename(
     let schema = qualifier_of(&old_name).named().unwrap_or((DEFAULT_SCHEMA, false));
     // A composite takes a relation name, which the other kinds do not.
     let is_composite = match target {
-        Doomed::UserType(position) => {
+        NamedType::UserType(position) => {
             builder.user_defined_types()[position].0.kind() == UserDefinedTypeKind::Composite
         }
-        Doomed::Domain(_) => false,
+        NamedType::Domain(_) => false,
     };
     if let Some(conflicting_kind) =
         is_composite.then(|| relation_name_holder(&builder, new_name, Some(schema), None)).flatten()
@@ -1620,18 +1666,18 @@ fn alter_type_rename(
     // Re-point the references, then rewrite the stored name.
     let mut builder = repoint_type_references(builder, &old_name, &destination)?;
     match target {
-        Doomed::Domain(position) => {
+        NamedType::Domain(position) => {
             let (domain, _) = &mut builder.domains_mut()[position];
             let domain = Arc::make_mut(domain);
             rewrite_last_ident(&mut domain.name, new_name);
         }
-        Doomed::UserType(position) if !is_multirange => {
+        NamedType::UserType(position) if !is_multirange => {
             range_constructors::follow_range_rename(&mut builder, position, new_name);
             let (type_, _) = &mut builder.user_defined_types_mut()[position];
             let type_ = Arc::make_mut(type_);
             rewrite_last_ident(&mut type_.name, new_name);
         }
-        Doomed::UserType(position) => {
+        NamedType::UserType(position) => {
             let dialect = *builder.dialect();
             let (type_, _) = &mut builder.user_defined_types_mut()[position];
             let type_ = Arc::make_mut(type_);
@@ -1683,8 +1729,8 @@ fn alter_type_add_value(
 ) -> Result<ParserDBBuilder, Error> {
     let (target, _is_multirange) = resolve_named_type(&builder, name)?;
     let (position, is_user_type) = match target {
-        Doomed::UserType(position) => (position, true),
-        Doomed::Domain(_) => (0, false),
+        NamedType::UserType(position) => (position, true),
+        NamedType::Domain(_) => (0, false),
     };
     if !is_user_type {
         return Err(Error::NotAnEnum {
@@ -1733,8 +1779,8 @@ fn alter_type_rename_value(
 ) -> Result<ParserDBBuilder, Error> {
     let (target, _is_multirange) = resolve_named_type(&builder, name)?;
     let (position, is_user_type) = match target {
-        Doomed::UserType(position) => (position, true),
-        Doomed::Domain(_) => (0, false),
+        NamedType::UserType(position) => (position, true),
+        NamedType::Domain(_) => (0, false),
     };
     if !is_user_type {
         return Err(Error::NotAnEnum {

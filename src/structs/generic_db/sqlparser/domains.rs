@@ -6,9 +6,9 @@
 //! A domain lands where a relation would, in the schema it names or in the
 //! first schema on the search path the input creates. Its name comes from the
 //! pool of type names of that schema, which holds every other domain and the
-//! row type of every table, view and materialized view. A sequence has no row
-//! type, yet a new sequence may not take a name a domain holds, while an index
-//! shares nothing with a type.
+//! row type of every table, foreign table, view and materialized view. A
+//! sequence has no row type, yet a new sequence may not take a name a domain
+//! holds, while an index shares nothing with a type.
 //!
 //! A type name written bare is looked for in the temporary schema, then in
 //! `pg_catalog`, then along the search path, unless the path lists either of
@@ -221,7 +221,13 @@ pub(super) fn type_name_holder(
 /// Whether a relation of this kind carries a row type, whose name is taken in
 /// the pool of type names.
 const fn has_row_type(kind: ObjectKind) -> bool {
-    matches!(kind, ObjectKind::Table | ObjectKind::View | ObjectKind::MaterializedView)
+    matches!(
+        kind,
+        ObjectKind::Table
+            | ObjectKind::ForeignTable
+            | ObjectKind::View
+            | ObjectKind::MaterializedView
+    )
 }
 
 /// An identifier as its value and whether it was quoted.

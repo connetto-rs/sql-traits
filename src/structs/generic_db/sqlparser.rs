@@ -10261,7 +10261,25 @@ impl ParserDB {
         arrays: &mut Arc<TypeArrays>,
     ) -> Result<(ParserDBBuilder, user_defined_types::TypeDrop), crate::errors::Error> {
         let cascade = refusing.is_none();
-        let mut removed = user_defined_types::TypeDrop::default();
+        let descendants = targets
+            .iter()
+            .flat_map(|target| inheritance::descendants(&builder, target))
+            .collect::<Vec<_>>();
+        let row_types = builder
+            .tables()
+            .iter()
+            .enumerate()
+            .filter(|(_, (table, _, _))| {
+                targets
+                    .iter()
+                    .chain(&descendants)
+                    .any(|target| target.matches(table, builder.identifier_case()))
+            })
+            .map(|(position, _)| user_defined_types::Doomed::RowType(position))
+            .collect::<Vec<_>>();
+        let (next, mut removed) =
+            user_defined_types::drop_positions(builder, &row_types, cascade, arrays)?;
+        builder = next;
         for dropped in targets {
             let case = builder.identifier_case();
             if !builder.tables().iter().any(|(table, _, _)| dropped.matches(table, case)) {
