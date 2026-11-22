@@ -1094,35 +1094,29 @@ fn extend_doomed_by_dependents(
 
 /// Refuses columns and composite attributes that depend on a doomed type.
 fn refuse_dependent_attributes(builder: &ParserDBBuilder, doomed: &[Doomed]) -> Result<(), Error> {
-    for (position, (table, _, _)) in builder.tables().iter().enumerate() {
-        if doomed.contains(&Doomed::RowType(position)) {
-            continue;
-        }
-        for column in &table.columns {
-            if let Some(used) = declared_type_reaches_doomed(builder, &column.data_type, doomed) {
-                return Err(dependents_error(
-                    builder,
-                    &used,
-                    ObjectKind::Column,
-                    stored_attribute_name(builder, &table.name, &column.name),
-                ));
-            }
-        }
-    }
-    for (type_, _) in builder.user_defined_types() {
-        let Some(attributes) = type_.composite_attributes() else {
-            continue;
-        };
-        for attribute in attributes {
-            if let Some(used) = declared_type_reaches_doomed(builder, &attribute.data_type, doomed)
-            {
-                return Err(dependents_error(
-                    builder,
-                    &used,
-                    ObjectKind::Column,
-                    stored_attribute_name(builder, &type_.name, &attribute.name),
-                ));
-            }
+    let columns = builder
+        .tables()
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| !doomed.contains(&Doomed::RowType(*position)))
+        .flat_map(|(_, (table, _, _))| {
+            table.columns.iter().map(|column| (&table.name, &column.name, &column.data_type))
+        });
+    let attributes = builder.user_defined_types().iter().flat_map(|(type_, _)| {
+        type_
+            .composite_attributes()
+            .unwrap_or_default()
+            .iter()
+            .map(|attribute| (&type_.name, &attribute.name, &attribute.data_type))
+    });
+    for (owner, name, data_type) in columns.chain(attributes) {
+        if let Some(used) = declared_type_reaches_doomed(builder, data_type, doomed) {
+            return Err(dependents_error(
+                builder,
+                &used,
+                ObjectKind::Column,
+                stored_attribute_name(builder, owner, name),
+            ));
         }
     }
     Ok(())
