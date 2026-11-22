@@ -128,6 +128,7 @@ mod length_check_spellings;
 mod literal_list_text_checks;
 mod maintenance_triggers;
 mod materialized_view_indexes;
+mod merged_column_bindings;
 mod multiple_primary_keys;
 mod names_outside_this_catalog;
 mod negated_length_checks;

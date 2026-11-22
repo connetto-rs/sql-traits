@@ -217,10 +217,10 @@ pub(crate) fn query_references<DB: DatabaseLike>(
                     .position(|address| *address == factor)
                     .map_or(SiteOutcome::Unknown, |factor| SiteOutcome::Entry { factor, ordinal })
             }
-            Reached::Origin(ColumnOrigin::Merged) => SiteOutcome::Merged,
+            Reached::Origin(ColumnOrigin::Merged { .. }) => SiteOutcome::Merged,
+            Reached::Origin(ColumnOrigin::Parameter) | Reached::Absent => SiteOutcome::Absent,
             Reached::Origin(ColumnOrigin::Output) => SiteOutcome::Output,
             Reached::Origin(ColumnOrigin::Unknown) | Reached::Unknown => SiteOutcome::Unknown,
-            Reached::Absent => SiteOutcome::Absent,
         }
     };
     references.sites = origins
@@ -882,7 +882,7 @@ fn unqualified_wildcard_items<DB: DatabaseLike>(
                     relation.shape.columns.iter().map(|column| (&*column.name, column.quoted)),
                 );
             }
-            WildcardEntry::Merged { name, quoted, provider } => {
+            WildcardEntry::Merged { name, quoted, provider, .. } => {
                 let qualifier =
                     provider.as_ref().map(|(provider, quoted)| [identifier(provider, *quoted)]);
                 items.push(column_item(

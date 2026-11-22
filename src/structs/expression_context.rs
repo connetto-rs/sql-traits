@@ -711,7 +711,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         } else {
             ColumnDefinition::Variable(variable)
         };
-        Some((definition, ColumnBinding::new(None, None, ColumnOrigin::Unknown, None)))
+        Some((definition, ColumnBinding::new(None, None, ColumnOrigin::Unknown, None, None)))
     }
 
     /// The type of the field of `variable` that `expression` names. A field
