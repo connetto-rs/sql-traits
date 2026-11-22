@@ -1017,6 +1017,7 @@ where
 /// the joined relation outputs and its wildcard plan, `None` when its columns
 /// cannot be enumerated. A merge among these joins absorbs only the entries
 /// `table` itself appended.
+#[cfg_attr(feature = "std", recursive::recursive)]
 fn collect_joined<'query, 'db, DB, P>(
     table: AstRef<'query, 'db, TableWithJoins>,
     scope: &mut P::Scope,
@@ -1705,6 +1706,7 @@ where
 
 /// Derives the output shape of a query used as a relation body. Returns
 /// `Ok(None)` when the columns cannot be enumerated.
+#[cfg_attr(feature = "std", recursive::recursive)]
 fn derive_query_shape<'query, 'db, DB, P>(
     query: AstRef<'query, 'db, Query>,
     cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
@@ -1742,6 +1744,7 @@ where
 /// Derives the output shape of a body. A set operation merges its arms by
 /// ordinal position: names come from the left arm (as in PostgreSQL) and a
 /// column keeps a source only while the arms agree on one.
+#[cfg_attr(feature = "std", recursive::recursive)]
 fn derive_set_expr_shape<'query, 'db, DB, P>(
     body: AstRef<'query, 'db, SetExpr>,
     cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
@@ -2034,6 +2037,7 @@ where
     profile.expression_definition(expression, scope)
 }
 
+#[cfg_attr(feature = "std", recursive::recursive)]
 fn index_nested_query_scopes<'query, 'db, DB, P>(
     query: AstRef<'query, 'db, Query>,
     outer_ctes: &[CteShape<'query, 'db, DB, P::Definition>],
@@ -2063,6 +2067,7 @@ where
     Ok(cursor)
 }
 
+#[cfg_attr(feature = "std", recursive::recursive)]
 fn index_nested_set_scopes<'query, 'db, DB, P>(
     body: AstRef<'query, 'db, SetExpr>,
     cte_scope: &[CteShape<'query, 'db, DB, P::Definition>],
@@ -2675,6 +2680,7 @@ where
         self.expression(right)
     }
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn factor_relation_inputs(&mut self, factor: &'source TableFactor) -> Result<(), LookupError> {
         match factor {
             TableFactor::Table {
@@ -2765,6 +2771,7 @@ where
         Ok(())
     }
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn factor_visible_expressions(
         &mut self,
         factor: &'source TableFactor,
@@ -3324,6 +3331,7 @@ where
         }
     }
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn expression(&mut self, expression: &'source Expr) -> Result<(), LookupError> {
         self.query.expression(expression)?;
         match expression {

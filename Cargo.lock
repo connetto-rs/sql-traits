@@ -990,6 +990,7 @@ dependencies = [
  "git2",
  "once_cell",
  "proptest",
+ "recursive",
  "serde",
  "serde_json",
  "sha2",
