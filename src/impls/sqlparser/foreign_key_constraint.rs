@@ -113,7 +113,13 @@ impl ForeignKeyLike for TableAttribute<CreateTable, ForeignKeyConstraint> {
     }
 
     fn is_validated(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        super::create_table::holds_validated(self.table(), self.attribute(), database)
+        Ok(super::create_table::holds_validated(self.table(), self.attribute(), database)?
+            && self.is_enforced(database))
+    }
+
+    #[inline]
+    fn is_enforced(&self, _database: &Self::DB) -> bool {
+        foreign_key_enforced(self.attribute())
     }
 
     #[inline]
@@ -238,9 +244,15 @@ impl<'key> From<&'key ForeignKeyConstraint> for StoredForeignKey<'key> {
             on_update: on_update.unwrap_or(ReferentialAction::NoAction),
             match_kind: match_kind.unwrap_or(ConstraintReferenceMatchKind::Simple),
             deferral: ConstraintDeferral::of(*characteristics),
-            enforced: characteristics.and_then(|written| written.enforced).unwrap_or(true),
+            enforced: foreign_key_enforced(key),
         }
     }
+}
+
+/// Whether the database checks rows against `key`, which only `NOT ENFORCED`
+/// turns off.
+pub(crate) fn foreign_key_enforced(key: &ForeignKeyConstraint) -> bool {
+    key.characteristics.and_then(|written| written.enforced).unwrap_or(true)
 }
 
 /// Whether `left` and `right` are one foreign key as PostgreSQL stores it,

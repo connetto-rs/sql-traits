@@ -46,6 +46,11 @@ fn absent_or_nonvalidatable_constraints() {
             "cannot validate constraint \"pk\" of relation \"t\"",
         ),
         (
+            "ALTER TABLE t ADD CONSTRAINT ne CHECK(a>0) NOT ENFORCED; ALTER TABLE t VALIDATE CONSTRAINT ne;",
+            "55000",
+            "cannot validate NOT ENFORCED constraint",
+        ),
+        (
             "ALTER TABLE t ADD CONSTRAINT uk UNIQUE(a) NOT VALID;",
             "0A000",
             "UNIQUE constraints cannot be marked NOT VALID",

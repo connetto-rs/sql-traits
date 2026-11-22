@@ -5555,6 +5555,18 @@ pub enum Error {
         constraint_name: String,
     },
     #[error(
+        "Constraint `{constraint_name}` of table `{table_name}` cannot be validated, because it is `NOT ENFORCED`."
+    )]
+    /// Error indicating that an `ALTER TABLE ... VALIDATE CONSTRAINT`
+    /// statement names a check or a foreign key the database does not
+    /// enforce, which PostgreSQL refuses since it never reads rows against it.
+    NotEnforcedNotValidatable {
+        /// The table the statement alters.
+        table_name: String,
+        /// The `NOT ENFORCED` constraint the statement names.
+        constraint_name: String,
+    },
+    #[error(
         "Constraint `{constraint}` added to table `{table_name}` cannot be marked `NOT VALID`, because only a check or a foreign key can be."
     )]
     /// Error indicating that `ALTER TABLE ... ADD ... NOT VALID` asked to skip

@@ -703,9 +703,11 @@ pub trait ForeignKeyLike:
     /// arrived have been checked against it.
     ///
     /// False for a foreign key added `NOT VALID` until `ALTER TABLE ...
-    /// VALIDATE CONSTRAINT` runs, matching `pg_constraint.convalidated`. New
-    /// rows are checked either way. Defaults to `true`, which is what every
-    /// foreign key not added `NOT VALID` means.
+    /// VALIDATE CONSTRAINT` runs, and always false for a foreign key the
+    /// database does not enforce, matching `pg_constraint.convalidated`. New
+    /// rows are checked only when the key is enforced. Defaults to `true`,
+    /// which is what every foreign key neither added `NOT VALID` nor written
+    /// `NOT ENFORCED` means.
     ///
     /// # Errors
     ///
@@ -739,6 +741,39 @@ pub trait ForeignKeyLike:
     #[inline]
     fn is_validated(&self, _database: &Self::DB) -> Result<bool, LookupError> {
         Ok(true)
+    }
+
+    /// Returns whether the database checks rows against the foreign key. A
+    /// foreign key written `NOT ENFORCED` is never checked, matching
+    /// `pg_constraint.conenforced`.
+    ///
+    /// Defaults to `true`, which is what every foreign key not spelling the
+    /// attribute means.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE customers (id INT PRIMARY KEY);
+    ///     CREATE TABLE orders (
+    ///         buyer INT REFERENCES customers (id) NOT ENFORCED,
+    ///         payer INT REFERENCES customers (id)
+    ///     );",
+    /// )?;
+    /// let orders = db.table_by_target(TargetName::new("orders", false), IdentifierCase::AsWritten)?;
+    /// let enforced: Vec<_> =
+    ///     orders.unwrap().foreign_keys(&db)?.map(|key| key.is_enforced(&db)).collect();
+    /// assert_eq!(enforced, [false, true]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_enforced(&self, _database: &Self::DB) -> bool {
+        true
     }
 
     /// Returns when the foreign key is checked within a transaction,
@@ -839,8 +874,9 @@ pub trait ForeignKeyLike:
     ///
     /// # Implementation note
     ///
-    /// A foreign key can be potentially not enforced if any of its columns is
-    /// nullable, and it is not labelled with a `MATCH FULL` clause.
+    /// A foreign key can be violated when the database does not enforce it,
+    /// or when any of its columns is nullable and it is not labelled with a
+    /// `MATCH FULL` clause.
     ///
     /// # Arguments
     ///
@@ -907,7 +943,8 @@ pub trait ForeignKeyLike:
     /// # }
     /// ```
     fn is_always_enforced(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(!self.has_nullable_host_columns(database)? || self.match_full(database))
+        Ok((!self.has_nullable_host_columns(database)? || self.match_full(database))
+            && self.is_enforced(database))
     }
 
     /// Returns an iterator over the columns in the referenced table that are

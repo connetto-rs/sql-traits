@@ -1488,6 +1488,12 @@ impl Error {
                     ),
                 ))
             }
+            Self::NotEnforcedNotValidatable { .. } => {
+                Some(PostgresError::new(
+                    pg::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    "cannot validate NOT ENFORCED constraint",
+                ))
+            }
             Self::NotValidRefused { kind: Some(kind), .. } => {
                 Some(PostgresError::new(
                     pg::FEATURE_NOT_SUPPORTED,

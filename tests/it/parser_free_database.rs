@@ -2344,10 +2344,11 @@ fn domains_without_quoting_records_store_folded_names() {
     assert_eq!(domain.stored_schema().as_deref(), Some("units"));
 }
 
-/// A catalog that keeps no `NOT VALID` state reports every constraint
-/// validated.
+/// A catalog that keeps no `NOT VALID` or `NOT ENFORCED` state reports every
+/// constraint enforced and validated.
 #[test]
-fn constraints_without_validation_records_report_validated() -> Result<(), LookupError> {
+fn constraints_without_validation_records_report_enforced_and_validated() -> Result<(), LookupError>
+{
     let catalog = catalog();
     let check = MemoryCheckConstraint {
         table_name: String::from("docs"),
@@ -2359,7 +2360,9 @@ fn constraints_without_validation_records_report_validated() -> Result<(), Looku
         referenced_table_name: String::from("docs"),
     };
 
+    assert!(check.is_enforced());
     assert!(check.is_validated(&catalog)?);
+    assert!(key.is_enforced(&catalog));
     assert!(key.is_validated(&catalog)?);
     Ok(())
 }
