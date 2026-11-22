@@ -33,7 +33,8 @@ fn unnested(mut expr: &Expr) -> &Expr {
 }
 
 /// What `check`'s expression can evaluate to on the rows of its table, under
-/// the column types, `NOT NULL` and the domain checks alone.
+/// the column types, `NOT NULL`, the domain checks and the generated columns
+/// alone.
 fn truth_on_its_own<C: CheckConstraintLike>(
     check: &C,
     database: &C::DB,
@@ -1398,10 +1399,10 @@ pub trait CheckConstraintLike:
     /// its expression never false and never raising.
     ///
     /// The expression is read as [`TableLike::expression_truth`] reads it,
-    /// under the column types, `NOT NULL` and the domain checks, and under
-    /// none of the table's other checks, so a check made redundant by
-    /// another is no tautology here. [`Self::truth_under_other_checks`]
-    /// answers that question.
+    /// under the column types, `NOT NULL`, the domain checks and the generated
+    /// columns, and under none of the table's other checks, so a check made
+    /// redundant by another is no tautology here.
+    /// [`Self::truth_under_other_checks`] answers that question.
     ///
     /// # Errors
     ///

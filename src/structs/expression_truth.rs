@@ -14,8 +14,8 @@ use sqlparser::{
 };
 use sqlparser_expr_eval::{
     ArrayElement, Builtin, Callee, CalleeKind, Collation, Context, EvalDialect, Evaluation,
-    Guarantees, Interval, NullInput, Outcomes, PostgreSqlOptions, Resolved, ScalarType, TextRules,
-    Unlisted, Values, Volatility, evaluate, implied,
+    Guarantees, Interval, NullInput, Outcomes, PostgreSqlOptions, Resolved, ScalarType, Subject,
+    TextRules, Unlisted, Values, Volatility, evaluate, implied,
     sql_values::postgres::{IntegerType, PgNumeric},
 };
 
@@ -29,7 +29,7 @@ use crate::{
     traits::{
         CheckConstraintLike, CollationMatch, ColumnCollation, ColumnLike, DataTypeLike,
         DatabaseLike, DialectLike, DomainLike, FunctionLike, MySqlCollationPadding,
-        NamedColumnCollation, TableLike,
+        NamedColumnCollation, TableLike, TypeModifier,
     },
     utils::{
         call_sites::{ExpressionForm, expression_form},
@@ -97,9 +97,10 @@ impl Engine {
 }
 
 /// What `expression` evaluates to on the rows of `table`, under the
-/// guarantees the column types, `NOT NULL`, the domain checks and the
-/// `checks` hold. `own` is the check `expression` belongs to, which seeds
-/// nothing and resolves its calls under the path it was created with.
+/// guarantees the column types, `NOT NULL`, the domain checks, the generated
+/// columns and the `checks` hold. `own` is the check `expression` belongs
+/// to, which seeds nothing and resolves its calls under the path it was
+/// created with.
 ///
 /// # Errors
 ///
@@ -157,7 +158,7 @@ fn truth_under<D: EvalDialect, DB: DatabaseLike>(
             context.value = Some(column);
             context.source = Source::Domain(current);
             for check in current.check_expressions() {
-                if context.holds_across_statements(check)? {
+                if context.holds_across_statements(check, TableContext::runs_immutable_alike)? {
                     guarantees = implied(
                         check,
                         Outcomes::NOT_FALSE,
@@ -172,8 +173,17 @@ fn truth_under<D: EvalDialect, DB: DatabaseLike>(
         }
     }
     context.value = None;
+    let mut generated = Vec::new();
+    for column in table.columns(database)? {
+        if let Some(expression) = column.generation_expression() {
+            context.source = Source::Generated(column);
+            if context.holds_across_statements(expression, TableContext::runs_immutable)? {
+                generated.push((column, expression));
+            }
+        }
+    }
+    let mut seeding = Vec::new();
     if let Checks::Validated = checks {
-        let mut seeding = Vec::new();
         for check in table.check_constraints(database)? {
             if context.own.is_none_or(|own| !ptr::eq(check, own))
                 && check.is_enforced()
@@ -181,30 +191,39 @@ fn truth_under<D: EvalDialect, DB: DatabaseLike>(
                 && check.is_validated(database)?
             {
                 context.source = Source::Check(check);
-                if context.holds_across_statements(check.expression(database))? {
+                if context.holds_across_statements(
+                    check.expression(database),
+                    TableContext::runs_immutable_alike,
+                )? {
                     seeding.push(check);
                 }
             }
         }
-        // A check may narrow a column only once another has, so the checks
-        // are read again until a round narrows nothing, at most once more
-        // than there are checks.
-        for _ in 0..=seeding.len() {
-            let before = guarantees.clone();
-            for check in &seeding {
-                context.source = Source::Check(*check);
-                guarantees = implied(
-                    check.expression(database),
-                    Outcomes::NOT_FALSE,
-                    dialect,
-                    options,
-                    &mut context,
-                    &guarantees,
-                )?;
-            }
-            if guarantees == before || guarantees.is_impossible() {
-                break;
-            }
+    }
+    // A check or a generated column may narrow a column only once another
+    // has, so they are read again until a round narrows nothing, at most
+    // once more than there are of them.
+    for _ in 0..=generated.len() + seeding.len() {
+        let before = guarantees.clone();
+        for &(column, expression) in &generated {
+            context.source = Source::Generated(column);
+            let evaluation = evaluate(expression, dialect, options, &mut context, &guarantees)?;
+            let held = context.generated(column, evaluation)?;
+            guarantees.restrict(Subject::Reference(ptr::from_ref(column).addr()), held);
+        }
+        for check in &seeding {
+            context.source = Source::Check(*check);
+            guarantees = implied(
+                check.expression(database),
+                Outcomes::NOT_FALSE,
+                dialect,
+                options,
+                &mut context,
+                &guarantees,
+            )?;
+        }
+        if guarantees == before || guarantees.is_impossible() {
+            break;
         }
     }
     // No row satisfies every guarantee, so the expression meets no row.
@@ -226,15 +245,20 @@ enum Source<'a, DB: DatabaseLike> {
     /// A check of a domain, resolved under the path the domain was created
     /// with.
     Domain(&'a DB::Domain),
+    /// The generation expression of a column, resolved under the path the
+    /// column was created with.
+    Generated(&'a DB::Column),
 }
 
 impl<DB: DatabaseLike> Source<'_, DB> {
-    /// The address of the check or domain, zero for the caller's expression.
+    /// The address of the check, domain or column, zero for the caller's
+    /// expression.
     fn address(&self) -> usize {
         match self {
             Source::Expression => 0,
             Source::Check(check) => ptr::from_ref(*check).addr(),
             Source::Domain(domain) => ptr::from_ref(*domain).addr(),
+            Source::Generated(column) => ptr::from_ref(*column).addr(),
         }
     }
 }
@@ -461,6 +485,12 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
                     domain.functions_reached_by(written, database).map(Iterator::collect)
                 })
             }
+            Source::Generated(column) => {
+                let column = *column;
+                reached_in(column.generation_expression(), call, |written| {
+                    column.functions_reached_by(written, database).map(Iterator::collect)
+                })
+            }
         };
         let functions: Vec<&DB::Function> = match reached {
             Ok(functions) => functions,
@@ -511,15 +541,15 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
     }
 
     /// Whether `expression` answers the same on a row in every statement,
-    /// which a check must for what it proved when the row was written to
-    /// still hold. A call to a function that is not immutable, or that
-    /// resolves to no function, and a SQL value function such as
-    /// `CURRENT_TIMESTAMP` may answer differently later.
-    ///
-    /// The guarantees a check seeds name its calls as written, so a call the
-    /// database's search path resolves to other functions than the check's
-    /// own path would carry them to calls of other functions.
-    fn holds_across_statements(&mut self, expression: &Expr) -> Result<bool, LookupError> {
+    /// which a check or a stored generated column must for what was proved
+    /// or computed when the row was written to still hold. A call `runs`
+    /// refuses and a SQL value function such as `CURRENT_TIMESTAMP` may
+    /// answer differently later.
+    fn holds_across_statements(
+        &mut self,
+        expression: &Expr,
+        runs: fn(&mut Self, &Function) -> Result<bool, LookupError>,
+    ) -> Result<bool, LookupError> {
         let mut answer = Ok(true);
         let _ = walk_expressions(expression, |node| {
             let Expr::Function(call) = node else { return ControlFlow::Continue(()) };
@@ -533,7 +563,7 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
                 }
                 None => {}
             }
-            match self.runs_immutable_alike(call) {
+            match runs(self, call) {
                 Ok(true) => ControlFlow::Continue(()),
                 Ok(false) => {
                     answer = Ok(false);
@@ -548,17 +578,23 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
         answer
     }
 
+    /// Whether `call` runs only immutable functions, under the path it was
+    /// written with.
+    fn runs_immutable(&mut self, call: &Function) -> Result<bool, LookupError> {
+        Ok(all_immutable(&self.runnable(call)?))
+    }
+
     /// Whether `call` runs only immutable functions, the same ones under
     /// the path it was written with as under the database's search path and,
     /// when the check being read writes the same call, under that check's
     /// path.
+    ///
+    /// The guarantees a check seeds name its calls as written, so a call the
+    /// database's search path resolves to other functions than the check's
+    /// own path would carry them to calls of other functions.
     fn runs_immutable_alike(&mut self, call: &Function) -> Result<bool, LookupError> {
         let written = self.runnable(call)?;
-        if written.is_empty()
-            || written
-                .iter()
-                .any(|function| !matches!(function.volatility(), FunctionBehavior::Immutable))
-        {
+        if !all_immutable(&written) {
             return Ok(false);
         }
         let own = self
@@ -580,6 +616,52 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
         }
         Ok(true)
     }
+
+    /// What `column` holds as its generation expression evaluates to
+    /// `evaluation`. A value the column's type may rewrite on assignment,
+    /// and any value outside PostgreSQL, whose assignment rules are the only
+    /// ones read here, leaves only whether the column may be `NULL`.
+    fn generated(
+        &mut self,
+        column: &DB::Column,
+        evaluation: Evaluation,
+    ) -> Result<Evaluation, LookupError> {
+        let database = self.database;
+        let own = self.engine.column(column, database, &mut self.collations)?.evaluation;
+        let data_type = column.data_type(database);
+        let base = data_type.base_type(database).unwrap_or(data_type);
+        let modified = base.typmod(database) != Some(TypeModifier::Unmodified);
+        let carried = self.engine == Engine::PostgreSql
+            && match (own.ty(), evaluation.ty()) {
+                (ScalarType::Text(_), ScalarType::Text(_) | ScalarType::UnknownLiteral)
+                | (ScalarType::Integer(_), ScalarType::Integer(_)) => true,
+                (ScalarType::Boolean | ScalarType::Date, ty) => ty == own.ty(),
+                (ScalarType::Numeric | ScalarType::Timestamp, ty) => ty == own.ty() && !modified,
+                _ => false,
+            };
+        // A listed value the type refuses or rewrites, such as text longer
+        // than a `varchar(n)` whose excess PostgreSQL trims as spaces,
+        // leaves the values unstated.
+        let stated = carried
+            && match evaluation.values() {
+                Values::Listed(listed) => {
+                    !listed.is_empty() && listed.iter().all(|value| own.values().admits(value))
+                }
+                Values::Unlisted(_) => !modified,
+                _ => false,
+            };
+        let held = evaluation.with_type(own.ty()).with_error(false);
+        Ok(if stated { held } else { held.with_values(Values::Unlisted(Unlisted::any())) })
+    }
+}
+
+/// Whether `functions` are immutable, none of them standing for a call that
+/// resolves to no function and may run anything.
+fn all_immutable<F: FunctionLike>(functions: &[&F]) -> bool {
+    !functions.is_empty()
+        && functions
+            .iter()
+            .all(|function| matches!(function.volatility(), FunctionBehavior::Immutable))
 }
 
 /// Whether `expression` writes a call equal to `call`.

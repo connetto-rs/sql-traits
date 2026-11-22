@@ -628,6 +628,74 @@ fn inherited_columns_keep_their_nullability() -> Result<(), Error> {
 }
 
 #[test]
+fn generated_columns_hold_what_their_expression_evaluates_to() -> Result<(), Error> {
+    let schema = "CREATE TABLE ownables (
+         id INT NOT NULL,
+         kind TEXT GENERATED ALWAYS AS ('note') STORED NOT NULL,
+         label TEXT GENERATED ALWAYS AS ('note') STORED,
+         computed TEXT GENERATED ALWAYS AS ('note') VIRTUAL,
+         doubled INT GENERATED ALWAYS AS (id * 2) STORED,
+         flag BOOLEAN GENERATED ALWAYS AS (true) STORED
+     );";
+    for sql in [
+        "kind = 'project'",
+        "label = 'folder'",
+        "computed <> 'note'",
+        "doubled IS NULL",
+        "NOT flag",
+    ] {
+        assert_eq!(truth_in(schema, "ownables", sql)?, never_raising(Outcomes::FALSE), "{sql}");
+    }
+    for sql in ["kind = 'note'", "label IS NOT NULL", "computed = 'note'", "flag"] {
+        assert_eq!(truth_in(schema, "ownables", sql)?, never_raising(Outcomes::TRUE), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn generated_values_the_column_type_rewrites_narrow_nothing() -> Result<(), Error> {
+    // PostgreSQL 18 stores 'ab', 1.3 and 2.
+    let schema = "CREATE TABLE rewritten (
+         short VARCHAR(2) GENERATED ALWAYS AS ('ab  ') STORED,
+         price NUMERIC(5, 1) GENERATED ALWAYS AS (1.25) STORED,
+         code INT GENERATED ALWAYS AS (1.6) STORED
+     );";
+    for sql in ["short = 'ab'", "price = 1.3", "code = 2"] {
+        assert!(truth_in(schema, "rewritten", sql)?.outcomes.truth, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn generated_columns_and_checks_narrow_each_other() -> Result<(), Error> {
+    let schema = "CREATE TABLE ownables (
+         id INT NOT NULL CHECK (id BETWEEN 1 AND 3),
+         doubled INT GENERATED ALWAYS AS (id * 2) STORED,
+         kind TEXT GENERATED ALWAYS AS ('note') STORED CHECK (kind = 'note')
+     );";
+    assert_eq!(truth_in(schema, "ownables", "doubled > 6")?, never_raising(Outcomes::FALSE));
+    let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
+    let table = db.tables().next().unwrap();
+    let kind_check = table
+        .check_constraints(&db)?
+        .find(|check| check.expression(&db).to_string() == "kind = 'note'")
+        .unwrap();
+    assert!(kind_check.is_tautology(&db)?);
+    Ok(())
+}
+
+#[test]
+fn generated_calls_resolve_under_the_path_the_column_was_created_with() -> Result<(), Error> {
+    // PostgreSQL 18 stores 5 and reads `abs(-5)` as 7 under the later path.
+    let schema = "CREATE SCHEMA app;
+         CREATE FUNCTION app.abs(n INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 7';
+         CREATE TABLE shadowed (k INT GENERATED ALWAYS AS (abs(-5)) STORED);
+         SET search_path TO app, pg_catalog;";
+    assert_eq!(truth_in(schema, "shadowed", "k = 5")?, never_raising(Outcomes::TRUE));
+    Ok(())
+}
+
+#[test]
 fn an_absent_table_is_an_error_even_for_a_literal() -> Result<(), Error> {
     let owned = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (id INT);")?;
     let elsewhere = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE other (id INT);")?;
