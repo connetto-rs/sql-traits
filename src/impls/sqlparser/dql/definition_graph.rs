@@ -8,8 +8,8 @@ use sqlparser::ast::{
 
 use super::{
     BaseColumnRef, ColumnOrigin, CteShape, DerivationProfile, DerivedShape, Deriving, FromScope,
-    LookupOutcome, OutputNameSource, RelationKey, ResolvedColumn, ResultColumnType, WildcardEntry,
-    derive_query_shape, factor_address, join_tree_address,
+    LookupOutcome, OutputNameSource, RelationKey, RelationOrigin, ResolvedColumn, ResultColumnType,
+    WildcardEntry, derive_query_shape, factor_address, join_tree_address,
     modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
     scoped_roots::is_input,
@@ -917,6 +917,27 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             entry_index: data.from_entry_count,
             output_columns,
             factor: 0,
+        });
+        data.from_entry_count += 1;
+    }
+
+    /// Appends a view of output columns `shape` to `scope` as its next
+    /// `FROM` entry, exposed under `key`.
+    pub(super) fn push_view_entry(
+        &mut self,
+        scope: ScopeId,
+        shape: DerivedShape<'query, 'db, DB, DefinitionId>,
+        key: RelationKey<'query, 'db>,
+    ) {
+        let data = &mut self.graph.scopes[scope.0].data;
+        data.wildcard_plans.push(alloc::vec![WildcardEntry::Derived(data.derived.len())]);
+        data.derived.push(super::DerivedRelationRef {
+            key: Some(key),
+            identity: Some(key),
+            shape,
+            nullable: false,
+            entry_index: data.from_entry_count,
+            origin: RelationOrigin::Factor(0),
         });
         data.from_entry_count += 1;
     }

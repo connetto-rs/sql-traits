@@ -7,6 +7,12 @@
     clippy::unreachable,
     reason = "Fixtures must hold the nodes they navigate to."
 )]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test code ships in no binary, so walking the tree directly costs nothing"
+)]
+
+use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
@@ -14,7 +20,7 @@ use sqlparser::{
         Assignment, CreateRuleEvent, Cte, DataType, Delete, DoUpdate, Expr, Insert, Merge,
         MergeAction, MergeClause, MergeInsertExpr, MergeInsertKind, MergeUpdateExpr,
         MergeUpdateKind, OnConflictAction, OnInsert, OutputClause, Query, SelectItem, SetExpr,
-        Statement, TableFactor, Update, UpdateTableFromKind,
+        Statement, TableFactor, Update, UpdateTableFromKind, visit_expressions,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -718,6 +724,109 @@ fn a_target_outside_the_catalog_lends_no_rows() {
         .map(|node| context.type_of(node).unwrap())
         .collect();
     assert_eq!(types, [OperandType::Unknown, pg("int4")]);
+}
+
+/// Every column reference `sql` writes, in the order written, with the
+/// relation it binds through and the name of the type it takes, against `t`
+/// and `logt` with the view `v (key, b)` over `t` and the materialized view
+/// `mv (a)`.
+fn view_target_references(sql: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{SCHEMA} CREATE VIEW v AS SELECT a AS key, b FROM t; \
+         CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;"
+    ))
+    .unwrap();
+    let root = statement(sql);
+    let context = context_of(&root, &ExpressionScope::Empty, &db);
+    let mut references = Vec::new();
+    let ControlFlow::<Infallible>::Continue(()) = visit_expressions(&root, |expression| {
+        if matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            let relation = context
+                .reference(expression)
+                .unwrap()
+                .and_then(|(_, binding)| binding.relation())
+                .map(|(relation, _)| relation.to_owned());
+            let type_name = match context.type_of(expression).unwrap() {
+                OperandType::Known { type_name, .. } => Some(type_name.name().to_owned()),
+                _ => None,
+            };
+            references.push((expression.to_string(), relation, type_name));
+        }
+        ControlFlow::Continue(())
+    });
+    references
+}
+
+/// A view written through is the statement's target as a table is: its
+/// name, its alias, `excluded`, `old` and `new` read the view's output
+/// columns. A materialized view is no target PostgreSQL writes, so it lends
+/// no row.
+#[test]
+fn a_view_target_lends_its_rows() {
+    for (sql, expected) in [
+        (
+            "INSERT INTO v VALUES (1, 2) ON CONFLICT (key) DO UPDATE SET b = excluded.b \
+             WHERE v.key > excluded.key RETURNING key, v.b, old.key, new.b",
+            [
+                ("excluded.b", Some("excluded"), Some("numeric")),
+                ("v.key", Some("v"), Some("int4")),
+                ("excluded.key", Some("excluded"), Some("int4")),
+                ("key", Some("v"), Some("int4")),
+                ("v.b", Some("v"), Some("numeric")),
+                ("old.key", Some("old"), Some("int4")),
+                ("new.b", Some("new"), Some("numeric")),
+            ]
+            .as_slice(),
+        ),
+        (
+            "INSERT INTO v AS w VALUES (1, 2) ON CONFLICT (key) DO UPDATE SET b = w.b \
+             RETURNING w.key, v.key",
+            &[
+                ("w.b", Some("w"), Some("numeric")),
+                ("w.key", Some("w"), Some("int4")),
+                ("v.key", None, None),
+            ],
+        ),
+        (
+            "UPDATE v SET b = 1 WHERE key > 0 RETURNING old.key, new.b",
+            &[
+                ("key", Some("v"), Some("int4")),
+                ("old.key", Some("old"), Some("int4")),
+                ("new.b", Some("new"), Some("numeric")),
+            ],
+        ),
+        (
+            "DELETE FROM v WHERE v.key > 0 RETURNING old.b, new.key",
+            &[
+                ("v.key", Some("v"), Some("int4")),
+                ("old.b", Some("old"), Some("numeric")),
+                ("new.key", Some("new"), Some("int4")),
+            ],
+        ),
+        (
+            "MERGE INTO v USING logt AS s ON v.key = s.a \
+             WHEN MATCHED THEN UPDATE SET b = s.a RETURNING old.b, new.key",
+            &[
+                ("v.key", Some("v"), Some("int4")),
+                ("s.a", Some("s"), Some("int8")),
+                ("s.a", Some("s"), Some("int8")),
+                ("old.b", Some("old"), Some("numeric")),
+                ("new.key", Some("new"), Some("int4")),
+            ],
+        ),
+        (
+            "INSERT INTO mv VALUES (1) RETURNING a, old.a",
+            &[("a", None, None), ("old.a", None, None)],
+        ),
+    ] {
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|(reference, relation, type_name)| {
+                ((*reference).to_owned(), relation.map(str::to_owned), type_name.map(str::to_owned))
+            })
+            .collect();
+        assert_eq!(view_target_references(sql), expected, "{sql}");
+    }
 }
 
 #[test]
