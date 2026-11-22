@@ -545,6 +545,20 @@ fn text_comparisons_follow_the_collation() -> Result<(), Error> {
 }
 
 #[test]
+fn the_c_collation_is_the_one_current_user_carries() -> Result<(), Error> {
+    let schema = "CREATE TABLE notes (
+            bytes TEXT COLLATE \"C\" NOT NULL,
+            posix TEXT COLLATE \"POSIX\" NOT NULL,
+            icu TEXT COLLATE \"und-x-icu\" NOT NULL
+         );";
+    assert!(!truth_in(schema, "notes", "bytes = current_user")?.may_raise);
+    for sql in ["posix = current_user", "icu = current_user"] {
+        assert!(truth_in(schema, "notes", sql)?.may_raise, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
 fn other_dialects_keep_only_shared_semantics() -> Result<(), Error> {
     let db = ParserDB::parse::<GenericDialect>(
         "CREATE TABLE invoices (
