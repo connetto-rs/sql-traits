@@ -8,7 +8,7 @@
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::{
     ast::Expr,
-    dialect::{GenericDialect, PostgreSqlDialect},
+    dialect::{GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     parser::Parser,
 };
 
@@ -450,6 +450,25 @@ fn catalog_functions_fold_their_constant_arguments() -> Result<(), Error> {
 }
 
 #[test]
+fn count_never_returns_null() -> Result<(), Error> {
+    assert_eq!(truth("count(tenant_id) IS NOT NULL")?, never_raising(Outcomes::TRUE));
+    Ok(())
+}
+
+#[test]
+fn names_no_reader_resolves_leave_the_expression_undecided() -> Result<(), Error> {
+    let schema =
+        "CREATE FUNCTION label(INT) RETURNS INT LANGUAGE sql IMMUTABLE STRICT AS 'SELECT 1';
+         CREATE FUNCTION label(TEXT) RETURNS INT LANGUAGE sql IMMUTABLE STRICT AS 'SELECT 1';
+         CREATE TABLE invoices (id INT NOT NULL);";
+    for sql in ["a.b.c.label(1) IS NULL", "label(missing) IS NOT NULL", "$1 IS NOT NULL"] {
+        let truth = truth_in(schema, "invoices", sql)?;
+        assert!(truth.outcomes.truth && truth.outcomes.falsity, "{sql}: {truth:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn stable_calls_answer_alike_within_a_statement() -> Result<(), Error> {
     let schema = "CREATE FUNCTION stable_level() RETURNS INT LANGUAGE sql STABLE AS 'SELECT 1';
          CREATE FUNCTION volatile_level() RETURNS INT LANGUAGE sql VOLATILE AS 'SELECT 1';
@@ -528,15 +547,49 @@ fn text_comparisons_follow_the_collation() -> Result<(), Error> {
 #[test]
 fn other_dialects_keep_only_shared_semantics() -> Result<(), Error> {
     let db = ParserDB::parse::<GenericDialect>(
-        "CREATE TABLE invoices (id INT NOT NULL, paid BOOLEAN NOT NULL);",
+        "CREATE TABLE invoices (
+            id INT NOT NULL,
+            paid BOOLEAN NOT NULL,
+            rate FLOAT NOT NULL,
+            issued DATE NOT NULL
+         );",
     )?;
     let table = db.tables().next().unwrap();
     let truth = |sql| table.expression_truth(&db, &expression(sql), IdentifierCase::AsWritten);
     assert_eq!(truth("id > 5 OR id <= 5")?, never_raising(Outcomes::TRUE));
     assert_eq!(truth("paid OR NOT paid")?, never_raising(Outcomes::TRUE));
     assert_eq!(truth("id IS NULL")?, never_raising(Outcomes::FALSE));
+    assert_eq!(truth("rate IS NULL OR issued IS NULL")?, never_raising(Outcomes::FALSE));
     let text = truth("'a' = 'A'")?;
     assert!(text.outcomes.truth && text.outcomes.falsity, "{text:?}");
+    Ok(())
+}
+
+#[test]
+fn sqlite_calls_are_not_folded_with_postgresql_semantics() -> Result<(), Error> {
+    let db = ParserDB::parse::<SQLiteDialect>("CREATE TABLE invoices (id INT NOT NULL);")?;
+    let table = db.tables().next().unwrap();
+    let truth =
+        table.expression_truth(&db, &expression("abs(-3) = 3"), IdentifierCase::AsWritten)?;
+    assert!(truth.outcomes.truth && truth.outcomes.falsity, "{truth:?}");
+    Ok(())
+}
+
+#[test]
+fn mysql_text_may_compare_without_case() -> Result<(), Error> {
+    let db = ParserDB::parse::<MySqlDialect>(
+        "CREATE TABLE notes (
+            plain TEXT NOT NULL,
+            encoded TEXT CHARACTER SET utf8mb4 NOT NULL,
+            named TEXT COLLATE utf8mb4_general_ci NOT NULL
+         );",
+    )?;
+    let table = db.tables().next().unwrap();
+    for column in ["plain", "encoded", "named"] {
+        let sql = format!("{column} = 'a' AND {column} = 'A'");
+        let truth = table.expression_truth(&db, &expression(&sql), IdentifierCase::AsWritten)?;
+        assert!(truth.outcomes.truth, "{sql}: {truth:?}");
+    }
     Ok(())
 }
 
