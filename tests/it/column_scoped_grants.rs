@@ -154,3 +154,182 @@ fn a_table_revoke_takes_the_column_grants_of_that_privilege() {
         .collect();
     assert_eq!(remaining, [true]);
 }
+
+fn all_columns_database(statements: &str) -> ParserDB {
+    parse(&format!("CREATE ROLE r1; CREATE TABLE a (id int, b int); {statements}"))
+}
+
+fn column_actions(database: &ParserDB) -> Vec<String> {
+    database
+        .column_grants()
+        .flat_map(|grant| grant.privileges(database))
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[test]
+fn all_columns_grants_only_the_four_column_privileges() {
+    for (columns, expected_columns) in
+        [("id", vec!["id"]), ("id, b", vec!["id", "b"]), ("id, id", vec!["id"])]
+    {
+        for keyword in ["ALL", "ALL PRIVILEGES"] {
+            let database =
+                all_columns_database(&format!("GRANT {keyword} ({columns}) ON a TO r1;"));
+            assert_eq!(table_privileges(&database, "r1"), [false; 3]);
+            assert!(!database.has_table_grants());
+            assert_eq!(
+                column_actions(&database),
+                ["SELECT", "INSERT", "UPDATE", "REFERENCES"]
+                    .map(|action| format!("{action} ({columns})"))
+            );
+            let grant = database.column_grants().next().expect("column grant");
+            assert!(!grant.is_all_privileges());
+            let held: Vec<_> = grant
+                .columns(table(&database, "a"), &database)
+                .expect("columns resolve")
+                .map(ColumnLike::column_name)
+                .collect();
+            assert_eq!(held, expected_columns);
+        }
+    }
+}
+
+#[test]
+fn all_columns_with_grant_option_stays_column_scoped() {
+    let database = all_columns_database("GRANT ALL (id) ON a TO r1 WITH GRANT OPTION;");
+    assert_eq!(table_privileges(&database, "r1"), [false; 3]);
+    assert_eq!(
+        rendered(database.column_grants()),
+        [
+            "GRANT SELECT (id), INSERT (id), UPDATE (id), REFERENCES (id) ON a TO r1 WITH GRANT OPTION"
+        ]
+    );
+}
+
+#[test]
+fn all_columns_on_all_tables_reaches_each_tables_columns() {
+    let database = all_columns_database(
+        "CREATE TABLE c (id int, b int);
+         GRANT ALL (id) ON ALL TABLES IN SCHEMA public TO r1;",
+    );
+    assert!(!database.has_table_grants());
+    for name in ["a", "c"] {
+        let relation = table(&database, name);
+        let grant = database
+            .column_grants()
+            .find(|grant| grant.table(&database) == Some(relation))
+            .expect("table has a column grant");
+        assert_eq!(grant.privileges(&database).count(), 4);
+        let columns: Vec<_> = grant
+            .columns(relation, &database)
+            .expect("columns resolve")
+            .map(ColumnLike::column_name)
+            .collect();
+        assert_eq!(columns, ["id"]);
+    }
+    assert_eq!(database.column_grants().count(), 2);
+}
+
+#[test]
+fn all_columns_on_views_and_foreign_tables_stays_column_scoped() {
+    for definition in [
+        "CREATE VIEW relation AS SELECT id, b FROM a;",
+        "CREATE FOREIGN TABLE relation (id int, b int) SERVER remote;",
+    ] {
+        let database =
+            all_columns_database(&format!("{definition} GRANT ALL (id) ON relation TO r1;"));
+        assert!(!database.has_table_grants());
+        assert_eq!(
+            column_actions(&database),
+            ["SELECT (id)", "INSERT (id)", "UPDATE (id)", "REFERENCES (id)"]
+        );
+    }
+}
+
+#[test]
+fn all_columns_validates_unknown_columns_for_grants_and_revokes() {
+    for statement in [
+        "GRANT ALL (missing) ON a TO r1;",
+        "REVOKE ALL (missing) ON a FROM r1;",
+        "CREATE TABLE c (missing int); GRANT ALL (missing) ON c, a TO r1;",
+    ] {
+        let error = ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "CREATE ROLE r1; CREATE TABLE a (id int); {statement}"
+        ))
+        .expect_err("unknown column");
+        let postgres = error.postgres_error().expect("PostgreSQL error");
+        assert_eq!(postgres.sqlstate().to_string(), "42703");
+        assert_eq!(postgres.message(), "column \"missing\" of relation \"a\" does not exist");
+    }
+}
+
+#[test]
+fn revoking_all_columns_leaves_table_privileges() {
+    let database = all_columns_database("GRANT ALL ON a TO r1; REVOKE ALL (id) ON a FROM r1;");
+    assert_eq!(table_privileges(&database, "r1"), [true; 3]);
+    assert!(!database.has_column_grants());
+}
+
+#[test]
+fn revoking_all_columns_preserves_other_columns() {
+    let database = all_columns_database(
+        "GRANT SELECT (id, b), UPDATE (id) ON a TO r1;
+         REVOKE ALL (id) ON a FROM r1;",
+    );
+    assert_eq!(column_actions(&database), ["SELECT (b)"]);
+}
+
+#[test]
+fn revoking_select_from_all_columns_preserves_other_privileges() {
+    let database =
+        all_columns_database("GRANT ALL (id) ON a TO r1; REVOKE SELECT (id) ON a FROM r1;");
+    assert_eq!(column_actions(&database), ["INSERT (id)", "UPDATE (id)", "REFERENCES (id)"]);
+    assert!(!database.has_table_grants());
+}
+
+#[test]
+fn revoking_all_table_privileges_removes_all_column_privileges() {
+    let granted = all_columns_database("GRANT ALL (id) ON a TO r1;");
+    assert_eq!(column_actions(&granted).len(), 4);
+    let database = all_columns_database("GRANT ALL (id) ON a TO r1; REVOKE ALL ON a FROM r1;");
+    assert!(!database.has_column_grants());
+    assert!(!database.has_table_grants());
+}
+
+#[test]
+fn revoking_all_column_grant_options_preserves_privileges() {
+    let database = all_columns_database(
+        "GRANT ALL (id) ON a TO r1 WITH GRANT OPTION;
+         REVOKE GRANT OPTION FOR ALL (id) ON a FROM r1;",
+    );
+    assert_eq!(
+        rendered(database.column_grants()),
+        ["GRANT SELECT (id), INSERT (id), UPDATE (id), REFERENCES (id) ON a TO r1"]
+    );
+    assert!(!database.has_table_grants());
+}
+
+#[test]
+fn all_columns_is_rejected_for_function_grants_and_revokes() {
+    for statement in
+        ["GRANT ALL (id) ON FUNCTION f() TO r1;", "REVOKE ALL (id) ON FUNCTION f() FROM r1;"]
+    {
+        let error = ParserDB::parse::<PostgreSqlDialect>(&format!(
+            "CREATE ROLE r1; CREATE FUNCTION f() RETURNS int LANGUAGE SQL AS 'SELECT 1';
+             {statement}"
+        ))
+        .expect_err("function column privileges");
+        let postgres = error.postgres_error().expect("PostgreSQL error");
+        assert_eq!(postgres.sqlstate().to_string(), "0LP01");
+        assert_eq!(postgres.message(), "column privileges are only valid for relations");
+    }
+}
+
+#[test]
+fn all_columns_is_rejected_for_default_privileges() {
+    let error = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE ROLE r1; ALTER DEFAULT PRIVILEGES GRANT ALL (id) ON TABLES TO r1;",
+    )
+    .expect_err("default column privileges");
+    assert_eq!(error.postgres_error().expect("PostgreSQL error").sqlstate().to_string(), "0LP01");
+}

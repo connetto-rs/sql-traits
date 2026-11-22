@@ -78,6 +78,20 @@ use crate::{
     },
 };
 
+/// Expands column-scoped `ALL` into the four relation column privileges.
+fn expand_all_column_privileges(privileges: &mut Privileges) {
+    let Privileges::All { columns: Some(columns), .. } = privileges else {
+        return;
+    };
+    let columns = core::mem::take(columns);
+    *privileges = Privileges::Actions(alloc::vec![
+        Action::Select { columns: Some(columns.clone()) },
+        Action::Insert { columns: Some(columns.clone()) },
+        Action::Update { columns: Some(columns.clone()) },
+        Action::References { columns: Some(columns) },
+    ]);
+}
+
 mod alter_inheritance;
 mod alter_passes;
 mod attach_partition;
@@ -14128,6 +14142,7 @@ impl ParserDB {
                     }
                 }
                 Statement::Grant(mut grant) => {
+                    expand_all_column_privileges(&mut grant.privileges);
                     // Every name the statement carries first, including the
                     // schemas of a blanket grant, since a grant recorded
                     // against a name nothing can read covers nothing and says
@@ -14210,6 +14225,7 @@ impl ParserDB {
                     }
                 }
                 Statement::Revoke(mut revoke) => {
+                    expand_all_column_privileges(&mut revoke.privileges);
                     require_static_access_names(revoke.objects.as_ref())?;
                     session_roles.bind_grantees(&mut revoke.grantees);
                     if let Some(routines) = routine_privileges::Routines::take(&mut revoke.objects)
@@ -14760,7 +14776,15 @@ impl ParserDB {
                         }
                     }
                 }
-                Statement::AlterDefaultPrivileges(statement) => {
+                Statement::AlterDefaultPrivileges(mut statement) => {
+                    let (sqlparser::ast::AlterDefaultPrivilegesOperation::Grant {
+                        privileges, ..
+                    }
+                    | sqlparser::ast::AlterDefaultPrivilegesOperation::Revoke {
+                        privileges,
+                        ..
+                    }) = &mut statement.operation;
+                    expand_all_column_privileges(privileges);
                     default_privileges.alter(
                         statement,
                         &session_roles,
