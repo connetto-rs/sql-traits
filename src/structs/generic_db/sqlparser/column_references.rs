@@ -8,13 +8,11 @@
 
 use alloc::vec::Vec;
 
-use sqlparser::ast::{
-    Expr, Ident, ObjectName, Query, SelectItem, TableAlias, TableFactor, TableWithJoins,
-};
+use sqlparser::ast::{Expr, Ident, ObjectName, Query, SelectItem, TableAlias, TableWithJoins};
 
 use super::{
     ParserDBBuilder,
-    function_bodies::{wrapping_query, wrapping_select},
+    function_bodies::{wrapping_from, wrapping_query, wrapping_select},
     object_name_last_identifier, view_rewrites, views,
 };
 use crate::{
@@ -89,29 +87,17 @@ pub(super) fn refuse_in_expressions<'e>(
     let from: Vec<TableWithJoins> = aliases
         .iter()
         .map(|alias| {
-            TableWithJoins {
-                relation: TableFactor::Table {
-                    name: relation.clone(),
-                    alias: alias.map(|alias| {
-                        TableAlias {
-                            explicit: true,
-                            name: Ident::new(alias),
-                            columns: Vec::new(),
-                            at: None,
-                        }
-                    }),
-                    args: None,
-                    with_hints: Vec::new(),
-                    version: None,
-                    with_ordinality: false,
-                    partitions: Vec::new(),
-                    json_path: None,
-                    sample: None,
-                    index_directives: Vec::new(),
-                    inheritance: None,
-                },
-                joins: Vec::new(),
-            }
+            wrapping_from(
+                relation.clone(),
+                alias.map(|alias| {
+                    TableAlias {
+                        explicit: true,
+                        name: Ident::new(alias),
+                        columns: Vec::new(),
+                        at: None,
+                    }
+                }),
+            )
         })
         .collect();
     let mut query = wrapping_query(wrapping_select(projection, from, None));

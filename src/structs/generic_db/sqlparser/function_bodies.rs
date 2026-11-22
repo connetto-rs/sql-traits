@@ -26,7 +26,7 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     ArgMode, CreateFunction, CreateFunctionBody, DataType, Expr, FunctionReturnType, GroupByExpr,
     Ident, Insert, ObjectName, OperateFunctionArg, Query, Select, SelectFlavor, SelectItem,
-    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, VisitMut, VisitorMut,
+    SetExpr, Statement, TableAlias, TableFactor, TableObject, TableWithJoins, VisitMut, VisitorMut,
     helpers::attached_token::AttachedToken,
 };
 
@@ -419,6 +419,26 @@ pub(super) fn wrapping_select(
         window_before_qualify: false,
         value_table_mode: None,
         flavor: SelectFlavor::Standard,
+    }
+}
+
+/// A `FROM` item reading the relation `name` under `alias`, and nothing else.
+pub(super) fn wrapping_from(name: ObjectName, alias: Option<TableAlias>) -> TableWithJoins {
+    TableWithJoins {
+        relation: TableFactor::Table {
+            name,
+            alias,
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+            json_path: None,
+            sample: None,
+            index_directives: Vec::new(),
+            inheritance: None,
+        },
+        joins: Vec::new(),
     }
 }
 

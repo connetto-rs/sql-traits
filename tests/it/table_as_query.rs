@@ -68,6 +68,16 @@ fn a_wildcard_records_every_source_column() {
     );
 }
 
+/// `TABLE t2` is `SELECT * FROM t2`, so it records the same columns.
+#[test]
+fn a_table_query_records_every_source_column() {
+    let db = parse("CREATE TABLE ct AS TABLE t2;");
+    assert_eq!(
+        columns(&db, "ct"),
+        pairs(&[("id", "INT"), ("iv", "INTERVAL"), ("name", "TEXT"), ("n", "INTEGER")])
+    );
+}
+
 #[test]
 fn copied_columns_carry_no_constraint_or_default() {
     let db = parse("CREATE TABLE ct AS SELECT id, n FROM t2;");
@@ -201,10 +211,20 @@ fn a_short_column_list_leaves_the_rest_named_by_the_query() {
 
 #[test]
 fn outputs_that_cannot_be_counted_leave_the_declared_names() {
-    for query in ["SELECT * FROM generate_series(1, 3) AS g", "TABLE t2"] {
-        let db = with_column_list(&["a"], query).expect("schema builds");
-        assert_eq!(columns(&db, "cn"), pairs(&[("a", "")]), "{query}");
-    }
+    let db = with_column_list(&["a"], "SELECT * FROM generate_series(1, 3) AS g")
+        .expect("schema builds");
+    assert_eq!(columns(&db, "cn"), pairs(&[("a", "")]));
+}
+
+/// Measured on PostgreSQL 18.7: `CREATE TABLE cn (a) AS TABLE t2` renames the
+/// first of the four columns `TABLE t2` reads.
+#[test]
+fn a_column_list_renames_what_a_table_query_reads() {
+    let db = with_column_list(&["a"], "TABLE t2").expect("schema builds");
+    assert_eq!(
+        columns(&db, "cn"),
+        pairs(&[("a", "INT"), ("iv", "INTERVAL"), ("name", "TEXT"), ("n", "INTEGER")])
+    );
 }
 
 #[test]
