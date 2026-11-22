@@ -1084,3 +1084,45 @@ fn a_grantee_naming_no_plain_role_is_listed_as_written() {
         Some([vec![String::from("SELECT")], Vec::new()])
     );
 }
+
+#[test]
+fn default_privileges_cannot_name_columns() {
+    let mut failures = Vec::new();
+    for action in ["SELECT", "INSERT", "UPDATE", "REFERENCES"] {
+        for (operation, preposition) in [("GRANT", "TO"), ("REVOKE", "FROM")] {
+            let sql = format!(
+                "ALTER DEFAULT PRIVILEGES {operation} {action} (id) ON TABLES {preposition} PUBLIC;"
+            );
+            match parse(&sql).err().and_then(|error| error.postgres_error()) {
+                Some(error)
+                    if error.sqlstate().to_string() == "0LP01"
+                        && error.message() == "default privileges cannot be set for columns" => {}
+                result => failures.push(format!("{sql} {result:?}")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn missing_grantee_precedes_default_column_privileges() {
+    for (operation, preposition) in [("GRANT", "TO"), ("REVOKE", "FROM")] {
+        let error = parse(&format!(
+            "ALTER DEFAULT PRIVILEGES {operation} SELECT (id) ON TABLES {preposition} missing_role;"
+        ))
+        .expect_err("grantee must exist")
+        .postgres_error()
+        .expect("PostgreSQL diagnostic");
+        assert_eq!(error.sqlstate().to_string(), "42704");
+        assert_eq!(error.message(), "role \"missing_role\" does not exist");
+    }
+}
+
+/// An open world takes an undeclared grantee on trust and still refuses
+/// the columns.
+#[test]
+fn open_world_still_refuses_default_column_privileges() {
+    let refused =
+        open_world("ALTER DEFAULT PRIVILEGES GRANT SELECT (id) ON TABLES TO undeclared_role;");
+    assert!(matches!(refused, Err(Error::DefaultPrivilegesForColumns)), "{refused:?}");
+}

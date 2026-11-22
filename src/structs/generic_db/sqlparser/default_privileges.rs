@@ -579,9 +579,10 @@ impl DefaultPrivileges {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidDefaultPrivilege`] for a privilege the object
-    /// type does not have, [`Error::DefaultPrivilegesInSchema`] for `IN
-    /// SCHEMA` on `SCHEMAS` or `LARGE OBJECTS`,
+    /// Returns [`Error::DefaultPrivilegesForColumns`] for column privileges,
+    /// [`Error::InvalidDefaultPrivilege`] for a privilege the object type does
+    /// not have, [`Error::DefaultPrivilegesInSchema`] for `IN SCHEMA` on
+    /// `SCHEMAS` or `LARGE OBJECTS`,
     /// [`Error::QualifiedDefaultPrivilegesSchema`] for a qualified schema
     /// name, [`Error::SchemaNotFoundForDefaultPrivileges`] for a schema the
     /// input never creates and, under the closed world,
@@ -618,6 +619,14 @@ impl DefaultPrivileges {
                 )
             }
         };
+        if let Privileges::Actions(actions) = &privileges
+            && actions.iter().any(|action| super::action_columns(action).is_some())
+        {
+            if access_resolution == AccessResolution::ClosedWorld {
+                validate_access_targets_against_builder(builder, &grantees, None)?;
+            }
+            return Err(Error::DefaultPrivilegesForColumns);
+        }
         let kind = DefaultPrivilegeKind::of(object_type);
         let rights = Rights::of(&privileges, kind, object_type)?;
 

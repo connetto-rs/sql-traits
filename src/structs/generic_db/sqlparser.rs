@@ -3575,6 +3575,28 @@ fn action_columns(action: &Action) -> Option<&[Ident]> {
     }
 }
 
+/// Refuses column privileges on PostgreSQL's non-relation grant targets.
+fn validate_column_privilege_target(
+    privileges: &Privileges,
+    objects: Option<&GrantObjects>,
+) -> Result<(), crate::errors::Error> {
+    let object_type = match objects {
+        Some(GrantObjects::Sequences(_) | GrantObjects::AllSequencesInSchema { .. }) => "SEQUENCE",
+        Some(GrantObjects::Schemas(_)) => "SCHEMA",
+        Some(GrantObjects::Databases(_)) => "DATABASE",
+        _ => return Ok(()),
+    };
+    if let Privileges::Actions(actions) = privileges
+        && let Some(action) = actions.iter().find(|action| action_columns(action).is_some())
+    {
+        return Err(crate::errors::Error::ColumnPrivilegeOnNonRelation {
+            privilege: action.to_string(),
+            object_type: object_type.to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn action_columns_mut(action: &mut Action) -> Option<&mut [Ident]> {
     match action {
         Action::Select { columns }
@@ -14166,6 +14188,7 @@ impl ParserDB {
                             grant.objects.as_ref(),
                         )?;
                     }
+                    validate_column_privilege_target(&grant.privileges, grant.objects.as_ref())?;
 
                     // One grant per object, as PostgreSQL writes one privilege
                     // list per object, each checked before any is stored. An
@@ -14248,6 +14271,7 @@ impl ParserDB {
                             revoke.objects.as_ref(),
                         )?;
                     }
+                    validate_column_privilege_target(&revoke.privileges, revoke.objects.as_ref())?;
 
                     builder.bind_access_targets(&mut revoke.objects);
                     // Each object loses the privilege on its own, whatever
