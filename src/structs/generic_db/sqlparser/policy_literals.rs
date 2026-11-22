@@ -20,13 +20,13 @@ use sql_values::postgres::{
 };
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select, TableFactor,
-    TableWithJoins, TimezoneInfo, TypedString, Value, ValueWithSpan, Visitor, VisitorMut,
+    FunctionArguments, InTarget, ObjectName, ObjectNamePart, Query, Select, TimezoneInfo,
+    TypedString, Value, ValueWithSpan, Visitor, VisitorMut,
 };
 
 use super::{
     ParserDBBuilder, SessionSettings,
-    function_bodies::{wrapping_query, wrapping_select},
+    function_bodies::{wrapping_from, wrapping_query, wrapping_select},
     view_rewrites,
 };
 use crate::{
@@ -640,22 +640,7 @@ pub(super) fn bind(
         return ClauseLiterals::AsWritten;
     }
     let clause = core::mem::replace(expression, Expr::Value(Value::Null.with_empty_span()));
-    let from = TableWithJoins {
-        relation: TableFactor::Table {
-            name: table.clone(),
-            alias: None,
-            args: None,
-            with_hints: Vec::new(),
-            version: None,
-            with_ordinality: false,
-            partitions: Vec::new(),
-            json_path: None,
-            sample: None,
-            index_directives: Vec::new(),
-            inheritance: None,
-        },
-        joins: Vec::new(),
-    };
+    let from = wrapping_from(table.clone(), None);
     let mut query = wrapping_query(wrapping_select(Vec::new(), alloc::vec![from], Some(clause)));
     let literals = match coercions(builder, &query, session) {
         Ok(coercions) if coercions.is_empty() => ClauseLiterals::AsWritten,

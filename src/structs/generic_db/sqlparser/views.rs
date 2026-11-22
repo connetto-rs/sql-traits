@@ -24,6 +24,7 @@
 //! the functions along.
 
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
     sync::Arc,
@@ -35,7 +36,7 @@ use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, AlterView, AlterViewOperation, CreateFunction,
     CreateView, Expr, Grant, GrantObjects, Ident, IndexColumn, ObjectName, ObjectNamePart, Owner,
     Query, RenameTableNameKind, SelectItem, SetExpr, SqlOption, Statement, TableFactor, Visitor,
-    VisitorMut,
+    VisitorMut, WildcardAdditionalOptions,
 };
 
 use super::{
@@ -1622,6 +1623,7 @@ impl VisitorMut for DefinitionBinder<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        select_table_queries(&mut query.body);
         self.scopes.enter(query);
         ControlFlow::Continue(())
     }
@@ -1645,9 +1647,38 @@ impl VisitorMut for DefinitionBinder<'_> {
     }
 }
 
+/// Writes every `TABLE name` arm of `body` as the `SELECT * FROM name`
+/// PostgreSQL defines it as, so the binder, the wildcard spelling and the
+/// dependency walk read the relation it names as they read any `FROM` item.
+///
+/// Arms nested in a parenthesized query are left to the visit of that query.
+fn select_table_queries(body: &mut SetExpr) {
+    match body {
+        SetExpr::SetOperation { left, right, .. } => {
+            select_table_queries(left);
+            select_table_queries(right);
+        }
+        SetExpr::Table(table) => {
+            let Some(table_name) = table.table_name.take() else {
+                return;
+            };
+            let name = ObjectName::from(
+                table.schema_name.take().into_iter().chain([table_name]).collect::<Vec<_>>(),
+            );
+            *body = SetExpr::Select(Box::new(function_bodies::wrapping_select(
+                alloc::vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+                alloc::vec![function_bodies::wrapping_from(name, None)],
+                None,
+            )));
+        }
+        _ => {}
+    }
+}
+
 /// Binds every stored relation a stored query reads, a view definition or the
 /// query of `CREATE TABLE … AS`, to the relation it reaches now, answering the
-/// name of the first temporary one.
+/// name of the first temporary one. A `TABLE name` arm is written as the
+/// `SELECT * FROM name` it stands for before its name binds.
 pub(super) fn bind_definition(builder: &ParserDBBuilder, query: &mut Query) -> Option<String> {
     let mut binder =
         DefinitionBinder { builder, scopes: WithScopes::default(), temporary_read: None };

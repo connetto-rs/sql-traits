@@ -1036,6 +1036,36 @@ fn a_relation_a_view_reads_cannot_be_dropped_from_under_it() {
 }
 
 #[test]
+fn a_table_query_holds_the_relation_it_names() {
+    // Measured on PostgreSQL 18.7: `cannot drop table docs because other
+    // objects depend on it` for every view reading it as `TABLE docs`, while
+    // a `TABLE c` the definition's own `WITH` clause binds holds nothing.
+    for definition in
+        ["TABLE docs", "SELECT 0 AS id UNION TABLE docs", "SELECT * FROM (TABLE docs) AS s"]
+    {
+        let refused = parse(&format!(
+            "CREATE TABLE docs (id INT); CREATE VIEW v AS {definition}; DROP TABLE docs;"
+        ))
+        .expect_err(definition);
+        assert!(
+            matches!(&refused, Error::RelationHasDependents { object_kind, object_name, dependent_kind, dependent_name, .. }
+                if *object_kind == ObjectKind::Table
+                    && object_name == "docs"
+                    && *dependent_kind == ObjectKind::View
+                    && dependent_name == "v"),
+            "{definition}: got {refused:?}"
+        );
+    }
+
+    parse(
+        "CREATE TABLE c (k INT);
+         CREATE VIEW v AS WITH c AS (SELECT 1 AS k) TABLE c;
+         DROP TABLE c;",
+    )
+    .expect("v reads its own c");
+}
+
+#[test]
 fn cascade_takes_the_whole_chain_of_readers() {
     // Measured: `DROP ... CASCADE` reports `drop cascades to view v2` and
     // removes the chain, transitively.

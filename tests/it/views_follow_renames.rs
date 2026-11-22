@@ -94,6 +94,31 @@ fn a_qualifier_naming_the_renamed_table_follows_it() {
     );
 }
 
+/// Measured on PostgreSQL 18.7: a view reads `TABLE name` as `SELECT * FROM
+/// name`, bound at creation like any other wildcard, so it follows a rename
+/// and a column added afterwards never joins it.
+#[test]
+fn a_table_query_is_bound_as_the_select_it_stands_for() {
+    for (table, definition, expected) in [
+        ("docs", "TABLE docs", "SELECT id FROM papers"),
+        ("docs", "SELECT 0 AS id UNION TABLE docs", "SELECT 0 AS id UNION SELECT id FROM papers"),
+        ("docs", "SELECT * FROM (TABLE docs) AS s", "SELECT id FROM (SELECT id FROM papers) AS s"),
+        ("other.docs", "TABLE other.docs", "SELECT id FROM other.papers"),
+        ("docs", "WITH c AS (SELECT 1 AS k) TABLE c", "WITH c AS (SELECT 1 AS k) SELECT k FROM c"),
+    ] {
+        assert_definition(
+            &format!(
+                "CREATE SCHEMA other; CREATE TABLE {table} (id INT);
+                 CREATE VIEW v AS {definition};
+                 ALTER TABLE {table} ADD COLUMN body TEXT;
+                 ALTER TABLE {table} RENAME TO papers;"
+            ),
+            "v",
+            expected,
+        );
+    }
+}
+
 #[test]
 fn an_alias_shields_its_references_from_a_table_rename() {
     assert_definition(
