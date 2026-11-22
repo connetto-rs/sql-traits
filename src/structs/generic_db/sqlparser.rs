@@ -10541,6 +10541,7 @@ impl ParserDB {
         }) {
             set_schema::require_dialect(&builder)?;
         }
+        alter_passes::require_foreign_table_grammar(&builder, &alter_table)?;
         alter_passes::require_standalone(&builder, &alter_table)?;
         if postgres {
             alter_passes::grammar(&builder, &alter_table.name, &alter_table.operations)?;

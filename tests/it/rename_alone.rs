@@ -70,20 +70,27 @@ fn combined_rename_forms_are_refused() {
                                 || first.starts_with("SET SCHEMA")
                                 || first.starts_with("ATTACH");
                             let standalone = if first_is_standalone { first } else { second };
-                            let expected_token = if relation == "FOREIGN TABLE"
-                                && first.starts_with("RENAME CONSTRAINT")
-                            {
-                                "CONSTRAINT"
-                            } else if relation == "FOREIGN TABLE" && first.starts_with("ATTACH") {
-                                "ATTACH"
-                            } else if first_is_standalone {
-                                ","
-                            } else if standalone.starts_with("SET SCHEMA") {
-                                "SCHEMA"
-                            } else {
-                                "RENAME"
-                            };
+                            let foreign_grammar = relation == "FOREIGN TABLE"
+                                && (first.starts_with("RENAME CONSTRAINT")
+                                    || first.starts_with("ATTACH"));
+                            let expected_token =
+                                if foreign_grammar && first.starts_with("RENAME CONSTRAINT") {
+                                    "CONSTRAINT"
+                                } else if foreign_grammar {
+                                    "ATTACH"
+                                } else if first_is_standalone {
+                                    ","
+                                } else if standalone.starts_with("SET SCHEMA") {
+                                    "SCHEMA"
+                                } else {
+                                    "RENAME"
+                                };
                             let written_token = match &error {
+                                Error::ForeignTableCommandUnavailable { written_token, .. }
+                                    if foreign_grammar =>
+                                {
+                                    written_token
+                                }
                                 Error::SetSchemaCommandNotAlone { written_token }
                                     if standalone.starts_with("SET SCHEMA") =>
                                 {

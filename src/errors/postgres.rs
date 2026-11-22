@@ -823,6 +823,7 @@ impl Error {
             Self::TemporaryMaterializedView { written_token, .. }
             | Self::PartitionCommandNotAlone { written_token, .. }
             | Self::SetSchemaCommandNotAlone { written_token }
+            | Self::ForeignTableCommandUnavailable { written_token, .. }
             | Self::RenameCommandNotAlone { written_token, .. } => {
                 Some(PostgresError::new(
                     pg::SYNTAX_ERROR,
@@ -2487,6 +2488,8 @@ impl Error {
             | Self::UnloggedTemporaryTable { written_token, .. }
             | Self::PartitionCommandNotAlone { written_token, .. }
             | Self::RenameCommandNotAlone { written_token, .. }
+            | Self::SetSchemaCommandNotAlone { written_token }
+            | Self::ForeignTableCommandUnavailable { written_token, .. }
             | Self::InvalidSessionRole { written_token, .. }
             | Self::NonLiteralSetting { written_token, .. }
             | Self::MaterializedViewCannotBeReplaced { written_token, .. }
