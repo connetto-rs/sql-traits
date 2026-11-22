@@ -1,7 +1,7 @@
 //! The SQLSTATE and the message PostgreSQL reports for each error that models
 //! one of its refusals.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 
 pub use sqlstate::SqlState;
 use sqlstate::pg;
