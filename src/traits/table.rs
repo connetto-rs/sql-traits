@@ -872,8 +872,9 @@ pub trait TableLike:
     /// The expression is read through
     /// [`sqlparser-expr-eval`](https://docs.rs/sqlparser-expr-eval) under
     /// what the table guarantees of every row, which is each column's type
-    /// and nullability, the checks of the domains its columns use and its
-    /// validated `CHECK` constraints. A PostgreSQL database folds with
+    /// and nullability, the checks of the domains its columns use, the
+    /// value each generated column computes and its validated `CHECK`
+    /// constraints. A PostgreSQL database folds with
     /// PostgreSQL's types, casts, overflow and built-ins. Other dialects
     /// decide comparisons of numeric and boolean columns and three-valued
     /// logic, and a SQLite column's type constrains no value it stores.

@@ -628,6 +628,119 @@ fn inherited_columns_keep_their_nullability() -> Result<(), Error> {
 }
 
 #[test]
+fn generated_columns_hold_what_their_expression_evaluates_to() -> Result<(), Error> {
+    let schema = "CREATE TABLE ownables (
+         id INT NOT NULL,
+         kind TEXT GENERATED ALWAYS AS ('note') STORED NOT NULL,
+         label TEXT GENERATED ALWAYS AS ('note') STORED,
+         computed TEXT GENERATED ALWAYS AS ('note') VIRTUAL,
+         doubled INT GENERATED ALWAYS AS (id * 2) STORED,
+         flag BOOLEAN GENERATED ALWAYS AS (true) STORED
+     );";
+    for sql in [
+        "kind = 'project'",
+        "label = 'folder'",
+        "computed <> 'note'",
+        "doubled IS NULL",
+        "NOT flag",
+    ] {
+        assert_eq!(truth_in(schema, "ownables", sql)?, never_raising(Outcomes::FALSE), "{sql}");
+    }
+    for sql in ["kind = 'note'", "label IS NOT NULL", "computed = 'note'", "flag"] {
+        assert_eq!(truth_in(schema, "ownables", sql)?, never_raising(Outcomes::TRUE), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn generated_values_the_column_type_rewrites_narrow_nothing() -> Result<(), Error> {
+    // PostgreSQL 18 stores 'ab', 1.3 and 2.
+    let schema = "CREATE TABLE rewritten (
+         short VARCHAR(2) GENERATED ALWAYS AS ('ab  ') STORED,
+         price NUMERIC(5, 1) GENERATED ALWAYS AS (1.25) STORED,
+         code INT GENERATED ALWAYS AS (1.6) STORED
+     );";
+    for sql in ["short = 'ab'", "price = 1.3", "code = 2"] {
+        assert!(truth_in(schema, "rewritten", sql)?.outcomes.truth, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn generated_columns_and_checks_narrow_each_other() -> Result<(), Error> {
+    let schema = "CREATE TABLE ownables (
+         id INT NOT NULL CHECK (id BETWEEN 1 AND 3),
+         doubled INT GENERATED ALWAYS AS (id * 2) STORED,
+         kind TEXT GENERATED ALWAYS AS ('note') STORED CHECK (kind = 'note')
+     );";
+    assert_eq!(truth_in(schema, "ownables", "doubled > 6")?, never_raising(Outcomes::FALSE));
+    let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
+    let table = db.tables().next().unwrap();
+    let kind_check = table
+        .check_constraints(&db)?
+        .find(|check| check.expression(&db).to_string() == "kind = 'note'")
+        .unwrap();
+    assert!(kind_check.is_tautology(&db)?);
+    Ok(())
+}
+
+#[test]
+fn generated_calls_resolve_under_the_path_the_column_was_created_with() -> Result<(), Error> {
+    // PostgreSQL 18 stores 5 and reads `abs(-5)` as 7 under the later path.
+    let schema = "CREATE SCHEMA app;
+         CREATE FUNCTION app.abs(n INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT 7';
+         CREATE TABLE shadowed (k INT GENERATED ALWAYS AS (abs(-5)) STORED);
+         SET search_path TO app, pg_catalog;";
+    assert_eq!(truth_in(schema, "shadowed", "k = 5")?, never_raising(Outcomes::TRUE));
+    Ok(())
+}
+
+#[test]
+fn enum_columns_narrow_to_the_labels_their_table_admits() -> Result<(), Error> {
+    let schema = "CREATE SCHEMA authz;
+         CREATE TYPE authz.resource_kind AS ENUM ('project', 'note', 'folder');
+         CREATE TABLE generated (
+             kind authz.resource_kind GENERATED ALWAYS AS ('note'::authz.resource_kind) STORED
+         );
+         CREATE TABLE checked (kind authz.resource_kind NOT NULL CHECK (kind = 'project'));
+         CREATE TABLE listed (
+             kind authz.resource_kind NOT NULL CHECK (kind IN ('project', 'folder'))
+         );";
+    for (table, sql, outcomes) in [
+        ("generated", "kind = 'note'", Outcomes::TRUE),
+        ("generated", "kind = 'project'", Outcomes::FALSE),
+        ("generated", "kind = 'folder'", Outcomes::FALSE),
+        ("checked", "kind = 'project'", Outcomes::TRUE),
+        ("checked", "kind = 'note'", Outcomes::FALSE),
+        ("listed", "kind = 'note'", Outcomes::FALSE),
+        ("listed", "kind = 'folder'", UNDECIDED),
+        ("checked", "kind < 'folder'", Outcomes::TRUE),
+    ] {
+        assert_eq!(truth_in(schema, table, sql)?, never_raising(outcomes), "{table}: {sql}");
+    }
+    assert!(truth_in(schema, "listed", "kind = 'bogus'")?.may_raise);
+    Ok(())
+}
+
+#[test]
+fn an_enum_is_one_type_however_its_name_is_written() -> Result<(), Error> {
+    let schema = "CREATE SCHEMA authz;
+         CREATE TYPE authz.resource_kind AS ENUM ('project', 'note');
+         SET search_path TO authz, public;
+         CREATE TABLE public.generated (
+             kind authz.resource_kind GENERATED ALWAYS AS ('note'::resource_kind) STORED
+         );";
+    for (sql, outcomes) in [
+        ("kind = 'project'", Outcomes::FALSE),
+        ("kind = 'note'::authz.resource_kind", Outcomes::TRUE),
+        ("kind = 'note'::resource_kind", Outcomes::TRUE),
+    ] {
+        assert_eq!(truth_in(schema, "generated", sql)?, never_raising(outcomes), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
 fn an_absent_table_is_an_error_even_for_a_literal() -> Result<(), Error> {
     let owned = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE invoices (id INT);")?;
     let elsewhere = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE other (id INT);")?;
