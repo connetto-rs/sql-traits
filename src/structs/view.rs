@@ -76,7 +76,7 @@ impl ViewDeclaration {
     ///     let Some(Statement::CreateView(node)) = statements.pop() else {
     ///         panic!("expected a view declaration")
     ///     };
-    ///     View::from_node(&node, SqlparserDialect::PostgreSql).ok()
+    ///     View::from_node(node, SqlparserDialect::PostgreSql).ok()
     /// };
     /// let ordinary = declaration("CREATE VIEW v AS SELECT 1 AS result").unwrap();
     /// let temporary = declaration("CREATE TEMP VIEW v AS SELECT 1 AS result").unwrap();
@@ -85,7 +85,7 @@ impl ViewDeclaration {
     /// assert!(temporary.is_temporary());
     /// ```
     #[must_use]
-    pub fn from_node(node: &CreateView) -> Option<Self> {
+    pub fn from_node(node: CreateView) -> Option<Self> {
         let (name, name_is_quoted) = object_name_last_part(&node.name)?;
         // A qualifier built at run time names no schema, so the view cannot be
         // recorded at all rather than being recorded unqualified.
@@ -102,13 +102,13 @@ impl ViewDeclaration {
             schema_is_quoted: schema.is_some_and(|(_, quoted)| quoted),
             temporary: node.temporary
                 || schema.is_some_and(|(value, quoted)| is_temporary_schema(value, quoted)),
-            query: (*node.query).clone(),
             columns: node
                 .columns
                 .iter()
                 .map(|column| (column.name.value.clone(), column.name.quote_style.is_some()))
                 .collect(),
             selects_wildcard: output_from_wildcard(&node.query),
+            query: *node.query,
         })
     }
 
@@ -228,11 +228,12 @@ impl View {
     /// name, and [`Error::UnrecognizedViewOption`],
     /// [`Error::InvalidViewOptionValue`] or [`Error::RepeatedViewOption`] for
     /// an option list PostgreSQL refuses.
-    pub fn from_node(node: &CreateView, dialect: SqlparserDialect) -> Result<Self, Error> {
+    pub fn from_node(node: CreateView, dialect: SqlparserDialect) -> Result<Self, Error> {
+        let options = options::plain_view_options(&node.name, with_options(&node), dialect);
         let declaration = ViewDeclaration::from_node(node)
             .ok_or(Error::UnnamedObject { object_kind: ObjectKind::View })?;
         let mut view = Self { declaration, security_barrier: false, security_invoker: false };
-        view.set_options(&node.name, with_options(node), dialect)?;
+        view.apply(options?);
         Ok(view)
     }
 
@@ -315,10 +316,11 @@ impl MaterializedView {
     /// Returns [`Error::UnnamedObject`] for a declaration carrying no usable
     /// name, and [`Error::UnrecognizedViewOption`] for an option only a plain
     /// view takes.
-    pub fn from_node(node: &CreateView, dialect: SqlparserDialect) -> Result<Self, Error> {
+    pub fn from_node(node: CreateView, dialect: SqlparserDialect) -> Result<Self, Error> {
+        let refused = options::refuse_plain_view_options(&node.name, with_options(&node), dialect);
         let declaration = ViewDeclaration::from_node(node)
             .ok_or(Error::UnnamedObject { object_kind: ObjectKind::MaterializedView })?;
-        options::refuse_plain_view_options(&node.name, with_options(node), dialect)?;
+        refused?;
         Ok(Self { declaration })
     }
 
@@ -358,7 +360,8 @@ mod tests {
         };
 
         assert_eq!(
-            ViewDeclaration::from_node(&node).map(|declaration| declaration.schema().is_some()),
+            ViewDeclaration::from_node(node.clone())
+                .map(|declaration| declaration.schema().is_some()),
             Some(true)
         );
 
@@ -366,6 +369,6 @@ mod tests {
             name: Ident::new("IDENTIFIER"),
             args: Vec::new(),
         });
-        assert!(ViewDeclaration::from_node(&node).is_none());
+        assert!(ViewDeclaration::from_node(node).is_none());
     }
 }

@@ -244,6 +244,7 @@ impl CarriedOperators {
                 Kind::Default | Kind::Generation => {
                     self.take_entry(owner, kind, None, |entry| entry.kind == kind)
                 }
+                _ if !self.holds_entry(owner, kind) => None,
                 _ => {
                     let shape = self.shape(&option.option, &self.rebuilt_columns);
                     let name = option.name.as_ref().map(|name| name.value.as_str());
@@ -296,8 +297,9 @@ impl CarriedOperators {
         node: &N,
         calls: &mut ExpressionCalls<CreateFunction>,
     ) {
-        let shape = self.shape(node, &self.rebuilt_columns);
-        let carried = self.take_entry(owner, kind, name, |entry| entry.shape == shape);
+        let shape = self.holds_entry(owner, kind).then(|| self.shape(node, &self.rebuilt_columns));
+        let carried = shape
+            .and_then(|shape| self.take_entry(owner, kind, name, |entry| entry.shape == shape));
         let state = if carried.is_some() { NodeState::Settled } else { NodeState::Pending };
         calls.set_call_states(0..usize::MAX, state);
         if let Some(carried) = carried {
@@ -345,6 +347,12 @@ impl CarriedOperators {
             calls.rewrite_operators(column, previous);
         }
         calls.keep_previous_calls_for_rewritten();
+    }
+
+    /// Whether an entry of `owner` and `kind` is recorded, the only ones a
+    /// shape is compared against.
+    fn holds_entry(&self, owner: Owner, kind: Kind) -> bool {
+        self.entries.iter().any(|entry| entry.owner == owner && entry.kind == kind)
     }
 
     /// Takes the selections of the entry of `owner` and `kind` that

@@ -3,7 +3,7 @@
 use alloc::string::String;
 
 use sqlparser::{
-    ast::{CreateTable, Spanned, comments::Comments},
+    ast::{CreateTable, comments::Comments},
     tokenizer::Location,
 };
 
@@ -24,7 +24,7 @@ impl TableDocumentation {
                 .columns
                 .iter()
                 .filter_map(|column| {
-                    let documentation = leading(source.comments, column.span().start)?;
+                    let documentation = leading(source.comments, column.name.span.start)?;
                     Some((column.name.clone(), documentation))
                 })
                 .collect(),

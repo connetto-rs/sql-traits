@@ -776,6 +776,7 @@ struct Reader<'db, DB: DatabaseLike> {
 }
 
 impl<'db, DB: DatabaseLike> Reader<'db, DB> {
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn answer(
         &mut self,
         function: &'db DB::Function,

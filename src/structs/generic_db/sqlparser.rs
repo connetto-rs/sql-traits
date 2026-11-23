@@ -1811,9 +1811,10 @@ impl ParserDBBuilder {
         let case = self.identifier_case();
         for (index, _) in self.indices_mut() {
             if table.matches(TableAttribute::table(index), case) {
-                let index = Arc::make_mut(index).attribute_mut();
-                rename_column_in_expressions(index, table, declaring, from, to);
-                rename_column_idents(&mut index.include, from, to);
+                Arc::make_mut(index).edit_attribute(|index| {
+                    rename_column_in_expressions(index, table, declaring, from, to);
+                    rename_column_idents(&mut index.include, from, to);
+                });
             }
         }
 
@@ -1943,7 +1944,7 @@ impl ParserDBBuilder {
             let table = TableAttribute::table(check);
             let detached = belongs_to(table);
             if detached {
-                carried.record(metadata.expression(), metadata.calls());
+                carried.record(check.attribute().expr.as_ref(), metadata.calls());
                 // A check written on a column belongs to the column.
                 let column = table.columns.iter().find(|column| {
                     column.options.iter().any(|option| {
@@ -2083,6 +2084,14 @@ impl ParserDBBuilder {
             .iter()
             .find(|(stored, _, _)| core::ptr::eq(stored.as_ref(), table))
             .map(|(_, metadata, _)| metadata)
+    }
+
+    /// The shared handle on `table`, one of this builder's nodes.
+    fn shared_node(&self, table: &CreateTable) -> Option<&Arc<CreateTable>> {
+        self.tables()
+            .iter()
+            .find(|(stored, _, _)| core::ptr::eq(stored.as_ref(), table))
+            .map(|(stored, _, _)| stored)
     }
 
     /// The kind of table `table`, a node this builder stores, is.
@@ -2435,8 +2444,11 @@ impl ParserDBBuilder {
     fn index_table(
         &self,
         create_index: &CreateIndex,
-    ) -> Result<&CreateTable, crate::errors::Error> {
-        if let Some(table) = self.resolve_table_object_name(&create_index.table_name)? {
+    ) -> Result<&Arc<CreateTable>, crate::errors::Error> {
+        if let Some(table) = self
+            .resolve_table_object_name(&create_index.table_name)?
+            .and_then(|table| self.shared_node(table))
+        {
             return Ok(table);
         }
         if let Some((actual_kind, _)) = self.relation_reached(&create_index.table_name) {
@@ -7134,31 +7146,25 @@ impl ParserDB {
     /// functions its expression reads, a call `carried` holds a binding for
     /// keeping it.
     fn add_check_constraint(
-        check: &CheckConstraint,
+        check: TableAttribute<CreateTable, CheckConstraint>,
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
         carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        let check_arc = Arc::new(TableAttribute::new(create_table.clone(), check.clone()));
+        let check_arc = Arc::new(check);
         table_metadata.add_check_constraint(check_arc.clone());
+        let expression = &check_arc.attribute().expr;
         let (columns_in_expression, mut calls) = Self::process_check_constraint(
-            &check.expr,
+            expression,
             create_table,
             table_metadata,
             &builder,
             carried,
         )?;
-        carried.operators.take_check(&check.expr, &mut calls);
-        Ok(builder.add_check_constraint(
-            check_arc,
-            CheckMetadata::new(
-                *check.expr.clone(),
-                create_table.clone(),
-                columns_in_expression,
-                calls,
-            ),
-        ))
+        carried.operators.take_check(expression, &mut calls);
+        let metadata = CheckMetadata::new(create_table.clone(), columns_in_expression, calls);
+        Ok(builder.add_check_constraint(check_arc, metadata))
     }
 
     /// Helper function to create an index expression from columns.
@@ -7178,16 +7184,15 @@ impl ParserDB {
         }
     }
 
-    /// Adds the index backing `unique_constraint`, binding the calls of its
-    /// key, a binding or a selection `carried` holds kept.
+    /// Adds the index backing `unique_key`, binding the calls of its key, a
+    /// binding or a selection `carried` holds kept.
     fn add_unique_key(
-        unique_constraint: UniqueConstraint,
-        create_table: &Arc<CreateTable>,
+        unique_key: TableAttribute<CreateTable, UniqueConstraint>,
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
         carried: &mut CarriedCalls,
     ) -> ParserDBBuilder {
-        let unique_index = Arc::new(TableAttribute::new(create_table.clone(), unique_constraint));
+        let unique_index = Arc::new(unique_key);
         let Some(expression) = Self::create_index_expression(&unique_index.attribute().columns)
         else {
             return builder;
@@ -7257,7 +7262,7 @@ impl ParserDB {
             *builder.dialect(),
         )?;
 
-        let index_arc = Arc::new(TableAttribute::new(Arc::new(table.clone()), create_index));
+        let index_arc = Arc::new(TableAttribute::new(Arc::clone(table), create_index));
         let Some(expression) = Self::create_index_expression(&index_arc.attribute().columns) else {
             return Err(crate::errors::Error::InvalidIndex {
                 index_name: index_arc.attribute().name.as_ref().map_or_else(
@@ -7799,17 +7804,25 @@ impl ParserDB {
                 Self::validate_foreign_key_deferral(&builder, &create_table.name, foreign_key)?;
                 continue;
             }
-            match option.option.clone() {
-                ColumnOption::Check(check_constraint) => {
-                    builder = Self::add_check_constraint(
-                        &check_constraint,
-                        create_table,
-                        table_metadata,
-                        builder,
-                        carried,
-                    )?;
+            let lent_check = column.part(|column| {
+                match &column.options.get(position)?.option {
+                    ColumnOption::Check(check) => Some(check),
+                    _ => None,
                 }
-                ColumnOption::Unique(mut unique_constraint) => {
+            });
+            if let Some(check) = lent_check {
+                builder = Self::add_check_constraint(
+                    check,
+                    create_table,
+                    table_metadata,
+                    builder,
+                    carried,
+                )?;
+                continue;
+            }
+            match &option.option {
+                ColumnOption::Unique(unique_constraint) => {
+                    let mut unique_constraint = unique_constraint.clone();
                     // sqlparser keeps the name of an inline constraint on the
                     // option rather than inside the constraint, so without this
                     // the index behind `CONSTRAINT c UNIQUE` would read back
@@ -7827,8 +7840,7 @@ impl ParserDB {
                     unique_constraint.on_conflict =
                         unique_constraint.on_conflict.or(conflict_clause);
                     builder = Self::add_unique_key(
-                        unique_constraint,
-                        create_table,
+                        TableAttribute::new(Arc::clone(create_table), unique_constraint),
                         table_metadata,
                         builder,
                         carried,
@@ -7855,8 +7867,10 @@ impl ParserDB {
                         on_conflict: primary_key.on_conflict.or(conflict_clause),
                     };
                     builder = Self::add_unique_key(
-                        primary_key_unique_constraint,
-                        create_table,
+                        TableAttribute::new(
+                            Arc::clone(create_table),
+                            primary_key_unique_constraint,
+                        ),
                         table_metadata,
                         builder,
                         carried,
@@ -7870,7 +7884,7 @@ impl ParserDB {
                     if !transformed
                         && matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
                 {
-                    generated_expressions::references(&builder, create_table, &expression)?;
+                    generated_expressions::references(&builder, create_table, expression)?;
                 }
                 _ => {}
             }
@@ -7966,7 +7980,7 @@ impl ParserDB {
                     foreign_key.name.clone_from(&option.name);
                     foreign_key.columns.push(column.name.clone());
                     builder = Self::process_foreign_key_table_constraint(
-                        &foreign_key,
+                        TableAttribute::new(Arc::clone(create_table), foreign_key),
                         constraint_names::Slot::Column {
                             column: column_position,
                             option: option_position,
@@ -7981,7 +7995,9 @@ impl ParserDB {
             }
         }
         for (position, constraint) in create_table.constraints.iter().enumerate() {
-            if let TableConstraint::ForeignKey(foreign_key) = constraint {
+            if let Some(foreign_key) =
+                Self::lend_constraint(create_table, position, foreign_key_constraint)
+            {
                 builder = Self::process_foreign_key_table_constraint(
                     foreign_key,
                     constraint_names::Slot::Table(position, constraint),
@@ -7996,12 +8012,14 @@ impl ParserDB {
 
     /// Resolves and installs a foreign-key constraint.
     fn process_foreign_key_table_constraint(
-        fk: &ForeignKeyConstraint,
+        foreign_key: TableAttribute<CreateTable, ForeignKeyConstraint>,
         slot: constraint_names::Slot<'_>,
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
+        let fk_arc = Arc::new(foreign_key);
+        let fk = fk_arc.attribute();
         let case = builder.identifier_case();
         let postgres = matches!(builder.dialect(), SqlparserDialect::PostgreSql);
         let mut host_columns = Vec::new();
@@ -8020,7 +8038,6 @@ impl ParserDB {
             }
         }
 
-        let fk_arc = Arc::new(TableAttribute::new(create_table.clone(), fk.clone()));
         if builder.dialect().binds_foreign_keys_on_use() {
             refuse_unequal_written_lists(create_table, fk)?;
         } else {
@@ -8193,9 +8210,20 @@ impl ParserDB {
         Ok((referenced_table, columns))
     }
 
+    /// Lends the constraint at `position` of `table` when `kind` picks it out,
+    /// read in place rather than copied.
+    fn lend_constraint<C: 'static>(
+        table: &Arc<CreateTable>,
+        position: usize,
+        kind: impl for<'table> FnOnce(&'table TableConstraint) -> Option<&'table C>,
+    ) -> Option<TableAttribute<CreateTable, C>> {
+        TableAttribute::declared_in(Arc::clone(table), |table| {
+            kind(table.constraints.get(position)?)
+        })
+    }
+
     /// Helper function to process table constraints.
     fn process_table_constraints(
-        constraints: &[TableConstraint],
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
@@ -8203,31 +8231,28 @@ impl ParserDB {
         transformed: bool,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let case = builder.identifier_case();
-        for constraint in constraints {
+        for (position, constraint) in create_table.constraints.iter().enumerate() {
             if !transformed {
                 Self::validate_key_columns(constraint, create_table, &builder, false)?;
             }
+            if let Some(check) = Self::lend_constraint(create_table, position, check_constraint) {
+                builder = Self::add_check_constraint(
+                    check,
+                    create_table,
+                    table_metadata,
+                    builder,
+                    carried,
+                )?;
+                continue;
+            }
+            if let Some(unique) = Self::lend_constraint(create_table, position, unique_constraint) {
+                builder =
+                    Self::add_unique_table_constraint(unique, table_metadata, builder, carried)?;
+                continue;
+            }
             match constraint {
-                TableConstraint::Unique(uc) => {
-                    builder = Self::add_unique_table_constraint(
-                        uc,
-                        create_table,
-                        table_metadata,
-                        builder,
-                        carried,
-                    )?;
-                }
                 TableConstraint::ForeignKey(foreign_key) if !transformed => {
                     Self::validate_foreign_key_deferral(&builder, &create_table.name, foreign_key)?;
-                }
-                TableConstraint::Check(check) => {
-                    builder = Self::add_check_constraint(
-                        check,
-                        create_table,
-                        table_metadata,
-                        builder,
-                        carried,
-                    )?;
                 }
                 TableConstraint::PrimaryKey(pk) => {
                     let mut primary_key_columns = Vec::new();
@@ -8265,8 +8290,10 @@ impl ParserDB {
                         on_conflict: pk.on_conflict,
                     };
                     builder = Self::add_unique_key(
-                        primary_key_unique_constraint,
-                        create_table,
+                        TableAttribute::new(
+                            Arc::clone(create_table),
+                            primary_key_unique_constraint,
+                        ),
                         table_metadata,
                         builder,
                         carried,
@@ -8300,23 +8327,16 @@ impl ParserDB {
         Ok(builder)
     }
 
-    /// Adds `unique_constraint`, written among the constraints of the table,
-    /// whose columns [`Self::validate_key_columns`] already checked.
+    /// Adds `unique_key`, written among the constraints of the table, whose
+    /// columns [`Self::validate_key_columns`] already checked.
     fn add_unique_table_constraint(
-        unique_constraint: &UniqueConstraint,
-        create_table: &Arc<CreateTable>,
+        unique_key: TableAttribute<CreateTable, UniqueConstraint>,
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
         carried: &mut CarriedCalls,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
-        Self::refuse_postgres_unique_expression(*builder.dialect(), unique_constraint)?;
-        Ok(Self::add_unique_key(
-            unique_constraint.clone(),
-            create_table,
-            table_metadata,
-            builder,
-            carried,
-        ))
+        Self::refuse_postgres_unique_expression(*builder.dialect(), unique_key.attribute())?;
+        Ok(Self::add_unique_key(unique_key, table_metadata, builder, carried))
     }
 
     /// Refuses an entry of `constraint` other than a plain column under
@@ -8517,8 +8537,8 @@ impl ParserDB {
         let search_path: Vec<_> =
             builder.search_path().map(|(schema, quoted)| (schema.to_string(), quoted)).collect();
 
-        for column in create_table.columns.clone() {
-            table_metadata.add_column(Arc::new(TableAttribute::new(create_table.clone(), column)));
+        for column in TableAttribute::each_declared(&create_table, |table| &table.columns) {
+            table_metadata.add_column(Arc::new(column));
         }
 
         for column in table_metadata.clone().column_arcs() {
@@ -8551,7 +8571,6 @@ impl ParserDB {
         }
 
         builder = Self::process_table_constraints(
-            &create_table.constraints,
             &create_table,
             &mut table_metadata,
             builder,
@@ -12942,7 +12961,7 @@ impl ParserDB {
                                 );
                             }
                             let mut renamed = (*stored).clone();
-                            renamed.attribute_mut().name = Some(new_name);
+                            renamed.edit_attribute(|index| index.name = Some(new_name));
                             let renamed = Arc::new(renamed);
 
                             // The same handle sits in the index store and in
@@ -15081,6 +15100,30 @@ impl ParserDB {
             ingestor = ingestor.apply_parsed(&sql, source)?;
         }
         Ok(ingestor.finish())
+    }
+}
+
+/// The check `constraint` is, if it is one.
+const fn check_constraint(constraint: &TableConstraint) -> Option<&CheckConstraint> {
+    match constraint {
+        TableConstraint::Check(check) => Some(check),
+        _ => None,
+    }
+}
+
+/// The unique key `constraint` is, if it is one.
+const fn unique_constraint(constraint: &TableConstraint) -> Option<&UniqueConstraint> {
+    match constraint {
+        TableConstraint::Unique(unique) => Some(unique),
+        _ => None,
+    }
+}
+
+/// The foreign key `constraint` is, if it is one.
+const fn foreign_key_constraint(constraint: &TableConstraint) -> Option<&ForeignKeyConstraint> {
+    match constraint {
+        TableConstraint::ForeignKey(foreign_key) => Some(foreign_key),
+        _ => None,
     }
 }
 

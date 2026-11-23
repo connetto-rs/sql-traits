@@ -20,7 +20,7 @@
 //! honouring those pins.
 
 use alloc::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
     sync::Arc,
@@ -137,7 +137,9 @@ fn settle<N: Visit + ?Sized>(
         calls.settle(node, |name: &ObjectName| selections.calls.get(&address(name)).copied());
     }
     if calls.has_pending_operators() {
-        calls.settle_operators(node, |node| selections.operators.remove(&node).unwrap_or_default());
+        calls.settle_operators(node, |node| {
+            selections.operators.get(&node).cloned().unwrap_or_default()
+        });
     } else if calls.has_untyped_calls() {
         calls.settle_remaining_operators();
     }
@@ -314,6 +316,40 @@ impl ParserDBBuilder {
         Ok(())
     }
 
+    /// Types the waiting check constraints and columns through `select`.
+    fn select_checks_and_columns(&self, select: &mut Select<'_>) {
+        // A check written on a column is a node the column shares with its
+        // check constraint, typed once, by the constraint when that types it.
+        let mut typed_checks = BTreeSet::new();
+        for (check, metadata) in self.check_constraints() {
+            let expression = &check.attribute().expr;
+            let scope = ExpressionScope::Table(TableAttribute::table(check));
+            let typed = select.typed(&**expression, metadata.calls(), |select| {
+                select.expression(expression, &scope);
+            });
+            if typed {
+                typed_checks.insert(address(check.attribute()));
+            }
+        }
+        for (column, metadata, _) in self.columns() {
+            if !is_waiting(metadata.calls()) {
+                continue;
+            }
+            let table = ExpressionScope::Table(TableAttribute::table(column));
+            for option in &column.attribute().options {
+                // A default sees no column, every other expression the table.
+                let scope = match &option.option {
+                    ColumnOption::Check(check) if typed_checks.contains(&address(check)) => {
+                        continue;
+                    }
+                    ColumnOption::Default(_) => &ExpressionScope::Empty,
+                    _ => &table,
+                };
+                select.roots(&option.option, scope);
+            }
+        }
+    }
+
     /// The function each waiting call and the operators each waiting
     /// operator node selects, typed in the scope its expression sees over
     /// `database`.
@@ -328,27 +364,7 @@ impl ParserDBBuilder {
             deparsed: None,
             stored: true,
         };
-        for (check, metadata) in self.check_constraints() {
-            let expression = &check.attribute().expr;
-            let scope = ExpressionScope::Table(TableAttribute::table(check));
-            select.typed(&**expression, metadata.calls(), |select| {
-                select.expression(expression, &scope);
-            });
-        }
-        for (column, metadata, _) in self.columns() {
-            if !is_waiting(metadata.calls()) {
-                continue;
-            }
-            let table = ExpressionScope::Table(TableAttribute::table(column));
-            for option in &column.attribute().options {
-                // A default sees no column, every other expression the table.
-                let scope = match option.option {
-                    ColumnOption::Default(_) => &ExpressionScope::Empty,
-                    _ => &table,
-                };
-                select.roots(&option.option, scope);
-            }
-        }
+        self.select_checks_and_columns(&mut select);
         for (index, metadata) in self.indices() {
             let scope = ExpressionScope::Table(TableAttribute::table(index));
             select.typed(index.attribute(), metadata.calls(), |select| {
@@ -453,13 +469,14 @@ struct Select<'s> {
 
 impl<'s> Select<'s> {
     /// Types `node`, whose record is `calls`, through `roots` when something
-    /// of it waits, twice with what the deparse pins when it is parsed again.
+    /// of it waits, twice with what the deparse pins when it is parsed again,
+    /// answering whether it typed it.
     fn typed<N: Visit + ?Sized>(
         &mut self,
         node: &N,
         calls: &ExpressionCalls<CreateFunction>,
         roots: impl Fn(&mut Select<'_>),
-    ) {
+    ) -> bool {
         if calls.is_rewritten() {
             let recorded = Recorded::of(node, calls, self.database, self.case);
             let mut deparsed = Deparsed::of(calls.written(), &recorded.positions);
@@ -483,7 +500,10 @@ impl<'s> Select<'s> {
             self.selections.written.insert(root_address(node), written);
         } else if is_waiting(calls) {
             roots(self);
+        } else {
+            return false;
         }
+        true
     }
 
     /// Types every statement and expression `node` holds that no other

@@ -165,7 +165,7 @@ pub(super) fn create_view(
         // The replacement keeps the stored name of the view it replaces,
         // whichever spelling of its schema the statement wrote.
         bind_reference(&mut node.name, stored_view_qualifier(existing.as_ref()));
-        let mut view = View::from_node(&node, *builder.dialect())?;
+        let mut view = View::from_node(node, *builder.dialect())?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         return Ok(builder.add_view_with_identity(Arc::new(view), metadata, identity));
     }
@@ -208,17 +208,18 @@ pub(super) fn create_view(
     let mut metadata = ViewMetadata::default();
     metadata.set_owner(creator.owner());
     metadata.set_calls(builder.calls_in(&node.query));
+    let name = node.name.clone();
     let builder = if node.materialized {
-        let mut view = MaterializedView::from_node(&node, *builder.dialect())?;
+        let mut view = MaterializedView::from_node(node, *builder.dialect())?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         builder.add_materialized_view(Arc::new(view), metadata)
     } else {
-        let mut view = View::from_node(&node, *builder.dialect())?;
+        let mut view = View::from_node(node, *builder.dialect())?;
         view.declaration_mut().set_selects_wildcard(selects_wildcard);
         builder.add_view(Arc::new(view), metadata)
     };
-    Arc::make_mut(arrays).create(&builder, &node.name);
-    Ok(creator.grant(builder, DefaultPrivilegeKind::Tables, &GrantObjects::Tables(vec![node.name])))
+    Arc::make_mut(arrays).create(&builder, &name);
+    Ok(creator.grant(builder, DefaultPrivilegeKind::Tables, &GrantObjects::Tables(vec![name])))
 }
 
 /// Checks the two rules a replacement has to keep: it may not drop an output
@@ -1652,6 +1653,7 @@ impl VisitorMut for DefinitionBinder<'_> {
 /// dependency walk read the relation it names as they read any `FROM` item.
 ///
 /// Arms nested in a parenthesized query are left to the visit of that query.
+#[cfg_attr(feature = "std", recursive::recursive)]
 fn select_table_queries(body: &mut SetExpr) {
     match body {
         SetExpr::SetOperation { left, right, .. } => {

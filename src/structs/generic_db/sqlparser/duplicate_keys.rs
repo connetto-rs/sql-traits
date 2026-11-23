@@ -226,7 +226,7 @@ pub(super) fn merge(
         positions.filter_map(|position| Key::at(columns, constraints, position)).collect();
     ordered.sort_by_key(|key| {
         let start = match key.position {
-            Position::Column(column, _) => columns[column].span().start,
+            Position::Column(column, _) => columns[column].name.span.start,
             Position::Table(position) => constraints[position].span().start,
         };
         (!key.primary, start)

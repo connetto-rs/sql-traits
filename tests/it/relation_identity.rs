@@ -208,11 +208,8 @@ fn a_database_assembled_through_the_builder_gives_each_object_an_identity() {
         panic!("expected a table")
     };
     let node = Arc::new(node);
-    let columns: Vec<_> = node
-        .columns
-        .iter()
-        .map(|definition| Arc::new(TableAttribute::new(node.clone(), definition.clone())))
-        .collect();
+    let columns: Vec<_> =
+        TableAttribute::each_declared(&node, |table| &table.columns).map(Arc::new).collect();
     let empty = ingest("").finish();
     let mut builder = ParserDBBuilder::new("built".to_owned(), *empty.dialect());
     for column in &columns {

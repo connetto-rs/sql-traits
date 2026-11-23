@@ -511,12 +511,12 @@ fn a_temporary_view_keeps_a_permanent_table_from_being_dropped() {
 #[test]
 fn a_declaration_read_on_its_own_tells_the_two_storages_apart() {
     let ordinary = View::from_node(
-        &view_node("CREATE VIEW v AS SELECT 1 AS result"),
+        view_node("CREATE VIEW v AS SELECT 1 AS result"),
         SqlparserDialect::PostgreSql,
     )
     .expect("usable declaration");
     let temporary = View::from_node(
-        &view_node("CREATE TEMP VIEW v AS SELECT 1 AS result"),
+        view_node("CREATE TEMP VIEW v AS SELECT 1 AS result"),
         SqlparserDialect::PostgreSql,
     )
     .expect("usable declaration");

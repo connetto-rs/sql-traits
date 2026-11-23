@@ -73,7 +73,21 @@ pub(super) fn columns(
 
 /// Checks index constraints in their written order across both AST lists.
 pub(super) fn keys(builder: &ParserDBBuilder, table: &CreateTable) -> Result<bool, Error> {
-    let mut constraints = table.constraints.iter().peekable();
+    // `key` acts only on these, so a check's span, which walks its whole
+    // expression, is never taken.
+    let mut constraints = table
+        .constraints
+        .iter()
+        .filter(|constraint| {
+            matches!(
+                constraint,
+                TableConstraint::Unique(_)
+                    | TableConstraint::PrimaryKey(_)
+                    | TableConstraint::PrimaryKeyUsingIndex(_)
+                    | TableConstraint::Index(_)
+            )
+        })
+        .peekable();
     let mut has_primary_key = false;
     for column in &table.columns {
         while constraints

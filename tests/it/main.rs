@@ -46,6 +46,7 @@ mod creation_identifier_case;
 mod data_statement_analysis;
 mod declared_type_names;
 mod declared_type_text;
+mod deep_input_stack;
 mod deep_query_scopes;
 mod default_column_references;
 mod default_privileges;
