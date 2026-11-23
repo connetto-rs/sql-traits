@@ -35,8 +35,8 @@ fn key_columns(database: &ParserDB) -> (Vec<&str>, Vec<&str>) {
     )
 }
 
-/// An unquoted name reaches the column under PostgreSQL's rule, whatever
-/// case each side spells it in.
+/// An unquoted name reaches the column under SQLite's rule and PostgreSQL's,
+/// whatever case each side spells it in.
 #[test]
 fn an_unquoted_name_reaches_the_column_in_another_case() -> Result<(), Error> {
     let sqlite = ParserDB::parse::<SQLiteDialect>(

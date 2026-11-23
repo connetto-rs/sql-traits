@@ -114,8 +114,10 @@ fn folded_cascade_removes_the_quoted_view_chain() -> Result<(), Error> {
 }
 
 #[test]
-fn default_catalog_keeps_differently_cased_references_unbound() -> Result<(), Error> {
-    let database = ParserDB::parse::<SQLiteDialect>(
+fn as_written_catalog_keeps_differently_cased_references_unbound() -> Result<(), Error> {
+    let database = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::AsWritten)
+        .parse::<SQLiteDialect>(
         r#"CREATE TABLE "T"("X" INT);
            CREATE VIEW v AS SELECT * FROM t;
            ALTER TABLE "T" RENAME TO u;

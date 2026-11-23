@@ -678,6 +678,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     pub fn new(catalog_name: String, dialect: P::Dialect) -> Self {
         let schemas = P::initial_schemas(&dialect).into_iter().collect();
         let search_path = initial_search_path(&dialect);
+        let identifier_case = Namespaces::of(dialect.sqlparser_dialect()).identifier_case();
         Self {
             dialect,
             catalog_name,
@@ -708,7 +709,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             table_grants: Vec::new(),
             column_grants: Vec::new(),
             search_path,
-            identifier_case: IdentifierCase::AsWritten,
+            identifier_case,
             identities: IdentityCounter::default(),
         }
     }
@@ -721,7 +722,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     }
 
     /// Sets the comparison deciding whether a creation takes a name already
-    /// held, which is PostgreSQL's rule unless the caller says otherwise.
+    /// held, which is the dialect's own rule unless the caller says otherwise.
     #[must_use]
     #[inline]
     pub fn with_identifier_case(mut self, case: IdentifierCase) -> Self {

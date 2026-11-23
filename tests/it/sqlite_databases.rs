@@ -8,7 +8,14 @@ use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 
 /// Parses `sql` the way SQLite compares names, folding every identifier.
 fn parse(sql: &str) -> Result<ParserDB, Error> {
-    ParseOptions::default().with_identifier_case(IdentifierCase::Folded).parse::<SQLiteDialect>(sql)
+    ParserDB::parse::<SQLiteDialect>(sql)
+}
+
+/// Parses `sql` under PostgreSQL's rule, where quoting decides.
+fn parse_as_written(sql: &str) -> Result<ParserDB, Error> {
+    ParseOptions::default()
+        .with_identifier_case(IdentifierCase::AsWritten)
+        .parse::<SQLiteDialect>(sql)
 }
 
 fn database(sql: &str) -> ParserDB {
@@ -335,8 +342,7 @@ fn a_column_qualified_by_main_reads_an_unqualified_table() {
     let expected = (String::from("t"), String::from("x"));
     let folded = database("CREATE TABLE t(x);");
     assert_eq!(column_named(&folded, "main.t.x", IdentifierCase::Folded), expected);
-    let as_written =
-        ParserDB::parse::<SQLiteDialect>("CREATE TABLE t(x);").expect("SQLite accepts it");
+    let as_written = parse_as_written("CREATE TABLE t(x);").expect("SQLite accepts it");
     assert_eq!(column_named(&as_written, "MAIN.t.x", IdentifierCase::AsWritten), expected);
 }
 
@@ -347,13 +353,13 @@ fn database_names_compare_as_the_caller_compares_names() {
         "ATTACH ':memory:' AS \"Aux\"; CREATE TABLE aux.a(x);",
         "CREATE TABLE t(y); CREATE INDEX \"Main\".i ON t(y);",
     ] {
-        assert!(ParserDB::parse::<SQLiteDialect>(sql).is_err(), "{sql}");
+        assert!(parse_as_written(sql).is_err(), "{sql}");
         assert!(parse(sql).is_ok(), "{sql}");
     }
-    let database = ParserDB::parse::<SQLiteDialect>(
+    let database = parse_as_written(
         "ATTACH ':memory:' AS \"Aux\"; CREATE TABLE \"Aux\".a(x); CREATE TABLE MAIN.m(y);",
     )
-    .expect("SQLite accepts the script");
+    .expect("PostgreSQL's rule accepts the script");
     for target in [
         TargetName::new("a", false).with_schema("Aux", true),
         TargetName::new("m", false).with_schema("main", false),

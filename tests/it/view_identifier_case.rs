@@ -92,9 +92,9 @@ fn a_folded_catalog_finds_the_source_table_of_a_query() {
 /// inside a view, whatever comparison the outer query states.
 #[test]
 fn an_as_written_view_keeps_a_quoted_table_apart() {
-    let database = ParserDB::parse::<SQLiteDialect>(
-        r#"CREATE TABLE "T"(x INT); CREATE VIEW v AS SELECT x FROM t;"#,
-    )
-    .expect("schema parses");
+    let database = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::AsWritten)
+        .parse::<SQLiteDialect>(r#"CREATE TABLE "T"(x INT); CREATE VIEW v AS SELECT x FROM t;"#)
+        .expect("schema parses");
     assert_eq!(traced_table(&database), None);
 }

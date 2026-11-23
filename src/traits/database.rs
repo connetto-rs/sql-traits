@@ -2894,7 +2894,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// A view, a foreign key or a trigger bound its references when it was
     /// created, under the engine's rule, so reading one back compares under
     /// that rule whatever comparison the caller states for its own query. The
-    /// default is [`IdentifierCase::AsWritten`], which is PostgreSQL's.
+    /// default is the dialect's engine's rule, [`IdentifierCase::Folded`] for
+    /// SQLite and [`IdentifierCase::AsWritten`], PostgreSQL's, for every other
+    /// dialect.
     ///
     /// # Example
     ///
@@ -2903,9 +2905,9 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// use sql_traits::prelude::*;
     /// use sqlparser::dialect::SQLiteDialect;
     ///
-    /// let db = ParseOptions::default()
-    ///     .with_identifier_case(IdentifierCase::Folded)
-    ///     .parse::<SQLiteDialect>(r#"CREATE TABLE "T" (x INT); CREATE VIEW v AS SELECT x FROM t;"#)?;
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     r#"CREATE TABLE "T" (x INT); CREATE VIEW v AS SELECT x FROM t;"#,
+    /// )?;
     /// assert_eq!(db.identifier_case(), IdentifierCase::Folded);
     /// // The view's `t` binds to `"T"` the way SQLite binds it.
     /// assert!(matches!(
@@ -2917,7 +2919,7 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     /// ```
     #[inline]
     fn identifier_case(&self) -> IdentifierCase {
-        IdentifierCase::AsWritten
+        Namespaces::of_database(self).identifier_case()
     }
 
     /// Returns the schema with the given name, if it exists.
