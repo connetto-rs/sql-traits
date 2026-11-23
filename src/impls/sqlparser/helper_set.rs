@@ -783,9 +783,32 @@ struct Reader<'db, DB: DatabaseLike> {
 /// for.
 type Answered<'db, DB> = Vec<(Vec<Value>, Arc<HelperSet<'db, DB>>)>;
 
+/// The stack [`Reader::answer`] leaves for one helper before it grows the
+/// stack, room for parsing the helper's body and the built-in declarations
+/// it reads, which run unguarded and take hundreds of KiB in a debug build.
+#[cfg(feature = "std")]
+const ANSWER_RED_ZONE: usize = 1 << 20;
+
+/// The stack [`Reader::answer`] grows by, room for many helpers.
+#[cfg(feature = "std")]
+const ANSWER_STACK_GROWTH: usize = 8 << 20;
+
 impl<'db, DB: DatabaseLike> Reader<'db, DB> {
-    #[cfg_attr(feature = "std", recursive::recursive)]
     fn answer(
+        &mut self,
+        function: &'db DB::Function,
+        arguments: &[Value],
+    ) -> Result<HelperSet<'db, DB>, HelperSetError> {
+        #[cfg(feature = "std")]
+        return stacker::maybe_grow(ANSWER_RED_ZONE, ANSWER_STACK_GROWTH, || {
+            self.answer_on_stack(function, arguments)
+        });
+        #[cfg(not(feature = "std"))]
+        self.answer_on_stack(function, arguments)
+    }
+
+    /// [`answer`](Self::answer) once the stack has room for it.
+    fn answer_on_stack(
         &mut self,
         function: &'db DB::Function,
         arguments: &[Value],
