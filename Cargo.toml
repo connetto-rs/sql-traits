@@ -19,6 +19,7 @@ std = [
     "sqlparser/std",
     "sqlparser/recursive-protection",
     "dep:recursive",
+    "dep:stacker",
     "geometric-traits/std",
     "thiserror/std",
     "sqlparser-plpgsql/std",
@@ -46,6 +47,8 @@ parity-fixtures = ["std", "serde", "dep:serde_json", "dep:toml"]
 [dependencies]
 sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
 recursive = { version = "0.1.1", optional = true }
+# Gives a builtin's declaration parse the stack it needs when a deep walk first reads it.
+stacker = { version = "0.1.25", optional = true }
 geometric-traits = { version = "0.2.3", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0", default-features = false }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", default-features = false, features = ["body-parse"] }

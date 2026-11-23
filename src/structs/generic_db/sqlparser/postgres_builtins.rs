@@ -257,6 +257,11 @@ fn stored_ident(name: &str) -> Ident {
     }
 }
 
+/// Stack a builtin's declaration parse may need, more than a recursive walk
+/// that first reads the builtin keeps free.
+#[cfg(feature = "std")]
+const DECLARATION_STACK: usize = 1 << 20;
+
 /// The declaration of a function the server provides, whose body the input
 /// never sees, from its parameter list and result as PostgreSQL prints them.
 ///
@@ -273,7 +278,12 @@ pub(super) fn declaration(
         "CREATE FUNCTION f({arguments}) RETURNS {result} LANGUAGE {} AS ''",
         language.name()
     );
-    let mut statements = Parser::parse_sql(&PostgreSqlDialect {}, &sql).ok()?;
+    let parse = || Parser::parse_sql(&PostgreSqlDialect {}, &sql);
+    #[cfg(feature = "std")]
+    let parsed = stacker::maybe_grow(DECLARATION_STACK, 2 * DECLARATION_STACK, parse);
+    #[cfg(not(feature = "std"))]
+    let parsed = parse();
+    let mut statements = parsed.ok()?;
     let Some(Statement::CreateFunction(mut function)) = statements.pop() else { return None };
     function.name = name;
     function.behavior = Some(volatility.behavior());
@@ -378,6 +388,19 @@ impl BuiltinTable<CreateFunction> for Postgres18Functions {
 mod tests {
     use super::{POSTGRES_18_BUILTINS, POSTGRES_18_FUNCTIONS, PostgresBuiltin, folded_bytes};
     use crate::structs::generic_db::builtin_functions::BuiltinTable;
+
+    /// A builtin first read deep in a recursive walk still parses its
+    /// declaration with the little stack the walk leaves.
+    #[test]
+    fn a_builtin_declares_on_a_nearly_spent_stack() {
+        let declared = std::thread::Builder::new()
+            .stack_size(64 << 10)
+            .spawn(|| POSTGRES_18_FUNCTIONS[0].function().is_some())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(declared);
+    }
 
     #[test]
     fn every_row_declares_its_function() {
