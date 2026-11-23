@@ -55,6 +55,7 @@ use crate::{
         ViewLike,
     },
     utils::{
+        call_sites::zero_argument_function,
         columns_in_expression,
         identifier_resolution::{
             identifiers_match, is_public_pseudo_role, is_temporary_schema, session_principal,
@@ -1500,46 +1501,24 @@ impl ParserDBBuilder {
     }
 
     /// The function a trigger written to run `called` runs, as of this
-    /// statement.
-    ///
-    /// PostgreSQL looks for a routine of that name taking no arguments, in
-    /// the named schema or else in the first schema of the path holding one,
-    /// `pg_catalog` first unless the path names it, and finds nothing when
-    /// that routine is a procedure.
-    fn trigger_function(&self, called: &ObjectName) -> Option<Arc<CreateFunction>> {
-        let functions: Vec<Arc<CreateFunction>> =
-            self.functions().iter().map(|(function, _)| Arc::clone(function)).collect();
-        let search_path: Vec<(&str, bool)> = self.search_path().collect();
-        let case = self.identifier_case();
-        let scope = calls_in_expression::CallScope {
-            functions: &functions,
-            builtins: self.builtins(),
-            search_path: &search_path,
-            case,
-        };
-        // `pg_catalog` comes first when the path leaves it out.
-        let path_position = |function: &CreateFunction| {
-            let declared_in = qualifier_of(&function.name).named();
-            search_path
-                .iter()
-                .position(|&entry| {
-                    schema_qualifiers_match(self.namespaces(), declared_in, Some(entry), case)
-                })
-                .map_or(0, |position| position + 1)
-        };
-        scope
-            .candidates(called)
-            .filter(|function| {
-                scope.reaches(function, called, 0)
-                    && function_argument_types(function.args.as_deref()).is_empty()
-            })
-            .min_by_key(|function| path_position(function))
+    /// statement, as [`zero_argument_function`] finds it among the declared
+    /// and provided functions, or nothing when that routine is a procedure.
+    fn trigger_function(&self, called: &ObjectName) -> Option<&CreateFunction> {
+        let named = object_name_last_part(called).map(|(name, _)| name);
+        let provided = named.into_iter().flat_map(|name| self.builtins().named(name));
+        let candidates = self
+            .functions()
+            .iter()
+            .map(|(function, _)| function)
+            .chain(provided.map(|(function, _)| function))
+            .map(Arc::as_ref);
+        zero_argument_function(candidates, called, || self.search_path(), self.identifier_case())
             .filter(|chosen| {
                 !self.functions().iter().any(|(function, metadata)| {
-                    Arc::ptr_eq(function, chosen) && metadata.kind() == FunctionKind::Procedure
+                    core::ptr::eq(function.as_ref(), *chosen)
+                        && metadata.kind() == FunctionKind::Procedure
                 })
             })
-            .cloned()
     }
 
     /// Whether a table outside `doomed` holds a foreign key to a table inside

@@ -8,13 +8,13 @@ use geometric_traits::{
     prelude::{GenericEdgesBuilder, Kahn, SquareCSR2D},
     traits::EdgesBuilder,
 };
-use sqlparser::ast::{Action, Function};
+use sqlparser::ast::{Action, Function, ObjectName};
 
 use crate::{
     errors::{Error, LookupError},
     structs::{
-        DefaultGrantee, DefaultPrivilege, DefaultPrivilegeKind, IdentifierCase, OperandType,
-        OperatorResolution, RoleSetting, TargetName, TypeFacts, WrittenCall,
+        DefaultGrantee, DefaultPrivilege, DefaultPrivilegeKind, FunctionKind, IdentifierCase,
+        OperandType, OperatorResolution, RoleSetting, TargetName, TypeFacts, WrittenCall,
     },
     traits::{
         CastLike, CheckConstraintLike, ColumnGrantLike, ColumnLike, DataTypeLike, DialectLike,
@@ -24,8 +24,11 @@ use crate::{
         UserDefinedTypeLike, ViewLike,
     },
     utils::{
-        call_sites::expression_form,
-        call_typing::{Called, Selection, expression_result, reached_functions, resolve_call},
+        call_sites::{expression_form, zero_argument_function},
+        call_typing::{
+            Called, Selection, called_object_name, expression_result, reached_functions,
+            resolve_call,
+        },
         coercion::common_type_name,
         identifier_resolution::stored_identifier_matches_lookup,
         object_name::{
@@ -1838,6 +1841,71 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
             case,
             crate::impls::SqlparserDialect::for_error_names(self.dialect()),
         )
+    }
+
+    /// Resolves the name a trigger's `EXECUTE FUNCTION` writes into the
+    /// function PostgreSQL binds the trigger to, the one its zero-argument
+    /// lookup finds.
+    ///
+    /// The arguments a trigger writes reach the function as `TG_ARGV` and
+    /// take no part in the lookup, so only a function taking no input
+    /// arguments counts, and a name whose other declarations all take some,
+    /// such as `log`, is not ambiguous here as it is for
+    /// [`Self::resolve_target_function`]. A qualified name reaches its own
+    /// schema. An unqualified one reaches the first schema holding such a
+    /// function among `pg_catalog`, unless [`Self::search_path`] names it, and
+    /// the schemas of the path. A procedure found there is no function a
+    /// trigger runs, so the name then reaches nothing.
+    ///
+    /// A stored trigger names its function already bound, which
+    /// [`TriggerLike::function`] reads, so this lookup serves a name read
+    /// from a statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::InvalidObjectName`] when the name has more than
+    /// two parts or a part built at run time.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{Ident, ObjectName},
+    ///     dialect::PostgreSqlDialect,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION log() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;",
+    /// )?;
+    /// // `pg_catalog` declares `log` three times, each taking arguments.
+    /// let log = TargetName::new("log", false);
+    /// assert!(db.resolve_target_function(log, IdentifierCase::AsWritten).is_err());
+    ///
+    /// let called = ObjectName::from(vec![Ident::new("log")]);
+    /// let function = db
+    ///     .resolve_trigger_function(&called, IdentifierCase::AsWritten)?
+    ///     .expect("the declared `log` takes no arguments");
+    /// assert_eq!(function.argument_modes().count(), 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn resolve_trigger_function(
+        &self,
+        called: &ObjectName,
+        case: IdentifierCase,
+    ) -> Result<Option<&Self::Function>, LookupError> {
+        let target = called_object_name(called)?;
+        let Some(function) = zero_argument_function(
+            self.functions_named(target.name()),
+            called,
+            || self.search_path(),
+            case,
+        ) else {
+            return Ok(None);
+        };
+        Ok((function.kind(self)? != FunctionKind::Procedure).then_some(function))
     }
 
     /// Returns the functions a call written in any statement may run, as

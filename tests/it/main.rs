@@ -246,6 +246,7 @@ mod thread_safety;
 mod transactional_ingestion;
 mod trigger_deferral;
 mod trigger_enablement;
+mod trigger_function_lookup;
 mod type_array_binding;
 mod type_array_builder;
 mod type_array_identities;
