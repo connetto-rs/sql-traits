@@ -1642,7 +1642,7 @@ impl VisitorMut for DefinitionBinder<'_> {
             if bound.temporary && self.temporary_read.is_none() {
                 self.temporary_read = Some(self.builder.dialect().stored_object_name_last(name));
             }
-            bind_reference(name, bound.qualifier);
+            self.builder.bind_relation_reference(name, bound.qualifier);
         }
         ControlFlow::Continue(())
     }

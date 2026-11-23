@@ -18,8 +18,8 @@ use sqlparser::ast::{
 };
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference, constraint_validity,
-    existing_child, idents_match,
+    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, constraint_validity, existing_child,
+    idents_match,
     inheritance::{self, ParentKind},
     partition_bounds, stored_qualifier, triggers, views,
 };
@@ -138,7 +138,7 @@ pub(super) fn attach_partition(
     received.merged.extend(merged_checks);
     refuse_foreign_under_unique_index(&builder, (&root, root_node), (&partition, partition_node))?;
     let mut bound_root = root_name.clone();
-    bind_reference(&mut bound_root, stored_qualifier(&root_node.name));
+    builder.bind_relation_reference(&mut bound_root, stored_qualifier(&root_node.name));
     received.edge = Some((bound_root, for_values.clone()));
 
     let column_names: Vec<String> =

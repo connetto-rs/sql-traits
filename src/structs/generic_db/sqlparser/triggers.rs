@@ -94,7 +94,7 @@ pub(super) fn create_trigger(
         refuse_firing(&builder, &create_trigger, true)?;
         stored_expressions::refuse_in_trigger_condition(&builder, &create_trigger.condition)?;
         let mut create_trigger = bind_parts(&builder, create_trigger)?;
-        bind_reference(&mut create_trigger.table_name, qualifier);
+        builder.bind_relation_reference(&mut create_trigger.table_name, qualifier);
         return create_on_view(builder, create_trigger, &host);
     }
     if let Some(actual_kind) = views::holds_view(&builder, &create_trigger.table_name) {
@@ -346,7 +346,7 @@ pub(super) fn drop_trigger(
     if let Some(relation_name) = &mut drop_trigger.table_name {
         if let Ok(Some(view)) = builder.resolve_view_object_name(relation_name) {
             let qualifier = stored_view_qualifier(view);
-            bind_reference(relation_name, qualifier);
+            builder.bind_relation_reference(relation_name, qualifier);
         } else {
             builder.bind_table_reference(relation_name);
         }

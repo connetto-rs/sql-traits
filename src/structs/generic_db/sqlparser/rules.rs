@@ -16,8 +16,8 @@ use sqlparser::ast::{
 };
 
 use super::{
-    NamedColumn, ParserDBBuilder, bind_reference, case_idents_match, function_bodies,
-    require_named, stored_qualifier, stored_view_qualifier, target_tables_match,
+    NamedColumn, ParserDBBuilder, case_idents_match, function_bodies, require_named,
+    stored_qualifier, stored_view_qualifier, target_tables_match,
     views::{self, ViewHost, relations_read_in, statements_read},
 };
 use crate::{
@@ -99,7 +99,7 @@ pub(super) fn create_rule(
             refusal,
         });
     }
-    bind_reference(&mut rule.table_name, qualifier);
+    builder.bind_relation_reference(&mut rule.table_name, qualifier);
 
     // The action and condition bind the relations they name the way a
     // `BEGIN ATOMIC` body does, under the search path in effect now.

@@ -378,6 +378,33 @@ fn indexes_on_temporary_and_permanent_tables_share_a_name() {
 }
 
 #[test]
+fn indexes_on_same_named_temporary_and_permanent_tables_share_a_name() {
+    let db = db("CREATE TABLE scratch (id INT);
+         CREATE TEMP TABLE scratch (id INT);
+         CREATE INDEX scratch_id ON public.scratch (id);
+         CREATE INDEX scratch_id ON scratch (id);");
+    let on_temporary: Vec<_> =
+        db.indexes().map(|index| TableIndexLike::table(index, &db).is_temporary()).collect();
+    assert_eq!(on_temporary.len(), 2);
+    assert!(on_temporary.contains(&true) && on_temporary.contains(&false));
+}
+
+#[test]
+fn a_key_naming_the_shadowed_permanent_table_keeps_its_schema() {
+    for key in [
+        "CREATE TABLE child (id INT REFERENCES public.scratch (id));",
+        "CREATE TABLE child (id INT);
+         ALTER TABLE child ADD FOREIGN KEY (id) REFERENCES public.scratch (id);",
+    ] {
+        db(&format!(
+            "CREATE TABLE scratch (id INT PRIMARY KEY);
+             CREATE TEMP TABLE scratch (id INT);
+             {key}"
+        ));
+    }
+}
+
+#[test]
 fn a_foreign_key_never_crosses_storage() {
     for sql in [
         "CREATE TEMP TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT REFERENCES p);",

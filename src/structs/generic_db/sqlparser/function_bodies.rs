@@ -31,7 +31,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    ParserDBBuilder, bind_reference,
+    ParserDBBuilder,
     views::{relations_read_in, statements_read},
 };
 use crate::{
@@ -511,7 +511,7 @@ impl BodyBinder<'_> {
             if bound.temporary && self.bare_temporary {
                 name.0.drain(..name.0.len() - 1);
             } else {
-                bind_reference(name, bound.qualifier);
+                self.builder.bind_relation_reference(name, bound.qualifier);
             }
         }
         ControlFlow::Continue(())

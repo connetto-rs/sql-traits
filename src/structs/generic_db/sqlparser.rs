@@ -2200,7 +2200,7 @@ impl ParserDBBuilder {
         };
         for name in names {
             if let Some(bound) = self.bound_relation(name) {
-                bind_reference(name, bound.qualifier);
+                self.bind_relation_reference(name, bound.qualifier);
             }
         }
     }
@@ -2328,9 +2328,43 @@ impl ParserDBBuilder {
     /// leaving one that reaches none as written.
     fn bind_table_reference(&self, reference: &mut ObjectName) {
         if let Ok(Some(table)) = self.resolve_table_object_name(reference) {
-            let qualifier = stored_qualifier(&table.name);
-            bind_reference(reference, qualifier);
+            self.bind_relation_reference(reference, stored_qualifier(&table.name));
         }
+    }
+
+    /// Binds a reference to the relation it reached, stored under `qualifier`.
+    fn bind_relation_reference(&self, reference: &mut ObjectName, qualifier: Option<Ident>) {
+        let qualifier = self.binding_qualifier(reference, qualifier);
+        bind_reference(reference, qualifier);
+    }
+
+    /// The qualifier a reference to a relation stored under `qualifier` binds
+    /// to, naming the default schema only when the bare name would not reach
+    /// it, as PostgreSQL qualifies a relation it deparses.
+    fn binding_qualifier(&self, reference: &ObjectName, qualifier: Option<Ident>) -> Option<Ident> {
+        if qualifier.is_some() {
+            return qualifier;
+        }
+        let Some(ObjectNamePart::Identifier(name)) = reference.0.last() else {
+            return None;
+        };
+        let namespaces = self.namespaces();
+        let case = self.identifier_case();
+        let mut key = RelationKey {
+            schema: String::new(),
+            name: case.compared_form(&name.value, name.quote_style.is_some()).into_owned(),
+        };
+        for (schema, quoted) in namespaces.relation_search_path(|| self.search_path()) {
+            if namespaces.is_default((schema, quoted), case) {
+                return None;
+            }
+            key.schema.clear();
+            key.schema.push_str(&case.compared_form(schema, quoted));
+            if self.relation_key_is_held(&key, case) {
+                break;
+            }
+        }
+        Some(Ident::new(namespaces.default_schema()))
     }
 
     /// Binds a foreign key declared on `host` to the table it reaches through
@@ -2358,8 +2392,7 @@ impl ParserDBBuilder {
     fn bind_foreign_key_at_declaration(&self, foreign_key: &mut ForeignKeyConstraint) {
         if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
             let primary_key_valid = referenced_keys::primary_key_is_valid(self, table);
-            ForeignKeyBinding::of(table, foreign_key, primary_key_valid, self.identifier_case())
-                .apply(foreign_key);
+            ForeignKeyBinding::of(self, table, foreign_key, primary_key_valid).apply(foreign_key);
         }
     }
 
@@ -4986,21 +5019,22 @@ struct ForeignKeyBinding {
 }
 
 impl ForeignKeyBinding {
-    /// Reads what `foreign_key` keeps of `target`, the table it reaches, with
-    /// column names matched under `case`.
+    /// Reads what `foreign_key` keeps of `target`, the table it reaches in
+    /// `builder`.
     fn of(
+        builder: &ParserDBBuilder,
         target: &CreateTable,
         foreign_key: &ForeignKeyConstraint,
         primary_key_valid: bool,
-        case: IdentifierCase,
     ) -> Self {
         Self {
-            qualifier: stored_qualifier(&target.name),
+            qualifier: builder
+                .binding_qualifier(&foreign_key.foreign_table, stored_qualifier(&target.name)),
             referred_columns: if foreign_key.referred_columns.is_empty()
                 && primary_key_valid
                 && !has_deferrable_primary_key(target)
             {
-                primary_key_columns(target, case)
+                primary_key_columns(target, builder.identifier_case())
             } else {
                 None
             },
@@ -5056,7 +5090,7 @@ fn bind_foreign_key_targets(
             .flatten()
             .map(|table| {
                 let primary_key_valid = referenced_keys::primary_key_is_valid(builder, table);
-                ForeignKeyBinding::of(table, foreign_key, primary_key_valid, case)
+                ForeignKeyBinding::of(builder, table, foreign_key, primary_key_valid)
             })
         })
         .collect();
