@@ -53,6 +53,7 @@ mod deferrable_key_targets;
 mod definer_helpers;
 mod deployment;
 mod descendant_drops;
+mod discriminated_extensions;
 mod do_blocks;
 mod domains;
 mod drop_expression;

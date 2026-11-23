@@ -3,7 +3,9 @@
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
-use sqlparser::ast::{Expr, GeneratedExpressionMode, Query};
+use sqlparser::ast::{
+    CastKind, Expr, GeneratedExpressionMode, Query, UnaryOperator, Value, ValueWithSpan,
+};
 
 use crate::{
     errors::LookupError,
@@ -1011,6 +1013,47 @@ pub trait ColumnLike:
     /// # }
     /// ```
     fn generation_storage(&self, database: &Self::DB) -> Option<GeneratedExpressionMode>;
+
+    /// Returns the generation expression of a column generated as one
+    /// literal other than `NULL`, under any parentheses, casts and sign, or
+    /// `None` for any other column.
+    ///
+    /// Every row holds this same value, which makes such a column the
+    /// discriminator of a subtype keyed to its supertype, as
+    /// [`ForeignKeyLike::referenced_constants`] reads it.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (
+    ///          id INT,
+    ///          kind TEXT GENERATED ALWAYS AS ('t'::text) STORED,
+    ///          doubled INT GENERATED ALWAYS AS (id * 2) STORED,
+    ///          nothing TEXT GENERATED ALWAYS AS (NULL) STORED
+    ///      );",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let constant = |name| {
+    ///     table.column(name, &db, IdentifierCase::AsWritten).map(|column| {
+    ///         column.expect("column exists").generated_constant().map(ToString::to_string)
+    ///     })
+    /// };
+    /// assert_eq!(constant("kind")?.as_deref(), Some("'t'::TEXT"));
+    /// assert_eq!(constant("doubled")?, None);
+    /// assert_eq!(constant("nothing")?, None);
+    /// assert_eq!(constant("id")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn generated_constant(&self) -> Option<&Expr> {
+        self.generation_expression().filter(|expression| is_literal(expression))
+    }
 
     /// Returns the functions one call in the column's default or generation
     /// expression may reach, resolved under the search path of the statement
@@ -2063,6 +2106,25 @@ fn identifies_row<DB: DatabaseLike>(
     }
 
     Ok(false)
+}
+
+/// Returns whether `expression` is one literal other than `NULL`, under any
+/// parentheses, plain casts and sign.
+fn is_literal(expression: &Expr) -> bool {
+    match expression {
+        Expr::Nested(inner)
+        | Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, expr: inner, .. } => {
+            is_literal(inner)
+        }
+        Expr::UnaryOp { op: UnaryOperator::Plus | UnaryOperator::Minus, expr: inner } => {
+            matches!(&**inner, Expr::Value(ValueWithSpan { value: Value::Number(..), .. }))
+        }
+        Expr::Value(ValueWithSpan { value, .. }) => {
+            !matches!(value, Value::Null | Value::Placeholder(_))
+        }
+        Expr::TypedString(_) => true,
+        _ => false,
+    }
 }
 
 impl<C> ColumnLike for &C

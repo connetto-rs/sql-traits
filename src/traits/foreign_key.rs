@@ -3,7 +3,7 @@
 use alloc::{borrow::Cow, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug};
 
-use sqlparser::ast::{ConstraintReferenceMatchKind, ReferentialAction};
+use sqlparser::ast::{ConstraintReferenceMatchKind, Expr, ReferentialAction};
 
 use crate::{
     errors::LookupError,
@@ -1509,9 +1509,14 @@ pub trait ForeignKeyLike:
         Ok(pk_columns.iter().all(|pk| fk_columns.contains(pk)))
     }
 
-    /// Returns whether the foreign key is an "extension" foreign key, i.e., it
-    /// references the primary key of another table, and the host table is not
-    /// self-referential.
+    /// Returns whether the foreign key is an "extension" foreign key, keying
+    /// a subtype to its supertype, so that every row of the host table is a
+    /// row of the referenced table too.
+    ///
+    /// The host primary key lands on the referenced primary key column for
+    /// column, in any order, and every other host column is generated as a
+    /// constant, a [`ColumnLike::generated_constant`] discriminator, landing
+    /// outside the referenced primary key. A self-reference is no extension.
     ///
     /// # Arguments
     ///
@@ -1527,21 +1532,32 @@ pub trait ForeignKeyLike:
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
     ///
-    /// let db = ParserDB::parse::<GenericDialect>(
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
-    /// CREATE TABLE parent_table (id INT PRIMARY KEY, name TEXT);
+    /// CREATE TABLE parent_table (id INT PRIMARY KEY, kind TEXT NOT NULL, UNIQUE (id, kind));
     /// CREATE TABLE extension_table (
     ///     id INT PRIMARY KEY,
     ///     extra_field TEXT,
     ///     FOREIGN KEY (id) REFERENCES parent_table(id)
     /// );
+    /// CREATE TABLE discriminated_table (
+    ///     id INT PRIMARY KEY,
+    ///     kind TEXT GENERATED ALWAYS AS ('discriminated') STORED,
+    ///     FOREIGN KEY (id, kind) REFERENCES parent_table(id, kind)
+    /// );
     /// CREATE TABLE reference_table (
     ///     id INT PRIMARY KEY,
     ///     parent_id INT,
     ///     FOREIGN KEY (parent_id) REFERENCES parent_table(id)
+    /// );
+    /// CREATE TABLE written_kind_table (
+    ///     id INT PRIMARY KEY,
+    ///     kind TEXT NOT NULL,
+    ///     FOREIGN KEY (id, kind) REFERENCES parent_table(id, kind)
     /// );
     /// CREATE TABLE self_ref_table (
     ///     id INT PRIMARY KEY,
@@ -1549,33 +1565,113 @@ pub trait ForeignKeyLike:
     /// );
     /// ",
     /// )?;
-    /// let extension_table = db
-    ///     .table_by_target(TargetName::new("extension_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let reference_table = db
-    ///     .table_by_target(TargetName::new("reference_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let self_ref_table = db
-    ///     .table_by_target(TargetName::new("self_ref_table", false), IdentifierCase::AsWritten)?
-    ///     .unwrap();
-    /// let extension_fk =
-    ///     extension_table.foreign_keys(&db)?.next().expect("Should have a foreign key");
-    /// let reference_fk =
-    ///     reference_table.foreign_keys(&db)?.next().expect("Should have a foreign key");
-    /// let self_ref_fk = self_ref_table.foreign_keys(&db)?.next().expect("Should have a foreign key");
-    /// assert!(extension_fk.is_extension_foreign_key(&db)?, "Should be extension FK");
-    /// assert!(!reference_fk.is_extension_foreign_key(&db)?, "parent_id is not the primary key");
-    /// assert!(
-    ///     !self_ref_fk.is_extension_foreign_key(&db)?,
-    ///     "Self-referential FK should not be extension FK"
-    /// );
+    /// let is_extension = |name| -> Result<bool, sql_traits::errors::Error> {
+    ///     let table =
+    ///         db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)?.unwrap();
+    ///     let foreign_key = table.foreign_keys(&db)?.next().expect("Should have a foreign key");
+    ///     Ok(foreign_key.is_extension_foreign_key(&db)?)
+    /// };
+    /// assert!(is_extension("extension_table")?);
+    /// assert!(is_extension("discriminated_table")?, "kind is a generated constant");
+    /// assert!(!is_extension("reference_table")?, "parent_id is not the primary key");
+    /// assert!(!is_extension("written_kind_table")?, "kind is written by each row");
+    /// assert!(!is_extension("self_ref_table")?, "a self-reference extends nothing");
     /// # Ok(())
     /// # }
     /// ```
     fn is_extension_foreign_key(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(self.is_host_primary_key(database)?
-            && self.is_referenced_primary_key(database)?
-            && !self.is_self_referential(database)?)
+        if self.is_self_referential(database)? {
+            return Ok(false);
+        }
+        let host_primary_key: Vec<_> =
+            self.host_table(database).primary_key_columns(database)?.collect();
+        let referenced_primary_key: Vec<_> =
+            self.referenced_table(database)?.primary_key_columns(database)?.collect();
+        if host_primary_key.is_empty() || host_primary_key.len() != referenced_primary_key.len() {
+            return Ok(false);
+        }
+
+        let mut primary_key_pairs = 0;
+        for (host_column, referenced_column) in
+            self.host_columns(database)?.zip(self.referenced_columns(database)?)
+        {
+            if let Some(position) = host_primary_key.iter().position(|key| *key == host_column) {
+                if referenced_primary_key.get(position) != Some(&referenced_column) {
+                    return Ok(false);
+                }
+                primary_key_pairs += 1;
+            } else if host_column.generated_constant().is_none()
+                || referenced_primary_key.contains(&referenced_column)
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(primary_key_pairs == host_primary_key.len())
+    }
+
+    /// Iterates over the referenced columns this foreign key fills with a
+    /// constant, each with the [`ColumnLike::generated_constant`] of the host
+    /// column at its position.
+    ///
+    /// On an [extension key](Self::is_extension_foreign_key) these are the
+    /// supertype's discriminators, the values a writer of the subtype puts in
+    /// the supertype's row.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - A reference to the database instance to which the foreign
+    ///   key belongs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError`] when `database` does not hold the host table of
+    /// this foreign key, or when the table or column it references is
+    /// absent.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE resources (id INT PRIMARY KEY, kind TEXT NOT NULL, UNIQUE (id, kind));
+    /// CREATE TABLE ownables (
+    ///     id INT PRIMARY KEY,
+    ///     kind TEXT GENERATED ALWAYS AS ('ownable') STORED,
+    ///     FOREIGN KEY (id, kind) REFERENCES resources (id, kind)
+    /// );
+    /// ",
+    /// )?;
+    /// let ownables =
+    ///     db.table_by_target(TargetName::new("ownables", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let foreign_key = ownables.foreign_keys(&db)?.next().expect("Should have a foreign key");
+    /// let constants: Vec<_> = foreign_key
+    ///     .referenced_constants(&db)?
+    ///     .map(|(column, constant)| (column.column_name(), constant.to_string()))
+    ///     .collect();
+    /// assert_eq!(constants, [("kind", "'ownable'".to_owned())]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn referenced_constants<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<
+        impl Iterator<Item = (&'db <Self::DB as DatabaseLike>::Column, &'db Expr)>,
+        LookupError,
+    >
+    where
+        Self: 'db,
+    {
+        Ok(self.host_columns(database)?.zip(self.referenced_columns(database)?).filter_map(
+            |(host_column, referenced_column)| {
+                Some((referenced_column, host_column.generated_constant()?))
+            },
+        ))
     }
 
     /// Returns whether the key is a singleton foreign key, i.e. it is the only
