@@ -127,7 +127,7 @@ fn only_a_non_null_literal_is_a_discriminator() {
     let database = parse(
         "
 CREATE TABLE parent (id INT PRIMARY KEY, kind TEXT NOT NULL, code INT NOT NULL,
-  UNIQUE (id, kind), UNIQUE (id, code));
+  since DATE NOT NULL, UNIQUE (id, kind), UNIQUE (id, code), UNIQUE (id, since));
 CREATE TABLE written (id INT PRIMARY KEY, kind TEXT NOT NULL,
   FOREIGN KEY (id, kind) REFERENCES parent (id, kind));
 CREATE TABLE computed (id INT PRIMARY KEY, kind TEXT GENERATED ALWAYS AS (id::text) STORED,
@@ -138,6 +138,8 @@ CREATE TABLE negative (id INT PRIMARY KEY, code INT GENERATED ALWAYS AS ((-1)) S
   FOREIGN KEY (id, code) REFERENCES parent (id, code));
 CREATE TABLE plain (id INT PRIMARY KEY, kind TEXT GENERATED ALWAYS AS ('plain') STORED,
   FOREIGN KEY (kind, id) REFERENCES parent (kind, id));
+CREATE TABLE dated (id INT PRIMARY KEY, since DATE GENERATED ALWAYS AS (DATE '2020-01-01') STORED,
+  FOREIGN KEY (id, since) REFERENCES parent (id, since));
 ",
     );
     assert!(!is_extension(&database, "written", &["id", "kind"]));
@@ -149,11 +151,13 @@ CREATE TABLE plain (id INT PRIMARY KEY, kind TEXT GENERATED ALWAYS AS ('plain') 
         [("code".to_owned(), "(-1)".to_owned())]
     );
     assert!(is_extension(&database, "plain", &["kind", "id"]));
+    assert!(is_extension(&database, "dated", &["id", "since"]));
     assert_eq!(constants(&database, "computed", &["id", "kind"]), []);
 }
 
 /// The host primary key must land on the referenced primary key, column for
-/// column, and a self-reference stays no extension.
+/// column, so a host without a primary key or with a wider one extends
+/// nothing, and a self-reference stays no extension.
 #[test]
 fn the_primary_keys_must_meet_column_for_column() {
     let database = parse(
@@ -170,10 +174,16 @@ CREATE TABLE swapped (a INT, b INT, PRIMARY KEY (a, b),
   FOREIGN KEY (b, a) REFERENCES pair (b, a));
 CREATE TABLE crossed (a INT, b INT, PRIMARY KEY (a, b),
   FOREIGN KEY (a, b) REFERENCES pair (b, a));
+CREATE TABLE keyless (id INT, kind TEXT GENERATED ALWAYS AS ('keyless') STORED,
+  FOREIGN KEY (id, kind) REFERENCES parent (id, kind));
+CREATE TABLE wider (id INT, kind TEXT, PRIMARY KEY (id, kind),
+  FOREIGN KEY (id, kind) REFERENCES parent (id, kind));
 ",
     );
     assert!(!is_extension(&database, "elsewhere", &["id", "kind"]));
     assert!(!is_extension(&database, "looped", &["id", "kind"]));
     assert!(is_extension(&database, "swapped", &["b", "a"]));
     assert!(!is_extension(&database, "crossed", &["a", "b"]));
+    assert!(!is_extension(&database, "keyless", &["id", "kind"]));
+    assert!(!is_extension(&database, "wider", &["id", "kind"]));
 }
