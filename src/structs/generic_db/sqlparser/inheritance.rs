@@ -1728,8 +1728,7 @@ fn bind_parents(builder: &ParserDBBuilder, create_table: &mut CreateTable) -> Re
             });
         }
         bound.push(StoredTable::of(parent));
-        let qualifier = super::stored_qualifier(&parent.name);
-        super::bind_reference(parent_name, qualifier);
+        builder.bind_relation_reference(parent_name, super::stored_qualifier(&parent.name));
     }
     Ok(())
 }

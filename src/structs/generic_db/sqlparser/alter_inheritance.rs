@@ -14,8 +14,8 @@ use alloc::{
 use sqlparser::ast::{AlterTableOperation, CreateTable, Ident, ObjectName, TableConstraint};
 
 use super::{
-    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, bind_reference, existing_child,
-    inheritance, stored_qualifier,
+    AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, existing_child, inheritance,
+    stored_qualifier,
 };
 use crate::{errors::Error, traits::TableLike};
 
@@ -82,7 +82,7 @@ pub(super) fn inherit(
         })?;
 
     let mut bound = parent_name.clone();
-    bind_reference(&mut bound, stored_qualifier(&parent_node.name));
+    builder.bind_relation_reference(&mut bound, stored_qualifier(&parent_node.name));
     ParserDB::replace_table_node(builder, &child, |_, node| {
         node.inherits.get_or_insert_with(Vec::new).push(bound);
         Ok(())

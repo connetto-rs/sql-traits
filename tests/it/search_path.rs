@@ -135,6 +135,20 @@ fn the_path_is_walked_in_order() {
 }
 
 #[test]
+fn a_written_default_schema_is_not_shadowed_by_an_earlier_entry() {
+    let db = parse(
+        "CREATE SCHEMA app;
+         CREATE TABLE docs (id INT PRIMARY KEY);
+         CREATE TABLE app.docs (id INT);
+         SET search_path TO app, public;
+         CREATE INDEX i ON public.docs (id);
+         CREATE TABLE app.child (d INT REFERENCES public.docs (id));",
+    );
+    let index = db.indexes().next().expect("one index");
+    assert_eq!(TableIndexLike::table(index, &db).table_schema(), None);
+}
+
+#[test]
 fn resetting_returns_to_the_default() {
     for tail in ["RESET search_path;", "SET search_path TO DEFAULT;", "RESET ALL;"] {
         let db = parse(&format!("CREATE SCHEMA app; SET search_path TO app; {tail}"));
