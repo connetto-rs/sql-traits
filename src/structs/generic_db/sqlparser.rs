@@ -339,6 +339,15 @@ impl UndeclaredRoleAlteration {
     }
 }
 
+/// How a table being ingested reads the targets its foreign keys name.
+#[derive(Clone, Copy)]
+enum KeyTargets {
+    /// Through the session's path, as the statement declaring them wrote them.
+    Written,
+    /// As ingestion bound them, a bare name meaning the default schema.
+    Bound,
+}
+
 enum TableOrigin {
     /// A `CREATE TABLE` statement, with what it declares about its columns
     /// and its local constraint requirements.
@@ -349,6 +358,14 @@ enum TableOrigin {
 }
 
 impl TableOrigin {
+    /// How the table reads its foreign key targets.
+    const fn key_targets(&self) -> KeyTargets {
+        match self {
+            TableOrigin::Declaration(_) => KeyTargets::Written,
+            TableOrigin::Replacement(..) => KeyTargets::Bound,
+        }
+    }
+
     /// Gives `metadata` what the statement declaring the column `name` wrote
     /// for it.
     fn declared_column(&mut self, name: &Ident, metadata: ColumnMetadata) -> ColumnMetadata {
@@ -2368,31 +2385,56 @@ impl ParserDBBuilder {
     }
 
     /// Binds a foreign key declared on `host` to the table it reaches through
-    /// the session's path, leaving one that reaches none as written. A
-    /// dialect binding keys on use keeps the name and fixes only the schema it
-    /// is looked up in.
+    /// the session's path. A dialect binding keys on use keeps the name and
+    /// fixes only the schema it is looked up in.
     ///
     /// # Errors
     ///
-    /// Returns the error [`bind_to_host_schema`] raises.
+    /// Returns the error [`bind_to_host_schema`] raises, and the one
+    /// [`Self::unreachable_foreign_key_target`] names for a target the path
+    /// does not reach.
     fn bind_foreign_key(
         &self,
         host: &StoredTable,
         foreign_key: &mut ForeignKeyConstraint,
     ) -> Result<(), crate::errors::Error> {
         if self.dialect().binds_foreign_keys_on_use() {
-            bind_to_host_schema(&host.name, host.qualifier(), foreign_key)?;
-        } else {
-            self.bind_foreign_key_at_declaration(foreign_key);
+            return bind_to_host_schema(&host.name, host.qualifier(), foreign_key);
         }
+        let Some(table) = self.resolve_table_object_name(&foreign_key.foreign_table)? else {
+            let host_node = ParserDB::stored_node(self, host)?;
+            return Err(self.unreachable_foreign_key_target(&host_node.name, foreign_key));
+        };
+        let primary_key_valid = referenced_keys::primary_key_is_valid(self, table);
+        ForeignKeyBinding::of(self, table, foreign_key, primary_key_valid).apply(foreign_key);
         Ok(())
     }
 
-    /// Binds a foreign key to the referenced table visible at declaration.
-    fn bind_foreign_key_at_declaration(&self, foreign_key: &mut ForeignKeyConstraint) {
-        if let Ok(Some(table)) = self.resolve_table_object_name(&foreign_key.foreign_table) {
-            let primary_key_valid = referenced_keys::primary_key_is_valid(self, table);
-            ForeignKeyBinding::of(self, table, foreign_key, primary_key_valid).apply(foreign_key);
+    /// The refusal for `foreign_key`, declared on the table `host`, whose
+    /// target reaches no table.
+    fn unreachable_foreign_key_target(
+        &self,
+        host: &ObjectName,
+        foreign_key: &ForeignKeyConstraint,
+    ) -> crate::errors::Error {
+        if let Some(schema_name) =
+            missing_schema::missing_schema_name(self, &foreign_key.foreign_table)
+        {
+            return crate::errors::Error::SchemaNotFound { schema_name };
+        }
+        // A view holding the name exists and cannot be referenced, which the
+        // database reports apart from an absent relation.
+        if let Some(actual_kind) = views::holds_view(self, &foreign_key.foreign_table) {
+            return crate::errors::Error::RelationKindMismatch {
+                object_name: self.dialect().stored_object_name_last(&foreign_key.foreign_table),
+                expected_kind: ObjectKind::Table,
+                actual_kind,
+                context: crate::errors::RelationKindContext::ForeignKey,
+            };
+        }
+        crate::errors::Error::ReferencedTableNotFoundForForeignKey {
+            referenced_table: self.dialect().stored_object_name(&foreign_key.foreign_table),
+            host_table: self.dialect().stored_object_name_last(host),
         }
     }
 
@@ -7908,7 +7950,7 @@ impl ParserDB {
     /// Resolves the table a foreign key references, refusing a view or a
     /// foreign table holding the name, which cannot be referenced.
     ///
-    /// An unqualified target resolves through the search path, which carries
+    /// A written target resolves through the search path, which carries
     /// `public`, so a bare `parent` reaches `public.parent` as it does in the
     /// database. The table being created is chained in so a table may
     /// reference itself.
@@ -7916,42 +7958,37 @@ impl ParserDB {
         builder: &'a ParserDBBuilder,
         create_table: &'a Arc<CreateTable>,
         fk: &ForeignKeyConstraint,
+        targets: KeyTargets,
     ) -> Result<&'a Arc<CreateTable>, crate::errors::Error> {
         let case = builder.identifier_case();
-        let referenced_table = resolve_stored_table_object_name_on_search_path_in_iter(
-            *builder.dialect(),
-            builder.namespaces(),
-            builder
-                .tables()
-                .iter()
-                .map(|(table, _, _)| table)
-                .chain(core::iter::once(create_table)),
-            &fk.foreign_table,
-            || builder.search_path(),
-            case,
-            |key| builder.relation_key_is_held(key, case),
-        )?;
+        let tables = || {
+            builder.tables().iter().map(|(table, _, _)| table).chain(core::iter::once(create_table))
+        };
+        let referenced_table = match targets {
+            KeyTargets::Written => {
+                resolve_stored_table_object_name_on_search_path_in_iter(
+                    *builder.dialect(),
+                    builder.namespaces(),
+                    tables(),
+                    &fk.foreign_table,
+                    || builder.search_path(),
+                    case,
+                    |key| builder.relation_key_is_held(key, case),
+                )?
+            }
+            KeyTargets::Bound => {
+                resolve_table_object_name_in_iter(
+                    *builder.dialect(),
+                    builder.namespaces(),
+                    tables().map(AsRef::as_ref),
+                    &fk.foreign_table,
+                    case,
+                )?
+                .and_then(|found| tables().find(|table| core::ptr::eq(table.as_ref(), found)))
+            }
+        };
         let Some(referenced_table) = referenced_table else {
-            if let Some(schema_name) =
-                missing_schema::missing_schema_name(builder, &fk.foreign_table)
-            {
-                return Err(crate::errors::Error::SchemaNotFound { schema_name });
-            }
-            // A view holding the name is a different complaint: the relation
-            // exists and simply cannot be referenced, which is what the
-            // database reports.
-            if let Some(actual_kind) = views::holds_view(builder, &fk.foreign_table) {
-                return Err(crate::errors::Error::RelationKindMismatch {
-                    object_name: builder.dialect().stored_object_name_last(&fk.foreign_table),
-                    expected_kind: ObjectKind::Table,
-                    actual_kind,
-                    context: crate::errors::RelationKindContext::ForeignKey,
-                });
-            }
-            return Err(crate::errors::Error::ReferencedTableNotFoundForForeignKey {
-                referenced_table: builder.dialect().stored_object_name(&fk.foreign_table),
-                host_table: builder.dialect().stored_object_name_last(&create_table.name),
-            });
+            return Err(builder.unreachable_foreign_key_target(&create_table.name, fk));
         };
         builder.refuse_table_kinds(
             referenced_table,
@@ -7980,11 +8017,13 @@ impl ParserDB {
         Ok(())
     }
 
-    /// Resolves and installs the foreign keys after table-name validation.
+    /// Resolves and installs the foreign keys after table-name validation,
+    /// reading their targets as `targets` says.
     fn process_foreign_keys(
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         mut builder: ParserDBBuilder,
+        targets: KeyTargets,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         for (column_position, column) in create_table.columns.iter().enumerate() {
             for (option_position, option) in column.options.iter().enumerate() {
@@ -8003,6 +8042,7 @@ impl ParserDB {
                         create_table,
                         table_metadata,
                         builder,
+                        targets,
                     )?;
                 }
             }
@@ -8017,6 +8057,7 @@ impl ParserDB {
                     create_table,
                     table_metadata,
                     builder,
+                    targets,
                 )?;
             }
         }
@@ -8030,6 +8071,7 @@ impl ParserDB {
         create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         builder: ParserDBBuilder,
+        targets: KeyTargets,
     ) -> Result<ParserDBBuilder, crate::errors::Error> {
         let fk_arc = Arc::new(foreign_key);
         let fk = fk_arc.attribute();
@@ -8055,7 +8097,7 @@ impl ParserDB {
             refuse_unequal_written_lists(create_table, fk)?;
         } else {
             let (target, referenced_columns) =
-                Self::refuse_unreachable_target(&builder, create_table, fk)?;
+                Self::refuse_unreachable_target(&builder, create_table, fk, targets)?;
             let generated_action_refusal = if matches!(
                 fk.on_update,
                 Some(
@@ -8125,11 +8167,12 @@ impl ParserDB {
         builder: &'table ParserDBBuilder,
         create_table: &'table Arc<CreateTable>,
         fk: &ForeignKeyConstraint,
+        targets: KeyTargets,
     ) -> Result<(&'table Arc<CreateTable>, Vec<foreign_key_types::BoundColumn>), crate::errors::Error>
     {
         let case = builder.identifier_case();
         let referenced_table_name = builder.dialect().stored_object_name_last(&fk.foreign_table);
-        let referenced_table = Self::foreign_key_target(builder, create_table, fk)?;
+        let referenced_table = Self::foreign_key_target(builder, create_table, fk, targets)?;
         refuse_reference_across_storage(create_table, referenced_table, *builder.dialect())?;
 
         let mut columns = Vec::new();
@@ -8602,7 +8645,12 @@ impl ParserDB {
             builder.ensure_table_lookup_invariants(&create_table)?;
         }
         virtual_generated_constraints::table_keys(&builder, &create_table)?;
-        builder = Self::process_foreign_keys(&create_table, &mut table_metadata, builder)?;
+        builder = Self::process_foreign_keys(
+            &create_table,
+            &mut table_metadata,
+            builder,
+            origin.key_targets(),
+        )?;
         Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
         sqlite_autoindex::record_autoindexes(&builder, &create_table, &mut table_metadata);
         table_metadata.set_documentation(documentation);

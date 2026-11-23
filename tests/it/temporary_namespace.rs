@@ -405,6 +405,17 @@ fn a_key_naming_the_shadowed_permanent_table_keeps_its_schema() {
 }
 
 #[test]
+fn a_rebuild_keeps_a_key_on_the_permanent_table_a_later_temporary_one_shadows() {
+    let db = db("CREATE TABLE p (id INT PRIMARY KEY);
+         CREATE TABLE c (id INT REFERENCES p (id));
+         CREATE TEMP TABLE p (id INT);
+         ALTER TABLE c ADD COLUMN z INT;");
+    let host = table(&db, None, "c").expect("c exists");
+    let key = host.foreign_keys(&db).expect("in this database").next().expect("one key");
+    assert!(!key.referenced_table(&db).expect("resolves").is_temporary());
+}
+
+#[test]
 fn a_foreign_key_never_crosses_storage() {
     for sql in [
         "CREATE TEMP TABLE p (id INT PRIMARY KEY); CREATE TABLE c (id INT REFERENCES p);",
