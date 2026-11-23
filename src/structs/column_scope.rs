@@ -1091,17 +1091,15 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     /// assert!(matches!(entries.next(), Some(QueryOutput::Unexpanded { item: Some(1) })));
     ///
     /// let sql = "SELECT a.*, 1 AS k, b.* FROM a JOIN a AS b ON a.id = b.id";
-    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
-    ///     unreachable!()
-    /// };
-    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
-    /// let root = scope.scope_for_query(&query).expect("the root query is recorded");
+    /// let parsed = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
+    /// let Statement::Query(query) = &parsed[0] else { unreachable!() };
+    /// let scope = ColumnScope::from_query(query, &db, IdentifierCase::AsWritten)?;
+    /// let root = scope.scope_for_query(query).expect("the root query is recorded");
     /// let written = root
     ///     .outputs()
     ///     .map(|output| {
-    ///         let QueryOutput::Column { name: Some((name, _)), item, wildcard, .. } = output else {
-    ///             unreachable!()
-    ///         };
+    ///         let QueryOutput::Column { name, item, wildcard, .. } = output else { unreachable!() };
+    ///         let (name, _) = name.expect("every output is named");
     ///         match wildcard.and_then(|binding| binding.relation()) {
     ///             Some((relation, _)) => format!("{item}: {relation}.{name}"),
     ///             None => format!("{item}: {name}"),
