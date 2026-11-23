@@ -333,14 +333,12 @@ mod tests {
     fn create_column(name: &str) -> <ParserDB as DatabaseLike>::Column {
         let sql = format!("CREATE TABLE t ({name} INT)");
         let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, &sql).expect("Failed to parse SQL");
-        if let Statement::CreateTable(ct) = &ast[0] {
-            let table = Arc::new(ct.clone());
-            let col_def = ct.columns[0].clone();
-            TableAttribute::new(table, col_def)
-        } else {
+        let mut ast = Parser::parse_sql(&dialect, &sql).expect("Failed to parse SQL");
+        let Some(Statement::CreateTable(table)) = ast.pop() else {
             panic!("Expected CreateTable statement");
-        }
+        };
+        TableAttribute::declared_in(Arc::new(table), |table| table.columns.first())
+            .expect("the table declares a column")
     }
 
     /// A qualifier chain reaching past this catalog names another one, and a

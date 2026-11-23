@@ -2,16 +2,12 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
-use sqlparser::ast::Expr;
-
 use super::ExpressionCalls;
 use crate::traits::{CheckConstraintLike, DatabaseLike};
 
 #[derive(Debug, Clone)]
 /// Struct collecting metadata about a check constraint.
 pub struct CheckMetadata<U: CheckConstraintLike> {
-    /// The expression defining the constraint.
-    expression: Expr,
     /// The table on which the constraint is defined.
     table: Arc<<U::DB as DatabaseLike>::Table>,
     /// The columns involved in the constraint.
@@ -24,19 +20,11 @@ impl<U: CheckConstraintLike> CheckMetadata<U> {
     /// Creates a new `CheckMetadata` instance.
     #[inline]
     pub fn new(
-        expression: Expr,
         table: Arc<<U::DB as DatabaseLike>::Table>,
         columns: Vec<Arc<<U::DB as DatabaseLike>::Column>>,
         calls: ExpressionCalls<<U::DB as DatabaseLike>::Function>,
     ) -> Self {
-        Self { expression, table, columns, calls }
-    }
-
-    /// Returns a reference to the expression defining the constraint.
-    #[must_use]
-    #[inline]
-    pub fn expression(&self) -> &Expr {
-        &self.expression
+        Self { table, columns, calls }
     }
 
     /// Returns a reference to the table on which the constraint is defined.

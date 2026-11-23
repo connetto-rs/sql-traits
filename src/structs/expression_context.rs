@@ -1,7 +1,7 @@
 //! The facts each expression node of one query takes.
 
-use alloc::{borrow::Cow, boxed::Box, string::ToString, vec::Vec};
-use core::{ops::ControlFlow, sync::atomic::Ordering};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::ToString, vec::Vec};
+use core::{cell::RefCell, ops::ControlFlow, sync::atomic::Ordering};
 
 use sqlparser::ast::{
     ArgMode, BinaryOperator, CastKind, ColumnDef, DataType, DuplicateTreatment, Expr, Function,
@@ -108,6 +108,9 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     /// runs it under.
     variables: Option<&'query PlPgSqlScope<'query, 'db, DB>>,
     declared_columns: Option<&'query [ColumnDef]>,
+    /// The type [`Self::type_of`] derived for each node it typed, by address,
+    /// so that typing an operator chain types each node of it once.
+    types: RefCell<BTreeMap<usize, OperandType<'static>>>,
 }
 
 /// An application of an operator, by the address of the node applying it
@@ -614,12 +617,14 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             pins: None,
             variables: None,
             declared_columns: None,
+            types: RefCell::default(),
         }
     }
 
     /// The context typing as `pins` has PostgreSQL's deparsed text pin it.
-    pub(crate) const fn pinned(mut self, pins: &'query (dyn ReparsePins<DB> + 'query)) -> Self {
+    pub(crate) fn pinned(mut self, pins: &'query (dyn ReparsePins<DB> + 'query)) -> Self {
         self.pins = Some(pins);
+        self.types.get_mut().clear();
         self
     }
 
@@ -1183,6 +1188,19 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// query, and the lookup errors resolving a column reference or a cursor
     /// query returns.
     pub fn type_of(&self, expression: &Expr) -> Result<OperandType<'_>, LookupError> {
+        let address = address(expression);
+        if let Some(known) = self.types.borrow().get(&address) {
+            return Ok(known.clone());
+        }
+        let derived = self.derived_type(expression)?;
+        self.types.borrow_mut().insert(address, derived.clone().into_owned());
+        Ok(derived)
+    }
+
+    /// The type of `expression` that [`Self::type_of`] answers, derived
+    /// from the types of the nodes below it.
+    #[cfg_attr(feature = "std", recursive::recursive)]
+    fn derived_type(&self, expression: &Expr) -> Result<OperandType<'_>, LookupError> {
         self.check(expression)?;
         Ok(match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {

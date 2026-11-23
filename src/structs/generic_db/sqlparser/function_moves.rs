@@ -362,7 +362,8 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
             if stored.matches(TableAttribute::table(index.as_ref()), case)
                 && moves.reached_by(metadata.calls())
             {
-                respell(Arc::make_mut(index).attribute_mut(), metadata.calls(), moves)?;
+                Arc::make_mut(index)
+                    .edit_attribute(|index| respell(index, metadata.calls(), moves))?;
             }
         }
         // The rebuild finds each bound call by name and argument count.
@@ -374,7 +375,7 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
         }
         for (check, metadata) in builder.check_constraints() {
             if stored.matches(TableAttribute::table(check.as_ref()), case) {
-                bound.record(metadata.expression(), metadata.calls());
+                bound.record(check.attribute().expr.as_ref(), metadata.calls());
             }
         }
         for (unique_key, metadata) in builder.unique_indices() {

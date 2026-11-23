@@ -203,7 +203,7 @@ fn bulk_builder_orders_both_view_kinds_and_terminates_a_snapshot_cycle() {
     let views = ["CREATE VIEW z AS SELECT 1 AS x", "CREATE VIEW a AS SELECT 1 AS x"].map(|sql| {
         (
             Arc::new(
-                View::from_node(&view_node(sql), SqlparserDialect::PostgreSql).expect("named view"),
+                View::from_node(view_node(sql), SqlparserDialect::PostgreSql).expect("named view"),
             ),
             ViewMetadata::default(),
         )
@@ -215,7 +215,7 @@ fn bulk_builder_orders_both_view_kinds_and_terminates_a_snapshot_cycle() {
     .map(|sql| {
         (
             Arc::new(
-                MaterializedView::from_node(&view_node(sql), SqlparserDialect::PostgreSql)
+                MaterializedView::from_node(view_node(sql), SqlparserDialect::PostgreSql)
                     .expect("named view"),
             ),
             ViewMetadata::default(),

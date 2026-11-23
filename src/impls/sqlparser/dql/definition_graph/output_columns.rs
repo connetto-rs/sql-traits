@@ -268,6 +268,7 @@ impl<'query, 'db, DB: DatabaseLike> QueryCollector<'_, 'query, 'db, DB> {
         Some(address)
     }
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn body_outputs(&mut self, body: &SetExpr) -> Option<QueryOutputs<'query, 'db>> {
         match body {
             SetExpr::Select(select) => {

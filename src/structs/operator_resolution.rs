@@ -22,6 +22,19 @@ pub enum OperandType<'a> {
     Unknown,
 }
 
+impl OperandType<'_> {
+    /// The type, owning the names it borrowed.
+    pub(crate) fn into_owned(self) -> OperandType<'static> {
+        match self {
+            Self::Known { type_name, typmod } => {
+                OperandType::Known { type_name: type_name.into_owned(), typmod }
+            }
+            Self::UntypedLiteral => OperandType::UntypedLiteral,
+            Self::Unknown => OperandType::Unknown,
+        }
+    }
+}
+
 /// What PostgreSQL does with an operator invocation.
 #[derive(Debug, Clone)]
 #[expect(

@@ -1004,6 +1004,7 @@ dependencies = [
  "thiserror",
  "toml",
  "unicode-normalization",
+ "yoke",
 ]
 
 [[package]]
@@ -1039,7 +1040,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#197fafd3d76a149fe7a4bd105db940d882f80c8a"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#46deb4392399a9658ac504ad39fd32556d4f9475"
 dependencies = [
  "rpds",
  "sql-values",

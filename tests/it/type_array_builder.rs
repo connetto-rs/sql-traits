@@ -89,8 +89,8 @@ fn a_builder_assembled_table_moves_schemas_with_no_recorded_array_ownership() {
     let empty = ParserDB::parse::<PostgreSqlDialect>("").expect("empty schema");
     let mut builder = ParserDBBuilder::new("built".to_owned(), *empty.dialect());
     let mut metadata = TableMetadata::default();
-    for definition in &node.columns {
-        let column = Arc::new(TableAttribute::new(Arc::clone(&node), definition.clone()));
+    for column in TableAttribute::each_declared(&node, |table| &table.columns) {
+        let column = Arc::new(column);
         metadata.add_column(Arc::clone(&column));
         builder = builder.add_column(column, ColumnMetadata::default());
     }

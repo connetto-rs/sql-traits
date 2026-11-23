@@ -476,6 +476,11 @@ pub(super) fn receives_column_constraint(
         return super::attach_partition::table_form(written_on, option)
             .is_some_and(|held| receives_partition_key(builder, child, &held, true));
     }
+    // Only a parent supplies one, so a table with none is answered before any
+    // option is compared.
+    if parents_with_kind(child).next().is_none() {
+        return false;
+    }
     parents_with_kind(child).any(|(kind, name)| {
         option_passes_down(kind, &option.option)
             && builder.resolve_bound_table_name(name).ok().flatten().is_some_and(|parent| {
