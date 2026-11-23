@@ -249,3 +249,66 @@ impl<T: 'static, A: 'static> TableAttribute<T, A> {
         }
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use alloc::{
+        string::{String, ToString},
+        sync::Arc,
+    };
+    use core::{cmp::Ordering, hash::BuildHasher};
+    use std::hash::RandomState;
+
+    use super::TableAttribute;
+
+    /// How an attribute is held stays invisible to equality, hashing,
+    /// ordering and formatting.
+    #[test]
+    fn a_lent_attribute_matches_an_owned_copy() {
+        let table = Arc::new(vec!["id", "name"]);
+        let lent =
+            TableAttribute::declared_in(Arc::clone(&table), |columns| columns.get(1)).unwrap();
+        let owned = TableAttribute::new(Arc::clone(&table), "name");
+        let hasher = RandomState::new();
+        assert_eq!(lent, owned);
+        assert_eq!(hasher.hash_one(&lent), hasher.hash_one(&owned));
+        assert_eq!(lent.partial_cmp(&owned), Some(Ordering::Equal));
+        assert_eq!(lent.cmp(&owned), Ordering::Equal);
+        assert_eq!(format!("{lent:?}"), format!("{owned:?}"));
+        assert_eq!(lent.to_string(), owned.to_string());
+    }
+
+    /// Attributes order by attribute before table.
+    #[test]
+    fn attributes_order_by_attribute_before_table() {
+        let first = TableAttribute::new(Arc::new(vec!["z"]), "a");
+        let second = TableAttribute::new(Arc::new(vec!["a"]), "b");
+        assert_eq!(first.partial_cmp(&second), Some(Ordering::Less));
+        assert_eq!(first.cmp(&second), Ordering::Less);
+    }
+
+    /// Editing a lent attribute copies it and leaves the table as declared.
+    #[test]
+    fn editing_a_lent_attribute_leaves_the_table_as_declared() {
+        let table = Arc::new(vec![String::from("id")]);
+        let mut column =
+            TableAttribute::declared_in(Arc::clone(&table), |columns| columns.first()).unwrap();
+        let length = column.edit_attribute(|name| {
+            name.push_str("_key");
+            name.len()
+        });
+        assert_eq!(length, 6);
+        assert_eq!(column.attribute(), "id_key");
+        assert_eq!(table[0], "id");
+        assert!(Arc::ptr_eq(column.shared_table(), &table));
+    }
+
+    /// A part of an owned attribute is picked out of it.
+    #[test]
+    fn a_part_of_an_owned_attribute_is_picked() {
+        let column = TableAttribute::new(Arc::new(vec!["t"]), ("id", 4));
+        let width = column.part(|column| Some(&column.1)).unwrap();
+        assert_eq!(*width.attribute(), 4);
+        assert!(column.part(|_| None::<&i32>).is_none());
+    }
+}
