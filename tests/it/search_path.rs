@@ -149,6 +149,39 @@ fn a_written_default_schema_is_not_shadowed_by_an_earlier_entry() {
 }
 
 #[test]
+fn a_rebuild_keeps_a_key_on_the_table_it_bound_under_another_path() {
+    let db = parse(
+        "CREATE TABLE p (id INT PRIMARY KEY);
+         CREATE TABLE c (id INT REFERENCES p (id));
+         CREATE SCHEMA app;
+         CREATE TABLE app.p (id INT);
+         SET search_path TO app, public;
+         ALTER TABLE public.c ADD COLUMN z INT;",
+    );
+    let host = db
+        .table_by_target(TargetName::new("c", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("c exists");
+    let key = host.foreign_keys(&db).expect("in this database").next().expect("one key");
+    assert_eq!(key.referenced_table(&db).expect("resolves").table_schema(), None);
+}
+
+#[test]
+fn an_added_key_is_refused_for_a_target_off_the_path_before_its_columns() {
+    let refused = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE p (id INT PRIMARY KEY);
+         CREATE TABLE c (id INT);
+         CREATE SCHEMA app;
+         SET search_path TO app;
+         ALTER TABLE public.c ADD FOREIGN KEY (absent) REFERENCES p (id);",
+    );
+    assert!(
+        matches!(refused, Err(Error::ReferencedTableNotFoundForForeignKey { .. })),
+        "{refused:?}"
+    );
+}
+
+#[test]
 fn resetting_returns_to_the_default() {
     for tail in ["RESET search_path;", "SET search_path TO DEFAULT;", "RESET ALL;"] {
         let db = parse(&format!("CREATE SCHEMA app; SET search_path TO app; {tail}"));
