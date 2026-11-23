@@ -150,7 +150,8 @@ impl<T: 'static, A: 'static> TableAttribute<T, A> {
         table: &Arc<T>,
         list: impl for<'table> FnOnce(&'table T) -> &'table [A],
     ) -> impl Iterator<Item = Self> {
-        let lent: Yoke<&'static [A], Arc<T>> = Yoke::attach_to_cart(Arc::clone(table), list);
+        let lent: Yoke<&'static [A], Arc<T>> =
+            Yoke::attach_to_cart(Arc::clone(table), |table| list(table));
         (0..lent.get().len()).map(move |position| {
             Self { held: Held::Declared(lent.map_project_cloned(|list, _| &list[position])) }
         })
