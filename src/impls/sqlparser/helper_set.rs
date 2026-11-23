@@ -3,7 +3,7 @@
 
 use alloc::{
     borrow::Cow,
-    boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -67,6 +67,7 @@ pub(crate) fn helper_set<'db, DB: DatabaseLike>(
         reads_exclusions: conditions.contains(&ArmCondition::Exclusion),
         reads_unset_settings: conditions.contains(&ArmCondition::UnsetSetting),
         answering: Vec::new(),
+        answered: BTreeMap::new(),
     }
     .answer(function, arguments)
 }
@@ -211,7 +212,7 @@ impl<'db> Gates<'db> {
 struct Called<'db, DB: DatabaseLike> {
     function: &'db DB::Function,
     arguments: Vec<Value>,
-    set: HelperSet<'db, DB>,
+    set: Arc<HelperSet<'db, DB>>,
 }
 
 /// A helper call an arm's subquery writes, the name it calls and the
@@ -773,7 +774,14 @@ struct Reader<'db, DB: DatabaseLike> {
     reads_unset_settings: bool,
     /// The helpers being answered, outermost first.
     answering: Vec<&'db DB::Function>,
+    /// The sets answered so far, by helper, which every later call of the
+    /// helper with the same arguments shares.
+    answered: BTreeMap<*const DB::Function, Answered<'db, DB>>,
 }
+
+/// The sets one helper answered, each beside the arguments it was answered
+/// for.
+type Answered<'db, DB> = Vec<(Vec<Value>, Arc<HelperSet<'db, DB>>)>;
 
 impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     #[cfg_attr(feature = "std", recursive::recursive)]
@@ -1035,7 +1043,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             [Returned::Read(0)] if callee_arity == 1 => set.covered_table(),
             _ => None,
         };
-        let arm = CalledArm { returned, function, arguments, set: Box::new(set) };
+        let arm = CalledArm { returned, function, arguments, set };
         Ok((keyed, vec![HelperArm::Called(arm)]))
     }
 
@@ -1238,7 +1246,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             operands: vec![CapOperand::Column(column)],
             function,
             arguments,
-            set: Box::new(set),
+            set,
             lift: None,
         })
     }
@@ -1766,7 +1774,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             parent_table,
             function: callee,
             arguments,
-            set: Box::new(set),
+            set,
         }))
     }
 
@@ -1793,7 +1801,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let call = projected_call(subquery).ok_or_else(shape)?;
         let Called { function, arguments, set } =
             self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
-        Ok(GranteeSet { column, foreign_key, function, arguments, set: Box::new(set) })
+        Ok(GranteeSet { column, foreign_key, function, arguments, set })
     }
 
     /// The helper `call` reaches, the arguments it passes, each a parameter
@@ -1838,8 +1846,29 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if returned_arity(callee, database).is_some_and(|returned| returned != arity) {
             return Err(shape());
         }
-        let set = self.answer(callee, &arguments)?;
+        let set = self.shared_answer(callee, &arguments)?;
         Ok(Called { function: callee, arguments, set })
+    }
+
+    /// What `function` returns for `arguments`, answered once and shared by
+    /// every later call with the same arguments, as a `STABLE` helper returns
+    /// the same rows for them.
+    fn shared_answer(
+        &mut self,
+        function: &'db DB::Function,
+        arguments: &[Value],
+    ) -> Result<Arc<HelperSet<'db, DB>>, HelperSetError> {
+        let key: *const DB::Function = function;
+        if let Some((_, set)) = self
+            .answered
+            .get(&key)
+            .and_then(|answered| answered.iter().find(|(passed, _)| passed == arguments))
+        {
+            return Ok(Arc::clone(set));
+        }
+        let set = Arc::new(self.answer(function, arguments)?);
+        self.answered.entry(key).or_default().push((arguments.to_vec(), Arc::clone(&set)));
+        Ok(set)
     }
 
     /// The one function a call written as `written` reaches under the path
@@ -2142,7 +2171,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         self.require_read(scope, conjunct, ArmCondition::Exclusion)?;
         let Called { function, arguments, set } =
             self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
-        Ok(Some(ExcludedSet { column, function, arguments, set: Box::new(set) }))
+        Ok(Some(ExcludedSet { column, function, arguments, set }))
     }
 
     /// Refuses `conjunct`, a condition read as `kind`, where the consumer
@@ -2484,7 +2513,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 _ => return Err(shape()),
             });
         }
-        Ok(Some(RowCap { operands, function, arguments, set: Box::new(set), lift }))
+        Ok(Some(RowCap { operands, function, arguments, set, lift }))
     }
 
     /// The `current_setting(<setting>) IS NULL` `expression` writes, if it

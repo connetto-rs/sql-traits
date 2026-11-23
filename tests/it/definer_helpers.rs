@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
+use alloc::{collections::BTreeSet, sync::Arc};
 
 use sql_traits::{
     errors::{AccessorRefusal, HelperSetError},
@@ -7749,4 +7749,59 @@ fn a_key_compared_with_a_set_alone_is_capped_by_it() {
         render(&writers),
         format!("resources.id WHERE (id) IN {}", resources_with("writer"))
     );
+}
+
+/// `authz.ids_0()` returning the caller's items, then `authz.ids_<k>()` for
+/// every `k` up to `depth`, each the items `ids_<k - 1>` returns and their
+/// children, which reads `ids_<k - 1>()` twice.
+fn item_chain(depth: usize) -> String {
+    let mut sql = String::from(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE TABLE items (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, parent_id TEXT REFERENCES items (id));
+         GRANT SELECT ON items TO authz_owner;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE FUNCTION authz.ids_0() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT item.id FROM public.items item WHERE item.owner_id = current_setting('app.user_id', true)
+         $$;
+         ALTER FUNCTION authz.ids_0() OWNER TO authz_owner;",
+    );
+    sql.extend((1..=depth).map(|level| {
+        let below = level - 1;
+        format!(
+            "CREATE FUNCTION authz.ids_{level}() RETURNS SETOF TEXT
+             LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+               SELECT item.id FROM public.items item WHERE item.id IN (SELECT authz.ids_{below}())
+               UNION
+               SELECT item.id FROM public.items item WHERE item.parent_id IN (SELECT authz.ids_{below}())
+             $$;
+             ALTER FUNCTION authz.ids_{level}() OWNER TO authz_owner;"
+        )
+    }));
+    sql
+}
+
+#[test]
+fn a_helper_called_twice_with_the_same_arguments_is_answered_once() {
+    const DEPTH: usize = 40;
+    let database = postgres(&item_chain(DEPTH));
+    let deployment = deployment();
+    let answered =
+        answer(&database, &deployment, "authz", &format!("ids_{DEPTH}"), &[]).expect("answered");
+    let mut set = &answered;
+    for level in (1..=DEPTH).rev() {
+        let [HelperArm::Grant(capped), HelperArm::Parent(parent)] = set.arms() else {
+            panic!("ids_{level} answers a capped arm and a parent arm: {}", render(set))
+        };
+        let [cap] = capped.caps() else { panic!("ids_{level} caps its first arm once") };
+        assert_eq!(cap.function().name(), format!("ids_{}", level - 1));
+        assert!(
+            Arc::ptr_eq(cap.set(), parent.set()),
+            "both arms of ids_{level} read the one answer of ids_{}",
+            level - 1
+        );
+        set = parent.set();
+    }
+    assert_eq!(render(set), "items.id WHERE owner_id = app.user_id");
 }

@@ -3,7 +3,7 @@
 //! [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
 //! answers it.
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 
 use sqlparser::ast::Value;
 
@@ -312,7 +312,7 @@ pub struct GranteeSet<'db, DB: DatabaseLike> {
     pub(crate) foreign_key: Option<&'db DB::ForeignKey>,
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
-    pub(crate) set: Box<HelperSet<'db, DB>>,
+    pub(crate) set: Arc<HelperSet<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
@@ -343,9 +343,11 @@ impl<'db, DB: DatabaseLike> GranteeSet<'db, DB> {
     }
 
     /// What [`function`](Self::function) returns for
-    /// [`arguments`](Self::arguments).
+    /// [`arguments`](Self::arguments), the one answer every arm of the same
+    /// [`helper_set`](crate::traits::FunctionLike::helper_set) call reading
+    /// that helper with those arguments holds.
     #[must_use]
-    pub fn set(&self) -> &HelperSet<'db, DB> {
+    pub fn set(&self) -> &Arc<HelperSet<'db, DB>> {
         &self.set
     }
 }
@@ -372,7 +374,7 @@ pub struct ExcludedSet<'db, DB: DatabaseLike> {
     pub(crate) column: &'db DB::Column,
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
-    pub(crate) set: Box<HelperSet<'db, DB>>,
+    pub(crate) set: Arc<HelperSet<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> ExcludedSet<'db, DB> {
@@ -396,9 +398,9 @@ impl<'db, DB: DatabaseLike> ExcludedSet<'db, DB> {
     }
 
     /// What [`function`](Self::function) returns for
-    /// [`arguments`](Self::arguments).
+    /// [`arguments`](Self::arguments), shared as [`GranteeSet::set`] is.
     #[must_use]
-    pub fn set(&self) -> &HelperSet<'db, DB> {
+    pub fn set(&self) -> &Arc<HelperSet<'db, DB>> {
         &self.set
     }
 }
@@ -428,7 +430,7 @@ pub struct RowCap<'db, DB: DatabaseLike> {
     pub(crate) operands: Vec<CapOperand<'db, DB>>,
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
-    pub(crate) set: Box<HelperSet<'db, DB>>,
+    pub(crate) set: Arc<HelperSet<'db, DB>>,
     pub(crate) lift: Option<UnsetSetting<'db>>,
 }
 
@@ -454,9 +456,9 @@ impl<'db, DB: DatabaseLike> RowCap<'db, DB> {
     }
 
     /// What [`function`](Self::function) returns for
-    /// [`arguments`](Self::arguments).
+    /// [`arguments`](Self::arguments), shared as [`GranteeSet::set`] is.
     #[must_use]
-    pub fn set(&self) -> &HelperSet<'db, DB> {
+    pub fn set(&self) -> &Arc<HelperSet<'db, DB>> {
         &self.set
     }
 
@@ -900,7 +902,7 @@ pub struct ParentArm<'db, DB: DatabaseLike> {
     pub(crate) parent_table: &'db DB::Table,
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
-    pub(crate) set: Box<HelperSet<'db, DB>>,
+    pub(crate) set: Arc<HelperSet<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
@@ -960,9 +962,9 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
     }
 
     /// What [`function`](Self::function) returns for
-    /// [`arguments`](Self::arguments).
+    /// [`arguments`](Self::arguments), shared as [`GranteeSet::set`] is.
     #[must_use]
-    pub fn set(&self) -> &HelperSet<'db, DB> {
+    pub fn set(&self) -> &Arc<HelperSet<'db, DB>> {
         &self.set
     }
 }
@@ -980,7 +982,7 @@ pub struct CalledArm<'db, DB: DatabaseLike> {
     pub(crate) returned: Vec<Returned<usize>>,
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
-    pub(crate) set: Box<HelperSet<'db, DB>>,
+    pub(crate) set: Arc<HelperSet<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> CalledArm<'db, DB> {
@@ -1006,9 +1008,9 @@ impl<'db, DB: DatabaseLike> CalledArm<'db, DB> {
     }
 
     /// What [`function`](Self::function) returns for
-    /// [`arguments`](Self::arguments).
+    /// [`arguments`](Self::arguments), shared as [`GranteeSet::set`] is.
     #[must_use]
-    pub fn set(&self) -> &HelperSet<'db, DB> {
+    pub fn set(&self) -> &Arc<HelperSet<'db, DB>> {
         &self.set
     }
 }
