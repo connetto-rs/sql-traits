@@ -98,6 +98,17 @@ impl Namespaces {
         }
     }
 
+    /// The comparison a name takes when the input states none, the engine's
+    /// own. PostgreSQL's folds an unquoted name and clips every name to 63
+    /// bytes, and SQLite's folds the ASCII letters of every name and keeps
+    /// all of its bytes.
+    pub(crate) const fn identifier_case(self) -> IdentifierCase {
+        match self {
+            Self::PostgreSql => IdentifierCase::AsWritten,
+            Self::Sqlite => IdentifierCase::Folded,
+        }
+    }
+
     /// Whether two schema names name one schema. PostgreSQL's compare as
     /// quoting decides, SQLite's as `case` decides, like every other name.
     pub(crate) fn schemas_match(

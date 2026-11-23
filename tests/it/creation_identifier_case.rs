@@ -21,11 +21,17 @@ const CASE_VARIANTS: &str = "CREATE TABLE docs (id INT PRIMARY KEY);
 const UNQUOTED_VARIANTS: &str = "CREATE TABLE docs (id INT PRIMARY KEY);
      CREATE TABLE Docs (id INT PRIMARY KEY);";
 
-/// PostgreSQL's rule stays the default, so nothing about a parse that says
-/// nothing changes, and the refusal says which rule read the two names as one.
+const LONG_TRIGGER_NAMES: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY);
+     CREATE TRIGGER organizations_organizations_id_kind_fkey_pg2sqlite_key_pg2sqlite_delete
+         AFTER DELETE ON t BEGIN SELECT 1; END;
+     CREATE TRIGGER organizations_organizations_id_kind_fkey_pg2sqlite_key_pg2sqlite_update
+         AFTER UPDATE ON t BEGIN SELECT 1; END;";
+
+/// A parse naming no comparison takes PostgreSQL's rule for every dialect but
+/// SQLite, and the refusal says which rule read the two names as one.
 #[test]
 fn the_default_parse_keeps_postgresqls_rule() {
-    assert_eq!(ParseOptions::default().identifier_case(), IdentifierCase::AsWritten);
+    assert_eq!(ParseOptions::default().identifier_case(), None);
 
     let db = ParserDB::parse::<GenericDialect>(CASE_VARIANTS).expect("PostgreSQL accepts the pair");
     assert_eq!(db.tables().count(), 2);
@@ -38,12 +44,37 @@ fn the_default_parse_keeps_postgresqls_rule() {
     );
 }
 
+/// A SQLite parse naming no comparison takes SQLite's, which keeps every byte
+/// of a name and folds its ASCII letters whatever the quoting.
+#[test]
+fn a_sqlite_parse_takes_sqlites_rule() {
+    let db = ParserDB::parse::<SQLiteDialect>(LONG_TRIGGER_NAMES)
+        .expect("SQLite keeps names agreeing in their first 63 bytes apart");
+    assert_eq!(db.identifier_case(), IdentifierCase::Folded);
+    assert_eq!(db.triggers().count(), 2);
+
+    let refused = ParserDB::parse::<SQLiteDialect>(CASE_VARIANTS)
+        .expect_err("SQLite reads the quoted case variant as the same name");
+    assert!(refused.to_string().contains("folded"), "the refusal names SQLite's rule: {refused}");
+}
+
+/// A stated comparison overrides the one a SQLite parse would take.
+#[test]
+fn a_stated_rule_overrides_sqlites() {
+    let db = ParseOptions::default()
+        .with_identifier_case(IdentifierCase::AsWritten)
+        .parse::<SQLiteDialect>(CASE_VARIANTS)
+        .expect("PostgreSQL's rule keeps the quoted spelling apart");
+    assert_eq!(db.identifier_case(), IdentifierCase::AsWritten);
+    assert_eq!(db.tables().count(), 2);
+}
+
 /// Two spellings a case-sensitive engine keeps apart still collide when they
 /// are the same bytes, and the refusal names that rule too.
 #[test]
 fn an_exact_parse_refuses_the_same_name_twice() {
     let options = ParseOptions::default().with_identifier_case(IdentifierCase::Exact);
-    assert_eq!(options.identifier_case(), IdentifierCase::Exact);
+    assert_eq!(options.identifier_case(), Some(IdentifierCase::Exact));
 
     let refused = options
         .parse::<MySqlDialect>(

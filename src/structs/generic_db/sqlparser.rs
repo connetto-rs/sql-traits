@@ -6421,8 +6421,10 @@ impl ParserDBIngestor {
         } else {
             PostgresCatalog::empty()
         });
-        let mut builder: ParserDBBuilder = super::GenericDBBuilder::new(catalog_name, dialect)
-            .with_identifier_case(identifier_case);
+        let mut builder: ParserDBBuilder = super::GenericDBBuilder::new(catalog_name, dialect);
+        if let Some(case) = identifier_case {
+            builder = builder.with_identifier_case(case);
+        }
 
         // Every PostgreSQL database is created holding the `pg_catalog`
         // functions and PL/pgSQL.

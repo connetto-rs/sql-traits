@@ -68,7 +68,7 @@ pub enum AccessResolution {
 pub struct ParseOptions {
     access_resolution: AccessResolution,
     postgres_catalog: PostgresCatalog,
-    identifier_case: IdentifierCase,
+    identifier_case: Option<IdentifierCase>,
     session_role: Option<String>,
     session_time_zone: Option<WrittenTimeZone>,
 }
@@ -84,7 +84,7 @@ pub(super) struct WrittenTimeZone {
 pub(super) struct IngestionParts {
     pub(super) access_resolution: AccessResolution,
     pub(super) postgres_catalog: PostgresCatalog,
-    pub(super) identifier_case: IdentifierCase,
+    pub(super) identifier_case: Option<IdentifierCase>,
     pub(super) session_role: Option<String>,
     pub(super) session_time_zone: Option<WrittenTimeZone>,
 }
@@ -94,7 +94,7 @@ impl Default for ParseOptions {
         Self {
             access_resolution: AccessResolution::ClosedWorld,
             postgres_catalog: PostgresCatalog::default(),
-            identifier_case: IdentifierCase::AsWritten,
+            identifier_case: None,
             session_role: None,
             session_time_zone: None,
         }
@@ -121,11 +121,13 @@ impl ParseOptions {
     /// Sets the comparison deciding whether a creation takes a name the input
     /// already holds.
     ///
-    /// Each engine answers it differently and no DDL carries the answer, so
-    /// this states it: [`IdentifierCase::AsWritten`] is PostgreSQL's rule and
-    /// the default, [`IdentifierCase::Folded`] is SQLite's and MySQL's with
-    /// `lower_case_table_names` at 1 or 2, and [`IdentifierCase::Exact`] is
-    /// MySQL's with that setting at 0, where `docs` and `Docs` are two tables.
+    /// Without one, a parse takes its dialect's engine's rule,
+    /// [`IdentifierCase::Folded`] for SQLite and [`IdentifierCase::AsWritten`],
+    /// PostgreSQL's, for every other dialect. This states the rule where a
+    /// server setting no DDL carries decides it. [`IdentifierCase::Folded`] is
+    /// MySQL's with `lower_case_table_names` at 1 or 2, and
+    /// [`IdentifierCase::Exact`] is MySQL's with that setting at 0, where
+    /// `docs` and `Docs` are two tables.
     ///
     /// # Example
     ///
@@ -135,22 +137,20 @@ impl ParseOptions {
     ///
     /// let sql = "CREATE TABLE docs (id INT); CREATE TABLE \"Docs\" (id INT);";
     ///
-    /// // PostgreSQL keeps the quoted spelling apart, and accepts both.
-    /// assert_eq!(ParserDB::parse::<SQLiteDialect>(sql)?.tables().count(), 2);
-    ///
     /// // SQLite reads them as one name and refuses the second.
-    /// assert!(
-    ///     ParseOptions::default()
-    ///         .with_identifier_case(IdentifierCase::Folded)
-    ///         .parse::<SQLiteDialect>(sql)
-    ///         .is_err()
-    /// );
+    /// assert!(ParserDB::parse::<SQLiteDialect>(sql).is_err());
+    ///
+    /// // PostgreSQL keeps the quoted spelling apart, and accepts both.
+    /// let db = ParseOptions::default()
+    ///     .with_identifier_case(IdentifierCase::AsWritten)
+    ///     .parse::<SQLiteDialect>(sql)?;
+    /// assert_eq!(db.tables().count(), 2);
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
     #[must_use]
     #[inline]
     pub fn with_identifier_case(mut self, case: IdentifierCase) -> Self {
-        self.identifier_case = case;
+        self.identifier_case = Some(case);
         self
     }
 
@@ -233,10 +233,11 @@ impl ParseOptions {
         }
     }
 
-    /// Returns the comparison a creation takes a name under.
+    /// Returns the comparison a creation takes a name under, [`None`] when
+    /// the parse's dialect decides it.
     #[must_use]
     #[inline]
-    pub const fn identifier_case(&self) -> IdentifierCase {
+    pub const fn identifier_case(&self) -> Option<IdentifierCase> {
         self.identifier_case
     }
 

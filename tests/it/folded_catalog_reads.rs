@@ -10,6 +10,10 @@ use sqlparser::{
     parser::Parser,
 };
 
+fn as_written_options() -> ParseOptions {
+    ParseOptions::default().with_identifier_case(IdentifierCase::AsWritten)
+}
+
 #[test]
 fn folded_foreign_key_reaches_quoted_table() -> Result<(), Error> {
     let database = ParseOptions::default()
@@ -27,8 +31,8 @@ fn folded_foreign_key_reaches_quoted_table() -> Result<(), Error> {
 }
 
 #[test]
-fn default_foreign_key_keeps_quoted_and_unquoted_tables_apart() -> Result<(), Error> {
-    let database = ParserDB::parse::<SQLiteDialect>(
+fn as_written_foreign_key_keeps_quoted_and_unquoted_tables_apart() -> Result<(), Error> {
+    let database = as_written_options().parse::<SQLiteDialect>(
         "CREATE TABLE \"T\" (id INT PRIMARY KEY);
          CREATE TABLE t (id INT PRIMARY KEY);
          CREATE TABLE child (parent INT REFERENCES t(id));",
@@ -62,8 +66,8 @@ fn folded_trigger_reaches_quoted_table() -> Result<(), Error> {
 }
 
 #[test]
-fn default_trigger_keeps_quoted_and_unquoted_tables_apart() -> Result<(), Error> {
-    let database = ParserDB::parse::<SQLiteDialect>(
+fn as_written_trigger_keeps_quoted_and_unquoted_tables_apart() -> Result<(), Error> {
+    let database = as_written_options().parse::<SQLiteDialect>(
         "CREATE TABLE \"T\" (id INT);
          CREATE TABLE t (id INT);
          CREATE TRIGGER audit AFTER INSERT ON t BEGIN SELECT 1; END;",
@@ -123,10 +127,9 @@ fn folded_checks_decide_truth_on_quoted_columns() -> Result<(), Error> {
 }
 
 #[test]
-fn default_checks_reach_the_written_column() -> Result<(), Error> {
-    let database = ParserDB::parse::<SQLiteDialect>(
-        "CREATE TABLE t (\"X\" TEXT, CHECK (\"X\" IN ('ab', 'cde')));",
-    )?;
+fn as_written_checks_reach_the_written_column() -> Result<(), Error> {
+    let database = as_written_options()
+        .parse::<SQLiteDialect>("CREATE TABLE t (\"X\" TEXT, CHECK (\"X\" IN ('ab', 'cde')));")?;
     let table = database
         .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?
         .expect("table exists");
@@ -141,7 +144,7 @@ fn dml_targets_take_the_catalog_case() -> Result<(), Error> {
     let folded = ParseOptions::default()
         .with_identifier_case(IdentifierCase::Folded)
         .parse::<SQLiteDialect>("CREATE TABLE \"T\" (id INT);")?;
-    let as_written = ParserDB::parse::<SQLiteDialect>("CREATE TABLE \"T\" (id INT);")?;
+    let as_written = as_written_options().parse::<SQLiteDialect>("CREATE TABLE \"T\" (id INT);")?;
     for statement in Parser::parse_sql(
         &SQLiteDialect {},
         "INSERT INTO t VALUES (1); UPDATE t SET id = 2; DELETE FROM t;",
@@ -198,9 +201,9 @@ fn folded_grant_targets_are_resolved() -> Result<(), Error> {
 }
 
 #[test]
-fn default_grant_targets_keep_quoted_tables_apart() -> Result<(), Error> {
+fn as_written_grant_targets_keep_quoted_tables_apart() -> Result<(), Error> {
     let database =
-        ParseOptions::default()
+        as_written_options()
             .with_access_resolution(AccessResolution::OpenWorld)
             .parse::<SQLiteDialect>("CREATE TABLE \"T\" (x INT); GRANT SELECT ON t TO PUBLIC;")?;
     assert!(matches!(

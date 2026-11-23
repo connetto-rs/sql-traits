@@ -61,7 +61,7 @@ fn an_exact_lookup_refuses_a_folded_spelling() -> Result<(), LookupError> {
 /// not an arbitrary winner.
 #[test]
 fn folding_two_stored_spellings_into_one_name_is_ambiguous() {
-    let db = ParserDB::parse::<SQLiteDialect>(
+    let db = ParserDB::parse::<PostgreSqlDialect>(
         "CREATE TABLE docs (id INT PRIMARY KEY);
          CREATE TABLE \"Docs\" (id INT PRIMARY KEY);",
     )
