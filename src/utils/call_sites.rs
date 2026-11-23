@@ -4,8 +4,8 @@
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget, ObjectName,
-    ObjectNamePart, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    ArgMode, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget,
+    ObjectName, ObjectNamePart, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 use crate::{
@@ -112,6 +112,44 @@ where
         Qualifier::Absent => function_search_path(search_path).any(in_schema),
         Qualifier::RunTime => false,
     }
+}
+
+/// The function among `candidates` that PostgreSQL's `LookupFuncName` finds
+/// for `called` with no arguments, as a trigger's `EXECUTE FUNCTION` looks it
+/// up.
+///
+/// Only a function taking no input arguments counts, since the lookup fills
+/// no defaults. A qualified name reaches its own schema, and an unqualified
+/// one the first schema of the function lookup path that
+/// [`function_search_path`] builds from `search_path`. Whether the function
+/// found is a procedure is left to the caller.
+pub(crate) fn zero_argument_function<'function, 'path, F: FunctionLike + 'function, I>(
+    candidates: impl IntoIterator<Item = &'function F>,
+    called: &ObjectName,
+    search_path: impl Fn() -> I,
+    case: IdentifierCase,
+) -> Option<&'function F>
+where
+    I: Iterator<Item = (&'path str, bool)>,
+{
+    let path_position = |function: &F| {
+        let declared_in = function.target_name();
+        let (schema, quoted) = declared_in
+            .schema()
+            .map_or(("public", false), |schema| (schema, declared_in.schema_is_quoted()));
+        function_search_path(&search_path)
+            .position(|(entry, entry_quoted)| {
+                case.identifiers_match(schema, quoted, entry, entry_quoted)
+            })
+            .unwrap_or(0)
+    };
+    candidates
+        .into_iter()
+        .filter(|function| {
+            function.argument_modes().all(|mode| mode == ArgMode::Out)
+                && call_reaches(*function, called, 0, &search_path, case)
+        })
+        .min_by_key(|function| path_position(function))
 }
 
 /// An expression PostgreSQL's grammar writes with the syntax of a call.
