@@ -1898,18 +1898,13 @@ impl<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> WildcardColumn<'scope, 'que
     /// The column as the relation listing it derives it, a merged column
     /// carrying `opaque` and no source.
     fn column(&self, opaque: D) -> DerivedColumn<'query, 'db, DB, D> {
-        match self {
-            Self::Base(base, ordinal) => base_column(base, *ordinal),
-            Self::Derived(relation, ordinal) => relation.shape.columns[*ordinal].clone(),
-            Self::Merged { name, quoted, .. } => {
-                DerivedColumn {
-                    name: (*name).to_owned(),
-                    quoted: *quoted,
-                    source: None,
-                    definition: opaque,
-                    marker: core::marker::PhantomData,
-                }
-            }
+        let (name, quoted) = self.name();
+        DerivedColumn {
+            name: name.to_owned(),
+            quoted,
+            source: self.source(),
+            definition: self.definition(opaque),
+            marker: core::marker::PhantomData,
         }
     }
 
@@ -1925,6 +1920,25 @@ impl<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> WildcardColumn<'scope, 'que
                 (&column.name, column.quoted)
             }
             Self::Merged { name, quoted, .. } => (name, *quoted),
+        }
+    }
+
+    /// The table the column passes through unchanged, `None` for a merged
+    /// column.
+    fn source(&self) -> Option<&'db DB::Table> {
+        match self {
+            Self::Base(base, _) => Some(base.table),
+            Self::Derived(relation, ordinal) => relation.shape.columns[*ordinal].source,
+            Self::Merged { .. } => None,
+        }
+    }
+
+    /// The column's definition, `opaque` for a merged column.
+    fn definition(&self, opaque: D) -> D {
+        match self {
+            Self::Base(base, ordinal) => base.output_columns[*ordinal].definition,
+            Self::Derived(relation, ordinal) => relation.shape.columns[*ordinal].definition,
+            Self::Merged { .. } => opaque,
         }
     }
 
@@ -3647,22 +3661,6 @@ fn three_part_output_name<DB: DatabaseLike, D: Copy>(
     )?;
     base_exposes_column(base, column, case)
         .then(|| (column.value.clone(), column.quote_style.is_some()))
-}
-
-/// Output column `ordinal` of a base relation as a derived column sourced by
-/// that table.
-fn base_column<'query, 'db, DB: DatabaseLike, D: Copy>(
-    base: &FromTableRef<'query, 'db, DB, D>,
-    ordinal: usize,
-) -> DerivedColumn<'query, 'db, DB, D> {
-    let column = &base.output_columns[ordinal];
-    DerivedColumn {
-        name: column.name.clone(),
-        quoted: column.quoted,
-        source: Some(base.table),
-        definition: column.definition,
-        marker: core::marker::PhantomData,
-    }
 }
 
 /// The relation a qualifier names.
