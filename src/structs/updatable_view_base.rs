@@ -392,7 +392,7 @@ fn source_width<DB: DatabaseLike>(
             let scope = ColumnScope::for_stored_definition(definition, database)?;
             Ok(scope.scope_for_query(definition).and_then(|query| {
                 query.outputs().try_fold(0, |count, output| {
-                    (!matches!(output, QueryOutput::Unexpanded)).then_some(count + 1)
+                    (!matches!(output, QueryOutput::Unexpanded { .. })).then_some(count + 1)
                 })
             }))
         }

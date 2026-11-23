@@ -109,7 +109,7 @@ pub(super) fn query_columns(
             return Ok(None);
         };
         for (ordinal, output) in outputs.outputs().enumerate() {
-            let QueryOutput::Column { name: Some((name, quoted)), definition } = output else {
+            let QueryOutput::Column { name: Some((name, quoted)), definition, .. } = output else {
                 return Ok(None);
             };
             output_names.push((name.to_owned(), quoted));

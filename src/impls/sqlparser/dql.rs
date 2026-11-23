@@ -1894,6 +1894,65 @@ enum WildcardColumn<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> {
     Merged { name: &'scope str, quoted: bool, join: JoinSite, ordinal: usize },
 }
 
+impl<'scope, 'query, 'db, DB: DatabaseLike, D: Copy> WildcardColumn<'scope, 'query, 'db, DB, D> {
+    /// The column as the relation listing it derives it, a merged column
+    /// carrying `opaque` and no source.
+    fn column(&self, opaque: D) -> DerivedColumn<'query, 'db, DB, D> {
+        match self {
+            Self::Base(base, ordinal) => base_column(base, *ordinal),
+            Self::Derived(relation, ordinal) => relation.shape.columns[*ordinal].clone(),
+            Self::Merged { name, quoted, .. } => {
+                DerivedColumn {
+                    name: (*name).to_owned(),
+                    quoted: *quoted,
+                    source: None,
+                    definition: opaque,
+                    marker: core::marker::PhantomData,
+                }
+            }
+        }
+    }
+
+    /// The name the column is exposed under and whether it is quoted.
+    fn name(&self) -> (&'scope str, bool) {
+        match self {
+            Self::Base(base, ordinal) => {
+                let column = &base.output_columns[*ordinal];
+                (&column.name, column.quoted)
+            }
+            Self::Derived(relation, ordinal) => {
+                let column = &relation.shape.columns[*ordinal];
+                (&column.name, column.quoted)
+            }
+            Self::Merged { name, quoted, .. } => (name, *quoted),
+        }
+    }
+
+    /// The relation a qualified reference reaches the column through, or
+    /// `None` for a column a join merged and for one of an anonymous
+    /// subquery.
+    fn relation(&self) -> Option<RelationKey<'query, 'db>> {
+        match self {
+            Self::Base(base, _) => Some(base_relation_key(base)),
+            Self::Derived(relation, _) => relation.identity,
+            Self::Merged { .. } => None,
+        }
+    }
+
+    /// What the column reads.
+    fn origin(&self) -> ColumnOrigin {
+        match self {
+            Self::Base(base, ordinal) => {
+                ColumnOrigin::Entry { factor: base.factor, ordinal: *ordinal }
+            }
+            Self::Derived(relation, ordinal) => derived_origin(relation, *ordinal),
+            Self::Merged { join, ordinal, .. } => {
+                ColumnOrigin::Merged { join: *join, ordinal: *ordinal }
+            }
+        }
+    }
+}
+
 /// Calls `visit` with each column a `*` over `scope` lists, materializing
 /// each `FROM` item's plan in PostgreSQL's join output order. A relation
 /// contributes its own columns except those a merge absorbed (relations
@@ -1942,21 +2001,7 @@ fn push_wildcard_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
     columns: &mut Vec<DerivedColumn<'query, 'db, DB, D>>,
     opaque: D,
 ) {
-    each_wildcard_column(scope, |column| {
-        columns.push(match column {
-            WildcardColumn::Base(base, ordinal) => base_column(base, ordinal),
-            WildcardColumn::Derived(relation, ordinal) => relation.shape.columns[ordinal].clone(),
-            WildcardColumn::Merged { name, quoted, .. } => {
-                DerivedColumn {
-                    name: name.to_owned(),
-                    quoted,
-                    source: None,
-                    definition: opaque,
-                    marker: core::marker::PhantomData,
-                }
-            }
-        });
-    });
+    each_wildcard_column(scope, |column| columns.push(column.column(opaque)));
 }
 
 /// What each column a `*` over `scope` lists reads, in the order it lists
@@ -1965,15 +2010,7 @@ fn wildcard_origins<DB: DatabaseLike, D: Copy>(
     scope: &FromScope<'_, '_, DB, D>,
 ) -> Vec<ColumnOrigin> {
     let mut origins = Vec::new();
-    each_wildcard_column(scope, |column| {
-        origins.push(match column {
-            WildcardColumn::Base(base, ordinal) => {
-                ColumnOrigin::Entry { factor: base.factor, ordinal }
-            }
-            WildcardColumn::Derived(relation, ordinal) => derived_origin(relation, ordinal),
-            WildcardColumn::Merged { join, ordinal, .. } => ColumnOrigin::Merged { join, ordinal },
-        });
-    });
+    each_wildcard_column(scope, |column| origins.push(column.origin()));
     origins
 }
 
@@ -3518,13 +3555,14 @@ where
             if wildcard_reshapes_output(options) {
                 return Ok(false);
             }
-            let Some(expansion) = ({
-                let data = profile.scope(scope);
-                expand_qualified_wildcard(&data.bases, &data.derived, object_name, data.case)
-            }) else {
+            let opaque = profile.opaque_definition();
+            let data = profile.scope(scope);
+            let Some(expansion) =
+                qualified_wildcard_columns(&data.bases, &data.derived, object_name, data.case)
+            else {
                 return Ok(false);
             };
-            columns.extend(expansion);
+            columns.extend(expansion.map(|column| column.column(opaque)));
             Ok(true)
         }
     }
@@ -3609,19 +3647,6 @@ fn three_part_output_name<DB: DatabaseLike, D: Copy>(
     )?;
     base_exposes_column(base, column, case)
         .then(|| (column.value.clone(), column.quote_style.is_some()))
-}
-
-/// Every column a qualified wildcard over a base relation reaches, as a
-/// derived column sourced by that table, which are the relation's
-/// `output_names` in declaration order without the hidden ones, so an alias
-/// column list renames the wildcard expansion too.
-fn base_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
-    base: &FromTableRef<'query, 'db, DB, D>,
-) -> Vec<DerivedColumn<'query, 'db, DB, D>> {
-    (0..base.output_columns.len())
-        .filter(|&ordinal| !base.output_columns[ordinal].hidden)
-        .map(|ordinal| base_column(base, ordinal))
-        .collect()
 }
 
 /// Output column `ordinal` of a base relation as a derived column sourced by
@@ -3722,16 +3747,30 @@ fn resolve_wildcard_target<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
     )
 }
 
-fn expand_qualified_wildcard<'query, 'db, DB: DatabaseLike, D: Copy>(
-    bases: &[FromTableRef<'query, 'db, DB, D>],
-    derived: &[DerivedRelationRef<'query, 'db, DB, D>],
+/// Each column a qualified `t.*` over `bases` and `derived` lists, a base
+/// relation's in declaration order without the hidden ones, under the names
+/// an alias column list gives them, or `None` when the qualifier names no
+/// relation whose columns are known.
+fn qualified_wildcard_columns<'scope, 'query, 'db, DB: DatabaseLike, D: Copy>(
+    bases: &'scope [FromTableRef<'query, 'db, DB, D>],
+    derived: &'scope [DerivedRelationRef<'query, 'db, DB, D>],
     qualifier: &ObjectName,
     case: IdentifierCase,
-) -> Option<Vec<DerivedColumn<'query, 'db, DB, D>>> {
-    match resolve_wildcard_target(bases, derived, qualifier, false, case)? {
-        QualifiedRelation::Base(base) => Some(base_columns(base)),
-        QualifiedRelation::Derived(relation) => Some(relation.shape.columns.clone()),
-    }
+) -> Option<impl Iterator<Item = WildcardColumn<'scope, 'query, 'db, DB, D>>> {
+    let (base, relation) = match resolve_wildcard_target(bases, derived, qualifier, false, case)? {
+        QualifiedRelation::Base(base) => (Some(base), None),
+        QualifiedRelation::Derived(relation) => (None, Some(relation)),
+    };
+    let base_columns = base.into_iter().flat_map(|base| {
+        (0..base.output_columns.len())
+            .filter(move |&ordinal| !base.output_columns[ordinal].hidden)
+            .map(move |ordinal| WildcardColumn::Base(base, ordinal))
+    });
+    let derived_columns = relation.into_iter().flat_map(|relation| {
+        (0..relation.shape.columns.len())
+            .map(move |ordinal| WildcardColumn::Derived(relation, ordinal))
+    });
+    Some(base_columns.chain(derived_columns))
 }
 
 fn apply_alias_columns<'query, 'db, DB: DatabaseLike, D: Copy>(
@@ -4002,6 +4041,21 @@ fn base_relation_identity<'scope, DB: DatabaseLike, D: Copy>(
         (base.key.value.get(), base.key.quoted)
     } else {
         (base.table.table_name(), base.table.table_name_is_quoted())
+    }
+}
+
+/// The relation key behind [`base_relation_identity`], held for as long as
+/// the query and the database are borrowed.
+fn base_relation_key<'query, 'db, DB: DatabaseLike, D: Copy>(
+    base: &FromTableRef<'query, 'db, DB, D>,
+) -> RelationKey<'query, 'db> {
+    if base.has_alias {
+        base.key
+    } else {
+        RelationKey {
+            value: AstRef::Database(base.table.table_name()),
+            quoted: base.table.table_name_is_quoted(),
+        }
     }
 }
 

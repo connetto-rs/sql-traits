@@ -78,7 +78,7 @@ fn outputs_in(database: &ParserDB, sql: &str, pick: fn(&Query) -> &Query) -> Vec
         .map(|output| {
             match output {
                 QueryOutput::Column { definition, .. } => describe(&definition),
-                QueryOutput::Unexpanded => "unexpanded".to_owned(),
+                QueryOutput::Unexpanded { .. } => "unexpanded".to_owned(),
             }
         })
         .collect::<Vec<_>>();
@@ -106,7 +106,7 @@ fn names_of(sql: &str, pick: impl Fn(&Query) -> &Query) -> Vec<String> {
                 QueryOutput::Column { name: Some((name, true)), .. } => format!("\"{name}\""),
                 QueryOutput::Column { name: Some((name, false)), .. } => name.to_owned(),
                 QueryOutput::Column { name: None, .. } => "?".to_owned(),
-                QueryOutput::Unexpanded => "*".to_owned(),
+                QueryOutput::Unexpanded { .. } => "*".to_owned(),
             }
         })
         .collect()
@@ -375,7 +375,7 @@ fn in_table_and_unnest_outputs_have_unnamed_expression_names() {
             .expect("scope builds");
         let outputs = scope.scope_for_query(&query).expect("query is recorded").outputs();
         for output in outputs {
-            let QueryOutput::Column { name, definition } = output else {
+            let QueryOutput::Column { name, definition, .. } = output else {
                 panic!("expected an expression output")
             };
             assert_eq!(name, Some(("?column?", true)), "{sql}");

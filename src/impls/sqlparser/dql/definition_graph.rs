@@ -401,7 +401,21 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         &'scope self,
         resolved: &ResolvedColumn<'scope, 'db, DB, DefinitionId>,
     ) -> Bound<'scope, 'query, 'db, DB> {
-        let (entry, merge) = match resolved.origin {
+        (
+            self.definition(resolved.definition),
+            self.binding(resolved.relation, resolved.exposed, resolved.origin),
+        )
+    }
+
+    /// The binding to the column `origin` names, exposed under `exposed`
+    /// through `relation`, with the `FROM` item or join it reaches.
+    pub(super) fn binding<'scope>(
+        &'scope self,
+        relation: Option<(&'scope str, bool)>,
+        exposed: Option<(&'scope str, bool)>,
+        origin: ColumnOrigin,
+    ) -> ColumnBinding<'scope> {
+        let (entry, merge) = match origin {
             ColumnOrigin::Entry { factor, ordinal } => {
                 let entry = self
                     .from_items
@@ -420,10 +434,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             }
             ColumnOrigin::Parameter | ColumnOrigin::Output | ColumnOrigin::Unknown => (None, None),
         };
-        (
-            self.definition(resolved.definition),
-            ColumnBinding::new(resolved.relation, resolved.exposed, resolved.origin, entry, merge),
-        )
+        ColumnBinding::new(relation, exposed, origin, entry, merge)
     }
 
     pub(crate) fn resolve_binding<'scope>(

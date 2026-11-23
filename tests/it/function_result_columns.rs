@@ -133,12 +133,12 @@ fn columns(from: &str) -> Vec<(String, String)> {
         .outputs()
         .map(|output| {
             match output {
-                QueryOutput::Column { name: Some((name, quoted)), definition } => {
+                QueryOutput::Column { name: Some((name, quoted)), definition, .. } => {
                     let name = if quoted { format!("\"{name}\"") } else { name.to_owned() };
                     (name, describe(&definition))
                 }
                 QueryOutput::Column { name: None, .. } => panic!("an unnamed column"),
-                QueryOutput::Unexpanded => ("*".to_owned(), "unexpanded".to_owned()),
+                QueryOutput::Unexpanded { .. } => ("*".to_owned(), "unexpanded".to_owned()),
             }
         })
         .collect()
