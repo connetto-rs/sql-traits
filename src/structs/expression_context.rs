@@ -512,10 +512,11 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// `excluded` row. A `MERGE` reaches its source and target, except that
     /// `WHEN NOT MATCHED` reaches the source alone and `WHEN NOT MATCHED BY
     /// SOURCE` the target alone. `RETURNING` also reaches the target's `old`
-    /// and `new` rows when no relation in reach takes either name. A
-    /// statement holds the same scopes behind a `WITH` and as a
-    /// data-modifying CTE, whose output is its `RETURNING` list. Any other
-    /// statement binds no column reference.
+    /// and `new` rows when no relation in reach takes either name. A target
+    /// is a table, a foreign table or a plain view, whose row holds the
+    /// view's output columns. A statement holds the same scopes behind a
+    /// `WITH` and as a data-modifying CTE, whose output is its `RETURNING`
+    /// list. Any other statement binds no column reference.
     ///
     /// # Errors
     ///
