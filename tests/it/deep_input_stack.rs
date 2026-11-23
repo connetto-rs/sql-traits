@@ -38,9 +38,14 @@ fn sum(length: usize) -> String {
 
 /// Runs `work` on a thread whose stack is [`STACK_SIZE`].
 fn on_small_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    on_stack_of(STACK_SIZE, work)
+}
+
+/// Runs `work` on a thread whose stack is `size` bytes.
+fn on_stack_of<T: Send>(size: usize, work: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|threads| {
         std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
+            .stack_size(size)
             .spawn_scoped(threads, work)
             .unwrap()
             .join()
@@ -160,7 +165,11 @@ fn helper_chain_160_deep_reads_its_helper_set() {
         .function_by_target(TargetName::new("ids_160", false), IdentifierCase::AsWritten)
         .unwrap()
         .unwrap();
-    on_small_stack(|| {
-        top.helper_set(&[], &deployment, &db, &[]).unwrap();
-    });
+    // Whether a guard grows the stack in time depends on where the deepest
+    // helper lands, so the chain runs at stack sizes covering every landing.
+    for size in (STACK_SIZE..STACK_SIZE + (256 << 10)).step_by(16 << 10) {
+        on_stack_of(size, || {
+            top.helper_set(&[], &deployment, &db, &[]).unwrap();
+        });
+    }
 }

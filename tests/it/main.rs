@@ -266,4 +266,5 @@ mod views_follow_renames;
 mod virtual_generated_constraints;
 mod virtual_generated_types;
 mod virtual_tables;
+mod wildcard_output_origins;
 mod written_index_clauses;

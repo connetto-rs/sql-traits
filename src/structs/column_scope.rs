@@ -143,6 +143,11 @@ pub enum FunctionResultType<'scope, 'query, 'db, DB: DatabaseLike> {
 
 /// One entry of a query's ordered output list.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "an output is yielded one at a time by an iterator and moved, so boxing the column \
+              would add a heap allocation to every output"
+)]
 pub enum QueryOutput<'scope, 'query, 'db, DB: DatabaseLike> {
     /// One output column.
     Column {
@@ -151,11 +156,29 @@ pub enum QueryOutput<'scope, 'query, 'db, DB: DatabaseLike> {
         name: Option<(&'scope str, bool)>,
         /// The definition that determines the column's type.
         definition: ColumnDefinition<'scope, 'query, 'db, DB>,
+        /// The position, counted from zero, of the item of the leading
+        /// `SELECT`'s list that produced the column, the wildcard for a column
+        /// a wildcard expanded into, or of the column in a leading `VALUES`
+        /// list.
+        item: usize,
+        /// For a column a wildcard expanded into, the binding a reference
+        /// reaches it through, which [`ColumnScope::resolve_column_binding`]
+        /// answers for `relation.exposed`, or for the bare `exposed` name of
+        /// a column a `USING` or `NATURAL` join merged. A column of an
+        /// anonymous subquery has no relation. `None` for a column an
+        /// expression produced.
+        wildcard: Option<ColumnBinding<'scope>>,
     },
     /// A wildcard whose columns cannot be enumerated, such as one over an
     /// opaque relation or one reshaped by `EXCLUDE`, `REPLACE` or `RENAME`.
     /// It stands for an unknown number of columns, possibly none.
-    Unexpanded,
+    Unexpanded {
+        /// The position, counted from zero, of the wildcard among the items
+        /// of the leading `SELECT`'s list, or `None` when the entry stands
+        /// for the whole output of a leading operand that is not modeled,
+        /// such as a `VALUES` list whose rows differ in length.
+        item: Option<usize>,
+    },
 }
 
 /// The relation and exposed column names matched by a resolved reference or
@@ -1014,6 +1037,11 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     /// wildcard reads after the relation's declared column list, and a set
     /// operation keeps its leading operand's names.
     ///
+    /// Each entry names the item of the leading `SELECT`'s list that produced
+    /// it, and a column a wildcard expanded into carries the binding a
+    /// reference reaches it through, so a caller can write each wildcard out
+    /// as the columns it reads.
+    ///
     /// The iterator's length counts entries, and an
     /// [`QueryOutput::Unexpanded`] entry stands for an unknown number of
     /// columns. The SQL column count, and the ordinal of every entry after an
@@ -1041,6 +1069,7 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     ///         let QueryOutput::Column {
     ///             name: Some((name, false)),
     ///             definition: ColumnDefinition::Base { column, .. },
+    ///             ..
     ///         } = output
     ///         else {
     ///             unreachable!()
@@ -1059,7 +1088,27 @@ impl<'scope, 'query, 'db, DB: DatabaseLike> ColumnQueryScope<'scope, 'query, 'db
     /// let mut entries = root.outputs();
     /// assert_eq!(entries.len(), 2);
     /// assert!(matches!(entries.next(), Some(QueryOutput::Column { name: Some(("id", false)), .. })));
-    /// assert!(matches!(entries.next(), Some(QueryOutput::Unexpanded)));
+    /// assert!(matches!(entries.next(), Some(QueryOutput::Unexpanded { item: Some(1) })));
+    ///
+    /// let sql = "SELECT a.*, 1 AS k, b.* FROM a JOIN a AS b ON a.id = b.id";
+    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let scope = ColumnScope::from_query(&query, &db, IdentifierCase::AsWritten)?;
+    /// let root = scope.scope_for_query(&query).expect("the root query is recorded");
+    /// let written = root
+    ///     .outputs()
+    ///     .map(|output| {
+    ///         let QueryOutput::Column { name: Some((name, _)), item, wildcard, .. } = output else {
+    ///             unreachable!()
+    ///         };
+    ///         match wildcard.and_then(|binding| binding.relation()) {
+    ///             Some((relation, _)) => format!("{item}: {relation}.{name}"),
+    ///             None => format!("{item}: {name}"),
+    ///         }
+    ///     })
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(written, ["0: a.id", "0: a.x", "1: k", "2: b.id", "2: b.x"]);
     /// # Ok::<(), sql_traits::errors::Error>(())
     /// ```
     pub fn outputs(
