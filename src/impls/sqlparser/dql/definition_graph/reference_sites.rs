@@ -15,7 +15,7 @@ use sqlparser::ast::{
 use super::{
     super::{
         ColumnOrigin, FromScope, RelationKey, WildcardEntry, build_definition_graph,
-        expand_qualified_wildcard, factor_address, join_constraint, subsumed_exposure,
+        factor_address, join_constraint, qualified_wildcard_columns, subsumed_exposure,
         wildcard_origins, wildcard_reshapes_output,
     },
     Bound, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
@@ -928,11 +928,13 @@ fn qualified_wildcard_items<DB: DatabaseLike>(
             }
         })
         .collect::<Option<Vec<_>>>()?;
-    let columns = expand_qualified_wildcard(&data.bases, &data.derived, qualifier, data.case)?;
-    let items: Vec<SelectItem> = columns
-        .iter()
-        .map(|column| column_item(Some(&parts), &column.name, column.quoted))
-        .collect();
+    let items: Vec<SelectItem> =
+        qualified_wildcard_columns(&data.bases, &data.derived, qualifier, data.case)?
+            .map(|column| {
+                let (name, quoted) = column.name();
+                column_item(Some(&parts), name, quoted)
+            })
+            .collect();
     (!items.is_empty()).then_some(items)
 }
 

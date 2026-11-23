@@ -148,7 +148,7 @@ pub(crate) fn row_of<DB: DatabaseLike>(
     let context = ExpressionContext::for_root(ScopedRoot::Query(query), &scope, database, case)?;
     let mut row = Vec::new();
     for output in context.query_outputs(query) {
-        let QueryOutput::Column { name: Some((name, quoted)), definition } = output else {
+        let QueryOutput::Column { name: Some((name, quoted)), definition, .. } = output else {
             break;
         };
         round.untyped.store(false, Ordering::Relaxed);

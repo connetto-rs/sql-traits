@@ -8,8 +8,9 @@ use sqlparser::ast::{
 
 use super::{
     super::{
-        ColumnOrigin, DerivationProfile, LookupOutcome, expand_qualified_wildcard,
-        push_wildcard_columns, resolve_definition_local, wildcard_reshapes_output,
+        ColumnOrigin, DerivationProfile, DerivedColumn, LookupOutcome, RelationKey, WildcardColumn,
+        each_wildcard_column, qualified_wildcard_columns, resolve_definition_local,
+        wildcard_reshapes_output,
     },
     AstRef, Bound, DefinitionDerivation, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
     select_address,
@@ -49,6 +50,19 @@ pub(super) struct OutputColumn<'query, 'db> {
     name: OutputName,
     definition: DefinitionId,
     expression: Option<AstRef<'query, 'db, Expr>>,
+    /// The position of the select-list item, or `VALUES` column, of the
+    /// leading `SELECT` that produced the column.
+    item: usize,
+    /// How a reference reaches a column a wildcard expanded into.
+    wildcard: Option<WildcardReach<'query, 'db>>,
+}
+
+/// The relation a reference reaches a wildcard's column through, `None` for
+/// a merged column or one of an anonymous subquery, and the column it reads.
+#[derive(Clone, Copy)]
+struct WildcardReach<'query, 'db> {
+    relation: Option<RelationKey<'query, 'db>>,
+    origin: ColumnOrigin,
 }
 
 impl OutputColumn<'_, '_> {
@@ -61,11 +75,13 @@ impl OutputColumn<'_, '_> {
     }
 }
 
-/// One select-list position, or a wildcard whose columns cannot be enumerated.
+/// One select-list position, or a wildcard whose columns cannot be
+/// enumerated, with its select-list item, `None` when it stands for the whole
+/// output of an operand that is not modeled.
 #[derive(Clone)]
 pub(super) enum OutputEntry<'query, 'db> {
     Column(OutputColumn<'query, 'db>),
-    Unexpanded,
+    Unexpanded(Option<usize>),
 }
 
 enum QueryOutputs<'query, 'db> {
@@ -192,7 +208,8 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             visible_entries: self.graph.scopes[scope.0].data.from_entry_count,
         };
         let mut outputs = Vec::new();
-        for item in select.map(|select| select.projection.as_slice()).iter() {
+        for (position, item) in select.map(|select| select.projection.as_slice()).iter().enumerate()
+        {
             let expression = item.try_map(|item| {
                 match item {
                     SelectItem::UnnamedExpr(expression)
@@ -215,41 +232,62 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                     name,
                     definition,
                     expression: Some(expression),
+                    item: position,
+                    wildcard: None,
                 }));
                 continue;
             }
             let data = &self.graph.scopes[scope.0].data;
-            let expansion = match item.get() {
+            let expanded = match item.get() {
                 SelectItem::Wildcard(options)
                     if !data.has_opaque() && !wildcard_reshapes_output(options) =>
                 {
-                    let mut columns = Vec::new();
-                    push_wildcard_columns(data, &mut columns, DefinitionId(0));
-                    Some(columns)
+                    each_wildcard_column(data, |column| {
+                        outputs.push(wildcard_output(&column, position));
+                    });
+                    true
                 }
                 SelectItem::QualifiedWildcard(
                     SelectItemQualifiedWildcardKind::ObjectName(object_name),
                     options,
                 ) if !wildcard_reshapes_output(options) => {
-                    expand_qualified_wildcard(&data.bases, &data.derived, object_name, data.case)
+                    match qualified_wildcard_columns(
+                        &data.bases,
+                        &data.derived,
+                        object_name,
+                        data.case,
+                    ) {
+                        Some(columns) => {
+                            outputs
+                                .extend(columns.map(|column| wildcard_output(&column, position)));
+                            true
+                        }
+                        None => false,
+                    }
                 }
-                _ => None,
+                _ => false,
             };
-            match expansion {
-                Some(columns) => {
-                    outputs.extend(columns.into_iter().map(|column| {
-                        OutputEntry::Column(OutputColumn {
-                            name: OutputName::Known { name: column.name, quoted: column.quoted },
-                            definition: column.definition,
-                            expression: None,
-                        })
-                    }));
-                }
-                None => outputs.push(OutputEntry::Unexpanded),
+            if !expanded {
+                outputs.push(OutputEntry::Unexpanded(Some(position)));
             }
         }
         Ok(outputs)
     }
+}
+
+/// The output a wildcard at select-list position `item` lists for `column`.
+fn wildcard_output<'query, 'db, DB: DatabaseLike>(
+    column: &WildcardColumn<'_, 'query, 'db, DB, DefinitionId>,
+    item: usize,
+) -> OutputEntry<'query, 'db> {
+    let DerivedColumn { name, quoted, definition, .. } = column.column(DefinitionId(0));
+    OutputEntry::Column(OutputColumn {
+        name: OutputName::Known { name, quoted },
+        definition,
+        expression: None,
+        item,
+        wildcard: Some(WildcardReach { relation: column.relation(), origin: column.origin() }),
+    })
 }
 
 struct QueryCollector<'derivation, 'query, 'db, DB: DatabaseLike> {
@@ -287,16 +325,18 @@ impl<'query, 'db, DB: DatabaseLike> QueryCollector<'_, 'query, 'db, DB> {
     /// were not enumerated, such as one whose rows differ in length.
     fn values_entries(&self, values: &Values) -> Vec<OutputEntry<'query, 'db>> {
         let Some(columns) = self.derivation.graph.values_columns(values) else {
-            return vec![OutputEntry::Unexpanded];
+            return vec![OutputEntry::Unexpanded(None)];
         };
         columns
             .iter()
-            .zip(1..)
-            .map(|(definition, position)| {
+            .enumerate()
+            .map(|(item, definition)| {
                 OutputEntry::Column(OutputColumn {
-                    name: OutputName::exact(&format!("column{position}")),
+                    name: OutputName::exact(&format!("column{}", item + 1)),
                     definition: *definition,
                     expression: None,
+                    item,
+                    wildcard: None,
                 })
             })
             .collect()
@@ -336,7 +376,7 @@ impl<'query, 'db, DB: DatabaseLike> QueryCollector<'_, 'query, 'db, DB> {
         right: &SetExpr,
     ) -> Vec<OutputEntry<'query, 'db>> {
         let Some(left) = self.arm(left) else {
-            return vec![OutputEntry::Unexpanded];
+            return vec![OutputEntry::Unexpanded(None)];
         };
         let right_definitions = self.arm(right).and_then(|right| {
             self.arm_entries(&right)
@@ -344,7 +384,7 @@ impl<'query, 'db, DB: DatabaseLike> QueryCollector<'_, 'query, 'db, DB> {
                 .map(|entry| {
                     match entry {
                         OutputEntry::Column(column) => Some(column.definition),
-                        OutputEntry::Unexpanded => None,
+                        OutputEntry::Unexpanded(_) => None,
                     }
                 })
                 .collect::<Option<Vec<_>>>()
@@ -442,15 +482,22 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         self.query_entries(query).iter().map(|entry| {
             match entry {
                 OutputEntry::Column(column) => {
+                    let name = match &column.name {
+                        OutputName::Known { name, quoted } => Some((name.as_str(), *quoted)),
+                        OutputName::Unknown => None,
+                    };
                     QueryOutput::Column {
-                        name: match &column.name {
-                            OutputName::Known { name, quoted } => Some((name.as_str(), *quoted)),
-                            OutputName::Unknown => None,
-                        },
+                        name,
                         definition: self.definition(column.definition),
+                        item: column.item,
+                        wildcard: column.wildcard.as_ref().map(|reach| {
+                            let relation =
+                                reach.relation.as_ref().map(|key| (key.value.get(), key.quoted));
+                            self.binding(relation, name, reach.origin)
+                        }),
                     }
                 }
-                OutputEntry::Unexpanded => QueryOutput::Unexpanded,
+                OutputEntry::Unexpanded(item) => QueryOutput::Unexpanded { item: *item },
             }
         })
     }
@@ -467,7 +514,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                         name: OutputName::Known { name, quoted },
                         ..
                     }) => Some((name.clone(), *quoted)),
-                    OutputEntry::Column(_) | OutputEntry::Unexpanded => None,
+                    OutputEntry::Column(_) | OutputEntry::Unexpanded(_) => None,
                 }
             })
             .collect()
