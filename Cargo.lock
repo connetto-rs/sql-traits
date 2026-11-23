@@ -1000,6 +1000,7 @@ dependencies = [
  "sqlparser-expr-eval",
  "sqlparser-plpgsql",
  "sqlstate",
+ "stacker",
  "tempfile",
  "thiserror",
  "toml",
