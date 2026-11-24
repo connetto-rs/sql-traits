@@ -30,6 +30,8 @@ pub struct FunctionMetadata {
     /// Call argument positions where `NULL` yields `NULL` despite
     /// non-strictness.
     null_returning_arguments: &'static [usize],
+    /// Whether the function returns `NULL` only through a `NULL` argument.
+    null_only_on_null_input: bool,
     /// The function's `pg_proc.prokind`.
     kind: FunctionKind,
     /// The aggregate's `pg_aggregate.aggkind`, `None` for a function that is
@@ -105,6 +107,21 @@ impl FunctionMetadata {
     #[inline]
     pub(crate) fn set_null_returning_arguments(&mut self, positions: &'static [usize]) {
         self.null_returning_arguments = positions;
+    }
+
+    /// Returns whether the function returns `NULL` only through a `NULL`
+    /// argument.
+    #[must_use]
+    #[inline]
+    pub(crate) fn null_only_on_null_input(&self) -> bool {
+        self.null_only_on_null_input
+    }
+
+    /// Sets whether the function returns `NULL` only through a `NULL`
+    /// argument.
+    #[inline]
+    pub(crate) fn set_null_only_on_null_input(&mut self, null_only_on_null_input: bool) {
+        self.null_only_on_null_input = null_only_on_null_input;
     }
 
     /// Returns the function's `pg_proc.prokind`.

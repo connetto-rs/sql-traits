@@ -29,7 +29,7 @@ use crate::{
         generic_db::{Stored, builtin_functions::BuiltinTable},
         metadata::FunctionMetadata,
     },
-    utils::{null_returning_positions, object_name::PG_CATALOG},
+    utils::{null_only_on_null_input, null_returning_positions, object_name::PG_CATALOG},
 };
 
 /// `pg_proc.prokind`, with `pg_aggregate.aggkind` and
@@ -223,11 +223,17 @@ impl PostgresBuiltin {
     fn metadata(&self) -> FunctionMetadata {
         let Self(name, arguments, ..) = *self;
         let mut metadata = FunctionMetadata::default();
-        if let Some(positions) =
-            null_returning_positions(name, |types| arguments.split(", ").eq(types.iter().copied()))
-        {
+        let declared = |types: &[&str]| {
+            arguments
+                .split(", ")
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| argument.strip_prefix("VARIADIC ").unwrap_or(argument))
+                .eq(types.iter().copied())
+        };
+        if let Some(positions) = null_returning_positions(name, declared) {
             metadata.set_null_returning_arguments(positions);
         }
+        metadata.set_null_only_on_null_input(null_only_on_null_input(name, declared));
         self.describe(&mut metadata);
         metadata
     }

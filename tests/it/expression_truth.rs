@@ -172,6 +172,31 @@ fn volatile_calls_that_may_return_null_stay_undecided() -> Result<(), Error> {
 }
 
 #[test]
+fn builtins_that_never_return_null_are_never_null() -> Result<(), Error> {
+    for sql in [
+        "now() IS NULL",
+        "pg_catalog.now() IS NULL",
+        "clock_timestamp() IS NULL",
+        "statement_timestamp() IS NULL",
+        "transaction_timestamp() IS NULL",
+        "current_setting('app.user_id') IS NULL",
+        "CURRENT_TIMESTAMP IS NULL",
+    ] {
+        assert_eq!(truth(sql)?, never_raising(Outcomes::FALSE), "{sql}");
+    }
+    for sql in ["current_setting('app.user_id', true) IS NULL", "current_setting(NULL) IS NULL"] {
+        let truth = truth(sql)?;
+        assert!(truth.outcomes.truth, "{sql}: {truth:?}");
+    }
+    assert_eq!(truth("concat_ws(',', tenant_id) IS NULL")?, never_raising(Outcomes::FALSE));
+    assert!(truth("concat_ws(tenant_id::text, 'a') IS NULL")?.outcomes.truth);
+    // `lower` of an empty range is `NULL`.
+    let spans = "CREATE TABLE spans (span DATERANGE NOT NULL);";
+    assert!(truth_in(spans, "spans", "lower(span) IS NULL")?.outcomes.truth);
+    Ok(())
+}
+
+#[test]
 fn calls_in_checks_resolve_where_the_evaluator_reads_copies() -> Result<(), Error> {
     let domain = "CREATE DOMAIN short AS TEXT CHECK (length(VALUE) BETWEEN 1 AND 50);
          CREATE TABLE invoices (code short NOT NULL);";

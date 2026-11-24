@@ -12692,6 +12692,7 @@ impl ParserDB {
                         (None, metadata)
                     };
                     metadata.set_null_returning_arguments(&[]);
+                    metadata.set_null_only_on_null_input(false);
                     // PostgreSQL drops the dependency on a range whose
                     // constructor a replacement takes over.
                     metadata.set_range_constructor(None);

@@ -328,6 +328,11 @@ impl FunctionLike for CreateFunction {
     }
 
     #[inline]
+    fn returns_null_only_on_null_input(&self, database: &Self::DB) -> bool {
+        function_metadata(self, database).is_ok_and(FunctionMetadata::null_only_on_null_input)
+    }
+
+    #[inline]
     fn volatility(&self) -> FunctionBehavior {
         self.behavior.clone().unwrap_or(FunctionBehavior::Volatile)
     }

@@ -24,8 +24,8 @@ use sqlparser::{
 };
 use sqlparser_expr_eval::{
     ArrayElement, Builtin, Callee, CalleeKind, Collation, Context, EnumType, EvalDialect,
-    Evaluation, Guarantees, Interval, NullInput, Outcomes, PostgreSqlOptions, Resolved, ScalarType,
-    Subject, TextRules, Unlisted, Values, Volatility, evaluate, implied,
+    Evaluation, Guarantees, Interval, NullInput, NullResult, Outcomes, PostgreSqlOptions, Resolved,
+    ScalarType, Subject, TextRules, Unlisted, Values, Volatility, evaluate, implied,
     sql_values::postgres::{IntegerType, PgNumeric},
 };
 
@@ -1108,6 +1108,11 @@ impl Engine {
         } else {
             NullInput::CalledOnNull(nulling)
         };
+        let null_result = if function.returns_null_only_on_null_input(database) {
+            NullResult::OnlyOnNullInput
+        } else {
+            NullResult::AnyInput
+        };
         let volatility = match function.volatility() {
             FunctionBehavior::Immutable => Volatility::Immutable,
             FunctionBehavior::Stable => Volatility::Stable,
@@ -1133,6 +1138,7 @@ impl Engine {
         Ok(Callee::new(
             builtin,
             null_input,
+            null_result,
             volatility,
             kind,
             returns,

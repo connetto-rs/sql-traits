@@ -1684,6 +1684,45 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn returns_null_on_null_argument(&self, database: &Self::DB, index: usize) -> bool;
 
+    /// Returns whether the call is `NULL` only when an argument
+    /// [`returns_null_on_null_argument`](Self::returns_null_on_null_argument)
+    /// names is `NULL`. The default answers false, which is safe for a
+    /// function whose `NULL` results are unknown.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION stamp() RETURNS TIMESTAMPTZ LANGUAGE sql AS 'SELECT now()';",
+    /// )?;
+    /// let builtin = |name: &str, arguments: usize| {
+    ///     db.functions()
+    ///         .find(|function| {
+    ///             function.name() == name && function.argument_type_names(&db).count() == arguments
+    ///         })
+    ///         .expect("the builtin is registered")
+    /// };
+    /// assert!(builtin("now", 0).returns_null_only_on_null_input(&db));
+    /// assert!(builtin("current_setting", 1).returns_null_only_on_null_input(&db));
+    /// // `current_setting(name, true)` is `NULL` for an unknown setting.
+    /// assert!(!builtin("current_setting", 2).returns_null_only_on_null_input(&db));
+    /// let stamp = db
+    ///     .function_by_target(TargetName::new("stamp", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// assert!(!stamp.returns_null_only_on_null_input(&db));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn returns_null_only_on_null_input(&self, database: &Self::DB) -> bool {
+        let _ = database;
+        false
+    }
+
     /// Returns effective volatility after alterations, defaulting to
     /// PostgreSQL's `VOLATILE`.
     ///
