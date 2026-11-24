@@ -15,7 +15,7 @@ use sqlparser::ast::{AlterTableOperation, CreateTable, Ident, ObjectName, TableC
 
 use super::{
     AlterTableScope, ParserDB, ParserDBBuilder, StoredTable, existing_child, inheritance,
-    stored_qualifier,
+    stored_qualifier, triggers,
 };
 use crate::{errors::Error, traits::TableLike};
 
@@ -26,8 +26,9 @@ use crate::{errors::Error, traits::TableLike};
 /// Returns the refusals PostgreSQL gives: a partition or partitioned table as
 /// the child, an absent parent or one that is no table, a partitioned or
 /// partition parent, a temporary parent of a permanent table, a parent named
-/// already, a parent that is the table or inherits from it, and a table
-/// without the parent's shape.
+/// already, a parent that is the table or inherits from it, a table carrying
+/// a row trigger with transition tables, and a table without the parent's
+/// shape.
 pub(super) fn inherit(
     builder: ParserDBBuilder,
     child_name: &ObjectName,
@@ -75,6 +76,9 @@ pub(super) fn inherit(
             .any(|descendant| descendant.matches(parent_node, case))
     {
         return Err(Error::CircularInheritance { table_name, parent_name: parent_text });
+    }
+    if let Some(trigger_name) = triggers::row_transition_trigger(&builder, &child) {
+        return Err(Error::InheritanceChildRowTransitionTrigger { table_name, trigger_name });
     }
     existing_child::merge_into_existing(&builder, (&parent, parent_node), (&child, child_node))
         .map_err(|reason| {

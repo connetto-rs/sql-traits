@@ -1036,6 +1036,16 @@ impl Error {
             Self::CircularInheritance { .. } => {
                 Some(PostgresError::new(pg::DUPLICATE_TABLE, "circular inheritance not allowed"))
             }
+            Self::InheritanceChildRowTransitionTrigger { table_name, trigger_name } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!(
+                        "trigger {} prevents table {} from becoming an inheritance child",
+                        quoted(trigger_name),
+                        quoted(table_name)
+                    ),
+                ))
+            }
             Self::NotAParentOf { table_name, parent_name } => {
                 Some(PostgresError::new(
                     pg::UNDEFINED_TABLE,
@@ -2170,11 +2180,15 @@ impl Error {
             }
             Self::MaterializedViewCannotBeReplaced { written_token, .. }
             | Self::ViewIfNotExistsUnsupported { written_token, .. }
-            | Self::FunctionBodySyntaxUnsupported { written_token, .. } => {
+            | Self::FunctionBodySyntaxUnsupported { written_token, .. }
+            | Self::ConstraintTriggerTransitionTables { written_token, .. } => {
                 Some(PostgresError::new(
                     pg::SYNTAX_ERROR,
                     format!("syntax error at or near {}", quoted(written_token)),
                 ))
+            }
+            Self::QualifiedTransitionTableName { .. } => {
+                Some(PostgresError::new(pg::SYNTAX_ERROR, "syntax error at or near \".\""))
             }
             Self::ViewColumnListTooLong { .. } => {
                 Some(PostgresError::new(
@@ -2540,6 +2554,7 @@ impl Error {
             | Self::MaterializedViewCannotBeReplaced { written_token, .. }
             | Self::ViewIfNotExistsUnsupported { written_token, .. }
             | Self::FunctionBodySyntaxUnsupported { written_token, .. }
+            | Self::ConstraintTriggerTransitionTables { written_token, .. }
             | Self::InvalidSequenceParameters {
                 reason:
                     SequenceParameterError::NotABigint {

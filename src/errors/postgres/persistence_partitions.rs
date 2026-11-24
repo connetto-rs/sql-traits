@@ -306,6 +306,16 @@ pub(super) fn attachment(
                 ),
             )
         }
+        UnattachablePartition::RowTransitionTrigger { trigger_name } => {
+            (
+                pg::FEATURE_NOT_SUPPORTED,
+                format!(
+                    "trigger {} prevents table {} from becoming a partition",
+                    quoted(trigger_name),
+                    quoted(partition_name)
+                ),
+            )
+        }
     };
     PostgresError::new(sqlstate, message)
 }

@@ -16,12 +16,17 @@
 //! PostgreSQL also `BEFORE` or `AFTER` it once per statement. It goes with
 //! the view, follows its renames and outlives its replacement.
 
-use alloc::{string::ToString, sync::Arc, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    CreateTable, CreateTrigger, DropTrigger, Expr, Ident, ObjectName, TriggerEvent, TriggerObject,
-    TriggerObjectKind, TriggerPeriod,
+    CreateTable, CreateTrigger, DropTrigger, Expr, Ident, ObjectName, ObjectNamePart, TriggerEvent,
+    TriggerObject, TriggerObjectKind, TriggerPeriod, TriggerReferencingType,
 };
 
 use super::{
@@ -36,7 +41,10 @@ use crate::{
     errors::{Error, ObjectKind, TriggerFiringRefusal},
     impls::SqlparserDialect,
     structs::{TriggerEnablement, metadata::TriggerMetadata},
-    utils::walk::walk_expressions,
+    utils::{
+        identifier_resolution::stored_identifier, object_name::object_name_last_part,
+        walk::walk_expressions,
+    },
 };
 
 /// Records a `CREATE TRIGGER` on the table or plain view its target reaches,
@@ -54,14 +62,18 @@ use crate::{
 /// condition that reaches nothing in `NEW` and `OLD`,
 /// [`Error::TriggerAlreadyExists`] when the relation or a partition below
 /// carries a trigger of the name and the statement wrote no `OR REPLACE`,
-/// [`Error::ClonedTriggerReplaced`] when the trigger replaced is a copy, and
+/// [`Error::ClonedTriggerReplaced`] when the trigger replaced is a copy,
 /// [`Error::ConstraintTriggerOnForeignTable`] for a constraint trigger that
-/// would land on a foreign table.
+/// would land on a foreign table, and under PostgreSQL
+/// [`Error::ConstraintTriggerTransitionTables`] and
+/// [`Error::QualifiedTransitionTableName`] for a `REFERENCING` clause its
+/// grammar refuses.
 pub(super) fn create_trigger(
     builder: ParserDBBuilder,
     create_trigger: CreateTrigger,
 ) -> Result<ParserDBBuilder, Error> {
     require_named(&create_trigger.name, ObjectKind::Trigger)?;
+    refuse_transition_table_syntax(&builder, &create_trigger)?;
     if let Some(table) = builder.resolve_table_object_name(&create_trigger.table_name)? {
         builder.refuse_table_kinds(
             table,
@@ -69,8 +81,9 @@ pub(super) fn create_trigger(
             &[ObjectKind::VirtualTable],
             crate::errors::RelationKindContext::Trigger,
         )?;
+        let host = FiringHost::of_table(&builder, table);
         let table = StoredTable::of(table);
-        refuse_firing(&builder, &create_trigger, false)?;
+        refuse_firing(&builder, &create_trigger, host)?;
         stored_expressions::refuse_in_trigger_condition(&builder, &create_trigger.condition)?;
         let mut create_trigger = create_trigger;
         builder.bind_table_reference(&mut create_trigger.table_name);
@@ -91,7 +104,7 @@ pub(super) fn create_trigger(
     if let Some(view) = builder.resolve_view_object_name(&create_trigger.table_name)? {
         let host = ViewHost::of_view(view);
         let qualifier = stored_view_qualifier(view);
-        refuse_firing(&builder, &create_trigger, true)?;
+        refuse_firing(&builder, &create_trigger, FiringHost::View)?;
         stored_expressions::refuse_in_trigger_condition(&builder, &create_trigger.condition)?;
         let mut create_trigger = bind_parts(&builder, create_trigger)?;
         builder.bind_relation_reference(&mut create_trigger.table_name, qualifier);
@@ -183,17 +196,52 @@ fn refuse_before_generated(
     }
 }
 
-/// Refuses `trigger` on its table, or on its view when `on_view` is set, when
-/// the engine of the dialect refuses its timing, level, events or clauses
-/// there. Other dialects refuse none.
+/// The kind of relation a trigger is created on, as the engine's checks of a
+/// new trigger tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FiringHost {
+    /// A plain table, inheriting from no other.
+    Table,
+    /// A partitioned table, a partition or not.
+    PartitionedTable,
+    /// A partition that is not itself partitioned.
+    Partition,
+    /// A table inheriting from another through `INHERITS`.
+    InheritanceChild,
+    /// A foreign table, a partition or not.
+    ForeignTable,
+    /// A plain view.
+    View,
+}
+
+impl FiringHost {
+    /// The kind of the table `node` declares.
+    fn of_table(builder: &ParserDBBuilder, node: &CreateTable) -> Self {
+        if builder.is_foreign_table(node) {
+            Self::ForeignTable
+        } else if node.partition_by.is_some() {
+            Self::PartitionedTable
+        } else if node.partition_of.is_some() {
+            Self::Partition
+        } else if node.inherits.as_ref().is_some_and(|parents| !parents.is_empty()) {
+            Self::InheritanceChild
+        } else {
+            Self::Table
+        }
+    }
+}
+
+/// Refuses `trigger` on its relation, of the kind `host`, when the engine of
+/// the dialect refuses its timing, level, events or clauses there. Other
+/// dialects refuse none.
 fn refuse_firing(
     builder: &ParserDBBuilder,
     trigger: &CreateTrigger,
-    on_view: bool,
+    host: FiringHost,
 ) -> Result<(), Error> {
     let refusal = match builder.dialect() {
-        SqlparserDialect::PostgreSql => postgres_firing_refusal(trigger, on_view),
-        SqlparserDialect::SQLite => sqlite_firing_refusal(trigger, on_view),
+        SqlparserDialect::PostgreSql => postgres_firing_refusal(trigger, host),
+        SqlparserDialect::SQLite => sqlite_firing_refusal(trigger, host == FiringHost::View),
         _ => None,
     };
     refusal.map_or(Ok(()), |reason| {
@@ -208,9 +256,12 @@ fn refuse_firing(
 /// What PostgreSQL refuses in `trigger`, checking the relation's kind, then
 /// the shape of an `INSTEAD OF` trigger, then the transition tables, as
 /// PostgreSQL does.
-fn postgres_firing_refusal(trigger: &CreateTrigger, on_view: bool) -> Option<TriggerFiringRefusal> {
+fn postgres_firing_refusal(
+    trigger: &CreateTrigger,
+    host: FiringHost,
+) -> Option<TriggerFiringRefusal> {
     let instead = trigger.period == Some(TriggerPeriod::InsteadOf);
-    if on_view {
+    if host == FiringHost::View {
         if !instead && fires_per_row(trigger) {
             return Some(TriggerFiringRefusal::RowLevelBeforeOrAfterOnView);
         }
@@ -219,6 +270,12 @@ fn postgres_firing_refusal(trigger: &CreateTrigger, on_view: bool) -> Option<Tri
         }
     } else if instead {
         return Some(TriggerFiringRefusal::InsteadOfOnTable);
+    }
+    if host == FiringHost::PartitionedTable
+        && fires_per_row(trigger)
+        && !trigger.referencing.is_empty()
+    {
+        return Some(TriggerFiringRefusal::RowTransitionTablesOnPartitionedTable);
     }
     if instead {
         if !fires_per_row(trigger) {
@@ -235,8 +292,115 @@ fn postgres_firing_refusal(trigger: &CreateTrigger, on_view: bool) -> Option<Tri
             return Some(TriggerFiringRefusal::InsteadOfColumnList);
         }
     }
-    (on_view && !trigger.referencing.is_empty())
-        .then_some(TriggerFiringRefusal::TransitionTablesOnView)
+    transition_table_refusal(trigger, host)
+}
+
+/// What PostgreSQL refuses in the transition tables `trigger` declares on a
+/// relation of the kind `host`, checking the relation, then the trigger's
+/// timing, events and column list, then each table in the order written,
+/// then the two names, as PostgreSQL does.
+fn transition_table_refusal(
+    trigger: &CreateTrigger,
+    host: FiringHost,
+) -> Option<TriggerFiringRefusal> {
+    if trigger.referencing.is_empty() {
+        return None;
+    }
+    match host {
+        FiringHost::ForeignTable => {
+            return Some(TriggerFiringRefusal::TransitionTablesOnForeignTable);
+        }
+        FiringHost::View => return Some(TriggerFiringRefusal::TransitionTablesOnView),
+        FiringHost::Partition if fires_per_row(trigger) => {
+            return Some(TriggerFiringRefusal::RowTransitionTablesOnPartition);
+        }
+        FiringHost::InheritanceChild if fires_per_row(trigger) => {
+            return Some(TriggerFiringRefusal::RowTransitionTablesOnInheritanceChild);
+        }
+        _ => {}
+    }
+    if trigger.period != Some(TriggerPeriod::After) {
+        return Some(TriggerFiringRefusal::TransitionTablesNotAfter);
+    }
+    if trigger.events.contains(&TriggerEvent::Truncate) {
+        return Some(TriggerFiringRefusal::TransitionTablesOnTruncate);
+    }
+    let fires_on = |kind: fn(&TriggerEvent) -> bool| trigger.events.iter().any(kind);
+    let insert = fires_on(|event| matches!(event, TriggerEvent::Insert));
+    let update = fires_on(|event| matches!(event, TriggerEvent::Update(_)));
+    let delete = fires_on(|event| matches!(event, TriggerEvent::Delete));
+    if usize::from(insert) + usize::from(update) + usize::from(delete) != 1 {
+        return Some(TriggerFiringRefusal::TransitionTablesWithSeveralEvents);
+    }
+    if fires_on(|event| matches!(event, TriggerEvent::Update(columns) if !columns.is_empty())) {
+        return Some(TriggerFiringRefusal::TransitionTablesWithColumnList);
+    }
+    let (mut new_name, mut old_name) = (None, None);
+    for referencing in &trigger.referencing {
+        let (fires, name, unfit, repeated) = match referencing.refer_type {
+            TriggerReferencingType::NewTable => {
+                (
+                    insert || update,
+                    &mut new_name,
+                    TriggerFiringRefusal::NewTableWithoutInsertOrUpdate,
+                    TriggerFiringRefusal::RepeatedNewTable,
+                )
+            }
+            TriggerReferencingType::OldTable => {
+                (
+                    delete || update,
+                    &mut old_name,
+                    TriggerFiringRefusal::OldTableWithoutDeleteOrUpdate,
+                    TriggerFiringRefusal::RepeatedOldTable,
+                )
+            }
+        };
+        if !fires {
+            return Some(unfit);
+        }
+        if name.replace(&referencing.transition_relation_name).is_some() {
+            return Some(repeated);
+        }
+    }
+    match (new_name.and_then(stored_transition_name), old_name.and_then(stored_transition_name)) {
+        (Some(new_name), Some(old_name)) if new_name == old_name => {
+            Some(TriggerFiringRefusal::SameTransitionTableNames)
+        }
+        _ => None,
+    }
+}
+
+/// The name PostgreSQL stores for the transition table `name`.
+fn stored_transition_name(name: &ObjectName) -> Option<Cow<'_, str>> {
+    object_name_last_part(name).map(|(value, quoted)| stored_identifier(value, quoted))
+}
+
+/// Refuses under PostgreSQL a `REFERENCING` clause its grammar does not
+/// accept, which is one on a constraint trigger or one naming a transition
+/// table by more than one identifier.
+fn refuse_transition_table_syntax(
+    builder: &ParserDBBuilder,
+    trigger: &CreateTrigger,
+) -> Result<(), Error> {
+    if *builder.dialect() != SqlparserDialect::PostgreSql || trigger.referencing.is_empty() {
+        return Ok(());
+    }
+    let trigger_name = || builder.dialect().stored_object_name_last(&trigger.name);
+    if trigger.is_constraint {
+        return Err(Error::ConstraintTriggerTransitionTables {
+            trigger_name: trigger_name(),
+            written_token: "REFERENCING".to_string(),
+        });
+    }
+    if trigger.referencing.iter().any(|referencing| {
+        !matches!(
+            referencing.transition_relation_name.0.as_slice(),
+            [ObjectNamePart::Identifier(_)]
+        )
+    }) {
+        return Err(Error::QualifiedTransitionTableName { trigger_name: trigger_name() });
+    }
+    Ok(())
 }
 
 /// What SQLite refuses in `trigger`: an `INSTEAD OF` trigger fires only on a
@@ -540,6 +704,26 @@ fn set_enablement(
             metadata.set_enablement(enablement);
         }
     }
+}
+
+/// The stored name of the first `FOR EACH ROW` trigger with a transition
+/// table that `table` carries, in the byte order of names PostgreSQL reads a
+/// table's triggers in, which keeps `table` from becoming a partition or an
+/// inheritance child.
+pub(super) fn row_transition_trigger(
+    builder: &ParserDBBuilder,
+    table: &StoredTable,
+) -> Option<String> {
+    builder
+        .triggers()
+        .iter()
+        .filter(|(trigger, _)| {
+            table.named_by(&trigger.table_name)
+                && fires_per_row(trigger)
+                && !trigger.referencing.is_empty()
+        })
+        .map(|(trigger, _)| builder.dialect().stored_object_name_last(&trigger.name))
+        .min()
 }
 
 /// Whether `trigger` fires once per row, the triggers PostgreSQL copies onto

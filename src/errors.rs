@@ -638,7 +638,7 @@ impl core::fmt::Display for FixedPersistence {
 }
 
 /// What the engine of the dialect refuses in a trigger on the kind of
-/// relation it names.
+/// relation it names, or in the transition tables it declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TriggerFiringRefusal {
     /// An `INSTEAD OF` trigger on a table, foreign and partitioned tables
@@ -662,6 +662,43 @@ pub enum TriggerFiringRefusal {
     /// A trigger on a view with a `REFERENCING` transition table, which
     /// PostgreSQL refuses.
     TransitionTablesOnView,
+    /// A trigger on a foreign table with a `REFERENCING` transition table,
+    /// which PostgreSQL refuses.
+    TransitionTablesOnForeignTable,
+    /// A `FOR EACH ROW` trigger on a partitioned table with a transition
+    /// table, which PostgreSQL refuses.
+    RowTransitionTablesOnPartitionedTable,
+    /// A `FOR EACH ROW` trigger on a partition with a transition table,
+    /// which PostgreSQL refuses.
+    RowTransitionTablesOnPartition,
+    /// A `FOR EACH ROW` trigger on a table inheriting from another with a
+    /// transition table, which PostgreSQL refuses.
+    RowTransitionTablesOnInheritanceChild,
+    /// A trigger with a transition table that does not fire `AFTER`, which
+    /// PostgreSQL refuses.
+    TransitionTablesNotAfter,
+    /// A `TRUNCATE` trigger with a transition table, which PostgreSQL
+    /// refuses.
+    TransitionTablesOnTruncate,
+    /// A trigger with a transition table firing on more than one of
+    /// `INSERT`, `UPDATE` and `DELETE`, which PostgreSQL refuses.
+    TransitionTablesWithSeveralEvents,
+    /// An `UPDATE OF` column list on a trigger with a transition table,
+    /// which PostgreSQL refuses.
+    TransitionTablesWithColumnList,
+    /// `NEW TABLE` on a trigger firing on neither `INSERT` nor `UPDATE`,
+    /// which PostgreSQL refuses.
+    NewTableWithoutInsertOrUpdate,
+    /// `NEW TABLE` written more than once, which PostgreSQL refuses.
+    RepeatedNewTable,
+    /// `OLD TABLE` on a trigger firing on neither `DELETE` nor `UPDATE`,
+    /// which PostgreSQL refuses.
+    OldTableWithoutDeleteOrUpdate,
+    /// `OLD TABLE` written more than once, which PostgreSQL refuses.
+    RepeatedOldTable,
+    /// `OLD TABLE` and `NEW TABLE` under the same stored name, which
+    /// PostgreSQL refuses.
+    SameTransitionTableNames,
 }
 
 /// Why PostgreSQL refuses an `ON SELECT` rule.
@@ -688,6 +725,41 @@ impl core::fmt::Display for TriggerFiringRefusal {
             Self::InsteadOfColumnList => "INSTEAD OF triggers cannot have column lists",
             Self::InsteadOfCondition => "INSTEAD OF triggers cannot have WHEN conditions",
             Self::TransitionTablesOnView => "triggers on views cannot have transition tables",
+            Self::TransitionTablesOnForeignTable => {
+                "triggers on foreign tables cannot have transition tables"
+            }
+            Self::RowTransitionTablesOnPartitionedTable => {
+                "ROW triggers with transition tables are not supported on partitioned tables"
+            }
+            Self::RowTransitionTablesOnPartition => {
+                "ROW triggers with transition tables are not supported on partitions"
+            }
+            Self::RowTransitionTablesOnInheritanceChild => {
+                "ROW triggers with transition tables are not supported on inheritance children"
+            }
+            Self::TransitionTablesNotAfter => {
+                "transition table name can only be specified for an AFTER trigger"
+            }
+            Self::TransitionTablesOnTruncate => {
+                "TRUNCATE triggers with transition tables are not supported"
+            }
+            Self::TransitionTablesWithSeveralEvents => {
+                "transition tables cannot be specified for triggers with more than one event"
+            }
+            Self::TransitionTablesWithColumnList => {
+                "transition tables cannot be specified for triggers with column lists"
+            }
+            Self::NewTableWithoutInsertOrUpdate => {
+                "NEW TABLE can only be specified for an INSERT or UPDATE trigger"
+            }
+            Self::RepeatedNewTable => "NEW TABLE cannot be specified multiple times",
+            Self::OldTableWithoutDeleteOrUpdate => {
+                "OLD TABLE can only be specified for a DELETE or UPDATE trigger"
+            }
+            Self::RepeatedOldTable => "OLD TABLE cannot be specified multiple times",
+            Self::SameTransitionTableNames => {
+                "OLD TABLE name and NEW TABLE name cannot be the same"
+            }
         })
     }
 }
@@ -944,6 +1016,13 @@ pub enum UnattachablePartition {
     /// The table is a foreign table and the partitioned table holds a unique
     /// index, which a foreign table cannot carry.
     ForeignTableUnderUniqueIndex,
+    /// The table carries a `FOR EACH ROW` trigger with a transition table,
+    /// which a partition cannot carry. PostgreSQL names the first such
+    /// trigger by name.
+    RowTransitionTrigger {
+        /// The stored trigger name.
+        trigger_name: String,
+    },
 }
 
 impl core::fmt::Display for UnattachablePartition {
@@ -964,6 +1043,9 @@ impl core::fmt::Display for UnattachablePartition {
                 f.write_str("it is a foreign table and the partitioned table holds a unique index")
             }
             Self::Typed => f.write_str("it is a typed table"),
+            Self::RowTransitionTrigger { trigger_name } => {
+                write!(f, "its row trigger `{trigger_name}` has transition tables")
+            }
         }
     }
 }
@@ -4049,6 +4131,18 @@ pub enum Error {
         /// The stored parent relation name.
         parent_name: String,
     },
+    #[error(
+        "Table `{table_name}` cannot inherit because its row trigger `{trigger_name}` has transition tables."
+    )]
+    /// Error indicating that `INHERIT` names a table carrying a `FOR EACH ROW`
+    /// trigger with a transition table, which an inheritance child cannot
+    /// carry. PostgreSQL names the first such trigger by name.
+    InheritanceChildRowTransitionTrigger {
+        /// The stored table name.
+        table_name: String,
+        /// The stored trigger name.
+        trigger_name: String,
+    },
     #[error("Relation `{parent_name}` is not a parent of table `{table_name}`.")]
     /// Error indicating that `NO INHERIT` names a relation the table does not
     /// inherit from.
@@ -5249,6 +5343,24 @@ pub enum Error {
         trigger_name: String,
         /// Stored name of the foreign table.
         table_name: String,
+    },
+    #[error("Constraint trigger `{trigger_name}` cannot declare transition tables.")]
+    /// Error indicating that `CREATE CONSTRAINT TRIGGER` writes `REFERENCING`,
+    /// which the parser accepts and PostgreSQL rejects as a syntax error.
+    ConstraintTriggerTransitionTables {
+        /// Stored name of the trigger.
+        trigger_name: String,
+        /// The token PostgreSQL reports the syntax error at, as written.
+        written_token: String,
+    },
+    #[error("Trigger `{trigger_name}` qualifies the name of a transition table.")]
+    /// Error indicating that `REFERENCING` names a transition table with a
+    /// qualified name, which the parser accepts and PostgreSQL rejects as a
+    /// syntax error at the first dot, since a transition table is named by a
+    /// single identifier.
+    QualifiedTransitionTableName {
+        /// Stored name of the trigger.
+        trigger_name: String,
     },
     #[error("Trigger `{trigger_name}` for table `{table_name}` does not exist.")]
     /// Error indicating that an `ALTER TABLE` enabling or disabling a trigger

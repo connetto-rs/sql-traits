@@ -1,12 +1,13 @@
 //! Implementation of the `TriggerLike` trait for sqlparser's `CreateTrigger`
 //! type.
 
-use sqlparser::ast::{ArgMode, CreateTrigger};
+use sqlparser::ast::{ArgMode, CreateTrigger, TriggerReferencingType};
 
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{
-        ConstraintDeferral, ParserDB, TargetName, TriggerEnablement, metadata::TriggerMetadata,
+        ConstraintDeferral, ParserDB, TargetName, TransitionTable, TriggerEnablement, TriggerRow,
+        metadata::TriggerMetadata,
     },
     traits::{DatabaseLike, FunctionLike, Metadata, Relation, TableLike, TriggerLike},
     utils::{
@@ -97,6 +98,17 @@ impl TriggerLike for CreateTrigger {
                 sqlparser::ast::Expr::Nested(inner) => inner.as_ref(),
                 condition => condition,
             }
+        })
+    }
+
+    fn transition_tables(&self) -> impl Iterator<Item = TransitionTable<'_>> {
+        self.referencing.iter().filter_map(|referencing| {
+            let rows = match referencing.refer_type {
+                TriggerReferencingType::NewTable => TriggerRow::New,
+                TriggerReferencingType::OldTable => TriggerRow::Old,
+            };
+            let (name, quoted) = object_name_last_part(&referencing.transition_relation_name)?;
+            Some(TransitionTable::new(rows, name, quoted))
         })
     }
 

@@ -6,7 +6,8 @@ use crate::{
     errors::LookupError,
     impls::maintenance_body,
     structs::{
-        ConstraintDeferral, MaintenanceRefusal, TargetName, TriggerEnablement, UndeclaredRowField,
+        ConstraintDeferral, MaintenanceRefusal, TargetName, TransitionTable, TriggerEnablement,
+        UndeclaredRowField,
     },
     traits::{DatabaseLike, Metadata, Relation},
 };
@@ -429,6 +430,50 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// # }
     /// ```
     fn condition(&self) -> Option<&sqlparser::ast::Expr>;
+
+    /// Returns the transition tables the trigger declares with
+    /// `REFERENCING`, in the order written, each with the rows it holds and
+    /// the name the trigger's function reads it by.
+    ///
+    /// A trigger without `REFERENCING` declares none.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE invitations (id INT PRIMARY KEY, accepted BOOLEAN NOT NULL DEFAULT false);
+    ///      CREATE TABLE memberships (user_id INT PRIMARY KEY, invitation_id INT);
+    ///      CREATE FUNCTION accept() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    ///      BEGIN
+    ///        UPDATE invitations SET accepted = true
+    ///          WHERE id IN (SELECT invitation_id FROM new_rows);
+    ///        RETURN NULL;
+    ///      END $$;
+    ///      CREATE TRIGGER accept AFTER INSERT ON memberships
+    ///        REFERENCING NEW TABLE AS new_rows
+    ///        FOR EACH STATEMENT EXECUTE FUNCTION accept();
+    ///      CREATE TRIGGER plain AFTER INSERT ON memberships
+    ///        FOR EACH STATEMENT EXECUTE FUNCTION accept();",
+    /// )?;
+    /// let tables: Vec<(&str, Vec<TransitionTable<'_>>)> = db
+    ///     .triggers()
+    ///     .map(|trigger| (trigger.name(), trigger.transition_tables().collect()))
+    ///     .collect();
+    /// assert_eq!(
+    ///     tables,
+    ///     [
+    ///         ("accept", vec![TransitionTable::new(TriggerRow::New, "new_rows", false)]),
+    ///         ("plain", vec![]),
+    ///     ]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn transition_tables(&self) -> impl Iterator<Item = TransitionTable<'_>>;
 
     /// Returns the trigger this one is the partition's copy of.
     ///
@@ -961,6 +1006,10 @@ impl<T: TriggerLike> TriggerLike for &T {
 
     fn condition(&self) -> Option<&sqlparser::ast::Expr> {
         (*self).condition()
+    }
+
+    fn transition_tables(&self) -> impl Iterator<Item = TransitionTable<'_>> {
+        (*self).transition_tables()
     }
 
     fn parent_trigger<'db>(
