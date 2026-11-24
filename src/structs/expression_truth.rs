@@ -17,7 +17,8 @@ use core::{
 
 use sqlparser::{
     ast::{
-        ArgMode, DataType, Expr, Function, FunctionBehavior, Query, Value, ValueWithSpan, Visitor,
+        ArgMode, DataType, Expr, Function, FunctionBehavior, Ident, Query, Value, ValueWithSpan,
+        Visitor,
     },
     dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect},
 };
@@ -127,8 +128,8 @@ impl<DB: DatabaseLike> Clone for Assumption<'_, DB> {
 
 impl<DB: DatabaseLike> Copy for Assumption<'_, DB> {}
 
-/// Every validated and enforced check of `table` its inheritors share, as
-/// assumptions, but `except`.
+/// Every validated and enforced check of `table` its inheritors share, but
+/// `except`.
 ///
 /// # Errors
 ///
@@ -138,7 +139,7 @@ pub(crate) fn validated_checks<'a, DB: DatabaseLike>(
     table: &'a DB::Table,
     database: &'a DB,
     except: Option<&DB::CheckConstraint>,
-) -> Result<Vec<Assumption<'a, DB>>, LookupError> {
+) -> Result<Vec<&'a DB::CheckConstraint>, LookupError> {
     let mut checks = Vec::new();
     for check in table.check_constraints(database)? {
         if except.is_none_or(|except| !ptr::eq(check, except))
@@ -146,7 +147,7 @@ pub(crate) fn validated_checks<'a, DB: DatabaseLike>(
             && !check.no_inherit()
             && check.is_validated(database)?
         {
-            checks.push(Assumption::Check(check));
+            checks.push(check);
         }
     }
     Ok(checks)
@@ -225,13 +226,14 @@ pub(crate) fn site_truth<'a, DB: DatabaseLike>(
     assumptions: &[Assumption<'a, DB>],
 ) -> Result<ExpressionTruth, LookupError> {
     let mut truth = TruthContext::new(context.database(), context.case(), None);
-    truth.site = Some(Site { references: Vec::new(), calls: Vec::new() });
-    truth.bind_site(context, expression)?;
+    let mut site = Site { references: Vec::new(), calls: Vec::new() };
+    truth.bind_site(context, expression, &mut site)?;
     for assumption in assumptions {
         if let Assumption::Expression { expression, .. } = assumption {
-            truth.bind_site(context, expression)?;
+            truth.bind_site(context, expression, &mut site)?;
         }
     }
+    truth.site = Some(site);
     truth.truth(expression, assumptions)
 }
 
@@ -485,19 +487,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             let type_name = Some(data_type.name(database).into_owned());
             self.named(key, evaluation, type_name, data_type.domain(database));
         }
-        let checks = if checked {
-            validated_checks(table, database, None)?
-                .into_iter()
-                .filter_map(|check| {
-                    match check {
-                        Assumption::Check(check) => Some(check),
-                        Assumption::Expression { .. } => None,
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let checks = if checked { validated_checks(table, database, None)? } else { Vec::new() };
         self.tables.push(TableRead { relation, table, scope: None, checks });
         Ok(self.tables.len() - 1)
     }
@@ -511,12 +501,14 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         self.named.iter().position(|named| named.key == key)
     }
 
-    /// Binds the references and calls `expression`, a node of `context`'s
-    /// root, writes outside the queries it holds, which the evaluator reads.
+    /// Binds into `site` the references and calls `expression`, a node of
+    /// `context`'s root, writes outside the queries it holds, which the
+    /// evaluator reads.
     fn bind_site(
         &mut self,
         context: &'a ExpressionContext<'_, '_, DB>,
         expression: &Expr,
+        site: &mut Site<'a, DB>,
     ) -> Result<(), LookupError> {
         if !context.is_node(expression) {
             return Err(LookupError::ExpressionNotInQuery { expression: expression.to_string() });
@@ -524,17 +516,22 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         let mut visitor = TopLevel {
             depth: 0,
             each: |node: &Expr| -> Result<(), LookupError> {
-                if let Expr::Function(call) = node {
-                    let functions = Self::site_call(context, node)?;
-                    if let Some(site) = &mut self.site {
+                let named = match node {
+                    Expr::Function(call) => {
+                        let functions = Self::site_call(context, node)?;
                         site.calls.push((ptr::from_ref(call).addr(), call.clone(), functions));
+                        return Ok(());
                     }
-                } else if is_reference(node) {
-                    let named = self.site_named(context, node)?;
-                    if let Some(site) = &mut self.site {
-                        site.references.push((ptr::from_ref(node).addr(), node.clone(), named));
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Placeholder(placeholder), ..
+                    }) => Some(self.site_placeholder(context, node, placeholder)?),
+                    Expr::Identifier(ident) => {
+                        self.site_named(context, node, core::slice::from_ref(ident))?
                     }
-                }
+                    Expr::CompoundIdentifier(parts) => self.site_named(context, node, parts)?,
+                    _ => return Ok(()),
+                };
+                site.references.push((ptr::from_ref(node).addr(), node.clone(), named));
                 Ok(())
             },
         };
@@ -563,32 +560,36 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         })
     }
 
-    /// The value the reference `node` reads where `context` resolves it,
-    /// `None` for a node the evaluator reads no value of.
+    /// The value the placeholder `node`, spelled `placeholder`, reads where
+    /// `context` resolves it.
+    fn site_placeholder(
+        &mut self,
+        context: &'a ExpressionContext<'_, '_, DB>,
+        node: &Expr,
+        placeholder: &str,
+    ) -> Result<usize, LookupError> {
+        if let Some(variable) = context.positional_variable(placeholder) {
+            return self.variable(context, node, &variable, Vec::new());
+        }
+        let key = match context.positional_parameter(placeholder) {
+            Some((function, ordinal)) => {
+                Key::Parameter { function: ptr::from_ref(function).addr(), ordinal }
+            }
+            None => Key::Placeholder(placeholder.into()),
+        };
+        let evaluation = self.engine.operand(&context.type_of(node)?, self.database, &self.enums);
+        Ok(self.named(key, evaluation, None, None))
+    }
+
+    /// The value the reference `node`, spelled `parts`, reads where `context`
+    /// resolves it, `None` for a node the evaluator reads no value of.
     fn site_named(
         &mut self,
         context: &'a ExpressionContext<'_, '_, DB>,
         node: &Expr,
+        parts: &[Ident],
     ) -> Result<Option<usize>, LookupError> {
         let database = self.database;
-        if let Expr::Value(ValueWithSpan { value: Value::Placeholder(placeholder), .. }) = node {
-            if let Some(variable) = context.positional_variable(placeholder) {
-                return Ok(Some(self.variable(context, node, &variable, Vec::new())?));
-            }
-            let key = match context.positional_parameter(placeholder) {
-                Some((function, ordinal)) => {
-                    Key::Parameter { function: ptr::from_ref(function).addr(), ordinal }
-                }
-                None => Key::Placeholder(placeholder.clone()),
-            };
-            let evaluation = self.engine.operand(&context.type_of(node)?, database, &self.enums);
-            return Ok(Some(self.named(key, evaluation, None, None)));
-        }
-        let parts = match node {
-            Expr::Identifier(ident) => core::slice::from_ref(ident),
-            Expr::CompoundIdentifier(parts) => parts.as_slice(),
-            _ => return Ok(None),
-        };
         let rule = context.rule(node);
         let unbound = || Key::Name { rule, parts: stored_parts(parts) };
         let Some((definition, binding)) = context.reference(node)? else {
@@ -720,16 +721,6 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         }
         Ok(self.site.as_ref().and_then(|site| site.named(expression)))
     }
-}
-
-/// Whether the evaluator reads `node` as a value the context resolves.
-fn is_reference(node: &Expr) -> bool {
-    matches!(
-        node,
-        Expr::Identifier(_)
-            | Expr::CompoundIdentifier(_)
-            | Expr::Value(ValueWithSpan { value: Value::Placeholder(_), .. })
-    )
 }
 
 /// Hands `each` every expression a node holds outside the queries in it,
