@@ -800,6 +800,10 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
         self.unreach()
     }
 
+    fn transition_tables(&self) -> impl Iterator<Item = TransitionTable<'_>> {
+        self.unreach::<core::iter::Empty<TransitionTable<'_>>>()
+    }
+
     fn parent_trigger<'db>(
         &'db self,
         _database: &'db Self::DB,

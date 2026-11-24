@@ -247,6 +247,7 @@ mod transactional_ingestion;
 mod trigger_deferral;
 mod trigger_enablement;
 mod trigger_function_lookup;
+mod trigger_transition_tables;
 mod type_array_binding;
 mod type_array_builder;
 mod type_array_identities;

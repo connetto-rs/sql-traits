@@ -6,12 +6,13 @@ use sqlstate::SqlState;
 
 use crate::utils::identifier_resolution::stored_identifier;
 
-/// The row of a row trigger a body reads a field of.
+/// The row of a row trigger a body reads a field of, or the rows a
+/// transition table holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TriggerRow {
-    /// `NEW`, the row the statement writes.
+    /// `NEW`, the row the statement writes, or the rows it wrote.
     New,
-    /// `OLD`, the row before the statement.
+    /// `OLD`, the row before the statement, or the rows before it.
     Old,
 }
 

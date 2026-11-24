@@ -373,6 +373,143 @@ fn trigger_firing_shapes() {
     }
 }
 
+const TRANSITION_SETUP: &str = "CREATE TABLE t(id int);
+    CREATE TABLE p(id int) PARTITION BY RANGE (id);
+    CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (10);
+    CREATE TABLE parent(id int); CREATE TABLE child() INHERITS (parent);
+    CREATE FOREIGN TABLE ft(id int) SERVER s;
+    CREATE TABLE lone(id int);
+    CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$;";
+const PER_STATEMENT: &str = "FOR EACH STATEMENT EXECUTE FUNCTION f();";
+const PER_ROW: &str = "FOR EACH ROW EXECUTE FUNCTION f();";
+
+#[test]
+fn transition_tables_refused_on_relations_postgres_refuses_them_on() {
+    for (trigger, state, message) in [
+        (
+            format!(
+                "CREATE TRIGGER tr AFTER INSERT ON t REFERENCING NEW TABLE AS s.x {PER_STATEMENT}"
+            ),
+            "42601",
+            "syntax error at or near \".\"",
+        ),
+        (
+            format!(
+                "CREATE TRIGGER tr AFTER INSERT ON ft REFERENCING NEW TABLE AS n {PER_STATEMENT}"
+            ),
+            "42809",
+            "\"ft\" is a foreign table",
+        ),
+        (
+            format!("CREATE TRIGGER tr AFTER INSERT ON p REFERENCING NEW TABLE AS n {PER_ROW}"),
+            "0A000",
+            "\"p\" is a partitioned table",
+        ),
+        (
+            format!("CREATE TRIGGER tr BEFORE INSERT ON p REFERENCING NEW TABLE AS n {PER_ROW}"),
+            "0A000",
+            "\"p\" is a partitioned table",
+        ),
+        (
+            format!(
+                "CREATE TRIGGER tr INSTEAD OF INSERT ON p REFERENCING NEW TABLE AS n {PER_ROW}"
+            ),
+            "42809",
+            "\"p\" is a table",
+        ),
+        (
+            format!("CREATE TRIGGER tr AFTER INSERT ON p1 REFERENCING OLD TABLE AS n {PER_ROW}"),
+            "0A000",
+            "ROW triggers with transition tables are not supported on partitions",
+        ),
+        (
+            format!("CREATE TRIGGER tr AFTER INSERT ON child REFERENCING NEW TABLE AS n {PER_ROW}"),
+            "0A000",
+            "ROW triggers with transition tables are not supported on inheritance children",
+        ),
+    ] {
+        refuses(&format!("{TRANSITION_SETUP} {trigger}"), state, message);
+    }
+}
+
+#[test]
+fn transition_tables_refused_in_triggers_postgres_refuses_them_in() {
+    for (referencing, state, message) in [
+        (
+            "BEFORE TRUNCATE ON t REFERENCING OLD TABLE AS a OLD TABLE AS b",
+            "42P17",
+            "transition table name can only be specified for an AFTER trigger",
+        ),
+        (
+            "AFTER TRUNCATE ON t REFERENCING NEW TABLE AS n",
+            "0A000",
+            "TRUNCATE triggers with transition tables are not supported",
+        ),
+        (
+            "AFTER INSERT OR UPDATE ON t REFERENCING NEW TABLE AS n",
+            "0A000",
+            "transition tables cannot be specified for triggers with more than one event",
+        ),
+        (
+            "AFTER UPDATE OF id ON t REFERENCING NEW TABLE AS n",
+            "0A000",
+            "transition tables cannot be specified for triggers with column lists",
+        ),
+        (
+            "AFTER DELETE ON t REFERENCING NEW TABLE AS n",
+            "42P17",
+            "NEW TABLE can only be specified for an INSERT or UPDATE trigger",
+        ),
+        (
+            "AFTER UPDATE ON t REFERENCING NEW TABLE AS a NEW TABLE AS b",
+            "42P17",
+            "NEW TABLE cannot be specified multiple times",
+        ),
+        (
+            "AFTER INSERT ON t REFERENCING OLD TABLE AS a NEW TABLE AS a",
+            "42P17",
+            "OLD TABLE can only be specified for a DELETE or UPDATE trigger",
+        ),
+        (
+            "AFTER UPDATE ON t REFERENCING OLD TABLE AS a OLD TABLE AS b",
+            "42P17",
+            "OLD TABLE cannot be specified multiple times",
+        ),
+        (
+            "AFTER UPDATE ON t REFERENCING NEW TABLE AS x OLD TABLE AS \"x\"",
+            "42P17",
+            "OLD TABLE name and NEW TABLE name cannot be the same",
+        ),
+    ] {
+        refuses(
+            &format!("{TRANSITION_SETUP} CREATE TRIGGER tr {referencing} {PER_STATEMENT}"),
+            state,
+            message,
+        );
+    }
+}
+
+#[test]
+fn a_row_trigger_with_transition_tables_keeps_its_table_out_of_hierarchies() {
+    let triggers = format!(
+        "CREATE TRIGGER zz AFTER INSERT ON lone REFERENCING NEW TABLE AS n {PER_ROW}
+         CREATE TRIGGER \"B\" AFTER INSERT ON lone REFERENCING NEW TABLE AS n {PER_ROW}
+         CREATE TRIGGER \"A\" AFTER INSERT ON lone REFERENCING NEW TABLE AS n {PER_STATEMENT}"
+    );
+    for (alteration, message) in [
+        (
+            "ALTER TABLE p ATTACH PARTITION lone FOR VALUES FROM (10) TO (20);",
+            "trigger \"B\" prevents table \"lone\" from becoming a partition",
+        ),
+        (
+            "ALTER TABLE lone INHERIT parent;",
+            "trigger \"B\" prevents table \"lone\" from becoming an inheritance child",
+        ),
+    ] {
+        refuses(&format!("{TRANSITION_SETUP} {triggers} {alteration}"), "0A000", message);
+    }
+}
+
 #[test]
 fn rule_actions_require_valid_relations_and_columns() {
     let setup = "CREATE TABLE t(id int PRIMARY KEY, a int, b text); CREATE TABLE parent(id int); CREATE SEQUENCE seq;";

@@ -19,6 +19,12 @@ pub(super) fn trigger_firing(
         | TriggerFiringRefusal::TransitionTablesOnView => {
             (pg::WRONG_OBJECT_TYPE, format!("{} is a view", quoted(relation_name)))
         }
+        TriggerFiringRefusal::TransitionTablesOnForeignTable => {
+            (pg::WRONG_OBJECT_TYPE, format!("{} is a foreign table", quoted(relation_name)))
+        }
+        TriggerFiringRefusal::RowTransitionTablesOnPartitionedTable => {
+            (pg::FEATURE_NOT_SUPPORTED, format!("{} is a partitioned table", quoted(relation_name)))
+        }
         TriggerFiringRefusal::InsteadOfPerStatement => {
             (pg::FEATURE_NOT_SUPPORTED, "INSTEAD OF triggers must be FOR EACH ROW".into())
         }
@@ -27,6 +33,21 @@ pub(super) fn trigger_firing(
         }
         TriggerFiringRefusal::InsteadOfCondition => {
             (pg::FEATURE_NOT_SUPPORTED, "INSTEAD OF triggers cannot have WHEN conditions".into())
+        }
+        TriggerFiringRefusal::RowTransitionTablesOnPartition
+        | TriggerFiringRefusal::RowTransitionTablesOnInheritanceChild
+        | TriggerFiringRefusal::TransitionTablesOnTruncate
+        | TriggerFiringRefusal::TransitionTablesWithSeveralEvents
+        | TriggerFiringRefusal::TransitionTablesWithColumnList => {
+            (pg::FEATURE_NOT_SUPPORTED, reason.to_string())
+        }
+        TriggerFiringRefusal::TransitionTablesNotAfter
+        | TriggerFiringRefusal::NewTableWithoutInsertOrUpdate
+        | TriggerFiringRefusal::RepeatedNewTable
+        | TriggerFiringRefusal::OldTableWithoutDeleteOrUpdate
+        | TriggerFiringRefusal::RepeatedOldTable
+        | TriggerFiringRefusal::SameTransitionTableNames => {
+            (pg::INVALID_OBJECT_DEFINITION, reason.to_string())
         }
         TriggerFiringRefusal::BeforeOrAfterOnView => return None,
     };

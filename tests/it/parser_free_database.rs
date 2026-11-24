@@ -1406,6 +1406,10 @@ impl TriggerLike for MemoryTrigger {
         None
     }
 
+    fn transition_tables(&self) -> impl Iterator<Item = TransitionTable<'_>> {
+        core::iter::empty()
+    }
+
     fn parent_trigger<'db>(
         &'db self,
         _database: &'db Self::DB,

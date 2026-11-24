@@ -324,6 +324,10 @@ fn refuse_unattachable(
         }
     }
 
+    if let Some(trigger_name) = triggers::row_transition_trigger(builder, partition) {
+        return refuse(UnattachablePartition::RowTransitionTrigger { trigger_name });
+    }
+
     Ok(())
 }
 

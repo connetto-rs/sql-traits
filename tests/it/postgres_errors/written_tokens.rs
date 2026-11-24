@@ -32,6 +32,11 @@ fn a_syntax_error_names_its_token_as_written() {
             "LeFt",
         ),
         ("create procedure pr() as SeLeCt 1;", "SeLeCt"),
+        (
+            "CREATE TABLE t (id int); CREATE CONSTRAINT TRIGGER c AFTER INSERT ON t
+             ReFeReNcInG NEW TABLE AS n FOR EACH ROW EXECUTE FUNCTION f();",
+            "ReFeReNcInG",
+        ),
     ] {
         refuses(sql, "42601", &format!("syntax error at or near \"{token}\""));
     }
