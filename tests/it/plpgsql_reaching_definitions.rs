@@ -742,6 +742,76 @@ fn commit_and_rollback_raise_in_a_function() {
     );
 }
 
+/// The variables each site of the procedure `run(p text, q integer)`
+/// running `body` reads.
+fn reaching_in_procedure(body: &str) -> Vec<Vec<(String, Vec<String>)>> {
+    let database = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{SCHEMA} CREATE PROCEDURE run(p text, q integer) LANGUAGE plpgsql AS $$ {body} $$;"
+    ))
+    .expect("schema parses");
+    reaching_in(&database, "run")
+}
+
+/// A procedure a `CALL` outside a transaction block runs goes on after
+/// `COMMIT` and `ROLLBACK`, in a query loop and in a handler too.
+#[test]
+fn commit_and_rollback_run_on_in_a_procedure() {
+    assert_eq!(
+        reaching_in_procedure(
+            "DECLARE s text := 'SELECT 1'; r record;
+             BEGIN
+              COMMIT;
+              s := 'SELECT ' || p;
+              EXECUTE s;
+              FOR r IN SELECT id FROM t LOOP ROLLBACK AND CHAIN; s := s || r.id; END LOOP;
+              EXECUTE s;
+              BEGIN
+               PERFORM 1 / q;
+              EXCEPTION WHEN division_by_zero THEN
+               COMMIT;
+               s := p;
+              END;
+              EXECUTE s;
+             END"
+        ),
+        [
+            vec![read("s", &["'SELECT ' || p"])],
+            vec![read("s", &["'SELECT ' || p", "s || r.id"])],
+            vec![read("s", &["'SELECT ' || p", "s || r.id", "p"])],
+        ]
+    );
+}
+
+/// A handler in force makes `COMMIT` and `ROLLBACK` in a procedure raise
+/// `invalid_transaction_termination`, whichever enclosing block holds it.
+#[test]
+fn commit_and_rollback_raise_under_a_handler_in_a_procedure() {
+    assert_eq!(
+        reaching_in_procedure(
+            "DECLARE s text := 'SELECT 1';
+             BEGIN
+              BEGIN
+               COMMIT;
+               s := p;
+              EXCEPTION WHEN invalid_transaction_termination THEN
+               EXECUTE s;
+              END;
+              BEGIN
+               BEGIN ROLLBACK; s := p; END;
+              EXCEPTION WHEN invalid_transaction_termination THEN
+               EXECUTE s;
+              END;
+              EXECUTE s;
+             END"
+        ),
+        [
+            vec![read("s", &["'SELECT 1'"])],
+            vec![read("s", &["'SELECT 1'"])],
+            vec![read("s", &["'SELECT 1'"])],
+        ]
+    );
+}
+
 /// `REVERSE` counts down from the first bound written, so the index of a
 /// reversed loop is told apart from one counting up between the same bounds.
 #[test]

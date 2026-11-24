@@ -16,8 +16,8 @@ use alloc::{
 use core::fmt::Display;
 
 use sqlparser::ast::{
-    ArgMode, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
-    ObjectNamePart, Query, Statement, Value,
+    ArgMode, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, FunctionSecurity,
+    Ident, ObjectName, ObjectNamePart, Query, Statement, Value,
 };
 use sqlparser_plpgsql::{
     embedded::{
@@ -55,7 +55,7 @@ use crate::{
 ///
 /// # Errors
 ///
-/// Returns the errors [`body_sql`] returns, and
+/// Returns the errors [`body_sql`] and [`FunctionLike::kind`] return, and
 /// [`LookupError::FunctionBodyUnresolvable`] for a write whose target names
 /// no variable.
 pub(crate) fn value_flow<'b, 'db, DB: DatabaseLike>(
@@ -63,7 +63,11 @@ pub(crate) fn value_flow<'b, 'db, DB: DatabaseLike>(
     block: &'b Block,
     hex_strings_may_be_integers: bool,
 ) -> Result<ValueFlow<'b, 'db, DB>, LookupError> {
-    let function = names.function().name();
+    let routine = names.function();
+    let function = routine.name();
+    let ends_transactions = routine.kind(names.database())? == FunctionKind::Procedure
+        && routine.configuration_parameters().is_empty()
+        && routine.security_mode() != FunctionSecurity::Definer;
     let (sites, paths) = body_sql(names, block, hex_strings_may_be_integers)?;
     let writes = block
         .write_sites(&names.signature(), |name| names.holds_row(name))
@@ -81,6 +85,7 @@ pub(crate) fn value_flow<'b, 'db, DB: DatabaseLike>(
         points: BTreeMap::new(),
         frames: Vec::new(),
         cursors: BTreeMap::new(),
+        ends_transactions,
     };
     flow.block(block, State::new())?;
     Ok(ValueFlow {
@@ -197,6 +202,10 @@ struct Flow<'b, 'db, DB: DatabaseLike> {
     /// The query each cursor declared with one opens, by the cursor
     /// variable's id, as the first `OPEN` or `FOR` loop opening it reads it.
     cursors: BTreeMap<usize, CursorQuery<'b, 'db, DB>>,
+    /// Whether the body is a procedure with neither a `SET` clause nor
+    /// `SECURITY DEFINER`, whose `COMMIT` and `ROLLBACK` run on where no
+    /// handler is in force.
+    ends_transactions: bool,
 }
 
 impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
@@ -470,9 +479,12 @@ impl<'b, 'db, DB: DatabaseLike> Flow<'b, 'db, DB> {
                 self.evaluated_queries(direction.expression(), &state);
             }
             NodeKind::Close { .. } => {}
-            // A function runs inside its caller's transaction, which it may
-            // not end, so these raise `invalid_transaction_termination`.
-            NodeKind::Commit { .. } | NodeKind::Rollback { .. } => return Ok(None),
+            // A handler in force opens a subtransaction, which may not commit.
+            NodeKind::Commit { .. } | NodeKind::Rollback { .. } => {
+                if !self.ends_transactions || self.frames.iter().any(|frame| frame.catching) {
+                    return Ok(None);
+                }
+            }
             NodeKind::Open(open) => self.open(address, open, &mut state)?,
             NodeKind::Block(block) => return self.block(block, state),
             NodeKind::If(choice) => {
