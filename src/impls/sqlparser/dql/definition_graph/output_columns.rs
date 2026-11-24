@@ -590,7 +590,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
                 false,
                 scope.data.case,
             )? {
-                LookupOutcome::Found(resolved) => return Ok(Some(self.bound(&resolved))),
+                LookupOutcome::Found(resolved) => {
+                    return Ok(Some(self.bound(&resolved, cursor.scope)));
+                }
                 LookupOutcome::Stop | LookupOutcome::SearchParent => {
                     if let Some(bound) = self.output_binding(
                         &scope.outputs,

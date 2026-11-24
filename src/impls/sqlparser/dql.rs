@@ -229,6 +229,10 @@ struct FromTableRef<'query, 'db, DB: DatabaseLike, D: Copy> {
     /// declared name.
     has_alias: bool,
     nullable: bool,
+    /// Whether the table's constraints may fail on a row the item yields
+    /// that no outer join extends, as on a row the statement builds, such
+    /// as a trigger's `NEW`, or on a row of a table inheriting from it.
+    unconstrained: bool,
     /// Whether the item reads `table` without `ONLY` while other tables
     /// inherit from it, so its rows include theirs, which do not carry
     /// `table`'s keys.
@@ -244,6 +248,16 @@ impl<DB: DatabaseLike, D: Copy> FromTableRef<'_, '_, DB, D> {
     /// null-extended join side or a read reaching inheriting tables breaks.
     fn yields_source_rows(&self) -> bool {
         !self.nullable && !self.reads_inheritors
+    }
+
+    /// The relation the item is at `index` among its scope's stored tables.
+    fn local_relation(&self, index: usize) -> LocalRelation {
+        LocalRelation {
+            table: true,
+            index,
+            null_extended: self.nullable,
+            constrained: !self.unconstrained && !self.reads_inheritors,
+        }
     }
 }
 
@@ -391,6 +405,33 @@ pub(crate) enum ColumnOrigin {
     /// Nothing certain, because an opaque relation could have answered or the
     /// reference was ambiguous.
     Unknown,
+}
+
+/// The relation of one scope a resolved reference reached, which tells two
+/// readings of one table apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LocalRelation {
+    /// Whether the relation reads a stored table directly, rather than
+    /// through a view, a CTE, a subquery, a function or a merge.
+    pub(crate) table: bool,
+    /// The relation's position among the scope's stored tables when it reads
+    /// one, and otherwise among its other relations.
+    pub(crate) index: usize,
+    /// Whether an outer join of the scope extends the relation with rows of
+    /// `NULL`s.
+    pub(crate) null_extended: bool,
+    /// Whether the table's constraints hold on every row the relation yields.
+    pub(crate) constrained: bool,
+}
+
+/// A [`LocalRelation`] and the scope holding it, which together name one
+/// relation of a query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RelationSlot {
+    /// The position of the scope among the scopes of its graph.
+    pub(crate) scope: usize,
+    /// The relation within the scope.
+    pub(crate) relation: LocalRelation,
 }
 
 struct CteShape<'query, 'db, DB: DatabaseLike, D: Copy> {
@@ -3976,6 +4017,23 @@ struct ResolvedColumn<'scope, 'db, DB: DatabaseLike, D: Copy> {
     exposed: Option<(&'scope str, bool)>,
     /// The `FROM` item and column the reference reached.
     origin: ColumnOrigin,
+    /// The relation of the scope the reference reached, `None` for a merged,
+    /// opaque or ambiguous match.
+    reached: Option<LocalRelation>,
+}
+
+impl<DB: DatabaseLike, D: Copy> ResolvedColumn<'_, '_, DB, D> {
+    /// A match no single column stands behind, reading `opaque`.
+    fn unknown(opaque: D) -> Self {
+        Self {
+            source: None,
+            definition: opaque,
+            relation: None,
+            exposed: None,
+            origin: ColumnOrigin::Unknown,
+            reached: None,
+        }
+    }
 }
 
 enum LookupOutcome<T> {
@@ -4071,13 +4129,7 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
     if scope.unqualified_poison
         || scope.opaque.iter().any(|entry| entry.entry_index < visible_entries)
     {
-        return Ok(LookupOutcome::Found(ResolvedColumn {
-            source: None,
-            definition: opaque,
-            relation: None,
-            exposed: None,
-            origin: ColumnOrigin::Unknown,
-        }));
+        return Ok(LookupOutcome::Found(ResolvedColumn::unknown(opaque)));
     }
     let mut definitions = Vec::new();
     let mut candidates = Vec::new();
@@ -4089,12 +4141,15 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
             relation: None,
             exposed: Some((merged.name.as_str(), merged.quoted)),
             origin: ColumnOrigin::Merged { join: merged.join, ordinal: merged.ordinal },
+            reached: None,
         });
     }
     let exposed = |entry_index: usize| {
         entry_index < visible_entries && !merges.clone().any(|merged| absorbs(merged, entry_index))
     };
-    for base in scope.bases.iter().filter(|base| exposed(base.entry_index)) {
+    for (index, base) in
+        scope.bases.iter().enumerate().filter(|(_, base)| exposed(base.entry_index))
+    {
         if let Some((ordinal, base_column)) = find_base_column(base, column, case) {
             definitions.push(ResolvedColumn {
                 source: (!require_row_identity || base.yields_source_rows()).then_some(base.table),
@@ -4102,11 +4157,14 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
                 relation: Some(base_relation_identity(base)),
                 exposed: Some((base_column.name.as_str(), base_column.quoted)),
                 origin: ColumnOrigin::Entry { factor: base.factor, ordinal },
+                reached: Some(base.local_relation(index)),
             });
             candidates.push(render_table_candidate(base.table));
         }
     }
-    for relation in scope.derived.iter().filter(|relation| exposed(relation.entry_index)) {
+    for (index, relation) in
+        scope.derived.iter().enumerate().filter(|(_, relation)| exposed(relation.entry_index))
+    {
         match find_derived_column(&relation.shape.columns, column, case) {
             Some(DerivedMatch::Column(ordinal, found)) => {
                 definitions.push(ResolvedColumn {
@@ -4117,24 +4175,18 @@ fn unqualified_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
                     relation: relation.identity.as_ref().map(|key| (key.value.get(), key.quoted)),
                     exposed: Some((found.name.as_str(), found.quoted)),
                     origin: derived_origin(relation, ordinal),
+                    reached: Some(LocalRelation {
+                        table: false,
+                        index,
+                        null_extended: relation.nullable,
+                        constrained: false,
+                    }),
                 });
                 candidates.push(relation_key_display(relation));
             }
             Some(DerivedMatch::Ambiguous) => {
-                definitions.push(ResolvedColumn {
-                    source: None,
-                    definition: opaque,
-                    relation: None,
-                    exposed: None,
-                    origin: ColumnOrigin::Unknown,
-                });
-                definitions.push(ResolvedColumn {
-                    source: None,
-                    definition: opaque,
-                    relation: None,
-                    exposed: None,
-                    origin: ColumnOrigin::Unknown,
-                });
+                definitions.push(ResolvedColumn::unknown(opaque));
+                definitions.push(ResolvedColumn::unknown(opaque));
                 candidates.push(relation_key_display(relation));
             }
             None => {}
@@ -4236,13 +4288,7 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
     let relation = match matched {
         QualifierMatch::Relation(relation) => relation,
         QualifierMatch::Opaque => {
-            return Ok(LookupOutcome::Found(ResolvedColumn {
-                source: None,
-                definition: opaque,
-                relation: None,
-                exposed: None,
-                origin: ColumnOrigin::Unknown,
-            }));
+            return Ok(LookupOutcome::Found(ResolvedColumn::unknown(opaque)));
         }
     };
     let identity = qualified_relation_identity(&relation);
@@ -4256,6 +4302,7 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
                         relation: identity,
                         exposed: Some((column.name.as_str(), column.quoted)),
                         origin: ColumnOrigin::Entry { factor: base.factor, ordinal },
+                        reached: Some(base.local_relation(position_of(&scope.bases, base))),
                     })
                 }
                 None => LookupOutcome::Stop,
@@ -4270,6 +4317,12 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
                         relation: identity,
                         exposed: Some((column.name.as_str(), column.quoted)),
                         origin: derived_origin(relation, ordinal),
+                        reached: Some(LocalRelation {
+                            table: false,
+                            index: position_of(&scope.derived, relation),
+                            null_extended: relation.nullable,
+                            constrained: false,
+                        }),
                     }))
                 }
                 Some(DerivedMatch::Ambiguous) => {
@@ -4283,6 +4336,11 @@ fn resolve_qualified_definition<'scope, 'db, DB: DatabaseLike, D: Copy>(
             }
         }
     }
+}
+
+/// The position of `item` among `items`, which hold it.
+fn position_of<T>(items: &[T], item: &T) -> usize {
+    items.iter().position(|held| core::ptr::eq(held, item)).unwrap_or_default()
 }
 
 fn resolve_definition_local<'scope, 'db, DB: DatabaseLike, D: Copy>(
@@ -4726,6 +4784,7 @@ where
             table,
             has_alias: alias.is_some(),
             nullable: false,
+            unconstrained: false,
             reads_inheritors,
             entry_index: 0,
             output_columns,

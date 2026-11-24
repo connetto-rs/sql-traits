@@ -5,18 +5,18 @@ use alloc::vec::Vec;
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Delete, Distinct, DoUpdate, Expr, FromTable, GroupByExpr, Ident, Insert, LimitClause, Merge,
-    MergeAction, MergeClause, MergeInsertExpr, MergeUpdateExpr, MergeUpdateKind, ObjectName,
-    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, OrderByKind, OutputClause, Query,
-    Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, Statement, TableFactor,
-    TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
+    Delete, Distinct, DoUpdate, Expr, FromTable, GroupByExpr, Ident, Insert, JoinConstraint,
+    LimitClause, Merge, MergeAction, MergeClause, MergeInsertExpr, MergeUpdateExpr,
+    MergeUpdateKind, ObjectName, ObjectNamePart, OnConflict, OnConflictAction, OnInsert,
+    OrderByKind, OutputClause, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+    Statement, TableFactor, TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
 };
 
 use super::{
     super::{
         ColumnOrigin, FromScope, RelationKey, WildcardEntry, build_definition_graph,
-        factor_address, join_constraint, qualified_wildcard_columns, subsumed_exposure,
-        wildcard_origins, wildcard_reshapes_output,
+        factor_address, join_constraint, nullable_sides, qualified_wildcard_columns,
+        subsumed_exposure, wildcard_origins, wildcard_reshapes_output,
     },
     Bound, DefinitionGraph, DefinitionId, ScopeCursor, ScopeId,
     output_columns::{QueryId, unwrap_nested},
@@ -29,7 +29,7 @@ use crate::{
     utils::{
         columns_in_expression::Labels,
         identifier_resolution::{identifiers_match, name_parts},
-        walk::walk,
+        walk::{walk, walk_expressions},
     },
 };
 
@@ -102,7 +102,7 @@ impl QueryReferences {
 }
 
 /// How the clause holding a column reference resolves it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SiteRule {
     /// Through the scope the cursor names, as an ordinary reference.
     Scope(ScopeCursor),
@@ -137,6 +137,86 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             }
             SiteRule::InputFirst(cursor) => self.resolve_input_first(cursor, reference),
         }
+    }
+
+    /// Whether `reference`, sitting where `rule` resolves it and binding a
+    /// relation of the scope `bound` names, or of its own scope when `None`,
+    /// reads rows the query builds rather than the relation's own. These are
+    /// the rows grouping sets build, on which a grouped column is `NULL` for
+    /// the sets leaving it out, read anywhere in a `SELECT` grouping by
+    /// `ROLLUP`, `CUBE`, `GROUPING SETS` or a `WITH` modifier outside its
+    /// `FROM`, `WHERE` and `GROUP BY`, and the rows a `RETURNING` list reads,
+    /// which the statement writes. A reference in an `ORDER BY` may sort
+    /// grouped rows too.
+    pub(crate) fn reads_built_rows(
+        &self,
+        rule: SiteRule,
+        bound: Option<usize>,
+        reference: &Expr,
+    ) -> bool {
+        let cursor = match rule {
+            SiteRule::OrderBy(_) => return true,
+            SiteRule::Scope(cursor)
+            | SiteRule::OutputFirst(cursor)
+            | SiteRule::InputFirst(cursor) => cursor,
+        };
+        let mut scope = bound.unwrap_or(cursor.scope.0);
+        while self.scopes[scope].owner_level
+            && let Some(owner) = self.scopes[scope].owner
+        {
+            scope = owner.0;
+        }
+        let address = core::ptr::from_ref(reference).addr();
+        let holds = |node: &Expr| {
+            if core::ptr::from_ref(node).addr() == address {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        if self.scopes[scope]
+            .returning
+            .is_some_and(|items| items.iter().any(|item| walk_expressions(item, holds).is_break()))
+        {
+            return true;
+        }
+        let Some(select) = self.scopes[scope].select.as_ref().map(super::AstRef::get) else {
+            return false;
+        };
+        let (keys, modifiers) = match &select.group_by {
+            GroupByExpr::All(modifiers) => (&[][..], modifiers),
+            GroupByExpr::Expressions(keys, modifiers) => (keys.as_slice(), modifiers),
+        };
+        let by_sets = !modifiers.is_empty()
+            || keys
+                .iter()
+                .any(|key| matches!(key, Expr::Rollup(_) | Expr::Cube(_) | Expr::GroupingSets(_)));
+        by_sets
+            && !(walk_expressions(&select.from, holds).is_break()
+                || walk_expressions(&select.selection, holds).is_break()
+                || walk_expressions(&select.group_by, holds).is_break())
+    }
+
+    /// Whether the `FROM` item at `factor`, a relation of the scope `bound`
+    /// names, may be null-extended where `reference` sits, `None` unless the
+    /// reference sits in the `ON` of a join of that scope's `SELECT` with the
+    /// item on one of its sides. Such an `ON` reads the rows of its sides
+    /// before any later join extends them.
+    pub(crate) fn null_extended_in_join(
+        &self,
+        bound: usize,
+        factor: usize,
+        reference: &Expr,
+    ) -> Option<bool> {
+        let mut scope = bound;
+        while self.scopes[scope].owner_level
+            && let Some(owner) = self.scopes[scope].owner
+        {
+            scope = owner.0;
+        }
+        let select = self.scopes[scope].select.as_ref().map(super::AstRef::get)?;
+        let reference = core::ptr::from_ref(reference).addr();
+        select.from.iter().find_map(|tree| join_site_nulls(tree, factor, reference))
     }
 
     /// The rule resolving each column reference of `query`, by the address of
@@ -983,4 +1063,68 @@ impl<DB: DatabaseLike> Visitor for Sites<'_, '_, '_, '_, '_, DB> {
         }
         ControlFlow::Continue(())
     }
+}
+
+/// Whether the item at `factor` is null-extended where the `ON` of a join of
+/// `tree` holding the expression at `reference` reads it, the innermost such
+/// join counting, `None` when no `ON` holds the reference or the item is on
+/// neither side of that join.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn join_site_nulls(tree: &TableWithJoins, factor: usize, reference: usize) -> Option<bool> {
+    let relations =
+        core::iter::once(&tree.relation).chain(tree.joins.iter().map(|join| &join.relation));
+    for relation in relations {
+        if let TableFactor::NestedJoin { table_with_joins, .. } = relation
+            && let Some(answer) = join_site_nulls(table_with_joins, factor, reference)
+        {
+            return Some(answer);
+        }
+    }
+    let holds = |node: &Expr| {
+        if core::ptr::from_ref(node).addr() == reference {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let position = tree.joins.iter().position(|join| {
+        matches!(
+            join_constraint(&join.join_operator),
+            Some(JoinConstraint::On(on)) if walk_expressions(on, holds).is_break()
+        )
+    })?;
+    nulled_among(tree, position + 2, position, factor)
+}
+
+/// Whether the item at `factor`, among the first `items` items of `tree`, is
+/// null-extended once the first `applied` joins of `tree` and every join
+/// nested in the item have run, `None` when it is not among those items.
+fn nulled_among(
+    tree: &TableWithJoins,
+    items: usize,
+    applied: usize,
+    factor: usize,
+) -> Option<bool> {
+    let (index, inner) = core::iter::once(&tree.relation)
+        .chain(tree.joins.iter().map(|join| &join.relation))
+        .take(items)
+        .enumerate()
+        .find_map(|(index, relation)| Some((index, nulled_in_factor(relation, factor)?)))?;
+    let outer = tree.joins[..applied].iter().enumerate().any(|(position, join)| {
+        let (left, right) = nullable_sides(&join.join_operator);
+        (left && index <= position) || (right && index == position + 1)
+    });
+    Some(inner || outer)
+}
+
+/// Whether the item at `factor`, `relation` itself or an item nested in it,
+/// is null-extended by the joins nested in `relation`, `None` when it is
+/// neither.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn nulled_in_factor(relation: &TableFactor, factor: usize) -> Option<bool> {
+    if factor_address(relation) == factor {
+        return Some(false);
+    }
+    let TableFactor::NestedJoin { table_with_joins, .. } = relation else { return None };
+    nulled_among(table_with_joins, usize::MAX, table_with_joins.joins.len(), factor)
 }

@@ -14,16 +14,16 @@ use crate::{
     impls::{
         BodyPath,
         dql::{
-            ColumnOrigin,
+            ColumnOrigin, RelationSlot,
             definition_graph::reference_sites::SiteRule,
             scoped_roots::{ScopedRoot, is_input},
         },
     },
     structs::{
-        AggregateKind, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope, Definition,
-        DefinitionSource, ExpressionScope, FunctionKind, FunctionResultType, IdentifierCase,
-        OperandType, OperatorResolution, PlPgSqlScope, PlPgSqlVariable, QueryOutput,
-        SelectedOperator, TargetName, VariableKind,
+        AggregateKind, Assumption, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope,
+        Definition, DefinitionSource, ExpressionScope, ExpressionTruth, FunctionKind,
+        FunctionResultType, IdentifierCase, OperandType, OperatorResolution, PlPgSqlScope,
+        PlPgSqlVariable, QueryOutput, SelectedOperator, TargetName, VariableKind,
         plpgsql_flow::{FlowPoint, Reached, Round, Row, is_record, join},
         plpgsql_scope::stored_parts,
     },
@@ -99,6 +99,8 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     /// The type of each input parameter of the function whose body the
     /// context types, in the order `$n` counts them.
     parameters: Vec<OperandType<'db>>,
+    /// The function whose body the context types.
+    function: Option<&'db DB::Function>,
     /// The type of `VALUE` in a domain constraint.
     value: Option<OperandType<'db>>,
     /// What the deparsed text of a stored expression pins when PostgreSQL
@@ -583,8 +585,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         };
         let mut context =
             Self::assemble(node, column_scope, sites, database, case, parameters, value);
-        if let ExpressionScope::PlPgSql(variables) = scope {
-            context.variables = Some(variables);
+        match scope {
+            ExpressionScope::PlPgSql(variables) => context.variables = Some(variables),
+            ExpressionScope::FunctionBody(function) => context.function = Some(function),
+            _ => {}
         }
         Ok(context)
     }
@@ -617,6 +621,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             value,
             pins: None,
             variables: None,
+            function: None,
             declared_columns: None,
             types: RefCell::default(),
         }
@@ -722,6 +727,78 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             return Ok(None);
         }
         Ok(self.variables.and_then(|variables| variables.variable(parts)))
+    }
+
+    /// Answers what `expression`, a node of the context's root, can evaluate
+    /// to where its clause evaluates it, under `assumptions` taking their
+    /// outcomes on the same rows.
+    ///
+    /// Each name reads what the context binds it to, and names bound to one
+    /// thing read one value, so `a.x` and a bare `x` reaching the same column
+    /// of the same `FROM` item are one value while `t.x` and `u.x` are two.
+    /// A column of a table read directly from the rows it stores carries its
+    /// type, its domain's checks, its `NOT NULL`, its generated value and the
+    /// validated checks of its table over the columns of that reading, each
+    /// reading of one table apart. A column of a row the statement builds,
+    /// such as a trigger's `NEW`, a rule's `new` or `excluded`, of a table
+    /// others inherit from, of a table an outer join of the `FROM` may
+    /// null-extend, the join's own `ON` included, and a column read through
+    /// a view, a CTE or a subquery carry only their type and domain's checks.
+    /// So does a reference reading rows the query builds, in a `RETURNING`
+    /// list or outside the `FROM`, `WHERE` and `GROUP BY` of a `SELECT`
+    /// grouping by grouping sets, which reads a value apart from the column's
+    /// in the rest of the query. Domain checks hold only where the value is
+    /// not `NULL`. A parameter, a PL/pgSQL variable, a column a `USING` join
+    /// merges and any other name the context types carry their type, and a
+    /// variable declared `NOT NULL` carries that too. A name binding nothing
+    /// reads as one value of unknown type per name.
+    ///
+    /// An [`Assumption::Expression`] is a node of the same root, read as the
+    /// expression is. An [`Assumption::Check`] holds over each reading of its
+    /// table whose stored rows hold its checks. Assumptions that admit no row
+    /// together leave no outcome and no error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ExpressionNotInQuery`] when `expression` or an
+    /// assumed expression is not a node of the context's root, and the lookup
+    /// errors resolving a reference, a call or a check raises.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{BinaryOperator, Expr, SetExpr, Statement},
+    ///     dialect::PostgreSqlDialect,
+    ///     parser::Parser,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (x INT, CHECK (x > 5));")?;
+    /// let sql = "SELECT 1 FROM t AS a WHERE a.x > 3 AND x < 9";
+    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
+    ///     unreachable!()
+    /// };
+    /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+    /// let Some(Expr::BinaryOp { left, op: BinaryOperator::And, right }) = &select.selection else {
+    ///     unreachable!()
+    /// };
+    /// let context = ExpressionContext::new(&query, &db, IdentifierCase::Folded)?;
+    /// // The check of `t` holds on every row `a` reads, so `a.x > 3` is never false.
+    /// let truth = context.truth_under(left, &[])?;
+    /// assert_eq!(truth, ExpressionTruth { outcomes: Outcomes::NOT_FALSE, raising: Raising::Never });
+    /// // Under `x < 9` true, the same `x` is not `NULL` either.
+    /// let assumed = Assumption::Expression { expression: right, outcomes: Outcomes::TRUE };
+    /// let truth = context.truth_under(left, &[assumed])?;
+    /// assert_eq!(truth, ExpressionTruth { outcomes: Outcomes::TRUE, raising: Raising::Never });
+    /// # Ok::<(), sql_traits::errors::Error>(())
+    /// ```
+    pub fn truth_under(
+        &self,
+        expression: &Expr,
+        assumptions: &[Assumption<'_, DB>],
+    ) -> Result<ExpressionTruth, LookupError> {
+        crate::structs::site_truth(self, expression, assumptions)
     }
 
     /// The PL/pgSQL variable the name `parts` writes, or whose field it names.
@@ -1157,7 +1234,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// The rule the clause holding the column reference `expression` resolves
     /// it by, `None` for a node that is no column reference or sits where no
     /// scope was derived.
-    fn rule(&self, expression: &Expr) -> Option<SiteRule> {
+    pub(crate) fn rule(&self, expression: &Expr) -> Option<SiteRule> {
         let address = address(expression);
         self.sites
             .binary_search_by_key(&address, |(held, _)| *held)
@@ -1929,7 +2006,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
 
     /// The type of `VALUE` when `expression` is that keyword in a domain
     /// constraint's context.
-    fn domain_value(&self, expression: &Expr) -> Option<OperandType<'db>> {
+    pub(crate) fn domain_value(&self, expression: &Expr) -> Option<OperandType<'db>> {
         match expression {
             Expr::Identifier(Ident { value, quote_style: None, .. })
                 if value.eq_ignore_ascii_case("value") =>
@@ -1970,6 +2047,68 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         } else {
             Err(LookupError::ExpressionNotInQuery { expression: expression.to_string() })
         }
+    }
+
+    /// The database the context reads.
+    pub(crate) fn database(&self) -> &'db DB {
+        self.database
+    }
+
+    /// How the context compares identifiers.
+    pub(crate) fn case(&self) -> IdentifierCase {
+        self.case
+    }
+
+    /// Whether the column reference `expression`, resolved by `rule` and
+    /// binding a relation of the scope `bound` names, reads rows the query
+    /// builds, the rows of grouping sets or of a `RETURNING` list.
+    pub(crate) fn reads_built_rows(
+        &self,
+        rule: SiteRule,
+        bound: Option<usize>,
+        expression: &Expr,
+    ) -> bool {
+        self.scope.reads_built_rows(rule, bound, expression)
+    }
+
+    /// The relation a reference at `expression` reached, `reached` with its
+    /// null extension read where the reference sits, since the `ON` of a join
+    /// reads the rows of its sides before any later join extends them.
+    pub(crate) fn relation_at(
+        &self,
+        reached: Option<RelationSlot>,
+        origin: ColumnOrigin,
+        expression: &Expr,
+    ) -> Option<RelationSlot> {
+        let mut slot = reached?;
+        if let ColumnOrigin::Entry { factor, .. } = origin
+            && let Some(extended) = self.scope.null_extended_in_join(slot.scope, factor, expression)
+        {
+            slot.relation.null_extended = extended;
+        }
+        Some(slot)
+    }
+
+    /// The function and input ordinal the positional parameter `placeholder`
+    /// names in a function body, `None` outside
+    /// [`ExpressionScope::FunctionBody`] or past its inputs.
+    pub(crate) fn positional_parameter(
+        &self,
+        placeholder: &str,
+    ) -> Option<(&'db DB::Function, usize)> {
+        let ordinal = placeholder.strip_prefix('$')?.parse::<usize>().ok()?.checked_sub(1)?;
+        (ordinal < self.parameters.len()).then_some((self.function?, ordinal))
+    }
+
+    /// The PL/pgSQL variable the positional parameter `placeholder` names,
+    /// `None` outside [`ExpressionScope::PlPgSql`].
+    pub(crate) fn positional_variable(&self, placeholder: &str) -> Option<PlPgSqlVariable<'db>> {
+        self.variables?.lookup(&[placeholder.into()]).map(|(variable, _)| variable)
+    }
+
+    /// Whether `expression` is a node of the context's root.
+    pub(crate) fn is_node(&self, expression: &Expr) -> bool {
+        self.holds(expression)
     }
 }
 

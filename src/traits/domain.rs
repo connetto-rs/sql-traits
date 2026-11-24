@@ -6,8 +6,8 @@ use core::fmt::Debug;
 use sqlparser::ast::Expr;
 
 use crate::{
-    errors::LookupError,
-    structs::WrittenCall,
+    errors::{LookupError, ObjectKind},
+    structs::{Assumption, ExpressionTruth, IdentifierCase, WrittenCall},
     traits::{DatabaseLike, Metadata},
     utils::identifier_resolution::stored_identifier,
 };
@@ -219,6 +219,57 @@ pub trait DomainLike: Clone + Debug + Metadata + Send + Sync {
         call: impl Into<WrittenCall<'call>>,
         database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Function> + 'db, LookupError>;
+
+    /// Answers what `expression` can evaluate to over the domain's `VALUE`,
+    /// under `assumptions` taking their outcomes on the same value.
+    ///
+    /// `VALUE` carries the domain's base type and the checks of the domains
+    /// the domain is defined over, which hold wherever it is not `NULL`. The
+    /// domain's own checks are left out, so reading one of them, or a term of
+    /// one, answers what it admits on the base type. Any other name reads as
+    /// an unknown value at each place it is written, and `case` compares the
+    /// names of the functions the expressions call. An [`Assumption::Check`]
+    /// assumes nothing, since no table is read. Assumptions that admit no
+    /// value together leave no outcome and no error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` holds no
+    /// domain of this one's schema and name, and the lookup errors resolving
+    /// a call raises.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{ast::Expr, dialect::PostgreSqlDialect, parser::Parser};
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE DOMAIN d AS INT CHECK (VALUE > 5);
+    ///      CREATE DOMAIN e AS d CHECK (VALUE < 9);",
+    /// )?;
+    /// let e = db.domains().find(|domain| domain.name() == "e").unwrap();
+    /// let term: Expr = Parser::new(&PostgreSqlDialect {}).try_with_sql("VALUE > 3")?.parse_expr()?;
+    /// let truth = e.truth_under(&db, &term, IdentifierCase::Folded, &[])?;
+    /// assert_eq!(truth, ExpressionTruth { outcomes: Outcomes::NOT_FALSE, raising: Raising::Never });
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn truth_under(
+        &self,
+        database: &Self::DB,
+        expression: &Expr,
+        case: IdentifierCase,
+        assumptions: &[Assumption<'_, Self::DB>],
+    ) -> Result<ExpressionTruth, LookupError> {
+        let (name, schema) = (self.stored_name(), self.stored_schema());
+        let domain = database
+            .domains()
+            .find(|domain| domain.stored_name() == name && domain.stored_schema() == schema)
+            .ok_or_else(|| ObjectKind::Domain.not_in_database(self.name()))?;
+        crate::structs::domain_truth(domain, database, expression, case, assumptions)
+    }
 }
 
 impl<T: DomainLike> DomainLike for &T {

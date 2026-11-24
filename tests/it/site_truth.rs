@@ -1,0 +1,393 @@
+//! Truth read where a query, a function body or a PL/pgSQL statement
+//! evaluates an expression, and over a domain's `VALUE`.
+#![expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "Tests require parsed fixtures of a known shape."
+)]
+
+use sql_traits::{errors::Error, prelude::*};
+use sqlparser::{
+    ast::{
+        BinaryOperator, Distinct, Expr, JoinConstraint, JoinOperator, Query, Select, SelectItem,
+        SetExpr, Statement,
+    },
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+};
+
+use crate::support::query_parsing::query_with;
+
+const SCHEMA: &str = "CREATE TABLE t (x INT NOT NULL, y INT);
+     CREATE TABLE u (x INT NOT NULL, z INT);
+     CREATE DOMAIN d AS INT CHECK (VALUE > 5 AND VALUE > 3);";
+
+const UNDECIDED: Outcomes = Outcomes { truth: true, falsity: true, null: false };
+
+const fn never_raising(outcomes: Outcomes) -> ExpressionTruth {
+    ExpressionTruth { outcomes, raising: Raising::Never }
+}
+
+fn expression(sql: &str) -> Expr {
+    Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap()
+}
+
+/// The two sides of the `AND` the `WHERE` or, without one, the `HAVING` of
+/// the outer `SELECT` of `query` writes, or the whole condition twice.
+fn sides(select: &sqlparser::ast::Select) -> (&Expr, &Expr) {
+    let condition = select.selection.as_ref().or(select.having.as_ref()).unwrap();
+    match condition {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => (left, right),
+        condition => (condition, condition),
+    }
+}
+
+/// The truth of the right side of the `AND` in the condition of `sql`, read
+/// with the left side assumed true, or of the whole condition with nothing
+/// assumed when it is no `AND`.
+fn query_truth(schema: &str, sql: &str) -> Result<ExpressionTruth, Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
+    let query = query_with(&PostgreSqlDialect {}, sql);
+    let SetExpr::Select(select) = query.body.as_ref() else { panic!("a SELECT body") };
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::Folded)?;
+    let (assumed, term) = sides(select);
+    let assumptions = if core::ptr::eq(assumed, term) {
+        Vec::new()
+    } else {
+        vec![Assumption::Expression { expression: assumed, outcomes: Outcomes::TRUE }]
+    };
+    Ok(context.truth_under(term, &assumptions)?)
+}
+
+#[test]
+fn an_alias_reads_the_column_it_qualifies() -> Result<(), Error> {
+    for sql in [
+        "SELECT 1 FROM t AS a WHERE a.x > 5 AND a.x > 3",
+        "SELECT 1 FROM t AS a WHERE x > 5 AND a.x > 3",
+        "SELECT 1 FROM t AS a WHERE a.x > 5 AND x > 3",
+        "SELECT 1 FROM t WHERE t.x > 5 AND x > 3",
+        "SELECT 1 FROM t AS a JOIN u ON a.y = u.z WHERE a.x > 5 AND a.x > 3",
+    ] {
+        assert_eq!(query_truth(SCHEMA, sql)?, never_raising(Outcomes::TRUE), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn columns_of_other_readings_are_other_values() -> Result<(), Error> {
+    for sql in [
+        "SELECT 1 FROM t, u WHERE u.x > 5 AND t.x > 3",
+        "SELECT 1 FROM t AS a, t AS b WHERE a.x > 5 AND b.x > 3",
+    ] {
+        assert_eq!(query_truth(SCHEMA, sql)?, never_raising(UNDECIDED), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn assumptions_admitting_no_row_leave_no_outcome() -> Result<(), Error> {
+    let sql = "SELECT 1 FROM t AS a WHERE (a.x > 5 AND x < 3) AND a.y = 1";
+    assert_eq!(query_truth(SCHEMA, sql)?, never_raising(Outcomes::NONE));
+    Ok(())
+}
+
+#[test]
+fn not_null_holds_on_rows_no_outer_join_extends() -> Result<(), Error> {
+    assert_eq!(
+        query_truth(SCHEMA, "SELECT 1 FROM t AS a WHERE a.x IS NOT NULL")?,
+        never_raising(Outcomes::TRUE)
+    );
+    for sql in [
+        "SELECT 1 FROM u LEFT JOIN t AS a ON true WHERE a.x IS NOT NULL",
+        "SELECT 1 FROM t AS a RIGHT JOIN u ON true WHERE a.x IS NOT NULL",
+        "SELECT 1 FROM u LEFT JOIN (t AS a JOIN t AS b ON true) ON true WHERE a.x IS NOT NULL",
+    ] {
+        assert_eq!(query_truth(SCHEMA, sql)?, never_raising(UNDECIDED), "{sql}");
+    }
+    Ok(())
+}
+
+/// The truth of the `ON` of the last join `sql` writes in its `FROM`, with
+/// nothing assumed.
+fn on_truth(schema: &str, sql: &str) -> Result<ExpressionTruth, Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
+    let query = query_with(&PostgreSqlDialect {}, sql);
+    let SetExpr::Select(select) = query.body.as_ref() else { panic!("a SELECT body") };
+    let join = select.from[0].joins.last().unwrap();
+    let (JoinOperator::Join(JoinConstraint::On(on))
+    | JoinOperator::Inner(JoinConstraint::On(on))
+    | JoinOperator::Left(JoinConstraint::On(on))
+    | JoinOperator::Right(JoinConstraint::On(on))) = &join.join_operator
+    else {
+        panic!("a join with an ON")
+    };
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::Folded)?;
+    Ok(context.truth_under(on, &[])?)
+}
+
+#[test]
+fn a_join_condition_reads_its_sides_before_later_joins_extend_them() -> Result<(), Error> {
+    for sql in [
+        "SELECT 1 FROM u LEFT JOIN t AS a ON a.x IS NOT NULL",
+        "SELECT 1 FROM t AS a RIGHT JOIN u ON a.x IS NOT NULL",
+        "SELECT 1 FROM u JOIN t AS a ON true LEFT JOIN t AS b ON a.x IS NOT NULL",
+    ] {
+        assert_eq!(on_truth(SCHEMA, sql)?, never_raising(Outcomes::TRUE), "{sql}");
+    }
+    for sql in [
+        "SELECT 1 FROM u LEFT JOIN t AS a ON true LEFT JOIN t AS b ON a.x IS NOT NULL",
+        "SELECT 1 FROM t AS a RIGHT JOIN u ON true JOIN t AS b ON a.x IS NOT NULL",
+        "SELECT 1 FROM (u LEFT JOIN t AS a ON true) JOIN t AS b ON a.x IS NOT NULL",
+    ] {
+        assert_eq!(on_truth(SCHEMA, sql)?, never_raising(UNDECIDED), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn table_checks_hold_over_each_reading() -> Result<(), Error> {
+    let schema = "CREATE TABLE t (x INT NOT NULL, CHECK (x > 5));
+                  CREATE TABLE u (x INT NOT NULL, z INT);";
+    for sql in [
+        "SELECT * FROM t AS a WHERE x > 3",
+        "SELECT * FROM t AS a WHERE a.x > 3",
+        "SELECT * FROM t AS a JOIN t AS b ON true WHERE b.x > 3",
+        "SELECT x FROM t GROUP BY x HAVING x > 3",
+    ] {
+        assert_eq!(query_truth(schema, sql)?, never_raising(Outcomes::TRUE), "{sql}");
+    }
+    assert_eq!(
+        on_truth(schema, "SELECT * FROM u LEFT JOIN t AS a ON a.x > 3")?,
+        never_raising(Outcomes::TRUE)
+    );
+    for sql in [
+        "SELECT * FROM u LEFT JOIN t AS a ON true WHERE a.x > 3",
+        "SELECT x FROM t GROUP BY ROLLUP (x) HAVING x > 3",
+    ] {
+        let truth = query_truth(schema, sql)?;
+        assert_ne!(truth.outcomes, Outcomes::TRUE, "{sql}");
+        assert!(truth.outcomes.falsity || truth.outcomes.null, "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_domain_column_carries_its_checks() -> Result<(), Error> {
+    let schema = format!("{SCHEMA} CREATE TABLE w (v d);");
+    assert_eq!(
+        query_truth(&schema, "SELECT 1 FROM w AS a WHERE a.v > 3")?,
+        never_raising(Outcomes::NOT_FALSE)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_parameter_is_one_value_of_its_type() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION f(p INT) RETURNS BOOL LANGUAGE sql RETURN true;",
+    )?;
+    let function = db.functions().find(|function| function.name() == "f").unwrap();
+    for sql in [
+        "SELECT 1 WHERE p > 5 AND f.p > 3",
+        "SELECT 1 WHERE $1 > 5 AND p > 3",
+        "SELECT 1 WHERE f.p > 5 AND $1 > 3",
+    ] {
+        let body = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0);
+        let context = ExpressionContext::for_statement(
+            &body,
+            &ExpressionScope::FunctionBody(function),
+            &db,
+            IdentifierCase::Folded,
+        )?;
+        let (assumed, term) = sides(select_of(query_of(&body)));
+        let assumption = Assumption::Expression { expression: assumed, outcomes: Outcomes::TRUE };
+        assert_eq!(
+            context.truth_under(term, &[assumption])?,
+            never_raising(Outcomes::TRUE),
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_variable_declared_not_null_is_never_null() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE FUNCTION run() RETURNS void LANGUAGE plpgsql AS $$
+         DECLARE v int NOT NULL := 6; n int; s text;
+         BEGIN
+          s := CASE WHEN v IS NOT NULL AND n IS NOT NULL THEN 'SELECT 1' END;
+          EXECUTE s;
+         END $$;",
+    )?;
+    let run =
+        db.function_by_target(TargetName::new("run", false), IdentifierCase::Folded)?.unwrap();
+    let body = run.dynamic_execution_sites(&db)?;
+    let sites = body.sites().unwrap();
+    let reads = sites[0].reads(IdentifierCase::Folded)?;
+    let Reaching::Definitions(definitions) = reads[0].reaching() else { panic!("s is reached") };
+    let DefinitionSource::Value(value) = definitions[0].source() else { panic!("a value") };
+    let value: &Expr = value;
+    let scope = definitions[0].scope().unwrap();
+    let scope = ExpressionScope::PlPgSql(&scope);
+    let context = ExpressionContext::for_expression(value, &scope, &db, IdentifierCase::Folded)?;
+    let Expr::Case { conditions, .. } = value else { panic!("a CASE") };
+    let Expr::BinaryOp { left, right, .. } = &conditions[0].condition else { panic!("an AND") };
+    assert_eq!(context.truth_under(left, &[])?, never_raising(Outcomes::TRUE));
+    assert_eq!(context.truth_under(right, &[])?, never_raising(UNDECIDED));
+    Ok(())
+}
+
+#[test]
+fn a_domain_value_carries_the_checks_of_the_domains_below_it() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{SCHEMA} CREATE DOMAIN e AS d CHECK (VALUE < 9);"
+    ))?;
+    let domain = |name: &str| db.domains().find(|domain| domain.name() == name).unwrap();
+    let assumed = expression("VALUE > 5");
+    let assumption = Assumption::Expression { expression: &assumed, outcomes: Outcomes::TRUE };
+    let term = expression("VALUE > 3");
+    assert_eq!(
+        domain("d").truth_under(&db, &term, IdentifierCase::Folded, &[assumption])?,
+        never_raising(Outcomes::TRUE)
+    );
+    assert_eq!(
+        domain("d").truth_under(&db, &term, IdentifierCase::Folded, &[])?,
+        never_raising(Outcomes::ANY),
+        "the domain's own checks are what a caller reads"
+    );
+    assert_eq!(
+        domain("e").truth_under(&db, &term, IdentifierCase::Folded, &[])?,
+        never_raising(Outcomes::NOT_FALSE)
+    );
+    Ok(())
+}
+
+/// The `SELECT` body of `query`.
+fn select_of(query: &Query) -> &Select {
+    let SetExpr::Select(select) = query.body.as_ref() else { panic!("a SELECT body") };
+    select
+}
+
+/// The expression the select item `item` writes.
+fn item_expression(item: &SelectItem) -> &Expr {
+    let SelectItem::UnnamedExpr(expression) = item else { panic!("an expression item") };
+    expression
+}
+
+/// Selects a term of a statement and, when any, the expression assumed true
+/// beside it.
+type Pick = for<'s> fn(&'s Statement) -> (&'s Expr, Option<&'s Expr>);
+
+/// The term `pick` selects in `sql`, a statement read with nothing in scope,
+/// with the expression `pick` selects beside it, when any, assumed true.
+fn statement_truth(schema: &str, sql: &str, pick: Pick) -> Result<ExpressionTruth, Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
+    let statement = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0);
+    let context = ExpressionContext::for_statement(
+        &statement,
+        &ExpressionScope::Empty,
+        &db,
+        IdentifierCase::Folded,
+    )?;
+    let (term, assumed) = pick(&statement);
+    let assumptions: Vec<_> = assumed
+        .map(|expression| Assumption::Expression { expression, outcomes: Outcomes::TRUE })
+        .into_iter()
+        .collect();
+    Ok(context.truth_under(term, &assumptions)?)
+}
+
+/// The query `statement` is.
+fn query_of(statement: &Statement) -> &Query {
+    let Statement::Query(query) = statement else { panic!("a query") };
+    query
+}
+
+/// The `WHERE` of the subquery `EXISTS` writes in `expression`.
+fn exists_condition(expression: &Expr) -> &Expr {
+    let Expr::Exists { subquery, .. } = expression else { panic!("an EXISTS") };
+    select_of(subquery).selection.as_ref().unwrap()
+}
+
+#[test]
+fn grouping_set_rows_reach_nested_references() -> Result<(), Error> {
+    let schema = "CREATE TABLE t (x INT NOT NULL);";
+    let built: [(&str, Pick); 3] = [
+        (
+            "SELECT x FROM t GROUP BY ROLLUP (x) HAVING EXISTS (SELECT 1 WHERE t.x IS NULL)",
+            |statement| {
+                (exists_condition(select_of(query_of(statement)).having.as_ref().unwrap()), None)
+            },
+        ),
+        ("SELECT x, (SELECT t.x IS NULL) FROM t GROUP BY ROLLUP (x)", |statement| {
+            let item = item_expression(&select_of(query_of(statement)).projection[1]);
+            let Expr::Subquery(subquery) = item else { panic!("a subquery") };
+            (item_expression(&select_of(subquery).projection[0]), None)
+        }),
+        ("SELECT DISTINCT ON (t.x IS NULL) x FROM t GROUP BY ROLLUP (x)", |statement| {
+            let Some(Distinct::On(keys)) = &select_of(query_of(statement)).distinct else {
+                panic!("DISTINCT ON")
+            };
+            (&keys[0], None)
+        }),
+    ];
+    for (sql, pick) in built {
+        assert!(statement_truth(schema, sql, pick)?.outcomes.truth, "{sql}");
+    }
+    let sql = "SELECT x FROM t WHERE EXISTS (SELECT 1 WHERE t.x IS NULL) GROUP BY ROLLUP (x)";
+    let truth = statement_truth(schema, sql, |statement| {
+        (exists_condition(select_of(query_of(statement)).selection.as_ref().unwrap()), None)
+    })?;
+    assert_eq!(truth, never_raising(Outcomes::FALSE));
+    Ok(())
+}
+
+#[test]
+fn a_returning_list_reads_the_written_row() -> Result<(), Error> {
+    let schema = "CREATE TABLE t (x INT NOT NULL);";
+    for sql in [
+        "UPDATE t SET x = x + 10 WHERE x < 5 RETURNING x < 5",
+        "UPDATE t SET x = x + 10 WHERE x < 5 RETURNING t.x < 5",
+    ] {
+        let truth = statement_truth(schema, sql, |statement| {
+            let Statement::Update(update) = statement else { panic!("an UPDATE") };
+            let returning = update.returning.as_ref().unwrap();
+            (item_expression(&returning[0]), update.selection.as_ref())
+        })?;
+        assert!(truth.outcomes.falsity, "{sql}");
+    }
+    let truth = statement_truth(schema, "DELETE FROM t RETURNING new.x IS NULL", |statement| {
+        let Statement::Delete(delete) = statement else { panic!("a DELETE") };
+        (item_expression(&delete.returning.as_ref().unwrap()[0]), None)
+    })?;
+    assert!(truth.outcomes.truth);
+    Ok(())
+}
+
+#[test]
+fn a_trigger_row_holds_no_constraint_yet() -> Result<(), Error> {
+    let db =
+        ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (x INT NOT NULL CHECK (x > 0));")?;
+    let table = db.table_by_target(TargetName::new("t", false), IdentifierCase::Folded)?.unwrap();
+    for (scope, sql, outcomes) in [
+        (ExpressionScope::Trigger(table), "NEW.x IS NULL OR NEW.x <= 0", UNDECIDED),
+        (ExpressionScope::Table(table), "x IS NULL OR x <= 0", Outcomes::FALSE),
+    ] {
+        let term = expression(sql);
+        let context =
+            ExpressionContext::for_expression(&term, &scope, &db, IdentifierCase::Folded)?;
+        assert_eq!(context.truth_under(&term, &[])?, never_raising(outcomes), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_domain_check_holds_only_on_values_not_null() -> Result<(), Error> {
+    let schema = "CREATE DOMAIN nn AS INT CHECK (VALUE IS NOT NULL);
+                  CREATE TABLE t (id INT);
+                  CREATE TABLE w (id INT, v nn);";
+    let sql = "SELECT 1 FROM t LEFT JOIN w ON t.id = w.id WHERE w.v IS NULL";
+    assert!(query_truth(schema, sql)?.outcomes.truth);
+    Ok(())
+}

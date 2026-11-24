@@ -202,7 +202,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             .map(|alias| (alias.alias.value.as_str(), alias.alias.quote_style.is_some()));
         let returned_scope = self.profile.begin_unowned_scope(self.outer);
         if let Some(target) = &target {
-            self.push_target(returned_scope, target, alias);
+            self.push_target(returned_scope, target, alias, true);
         }
         let conflict = match on {
             Some(OnInsert::OnConflict(OnConflict {
@@ -211,8 +211,8 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             })) => {
                 let scope = self.profile.begin_unowned_scope(self.outer);
                 if let Some(target) = &target {
-                    self.push_target(scope, target, alias);
-                    self.push_target(scope, target, Some(("excluded", false)));
+                    self.push_target(scope, target, alias, false);
+                    self.push_target(scope, target, Some(("excluded", false)), true);
                 }
                 let cursor = Some(self.profile.location(&scope));
                 self.nested(cursor, |walker| {
@@ -348,16 +348,19 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
 
     /// Appends `target` to `scope` as its next entry, exposed under the
     /// alias `alias` names with its quoting when one is given, and otherwise
-    /// under its own name.
+    /// under its own name, reading a row the statement builds when
+    /// `built_row`.
     fn push_target(
         &mut self,
         scope: ScopeId,
         target: &Target<'query, 'db, DB>,
         alias: Option<(&'query str, bool)>,
+        built_row: bool,
     ) {
         match target {
             Target::Table(table) => {
-                self.profile.push_table_entry(scope, table, self.deriving.database, alias);
+                let database = self.deriving.database;
+                self.profile.push_table_entry(scope, table, database, alias, built_row);
             }
             Target::View { name: (name, name_quoted), shape } => {
                 let key = alias.map_or(
@@ -388,7 +391,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
                 continue;
             }
             let scope = *rows.get_or_insert_with(|| self.profile.begin_qualified_scope(relations));
-            self.push_target(scope, target, Some((name, false)));
+            self.push_target(scope, target, Some((name, false)), true);
         }
         rows.map_or(relations, |rows| self.profile.location(&rows))
     }
@@ -432,6 +435,7 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
         let Some(items) = items else {
             return Ok(None);
         };
+        self.profile.record_returning(scope, items);
         self.nested(Some(cursor), |walker| {
             items.iter().try_for_each(|item| walker.select_item(item))
         })?;
