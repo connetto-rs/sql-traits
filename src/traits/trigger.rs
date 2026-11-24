@@ -1214,6 +1214,31 @@ mod tests {
     }
 
     #[test]
+    fn transition_tables_through_a_reference_answer_the_referenced_trigger() {
+        let db = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            r"
+            CREATE TABLE parents (id INT);
+            CREATE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql;
+            CREATE TRIGGER audited AFTER UPDATE ON parents
+            REFERENCING OLD TABLE AS before_rows NEW TABLE AS after_rows
+            FOR EACH STATEMENT EXECUTE FUNCTION f();
+        ",
+        )
+        .expect("Failed to parse SQL");
+        let trigger = db.triggers().next().expect("No trigger found");
+
+        assert_eq!(
+            <&_ as TriggerLike>::transition_tables(&trigger)
+                .map(|table| (table.rows(), table.stored_name().into_owned()))
+                .collect::<Vec<_>>(),
+            [
+                (crate::structs::TriggerRow::Old, "before_rows".to_owned()),
+                (crate::structs::TriggerRow::New, "after_rows".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_trigger_function_no_body() {
         // Defines a function with RETURN expression which is not a string
         // literal block. FunctionLike implementation returns None for
