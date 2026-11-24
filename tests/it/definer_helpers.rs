@@ -4663,6 +4663,98 @@ fn a_listed_scalar_is_read_in_every_spelling_a_listed_principal_is() {
     }
 }
 
+/// What `authz.blocking_organizations` keeping the blocks `condition` keeps
+/// answers, read with its `IS NULL` tests, once `authz.caller_id()` and
+/// `authz.installation_id()` return their `uuid` principals.
+fn principal_reading(condition: &str) -> Result<String, HelperSetError> {
+    let installation_id = accessor(
+        "installation_id",
+        "UUID",
+        ACCESSOR,
+        "NULLIF(current_setting('app.installation_id', true), '')::uuid",
+    );
+    let accessors = format!("{}{installation_id}", caller_id(ACCESSOR));
+    let database = postgres(&blocking_where("''", condition, &accessors));
+    let deployment = principals(&DataType::Uuid);
+    function(&database, "authz", "blocking_organizations")
+        .helper_set(&[], &deployment, &database, &[ArmCondition::UnsetSetting])
+        .map(|set| render(&set))
+}
+
+#[test]
+fn a_read_in_a_scalar_subquery_returning_its_one_row_is_the_read() {
+    let caller = "b.principal_id = authz.caller_id()";
+    let absent = &format!("b.principal_id = {ABSENT}::uuid");
+    let raw_installation = "current_setting('app.installation_id', true)";
+    for (bare, wrapped) in [
+        (caller, "b.principal_id = (SELECT authz.caller_id())"),
+        (caller, "(SELECT authz.caller_id()) = b.principal_id"),
+        (caller, "b.principal_id = ((SELECT (SELECT authz.caller_id())))"),
+        (caller, "b.principal_id = (SELECT DISTINCT authz.caller_id())"),
+        (
+            &format!("{caller} AND authz.installation_id() IS NULL"),
+            &format!("{caller} AND (SELECT authz.installation_id()) IS NULL"),
+        ),
+        (
+            &format!("{caller} AND {raw_installation} IS NULL"),
+            &format!("{caller} AND (SELECT {raw_installation}) IS NULL"),
+        ),
+        (
+            "b.principal_id IN (authz.caller_id(), authz.installation_id())",
+            "b.principal_id IN ((SELECT authz.caller_id()), (SELECT authz.installation_id()))",
+        ),
+        (absent, &format!("b.principal_id = (SELECT {ABSENT})::uuid")),
+        (absent, &format!("b.principal_id = (SELECT {ABSENT}::uuid)")),
+        (
+            absent,
+            "b.principal_id = NULLIF((SELECT current_setting('app.user_id', true)), '')::uuid",
+        ),
+    ] {
+        let answered = principal_reading(bare);
+        assert!(answered.is_ok(), "{bare}: {answered:?}");
+        assert_eq!(principal_reading(wrapped), answered, "{wrapped}");
+    }
+    for (bare, wrapped) in [
+        ("current_setting('app.user_id')::uuid", "(SELECT current_setting('app.user_id'))::uuid"),
+        ("authz.caller_id()", "(SELECT authz.caller_id())"),
+    ] {
+        let answered = blocked_through(&caller_id(ACCESSOR), bare);
+        assert!(answered.is_ok(), "{bare}: {answered:?}");
+        assert_eq!(blocked_through(&caller_id(ACCESSOR), wrapped), answered, "{wrapped}");
+    }
+    for (bare, wrapped) in [
+        ("authz.caller_id() IS NOT NULL", "(SELECT authz.caller_id()) IS NOT NULL"),
+        (
+            &format!("authz.caller_id() <> {NIL}::uuid") as &str,
+            &format!("(SELECT authz.caller_id()) <> {NIL}::uuid"),
+        ),
+    ] {
+        let gate = |gate: &str| signed_in_gate(&signing("''", gate, &caller_id(ACCESSOR)));
+        assert!(gate(bare).is_ok_and(|gate| gate.is_some()), "{bare}");
+        assert_eq!(gate(wrapped), gate(bare), "{wrapped}");
+    }
+}
+
+#[test]
+fn a_scalar_subquery_that_may_change_or_drop_its_row_is_no_read() {
+    for wrapped in [
+        "(SELECT authz.caller_id() WHERE false)",
+        "(SELECT authz.caller_id() HAVING false)",
+        "(SELECT authz.caller_id() LIMIT 0)",
+        "(SELECT authz.caller_id() OFFSET 1)",
+        "(SELECT authz.caller_id() FROM public.organization_blocks)",
+        "(SELECT authz.caller_id() UNION ALL SELECT authz.installation_id())",
+        "(SELECT b.principal_id)",
+        "(SELECT COALESCE(authz.caller_id(), b.principal_id))",
+    ] {
+        let condition = format!("b.principal_id = {wrapped}");
+        assert!(
+            matches!(principal_reading(&condition), Err(HelperSetError::Irreducible { .. })),
+            "{wrapped}"
+        );
+    }
+}
+
 #[test]
 fn a_list_naming_anything_but_request_values_literals_and_parameters_refuses_the_answer() {
     let user = "NULLIF(current_setting('app.user_id', true), '')::uuid";
