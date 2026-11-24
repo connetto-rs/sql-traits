@@ -108,3 +108,36 @@ fn statement_triggers_with_transition_tables_leave_a_table_free_to_join_a_hierar
         [(TriggerRow::New, "added".to_owned())]
     );
 }
+
+#[test]
+fn a_refused_transition_table_names_what_keeps_it_out() {
+    let per_row = "REFERENCING NEW TABLE AS n FOR EACH ROW EXECUTE FUNCTION f();";
+    for (statements, message) in [
+        (
+            "CREATE FOREIGN TABLE ft (id INT) SERVER s;
+             CREATE TRIGGER tr AFTER INSERT ON ft REFERENCING NEW TABLE AS n
+               FOR EACH STATEMENT EXECUTE FUNCTION f();"
+                .to_owned(),
+            "Trigger `tr` on `ft` is refused because triggers on foreign tables cannot have \
+             transition tables.",
+        ),
+        (
+            format!("CREATE TRIGGER tr AFTER INSERT ON p {per_row}"),
+            "Trigger `tr` on `p` is refused because ROW triggers with transition tables are not \
+             supported on partitioned tables.",
+        ),
+        (
+            format!(
+                "CREATE TRIGGER zz AFTER INSERT ON lone {per_row}
+                 CREATE TRIGGER \"B\" AFTER INSERT ON lone {per_row}
+                 ALTER TABLE p ATTACH PARTITION lone FOR VALUES FROM (10) TO (20);"
+            ),
+            "Table `lone` cannot be attached as a partition of `p` because its row trigger `B` \
+             has transition tables.",
+        ),
+    ] {
+        let refusal = ParserDB::parse::<PostgreSqlDialect>(&format!("{SETUP} {statements}"))
+            .expect_err(message);
+        assert_eq!(refusal.to_string(), message);
+    }
+}
