@@ -2978,13 +2978,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// The setting `expression` reads, `current_setting(...)`,
-    /// `NULLIF(<read>, '')`, `lower(<read>)` or an accessor returning a read.
+    /// `NULLIF(<read>, '')`, `lower(<read>)` or an accessor returning a read,
+    /// optionally as the one row of a scalar subquery.
     fn setting_expression(
         &self,
         scope: &Scope<'db, DB>,
         expression: &Expr,
     ) -> Result<Option<SettingRead>, HelperSetError> {
-        let Expr::Function(call) = unnest(expression) else { return Ok(None) };
+        let Expr::Function(call) = scalar(expression) else { return Ok(None) };
         if let Some([FunctionArg::Unnamed(FunctionArgExpr::Expr(read))]) =
             self.catalog_arguments(scope, call, "lower").map(|list| list.args.as_slice())
         {
@@ -3031,7 +3032,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             expr,
             data_type,
             format: None,
-        } = unnest(expression)
+        } = scalar(expression)
         else {
             return Ok(self.setting_expression(scope, expression)?.map(|read| (read, None)));
         };
@@ -4023,6 +4024,22 @@ fn unnest(mut expression: &Expr) -> &Expr {
         expression = inner;
     }
     expression
+}
+
+/// `expression` without the parentheses and the scalar subqueries `(SELECT
+/// <expression>)` writing nothing else around it, each returning one row
+/// holding the value, `NULL` included.
+fn scalar(mut expression: &Expr) -> &Expr {
+    loop {
+        expression = match expression {
+            Expr::Nested(inner) => inner,
+            Expr::Subquery(query) => {
+                let Some(projected) = projected(query) else { return expression };
+                projected
+            }
+            _ => return expression,
+        };
+    }
 }
 
 /// The terms `expression` joins with `AND`.
