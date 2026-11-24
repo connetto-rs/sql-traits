@@ -3,13 +3,13 @@ use core::{marker::PhantomData, ops::Range, slice};
 
 use sqlparser::ast::{
     CastKind, Expr, Function, FunctionArguments, Ident, ObjectName, ObjectNamePart, Select,
-    SetOperator, Statement, TableFactor, TableWithJoins, Values,
+    SelectItem, SetOperator, Statement, TableFactor, TableWithJoins, Values,
 };
 
 use super::{
     BaseColumnRef, ColumnOrigin, CteShape, DerivationProfile, DerivedShape, Deriving, FromScope,
-    LookupOutcome, OutputNameSource, RelationKey, RelationOrigin, ResolvedColumn, ResultColumnType,
-    WildcardEntry, derive_query_shape, factor_address, join_tree_address,
+    LookupOutcome, OutputNameSource, RelationKey, RelationOrigin, RelationSlot, ResolvedColumn,
+    ResultColumnType, WildcardEntry, derive_query_shape, factor_address, join_tree_address,
     modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
     scoped_roots::is_input,
@@ -176,6 +176,9 @@ struct ScopeNode<'query, 'db, DB: DatabaseLike> {
     /// as the items of a parenthesized join under an alias and the `old` and
     /// `new` rows of a `RETURNING` list do.
     owner_level: bool,
+    /// The `RETURNING` list of the data-modifying statement whose relations
+    /// the scope holds.
+    returning: Option<&'query [SelectItem]>,
     data: FromScope<'query, 'db, DB, DefinitionId>,
     outputs: Vec<OutputEntry<'query, 'db>>,
 }
@@ -397,14 +400,16 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             .map(|resolved| self.definition(resolved.definition)))
     }
 
+    /// The definition and binding `resolved` names, `scope` holding the
+    /// relation it reached.
     fn bound<'scope>(
         &'scope self,
         resolved: &ResolvedColumn<'scope, 'db, DB, DefinitionId>,
+        scope: ScopeId,
     ) -> Bound<'scope, 'query, 'db, DB> {
-        (
-            self.definition(resolved.definition),
-            self.binding(resolved.relation, resolved.exposed, resolved.origin),
-        )
+        let binding = self.binding(resolved.relation, resolved.exposed, resolved.origin);
+        let reached = resolved.reached.map(|relation| RelationSlot { scope: scope.0, relation });
+        (self.definition(resolved.definition), binding.reaching(reached))
     }
 
     /// The binding to the column `origin` names, exposed under `exposed`
@@ -442,7 +447,9 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
         cursor: ScopeCursor,
         reference: &Expr,
     ) -> Result<Option<Bound<'scope, 'query, 'db, DB>>, LookupError> {
-        Ok(self.resolve_definition_id(cursor, reference)?.map(|resolved| self.bound(&resolved)))
+        Ok(self
+            .resolve_definition_in(cursor, reference)?
+            .map(|(resolved, scope)| self.bound(&resolved, scope)))
     }
 
     pub(crate) fn resolve_relation<'scope>(
@@ -792,6 +799,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             parent,
             owner: parent.map(|parent| parent.scope),
             owner_level: false,
+            returning: None,
             data: FromScope::new(self.graph.case, self.graph.dialect),
             outputs: Vec::new(),
         });
@@ -810,10 +818,17 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             parent: Some(parent),
             owner: Some(parent.scope),
             owner_level: true,
+            returning: None,
             data,
             outputs: Vec::new(),
         });
         scope
+    }
+
+    /// Records `items` as the `RETURNING` list reading the relations of
+    /// `scope`.
+    pub(super) fn record_returning(&mut self, scope: ScopeId, items: &'query [SelectItem]) {
+        self.graph.scopes[scope.0].returning = Some(items);
     }
 
     /// Records the `FROM` items of a data-modifying statement and their join
@@ -874,13 +889,15 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
 
     /// Appends `table` to `scope` as its next `FROM` entry, exposed under
     /// the alias `alias` names with its quoting when one is given, and
-    /// otherwise under its own schema and name.
+    /// otherwise under its own schema and name. A `built_row` entry reads a
+    /// row the statement builds rather than one the table stores.
     pub(super) fn push_table_entry(
         &mut self,
         scope: ScopeId,
         table: &'db DB::Table,
         database: &'db DB,
         alias: Option<(&'query str, bool)>,
+        built_row: bool,
     ) {
         let output_columns: Vec<_> = table
             .columns(database)
@@ -924,6 +941,10 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
             table,
             has_alias: alias.is_some(),
             nullable: false,
+            unconstrained: built_row
+                || table
+                    .inheritors(database)
+                    .map_or(true, |mut inheritors| inheritors.next().is_some()),
             reads_inheritors: false,
             entry_index: data.from_entry_count,
             output_columns,
@@ -981,6 +1002,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             parent,
             owner,
             owner_level: false,
+            returning: None,
             data: FromScope::new(
                 match select {
                     AstRef::Query(_) => self.graph.case,
@@ -1006,6 +1028,7 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
             parent,
             owner: parent.map(|parent| parent.scope),
             owner_level: true,
+            returning: None,
             data: FromScope::new(
                 match join {
                     AstRef::Query(_) => self.graph.case,
@@ -1195,6 +1218,6 @@ pub(crate) fn table_graph<'db, DB: DatabaseLike>(
 ) -> (DefinitionGraph<'db, 'db, DB>, ScopeCursor) {
     let mut profile = DefinitionDerivation::new(database, case);
     let scope = profile.begin_unowned_scope(None);
-    profile.push_table_entry(scope, table, database, None);
+    profile.push_table_entry(scope, table, database, None, false);
     profile.finish(scope)
 }

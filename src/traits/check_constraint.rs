@@ -1562,8 +1562,11 @@ pub trait CheckConstraintLike:
         &self,
         database: &Self::DB,
     ) -> Result<ExpressionTruth, LookupError> {
-        let others =
-            crate::structs::validated_checks(self.table(database)?, database, Some(self.borrow()))?;
+        let others: Vec<_> =
+            crate::structs::validated_checks(self.table(database)?, database, Some(self.borrow()))?
+                .into_iter()
+                .map(Assumption::Check)
+                .collect();
         self.truth_under(database, &others)
     }
 

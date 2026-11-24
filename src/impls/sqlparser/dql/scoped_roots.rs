@@ -92,17 +92,19 @@ fn reach<'db, DB: DatabaseLike>(
 ) {
     match scope {
         ExpressionScope::Empty | ExpressionScope::DomainValue(_) | ExpressionScope::PlPgSql(_) => {}
-        ExpressionScope::Table(table) => profile.push_table_entry(outer, table, database, None),
+        ExpressionScope::Table(table) => {
+            profile.push_table_entry(outer, table, database, None, false);
+        }
         ExpressionScope::Trigger(table) => {
-            profile.push_table_entry(outer, table, database, Some(("new", false)));
-            profile.push_table_entry(outer, table, database, Some(("old", false)));
+            profile.push_table_entry(outer, table, database, Some(("new", false)), true);
+            profile.push_table_entry(outer, table, database, Some(("old", false)), true);
         }
         ExpressionScope::Rule { table, event } => {
             if matches!(event, CreateRuleEvent::Insert | CreateRuleEvent::Update) {
-                profile.push_table_entry(outer, table, database, Some(("new", false)));
+                profile.push_table_entry(outer, table, database, Some(("new", false)), true);
             }
             if !matches!(event, CreateRuleEvent::Insert) {
-                profile.push_table_entry(outer, table, database, Some(("old", false)));
+                profile.push_table_entry(outer, table, database, Some(("old", false)), true);
             }
         }
         ExpressionScope::FunctionBody(function) => {

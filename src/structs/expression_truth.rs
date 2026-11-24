@@ -1,8 +1,9 @@
-//! What an expression evaluates to on the rows of a table, read through
-//! `sqlparser-expr-eval` over the table's columns and the database's
-//! functions.
+//! What an expression evaluates to on the rows of a table, at a query site
+//! or over a domain's `VALUE`, read through `sqlparser-expr-eval` over the
+//! values its names bind and the database's functions.
 
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
     sync::Arc,
@@ -15,7 +16,10 @@ use core::{
 };
 
 use sqlparser::{
-    ast::{ArgMode, DataType, Expr, Function, FunctionBehavior},
+    ast::{
+        ArgMode, DataType, Expr, Function, FunctionBehavior, Ident, Query, Value, ValueWithSpan,
+        Visitor,
+    },
     dialect::{GenericDialect, PostgreSqlDialect, SQLiteDialect},
 };
 use sqlparser_expr_eval::{
@@ -27,10 +31,14 @@ use sqlparser_expr_eval::{
 
 use crate::{
     errors::LookupError,
-    impls::SqlparserDialect,
+    impls::{
+        SqlparserDialect,
+        dql::{ColumnOrigin, JoinSite, RelationSlot, definition_graph::reference_sites::SiteRule},
+    },
     structs::{
-        ColumnDefinition, ColumnScope, FunctionKind, IdentifierCase, TargetName,
-        expression_context::plain_arguments,
+        CallResolution, ColumnDefinition, ColumnScope, ExpressionContext, FunctionKind,
+        IdentifierCase, OperandType, PlPgSqlVariable, TargetName, VariableKind,
+        expression_context::plain_arguments, plpgsql_scope::stored_parts,
     },
     traits::{
         CheckConstraintLike, CollationMatch, ColumnCollation, ColumnLike, DataTypeLike,
@@ -43,7 +51,7 @@ use crate::{
         coercion::canonical,
         postgres_types::PgType,
         scalar_family::ScalarFamily,
-        walk::walk_expressions,
+        walk::{walk, walk_expressions},
     },
 };
 
@@ -87,18 +95,22 @@ impl From<&Evaluation> for ExpressionTruth {
     }
 }
 
-/// What an expression is read under beside the guarantees of its table's
-/// column types, `NOT NULL`, domain checks and generated columns.
+/// What an expression is read under beside the guarantees of the types,
+/// `NOT NULL`, domain checks and generated columns of the values it reads.
 pub enum Assumption<'a, DB: DatabaseLike> {
-    /// A check of the table, true or `NULL` on every row as PostgreSQL
+    /// A check of a table, true or `NULL` on every row as PostgreSQL
     /// enforces it. A check calling a SQL value function such as
     /// `CURRENT_TIMESTAMP`, a function that is not immutable, or one that the
     /// database's search path or the read check's path resolves to other
     /// functions than the check's own path, assumes nothing.
     Check(&'a DB::CheckConstraint),
-    /// An expression taking one of `outcomes` on every row, its calls
-    /// resolved under the database's search path. An expression whose calls
-    /// the read check's path resolves to other functions assumes nothing.
+    /// An expression taking one of `outcomes` on every row. A table or domain
+    /// read resolves its calls under the database's search path, and an
+    /// expression whose calls the read check's path resolves to other
+    /// functions assumes nothing. A read through an [`ExpressionContext`]
+    /// takes the calls the context selects.
+    ///
+    /// [`ExpressionContext`]: crate::structs::ExpressionContext
     Expression {
         /// The expression assumed.
         expression: &'a Expr,
@@ -116,8 +128,8 @@ impl<DB: DatabaseLike> Clone for Assumption<'_, DB> {
 
 impl<DB: DatabaseLike> Copy for Assumption<'_, DB> {}
 
-/// Every validated and enforced check of `table` its inheritors share, as
-/// assumptions, but `except`.
+/// Every validated and enforced check of `table` its inheritors share, but
+/// `except`.
 ///
 /// # Errors
 ///
@@ -127,7 +139,7 @@ pub(crate) fn validated_checks<'a, DB: DatabaseLike>(
     table: &'a DB::Table,
     database: &'a DB,
     except: Option<&DB::CheckConstraint>,
-) -> Result<Vec<Assumption<'a, DB>>, LookupError> {
+) -> Result<Vec<&'a DB::CheckConstraint>, LookupError> {
     let mut checks = Vec::new();
     for check in table.check_constraints(database)? {
         if except.is_none_or(|except| !ptr::eq(check, except))
@@ -135,7 +147,7 @@ pub(crate) fn validated_checks<'a, DB: DatabaseLike>(
             && !check.no_inherit()
             && check.is_validated(database)?
         {
-            checks.push(Assumption::Check(check));
+            checks.push(check);
         }
     }
     Ok(checks)
@@ -184,137 +196,685 @@ pub(crate) fn table_truth<'a, DB: DatabaseLike>(
     own: Option<&'a DB::CheckConstraint>,
     assumptions: &[Assumption<'a, DB>],
 ) -> Result<ExpressionTruth, LookupError> {
-    let engine = Engine::of(database);
-    let context = TableContext {
-        table,
-        database,
-        case,
-        engine,
-        scope: None,
-        value: None,
-        source: Source::Expression,
-        own,
-        collations: Vec::new(),
-        enums: Enums::default(),
-        reached: Vec::new(),
-    };
-    match engine {
-        Engine::PostgreSql => {
-            truth_under(
-                &PostgreSqlDialect {},
-                &PostgreSqlOptions::default(),
-                context,
-                expression,
-                assumptions,
-            )
+    for assumption in assumptions {
+        if let Assumption::Check(check) = *assumption
+            && !table.check_constraints(database)?.any(|held| ptr::eq(held, check))
+        {
+            return Err(LookupError::CheckNotOfTable {
+                check: check.expression(database).to_string(),
+                table: table.table_name().into(),
+            });
         }
-        Engine::Sqlite | Engine::Other => {
-            truth_under(&GenericDialect {}, &(), context, expression, assumptions)
+    }
+    let mut context = TruthContext::new(database, case, own);
+    let read = context.read_table(None, table, false)?;
+    context.caller = Some(read);
+    context.truth(expression, assumptions)
+}
+
+/// What `expression`, a node of `context`'s root, evaluates to wherever it
+/// is evaluated, under the guarantees what its references bind holds and the
+/// `assumptions`, nodes of the same root.
+///
+/// # Errors
+///
+/// Returns [`LookupError::ExpressionNotInQuery`] for a node of another root,
+/// and the lookup errors resolving a reference, a call or a check raises.
+pub(crate) fn site_truth<'a, DB: DatabaseLike>(
+    context: &'a ExpressionContext<'_, '_, DB>,
+    expression: &Expr,
+    assumptions: &[Assumption<'a, DB>],
+) -> Result<ExpressionTruth, LookupError> {
+    let mut truth = TruthContext::new(context.database(), context.case(), None);
+    let mut site = Site { references: Vec::new(), calls: Vec::new() };
+    truth.bind_site(context, expression, &mut site)?;
+    for assumption in assumptions {
+        if let Assumption::Expression { expression, .. } = assumption {
+            truth.bind_site(context, expression, &mut site)?;
+        }
+    }
+    truth.site = Some(site);
+    truth.truth(expression, assumptions)
+}
+
+/// What `expression` evaluates to over the `VALUE` of `domain`, under the
+/// guarantees its base type and the checks of the domains it is defined
+/// over, not its own, hold, and the `assumptions`.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving a call or a check raises.
+pub(crate) fn domain_truth<'a, DB: DatabaseLike>(
+    domain: &'a DB::Domain,
+    database: &'a DB,
+    expression: &Expr,
+    case: IdentifierCase,
+    assumptions: &[Assumption<'a, DB>],
+) -> Result<ExpressionTruth, LookupError> {
+    let mut context = TruthContext::new(database, case, None);
+    let data_type = domain.data_type(database);
+    let rules = text_rules(ColumnCollation::Unknown, &mut context.collations);
+    let evaluation = context.engine.values(data_type, database, rules, true, &context.enums);
+    let type_name = Some(data_type.name(database).into_owned());
+    let value = context.named(Key::Value, evaluation, type_name, data_type.domain(database));
+    context.read_value = Some(value);
+    context.truth(expression, assumptions)
+}
+
+impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
+    /// A read of nothing yet over `database`, comparing names under `case`,
+    /// of the expression of `own` when it is set.
+    fn new(database: &'a DB, case: IdentifierCase, own: Option<&'a DB::CheckConstraint>) -> Self {
+        Self {
+            database,
+            case,
+            engine: Engine::of(database),
+            named: Vec::new(),
+            tables: Vec::new(),
+            site: None,
+            caller: None,
+            reading: None,
+            read_value: None,
+            value: None,
+            source: Source::Expression,
+            own,
+            collations: Vec::new(),
+            enums: Enums::default(),
+            reached: Vec::new(),
+        }
+    }
+
+    /// What the read expression evaluates to under `assumptions`, read under
+    /// the engine's dialect.
+    fn truth(
+        self,
+        expression: &Expr,
+        assumptions: &[Assumption<'a, DB>],
+    ) -> Result<ExpressionTruth, LookupError> {
+        match self.engine {
+            Engine::PostgreSql => {
+                self.truth_under(
+                    &PostgreSqlDialect {},
+                    &PostgreSqlOptions::default(),
+                    expression,
+                    assumptions,
+                )
+            }
+            Engine::Sqlite | Engine::Other => {
+                self.truth_under(&GenericDialect {}, &(), expression, assumptions)
+            }
+        }
+    }
+
+    /// [`Self::truth`] under `dialect` and its `options`.
+    fn truth_under<D: EvalDialect>(
+        mut self,
+        dialect: &D,
+        options: &D::Options,
+        expression: &Expr,
+        assumptions: &[Assumption<'a, DB>],
+    ) -> Result<ExpressionTruth, LookupError> {
+        let database = self.database;
+        let mut guarantees = self.domain_guarantees(dialect, options)?;
+        self.value = self.read_value;
+        let mut generated = Vec::new();
+        for read in 0..self.tables.len() {
+            self.reading = Some(read);
+            for column in self.tables[read].table.columns(database)? {
+                if let Some(expression) = column.generation_expression() {
+                    self.source = Source::Generated(column);
+                    if self.holds_across_statements(expression, Self::runs_immutable)? {
+                        generated.push((read, column, expression));
+                    }
+                }
+            }
+        }
+        let mut seeding = Vec::new();
+        for read in 0..self.tables.len() {
+            self.reading = Some(read);
+            let table = self.tables[read].table;
+            let held = assumptions.iter().filter_map(|assumption| {
+                match *assumption {
+                    Assumption::Check(check) => Some(check),
+                    Assumption::Expression { .. } => None,
+                }
+            });
+            for check in self.tables[read].checks.clone().into_iter().chain(held) {
+                if !table.check_constraints(database)?.any(|own| ptr::eq(own, check)) {
+                    continue;
+                }
+                self.source = Source::Check(check);
+                if self.holds_across_statements(
+                    check.expression(database),
+                    Self::runs_immutable_alike,
+                )? {
+                    seeding.push((Some(read), Assumption::Check(check)));
+                }
+            }
+        }
+        self.reading = self.caller;
+        self.source = self.caller_source();
+        for assumption in assumptions {
+            if let Assumption::Expression { expression, .. } = *assumption
+                && (self.site.is_some() || self.every_call(expression, Self::resolves_alike)?)
+            {
+                seeding.push((self.caller, *assumption));
+            }
+        }
+        // A check or a generated column may narrow a column only once another
+        // has, so they are read again until a round narrows nothing, at most
+        // once more than there are of them.
+        for _ in 0..=generated.len() + seeding.len() {
+            let before = guarantees.clone();
+            for &(read, column, expression) in &generated {
+                self.reading = Some(read);
+                self.source = Source::Generated(column);
+                let evaluation = evaluate(expression, dialect, options, &mut self, &guarantees)?;
+                let held = self.generated(column, evaluation)?;
+                if let Some(named) = self.column_named(read, column) {
+                    guarantees.restrict(Subject::Reference(named), held);
+                }
+            }
+            for &(reading, assumption) in &seeding {
+                self.reading = reading;
+                let (expression, outcomes) = match assumption {
+                    Assumption::Check(check) => {
+                        self.source = Source::Check(check);
+                        (check.expression(database), Outcomes::NOT_FALSE)
+                    }
+                    Assumption::Expression { expression, outcomes } => {
+                        self.source = self.caller_source();
+                        (expression, outcomes)
+                    }
+                };
+                guarantees =
+                    implied(expression, outcomes, dialect, options, &mut self, &guarantees)?;
+            }
+            if guarantees == before || guarantees.is_impossible() {
+                break;
+            }
+        }
+        // No row satisfies every guarantee, so the expression meets no row.
+        if guarantees.is_impossible() {
+            return Ok(ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Never });
+        }
+        self.reading = self.caller;
+        self.source = self.own.map_or_else(|| self.caller_source(), Source::Check);
+        let evaluation = evaluate(expression, dialect, options, &mut self, &guarantees)?;
+        Ok(ExpressionTruth::from(&evaluation))
+    }
+
+    /// What the checks of the domains of every named value guarantee, each
+    /// over its value. PostgreSQL leaves a domain value `NULL` without
+    /// checking it on an outer join's null-extended side, on grouping-set
+    /// rows and from a scalar subquery finding no row, so the checks hold
+    /// only where the value is not `NULL`.
+    fn domain_guarantees<D: EvalDialect>(
+        &mut self,
+        dialect: &D,
+        options: &D::Options,
+    ) -> Result<Guarantees<usize>, LookupError> {
+        let database = self.database;
+        let mut guarantees = Guarantees::new();
+        for named in 0..self.named.len() {
+            let mut domain = self.named[named].domain;
+            if domain.is_none() {
+                continue;
+            }
+            let mut checked = Guarantees::new();
+            while let Some(current) = domain {
+                self.value = Some(named);
+                self.source = Source::Domain(current);
+                for check in current.check_expressions() {
+                    if self.holds_across_statements(check, Self::runs_immutable_alike)? {
+                        checked =
+                            implied(check, Outcomes::NOT_FALSE, dialect, options, self, &checked)?;
+                    }
+                }
+                domain = current.data_type(database).domain(database);
+            }
+            let mut null = Guarantees::new();
+            let ty = self.named[named].evaluation.ty().clone();
+            null.restrict(Subject::Reference(named), Evaluation::null(ty));
+            guarantees = guarantees.meet(&checked.join(&null));
+        }
+        Ok(guarantees)
+    }
+
+    /// Where the caller's expression and assumptions resolve their calls.
+    fn caller_source(&self) -> Source<'a, DB> {
+        if self.site.is_some() { Source::Site } else { Source::Expression }
+    }
+
+    /// The value `key` names, held as `evaluation` before any guarantee
+    /// narrows it, of the type named `type_name` and of `domain`.
+    fn named(
+        &mut self,
+        key: Key,
+        evaluation: Evaluation,
+        type_name: Option<String>,
+        domain: Option<&'a DB::Domain>,
+    ) -> usize {
+        if let Some(held) = self.named.iter().position(|named| named.key == key) {
+            return held;
+        }
+        self.named.push(NamedValue { key, evaluation, type_name, domain });
+        self.named.len() - 1
+    }
+
+    /// The read of the stored rows of `table` that `relation` names, with a
+    /// value for each of its columns, holding its validated checks when
+    /// `checked`.
+    fn read_table(
+        &mut self,
+        relation: Option<RelationSlot>,
+        table: &'a DB::Table,
+        checked: bool,
+    ) -> Result<usize, LookupError> {
+        if let Some(read) = self
+            .tables
+            .iter()
+            .position(|read| read.relation == relation && ptr::eq(read.table, table))
+        {
+            return Ok(read);
+        }
+        let database = self.database;
+        for column in table.columns(database)? {
+            let evaluation =
+                self.engine.column(column, database, &mut self.collations, &self.enums)?;
+            let data_type = column.data_type(database);
+            let key = Key::Column { relation, column: ptr::from_ref(column).addr() };
+            let type_name = Some(data_type.name(database).into_owned());
+            self.named(key, evaluation, type_name, data_type.domain(database));
+        }
+        let checks = if checked { validated_checks(table, database, None)? } else { Vec::new() };
+        self.tables.push(TableRead { relation, table, scope: None, checks });
+        Ok(self.tables.len() - 1)
+    }
+
+    /// The value of `column` in the read `read`.
+    fn column_named(&self, read: usize, column: &DB::Column) -> Option<usize> {
+        let key = Key::Column {
+            relation: self.tables[read].relation,
+            column: ptr::from_ref(column).addr(),
+        };
+        self.named.iter().position(|named| named.key == key)
+    }
+
+    /// Binds into `site` the references and calls `expression`, a node of
+    /// `context`'s root, writes outside the queries it holds, which the
+    /// evaluator reads.
+    fn bind_site(
+        &mut self,
+        context: &'a ExpressionContext<'_, '_, DB>,
+        expression: &Expr,
+        site: &mut Site<'a, DB>,
+    ) -> Result<(), LookupError> {
+        if !context.is_node(expression) {
+            return Err(LookupError::ExpressionNotInQuery { expression: expression.to_string() });
+        }
+        let mut visitor = TopLevel {
+            depth: 0,
+            each: |node: &Expr| -> Result<(), LookupError> {
+                let named = match node {
+                    Expr::Function(call) => {
+                        let functions = Self::site_call(context, node)?;
+                        site.calls.push((ptr::from_ref(call).addr(), call.clone(), functions));
+                        return Ok(());
+                    }
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Placeholder(placeholder), ..
+                    }) => Some(self.site_placeholder(context, node, placeholder)?),
+                    Expr::Identifier(ident) => {
+                        self.site_named(context, node, core::slice::from_ref(ident))?
+                    }
+                    Expr::CompoundIdentifier(parts) => self.site_named(context, node, parts)?,
+                    _ => return Ok(()),
+                };
+                site.references.push((ptr::from_ref(node).addr(), node.clone(), named));
+                Ok(())
+            },
+        };
+        match walk(expression, &mut visitor) {
+            ControlFlow::Break(error) => Err(error),
+            ControlFlow::Continue(()) => Ok(()),
+        }
+    }
+
+    /// The functions the call `node` runs, as `context` selects them.
+    fn site_call(
+        context: &'a ExpressionContext<'_, '_, DB>,
+        node: &Expr,
+    ) -> Result<Vec<&'a DB::Function>, LookupError> {
+        let Some(application) = context.call(node)? else { return Ok(Vec::new()) };
+        Ok(match application.resolution() {
+            CallResolution::Selected(selected) => alloc::vec![selected.function()],
+            CallResolution::Ambiguous(functions) => functions.clone(),
+            // No known function leaves the call unknown to the evaluator,
+            // which a call whose path is unknown, a cast and a call
+            // PostgreSQL refuses all are.
+            CallResolution::Undetermined
+            | CallResolution::Cast(_)
+            | CallResolution::NotFound
+            | CallResolution::UnboundPolymorphic(_) => Vec::new(),
+        })
+    }
+
+    /// The value the placeholder `node`, spelled `placeholder`, reads where
+    /// `context` resolves it.
+    fn site_placeholder(
+        &mut self,
+        context: &'a ExpressionContext<'_, '_, DB>,
+        node: &Expr,
+        placeholder: &str,
+    ) -> Result<usize, LookupError> {
+        if let Some(variable) = context.positional_variable(placeholder) {
+            return self.variable(context, node, &variable, Vec::new());
+        }
+        let key = match context.positional_parameter(placeholder) {
+            Some((function, ordinal)) => {
+                Key::Parameter { function: ptr::from_ref(function).addr(), ordinal }
+            }
+            None => Key::Placeholder(placeholder.into()),
+        };
+        let evaluation = self.engine.operand(&context.type_of(node)?, self.database, &self.enums);
+        Ok(self.named(key, evaluation, None, None))
+    }
+
+    /// The value the reference `node`, spelled `parts`, reads where `context`
+    /// resolves it, `None` for a node the evaluator reads no value of.
+    fn site_named(
+        &mut self,
+        context: &'a ExpressionContext<'_, '_, DB>,
+        node: &Expr,
+        parts: &[Ident],
+    ) -> Result<Option<usize>, LookupError> {
+        let database = self.database;
+        let rule = context.rule(node);
+        let unbound = || Key::Name { rule, parts: stored_parts(parts) };
+        let Some((definition, binding)) = context.reference(node)? else {
+            if let Some(value) = context.domain_value(node) {
+                let evaluation = self.engine.operand(&value, database, &self.enums);
+                return Ok(Some(self.named(Key::Value, evaluation, None, None)));
+            }
+            let evaluation = Evaluation::new(
+                ScalarType::Unknown,
+                true,
+                false,
+                Values::Unlisted(Unlisted::any()),
+            );
+            return Ok(Some(self.named(unbound(), evaluation, None, None)));
+        };
+        let relation = context.relation_at(binding.reached(), binding.origin(), node);
+        let built = rule.is_some_and(|rule| {
+            context.reads_built_rows(rule, relation.map(|slot| slot.scope), node)
+        });
+        let output = || {
+            let key = match (relation, binding.origin()) {
+                (
+                    Some(relation),
+                    ColumnOrigin::Entry { ordinal, .. } | ColumnOrigin::Merged { ordinal, .. },
+                ) => Key::Output { relation, ordinal },
+                (None, ColumnOrigin::Merged { join, ordinal }) => Key::Merged { join, ordinal },
+                _ => unbound(),
+            };
+            if built { Key::Built(Box::new(key)) } else { key }
+        };
+        let key = match definition {
+            ColumnDefinition::Base { table, column, database: catalog } => {
+                let own_catalog = ptr::eq(catalog, database);
+                if own_catalog
+                    && !built
+                    && let Some(relation) = relation.filter(|slot| {
+                        slot.relation.table
+                            && slot.relation.constrained
+                            && !slot.relation.null_extended
+                    })
+                {
+                    let read = self.read_table(Some(relation), table, true)?;
+                    return Ok(self.column_named(read, column));
+                }
+                let key = match relation {
+                    Some(relation) if relation.relation.table => {
+                        let key = Key::Column {
+                            relation: Some(relation),
+                            column: ptr::from_ref(column).addr(),
+                        };
+                        if built { Key::Built(Box::new(key)) } else { key }
+                    }
+                    _ => output(),
+                };
+                // A row an outer join, a grouping set or the statement
+                // builds, or one read through another relation, may be
+                // `NULL` in the column and break the table's constraints.
+                let evaluation = self
+                    .engine
+                    .column(column, catalog, &mut self.collations, &self.enums)?
+                    .with_null(true);
+                let data_type = column.data_type(catalog);
+                let domain = own_catalog.then(|| data_type.domain(catalog)).flatten();
+                let type_name = Some(data_type.name(catalog).into_owned());
+                return Ok(Some(self.named(key, evaluation, type_name, domain)));
+            }
+            ColumnDefinition::Parameter { function, ordinal } => {
+                Key::Parameter { function: ptr::from_ref(function).addr(), ordinal }
+            }
+            ColumnDefinition::Variable(variable) => {
+                return self.variable(context, node, &variable, Vec::new()).map(Some);
+            }
+            ColumnDefinition::VariableField(variable) => {
+                return self.variable(context, node, &variable, stored_parts(parts)).map(Some);
+            }
+            _ => output(),
+        };
+        let evaluation = self.engine.operand(&context.type_of(node)?, database, &self.enums);
+        Ok(Some(self.named(key, evaluation, None, None)))
+    }
+
+    /// The value of `variable`, or of the field `fields` name when there are
+    /// any, which `node` reads.
+    fn variable(
+        &mut self,
+        context: &'a ExpressionContext<'_, '_, DB>,
+        node: &Expr,
+        variable: &PlPgSqlVariable<'_>,
+        fields: Vec<String>,
+    ) -> Result<usize, LookupError> {
+        let never_null = fields.is_empty()
+            && matches!(
+                variable.kind(),
+                VariableKind::Declared { not_null: true, .. }
+                    | VariableKind::LoopIndex
+                    | VariableKind::Found
+            );
+        let evaluation = self
+            .engine
+            .operand(&context.type_of(node)?, self.database, &self.enums)
+            .with_null(!never_null);
+        Ok(self.named(Key::Variable { id: variable.id(), fields }, evaluation, None, None))
+    }
+
+    /// The value `expression` reads, `None` for a node that is no reference
+    /// or one naming nothing in reach.
+    fn named_by(&mut self, expression: &Expr) -> Result<Option<usize>, LookupError> {
+        if let (Some(named), Expr::Identifier(name)) = (self.value, expression)
+            && name.quote_style.is_none()
+            && name.value.eq_ignore_ascii_case("value")
+        {
+            return Ok(Some(named));
+        }
+        if let Some(read) = self.reading {
+            if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                return Ok(None);
+            }
+            let (database, case) = (self.database, self.case);
+            let table = self.tables[read].table;
+            let scope = self.tables[read]
+                .scope
+                .get_or_insert_with(|| ColumnScope::for_table(table, database, case));
+            let column = match scope.resolve_column_definition(expression)? {
+                Some(ColumnDefinition::Base { column, .. }) => ptr::from_ref(column).addr(),
+                _ => return Ok(None),
+            };
+            let key = Key::Column { relation: self.tables[read].relation, column };
+            return Ok(self.named.iter().position(|named| named.key == key));
+        }
+        Ok(self.site.as_ref().and_then(|site| site.named(expression)))
+    }
+}
+
+/// Hands `each` every expression a node holds outside the queries in it,
+/// the nodes the evaluator reads, until `each` fails.
+struct TopLevel<F> {
+    depth: usize,
+    each: F,
+}
+
+impl<F: FnMut(&Expr) -> Result<(), LookupError>> Visitor for TopLevel<F> {
+    type Break = LookupError;
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.depth += 1;
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        if self.depth > 0 {
+            return ControlFlow::Continue(());
+        }
+        match (self.each)(expression) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
         }
     }
 }
 
-/// [`table_truth`] under `dialect` and its `options`.
-fn truth_under<'a, D: EvalDialect, DB: DatabaseLike>(
-    dialect: &D,
-    options: &D::Options,
-    mut context: TableContext<'a, DB>,
-    expression: &Expr,
-    assumptions: &[Assumption<'a, DB>],
-) -> Result<ExpressionTruth, LookupError> {
-    let (table, database) = (context.table, context.database);
-    let mut guarantees = Guarantees::new();
-    for column in table.columns(database)? {
-        let mut domain = column.data_type(database).domain(database);
-        while let Some(current) = domain {
-            context.value = Some(column);
-            context.source = Source::Domain(current);
-            for check in current.check_expressions() {
-                if context.holds_across_statements(check, TableContext::runs_immutable_alike)? {
-                    guarantees = implied(
-                        check,
-                        Outcomes::NOT_FALSE,
-                        dialect,
-                        options,
-                        &mut context,
-                        &guarantees,
-                    )?;
-                }
-            }
-            domain = current.data_type(database).domain(database);
+/// What a value the read names stands for, which tells two references of one
+/// value from references of two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Key {
+    /// A column of the rows of a stored table the relation `relation` reads,
+    /// `None` for the table a table read reads.
+    Column {
+        /// The relation reading the table.
+        relation: Option<RelationSlot>,
+        /// The address of the column.
+        column: usize,
+    },
+    /// Output column `ordinal` of a relation other than a stored table.
+    Output {
+        /// The relation.
+        relation: RelationSlot,
+        /// The position of the column among the relation's.
+        ordinal: usize,
+    },
+    /// Column `ordinal` of the columns the join `join` merged.
+    Merged {
+        /// The join.
+        join: JoinSite,
+        /// The position of the column among those the join merged.
+        ordinal: usize,
+    },
+    /// Input parameter `ordinal` of the function at address `function`.
+    Parameter {
+        /// The address of the function.
+        function: usize,
+        /// The position of the parameter among the inputs.
+        ordinal: usize,
+    },
+    /// The PL/pgSQL variable `id`, or the field of it `fields` names.
+    Variable {
+        /// The variable's id.
+        id: usize,
+        /// The parts naming the field, empty for the variable itself.
+        fields: Vec<String>,
+    },
+    /// A positional parameter of a function body.
+    Placeholder(String),
+    /// The value a domain constraint checks.
+    Value,
+    /// A name nothing in reach binds, as stored, where `rule` resolves it.
+    Name {
+        /// The rule resolving references where the name sits.
+        rule: Option<SiteRule>,
+        /// The parts of the name, as stored.
+        parts: Vec<String>,
+    },
+    /// What the key names, on rows the query builds, which grouping sets
+    /// and a `RETURNING` list read.
+    Built(Box<Key>),
+}
+
+/// A value the read names, and what holds of it before any guarantee.
+struct NamedValue<'a, DB: DatabaseLike> {
+    key: Key,
+    /// What the value holds before any guarantee narrows it.
+    evaluation: Evaluation,
+    /// The name of its declared type, which selects among the overloads of a
+    /// call a check writes over it.
+    type_name: Option<String>,
+    /// The domain the value belongs to, whose checks and those of the
+    /// domains it is defined over hold on it.
+    domain: Option<&'a DB::Domain>,
+}
+
+/// The stored rows of a table one relation reads.
+struct TableRead<'a, DB: DatabaseLike> {
+    /// The relation reading the table, `None` for a table read.
+    relation: Option<RelationSlot>,
+    table: &'a DB::Table,
+    /// The table's column scope, built on the first column reference.
+    scope: Option<ColumnScope<'a, 'a, DB>>,
+    /// The checks every row of the table holds.
+    checks: Vec<&'a DB::CheckConstraint>,
+}
+
+/// The references and calls of a query site, bound before the read, each
+/// by its address and with a copy matching the copies the evaluator reads
+/// of some forms.
+struct Site<'a, DB: DatabaseLike> {
+    references: Vec<(usize, Expr, Option<usize>)>,
+    calls: Vec<(usize, Function, Vec<&'a DB::Function>)>,
+}
+
+impl<'a, DB: DatabaseLike> Site<'a, DB> {
+    /// The value the reference `expression` reads, or that every reference
+    /// equal to the copy `expression` is reads.
+    fn named(&self, expression: &Expr) -> Option<usize> {
+        let address = ptr::from_ref(expression).addr();
+        if let Some((.., named)) = self.references.iter().find(|(held, ..)| *held == address) {
+            return *named;
         }
+        let mut equal = self
+            .references
+            .iter()
+            .filter(|(_, written, _)| written == expression)
+            .map(|(.., named)| *named);
+        let first = equal.next()??;
+        equal.all(|named| named == Some(first)).then_some(first)
     }
-    context.value = None;
-    let mut generated = Vec::new();
-    for column in table.columns(database)? {
-        if let Some(expression) = column.generation_expression() {
-            context.source = Source::Generated(column);
-            if context.holds_across_statements(expression, TableContext::runs_immutable)? {
-                generated.push((column, expression));
-            }
+
+    /// The functions the call `call` runs, or that every call equal to the
+    /// copy `call` runs, `None` for a call the site does not write.
+    fn call(&self, call: &Function) -> Option<Vec<&'a DB::Function>> {
+        let address = ptr::from_ref(call).addr();
+        if let Some((.., functions)) = self.calls.iter().find(|(held, ..)| *held == address) {
+            return Some(functions.clone());
         }
+        let mut equal =
+            self.calls.iter().filter(|(_, written, _)| written == call).map(|(.., run)| run);
+        let first = equal.next()?;
+        let alike = equal.all(|run| {
+            run.len() == first.len()
+                && run.iter().all(|function| first.iter().any(|held| ptr::eq(*function, *held)))
+        });
+        Some(if alike { first.clone() } else { Vec::new() })
     }
-    let mut seeding = Vec::new();
-    for assumption in assumptions {
-        let holds = match *assumption {
-            Assumption::Check(check) => {
-                if !table.check_constraints(database)?.any(|own| ptr::eq(own, check)) {
-                    return Err(LookupError::CheckNotOfTable {
-                        check: check.expression(database).to_string(),
-                        table: table.table_name().into(),
-                    });
-                }
-                context.source = Source::Check(check);
-                context.holds_across_statements(
-                    check.expression(database),
-                    TableContext::runs_immutable_alike,
-                )?
-            }
-            Assumption::Expression { expression, .. } => {
-                context.source = Source::Expression;
-                context.every_call(expression, TableContext::resolves_alike)?
-            }
-        };
-        if holds {
-            seeding.push(*assumption);
-        }
-    }
-    // A check or a generated column may narrow a column only once another
-    // has, so they are read again until a round narrows nothing, at most
-    // once more than there are of them.
-    for _ in 0..=generated.len() + seeding.len() {
-        let before = guarantees.clone();
-        for &(column, expression) in &generated {
-            context.source = Source::Generated(column);
-            let evaluation = evaluate(expression, dialect, options, &mut context, &guarantees)?;
-            let held = context.generated(column, evaluation)?;
-            guarantees.restrict(Subject::Reference(ptr::from_ref(column).addr()), held);
-        }
-        for assumption in &seeding {
-            let (expression, outcomes) = match *assumption {
-                Assumption::Check(check) => {
-                    context.source = Source::Check(check);
-                    (check.expression(database), Outcomes::NOT_FALSE)
-                }
-                Assumption::Expression { expression, outcomes } => {
-                    context.source = Source::Expression;
-                    (expression, outcomes)
-                }
-            };
-            guarantees =
-                implied(expression, outcomes, dialect, options, &mut context, &guarantees)?;
-        }
-        if guarantees == before || guarantees.is_impossible() {
-            break;
-        }
-    }
-    // No row satisfies every guarantee, so the expression meets no row.
-    if guarantees.is_impossible() {
-        return Ok(ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Never });
-    }
-    context.source = context.own.map_or(Source::Expression, Source::Check);
-    let evaluation = evaluate(expression, dialect, options, &mut context, &guarantees)?;
-    Ok(ExpressionTruth::from(&evaluation))
 }
 
 /// Where the expression the evaluator reads was written, which decides the
@@ -322,6 +882,9 @@ fn truth_under<'a, D: EvalDialect, DB: DatabaseLike>(
 enum Source<'a, DB: DatabaseLike> {
     /// The caller's expression, resolved under the database's path.
     Expression,
+    /// The caller's expression at a query site, resolved as the site's
+    /// context selects its calls.
+    Site,
     /// A check of the table, resolved under the path it was created with.
     Check(&'a DB::CheckConstraint),
     /// A check of a domain, resolved under the path the domain was created
@@ -337,7 +900,7 @@ impl<DB: DatabaseLike> Source<'_, DB> {
     /// expression.
     fn address(&self) -> usize {
         match self {
-            Source::Expression => 0,
+            Source::Expression | Source::Site => 0,
             Source::Check(check) => ptr::from_ref(*check).addr(),
             Source::Domain(domain) => ptr::from_ref(*domain).addr(),
             Source::Generated(column) => ptr::from_ref(*column).addr(),
@@ -346,25 +909,35 @@ impl<DB: DatabaseLike> Source<'_, DB> {
 }
 
 /// The functions a call resolved to, by the address of where it was written
-/// and of the column `VALUE` stood for.
+/// and of the value `VALUE` stood for.
 struct Reached<'a, F> {
     source: usize,
-    value: usize,
+    value: Option<usize>,
     call: Function,
     functions: Vec<&'a F>,
 }
 
-/// The table's columns and the database's functions, as the evaluator asks
-/// for them.
-struct TableContext<'a, DB: DatabaseLike> {
-    table: &'a DB::Table,
+/// The values a read names and the database's functions, as the evaluator
+/// asks for them.
+struct TruthContext<'a, DB: DatabaseLike> {
     database: &'a DB,
     case: IdentifierCase,
     engine: Engine,
-    /// The table's column scope, built on the first column reference.
-    scope: Option<ColumnScope<'a, 'a, DB>>,
-    /// The column `VALUE` stands for while a domain check is read.
-    value: Option<&'a DB::Column>,
+    /// The values met so far.
+    named: Vec<NamedValue<'a, DB>>,
+    /// The stored rows the read reads.
+    tables: Vec<TableRead<'a, DB>>,
+    /// The references and calls of the query site the read is at, if any.
+    site: Option<Site<'a, DB>>,
+    /// The table read whose columns the caller's names read, if any.
+    caller: Option<usize>,
+    /// The table read whose columns the expression being read reads, or
+    /// `None` for the caller's names.
+    reading: Option<usize>,
+    /// The value `VALUE` stands for in the caller's expression, if any.
+    read_value: Option<usize>,
+    /// The value `VALUE` stands for in the expression being read.
+    value: Option<usize>,
     /// Where the expression being read was written.
     source: Source<'a, DB>,
     /// The check whose expression is read last, if the expression is one.
@@ -435,10 +1008,23 @@ impl Engine {
         database: &DB,
         collations: &mut Vec<ColumnCollation<'static>>,
         enums: &Enums,
-    ) -> Result<Resolved<usize>, LookupError> {
-        let data_type = column.data_type(database);
-        let base = data_type.base_type(database).unwrap_or(data_type);
+    ) -> Result<Evaluation, LookupError> {
         let rules = text_rules(column.collation(database)?, collations);
+        let nullable = column.is_nullable(database)?;
+        Ok(self.values(column.data_type(database), database, rules, nullable, enums))
+    }
+
+    /// What a value of `data_type` holds before any guarantee narrows it, its
+    /// text compared under `rules`, `NULL` when `nullable`.
+    fn values<DB: DatabaseLike>(
+        self,
+        data_type: &DB::DataType,
+        database: &DB,
+        rules: TextRules,
+        nullable: bool,
+        enums: &Enums,
+    ) -> Evaluation {
+        let base = data_type.base_type(database).unwrap_or(data_type);
         let scalar_type = self.scalar_type(base, database, rules, enums);
         let mut values = Unlisted::any();
         if scalar_type.is_text()
@@ -454,13 +1040,29 @@ impl Engine {
             values.numbers =
                 Interval { low: Bound::Excluded(PgNumeric::from(-bound)), high: Bound::Unbounded };
         }
-        let evaluation = Evaluation::new(
-            scalar_type,
-            column.is_nullable(database)?,
-            false,
-            Values::Unlisted(values),
-        );
-        Ok(Resolved { reference: ptr::from_ref(column).addr(), evaluation })
+        Evaluation::new(scalar_type, nullable, false, Values::Unlisted(values))
+    }
+
+    /// What a value of the type `operand` holds before any guarantee narrows
+    /// it, possibly `NULL`, its text compared under rules not known.
+    fn operand<DB: DatabaseLike>(
+        self,
+        operand: &OperandType<'_>,
+        database: &DB,
+        enums: &Enums,
+    ) -> Evaluation {
+        let scalar_type = match (self, operand) {
+            (Engine::PostgreSql, OperandType::Known { type_name, .. }) => {
+                postgres_scalar_type(
+                    &PgType::from_target(type_name),
+                    TextRules::UNKNOWN,
+                    database,
+                    enums,
+                )
+            }
+            _ => ScalarType::Unknown,
+        };
+        Evaluation::new(scalar_type, true, false, Values::Unlisted(Unlisted::any()))
     }
 
     /// The scalar type values of `data_type` read as under the engine.
@@ -540,31 +1142,14 @@ impl Engine {
     }
 }
 
-impl<DB: DatabaseLike> Context for TableContext<'_, DB> {
+impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
     type Reference = usize;
     type Error = LookupError;
 
     fn reference(&mut self, expression: &Expr) -> Result<Option<Resolved<usize>>, LookupError> {
-        if let (Some(column), Expr::Identifier(name)) = (self.value, expression)
-            && name.quote_style.is_none()
-            && name.value.eq_ignore_ascii_case("value")
-        {
-            return self
-                .engine
-                .column(column, self.database, &mut self.collations, &self.enums)
-                .map(Some);
-        }
-        if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            return Ok(None);
-        }
-        let (table, database, case, engine) = (self.table, self.database, self.case, self.engine);
-        let scope = self.scope.get_or_insert_with(|| ColumnScope::for_table(table, database, case));
-        match scope.resolve_column_definition(expression)? {
-            Some(ColumnDefinition::Base { column, database, .. }) => {
-                engine.column(column, database, &mut self.collations, &self.enums).map(Some)
-            }
-            _ => Ok(None),
-        }
+        Ok(self.named_by(expression)?.map(|named| {
+            Resolved { reference: named, evaluation: self.named[named].evaluation.clone() }
+        }))
     }
 
     fn callees(&mut self, call: &Function) -> Result<Vec<Callee>, LookupError> {
@@ -594,13 +1179,15 @@ impl<DB: DatabaseLike> Context for TableContext<'_, DB> {
     }
 }
 
-impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
+impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// The functions `call` may run, resolved under the search path of
     /// where it was written, or none when it names no known function or
     /// PostgreSQL reads it as a cast.
     fn runnable(&mut self, call: &Function) -> Result<Vec<&'a DB::Function>, LookupError> {
-        let source = self.source.address();
-        let value = self.value.map_or(0, |column| ptr::from_ref(column).addr());
+        if let Source::Site = self.source {
+            return Ok(self.site.as_ref().and_then(|site| site.call(call)).unwrap_or_default());
+        }
+        let (source, value) = (self.source.address(), self.value);
         if let Some(reached) = self.reached.iter().find(|reached| {
             reached.source == source && reached.value == value && reached.call == *call
         }) {
@@ -620,7 +1207,9 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
     fn resolve(&mut self, call: &Function) -> Result<Vec<&'a DB::Function>, LookupError> {
         let (database, case) = (self.database, self.case);
         let reached = match &self.source {
-            Source::Expression => database.functions_reached_by(call, case).map(Iterator::collect),
+            Source::Expression | Source::Site => {
+                database.functions_reached_by(call, case).map(Iterator::collect)
+            }
             Source::Check(check) => {
                 let check = *check;
                 reached_in(core::iter::once(check.expression(database)), call, |written| {
@@ -656,36 +1245,17 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
     }
 
     /// The type name of each argument `call` writes, `None` for one that is
-    /// not a column reference, or nothing for a call written with clauses
-    /// beside its arguments.
+    /// not a reference to a value of a declared type, or nothing for a call
+    /// written with clauses beside its arguments.
     fn argument_type_names(&mut self, call: &Function) -> Result<Vec<Option<String>>, LookupError> {
         let Some(arguments) = plain_arguments(call) else { return Ok(Vec::new()) };
         let mut type_names = Vec::with_capacity(arguments.len());
         for argument in arguments {
-            type_names.push(self.column_type_name(argument)?);
+            type_names.push(
+                self.named_by(argument)?.and_then(|named| self.named[named].type_name.clone()),
+            );
         }
         Ok(type_names)
-    }
-
-    /// The name of the type declared for the column `argument` names.
-    fn column_type_name(&mut self, argument: &Expr) -> Result<Option<String>, LookupError> {
-        let (table, database, case) = (self.table, self.database, self.case);
-        if let (Some(column), Expr::Identifier(name)) = (self.value, argument)
-            && name.quote_style.is_none()
-            && name.value.eq_ignore_ascii_case("value")
-        {
-            return Ok(Some(column.data_type(database).name(database).into_owned()));
-        }
-        if !matches!(argument, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
-            return Ok(None);
-        }
-        let scope = self.scope.get_or_insert_with(|| ColumnScope::for_table(table, database, case));
-        Ok(match scope.resolve_column_definition(argument)? {
-            Some(ColumnDefinition::Base { column, database, .. }) => {
-                Some(column.data_type(database).name(database).into_owned())
-            }
-            _ => None,
-        })
     }
 
     /// Whether `expression` answers the same on a row in every statement,
@@ -753,19 +1323,26 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
     }
 
     /// Whether `call` runs the same functions under the path it was written
-    /// with as under the database's search path and, when the check being
-    /// read writes the same call, under that check's path.
+    /// with as where the caller's expression resolves it and, when the check
+    /// being read writes the same call, under that check's path. A table or
+    /// domain read resolves the caller's calls under the database's search
+    /// path, and a site read as its context selects the site's calls, which
+    /// matters only for a call the site writes.
     ///
     /// The guarantees an assumption seeds name its calls as written, so a
     /// call another path resolves to other functions would carry them to
     /// calls of other functions.
     fn resolves_alike(&mut self, call: &Function) -> Result<bool, LookupError> {
         let written = self.runnable(call)?;
+        let caller = match &self.site {
+            Some(site) => site.call(call).is_some().then_some(Source::Site),
+            None => Some(Source::Expression),
+        };
         let own = self
             .own
             .filter(|own| writes_call(own.expression(self.database), call))
             .map(Source::Check);
-        for path in core::iter::once(Source::Expression).chain(own) {
+        for path in caller.into_iter().chain(own) {
             let source = core::mem::replace(&mut self.source, path);
             let other = self.runnable(call);
             self.source = source;
@@ -791,8 +1368,7 @@ impl<'a, DB: DatabaseLike> TableContext<'a, DB> {
         evaluation: Evaluation,
     ) -> Result<Evaluation, LookupError> {
         let database = self.database;
-        let own =
-            self.engine.column(column, database, &mut self.collations, &self.enums)?.evaluation;
+        let own = self.engine.column(column, database, &mut self.collations, &self.enums)?;
         let data_type = column.data_type(database);
         let base = data_type.base_type(database).unwrap_or(data_type);
         let modified = base.typmod(database) != Some(TypeModifier::Unmodified);

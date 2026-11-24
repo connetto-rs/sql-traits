@@ -10,7 +10,7 @@ use sqlparser::ast::{
 use crate::{
     errors::LookupError,
     impls::dql::{
-        ColumnOrigin, build_definition_graph, build_stored_definition_graph,
+        ColumnOrigin, RelationSlot, build_definition_graph, build_stored_definition_graph,
         definition_graph::{
             DefinitionGraph, DefinitionId, QueryId, ScopeCursor,
             reference_sites::{SiteRule, SiteRules},
@@ -190,6 +190,7 @@ pub struct ColumnBinding<'scope> {
     origin: ColumnOrigin,
     entry: Option<RangeTableEntry<'scope>>,
     merge: Option<MergedColumn<'scope>>,
+    reached: Option<RelationSlot>,
 }
 
 impl<'scope> ColumnBinding<'scope> {
@@ -200,7 +201,18 @@ impl<'scope> ColumnBinding<'scope> {
         entry: Option<RangeTableEntry<'scope>>,
         merge: Option<MergedColumn<'scope>>,
     ) -> Self {
-        Self { relation, exposed, origin, entry, merge }
+        Self { relation, exposed, origin, entry, merge, reached: None }
+    }
+
+    /// The binding, reaching the relation `reached` names.
+    pub(crate) fn reaching(self, reached: Option<RelationSlot>) -> Self {
+        Self { reached, ..self }
+    }
+
+    /// The relation of its scope the reference reached, `None` for a merged,
+    /// opaque or ambiguous match and for a select-list output.
+    pub(crate) fn reached(&self) -> Option<RelationSlot> {
+        self.reached
     }
 
     /// The `FROM` item and column the binding reached.
@@ -1463,6 +1475,30 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     ) -> Result<Option<(ColumnDefinition<'_, 'query, 'db, DB>, ColumnBinding<'_>)>, LookupError>
     {
         self.graph.resolve_site(rule, reference)
+    }
+
+    /// Whether `reference`, sitting where `rule` resolves it and binding a
+    /// relation of the scope `bound` names, reads rows the query builds, the
+    /// rows of grouping sets or of a `RETURNING` list.
+    pub(crate) fn reads_built_rows(
+        &self,
+        rule: SiteRule,
+        bound: Option<usize>,
+        reference: &Expr,
+    ) -> bool {
+        self.graph.reads_built_rows(rule, bound, reference)
+    }
+
+    /// Whether the `FROM` item at `factor`, of the scope `bound` names, may
+    /// be null-extended where `reference` sits in the `ON` of one of its
+    /// joins, `None` when no such `ON` holds the reference.
+    pub(crate) fn null_extended_in_join(
+        &self,
+        bound: usize,
+        factor: usize,
+        reference: &Expr,
+    ) -> Option<bool> {
+        self.graph.null_extended_in_join(bound, factor, reference)
     }
 
     /// Whether `reference`, sitting in the scope `cursor` names, binds in the

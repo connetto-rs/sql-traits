@@ -920,7 +920,10 @@ pub trait TableLike:
         case: IdentifierCase,
     ) -> Result<ExpressionTruth, LookupError> {
         self.require_in_database(database)?;
-        let checks = crate::structs::validated_checks(self.borrow(), database, None)?;
+        let checks: Vec<_> = crate::structs::validated_checks(self.borrow(), database, None)?
+            .into_iter()
+            .map(Assumption::Check)
+            .collect();
         self.truth_under(database, expression, case, &checks)
     }
 

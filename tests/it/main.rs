@@ -217,6 +217,7 @@ mod sequence_parameters;
 mod sequences;
 mod set_returning_functions;
 mod simple_index_entries;
+mod site_truth;
 mod sql_text_calls;
 mod sqlite_autoindex_names;
 mod sqlite_databases;
