@@ -1,5 +1,5 @@
-//! The non-strict PostgreSQL builtins that still return `NULL` for a `NULL`
-//! argument at some positions, a fact `pg_proc` does not record.
+//! What `pg_proc` does not record about where PostgreSQL builtins get a
+//! `NULL` result.
 
 use alloc::vec::Vec;
 
@@ -24,10 +24,55 @@ static NULL_RETURNING: &[NullReturning] = &[
         argument_types: &["text", "text", "text"],
         positions: &[0],
     },
+    NullReturning { name: "concat_ws", argument_types: &["text", "\"any\""], positions: &[0] },
+];
+
+/// The `pg_catalog` functions, by name and argument types, that return `NULL`
+/// only through a `NULL` argument their strictness or [`NULL_RETURNING`]
+/// names.
+static NULL_ONLY_ON_NULL_INPUT: &[(&str, &[&str])] = &[
+    ("abs", &["real"]),
+    ("abs", &["double precision"]),
+    ("abs", &["bigint"]),
+    ("abs", &["integer"]),
+    ("abs", &["smallint"]),
+    ("abs", &["numeric"]),
+    ("btrim", &["text"]),
+    ("btrim", &["text", "text"]),
+    ("btrim", &["bytea", "bytea"]),
+    ("char_length", &["character"]),
+    ("char_length", &["text"]),
+    ("character_length", &["character"]),
+    ("character_length", &["text"]),
+    ("clock_timestamp", &[]),
+    ("concat", &["\"any\""]),
+    ("concat_ws", &["text", "\"any\""]),
+    ("count", &[]),
+    ("count", &["\"any\""]),
+    // An unknown setting raises `42704`.
+    ("current_setting", &["text"]),
+    ("length", &["text"]),
+    ("length", &["character"]),
+    ("length", &["lseg"]),
+    ("length", &["path"]),
+    ("length", &["bit"]),
+    ("length", &["bytea", "name"]),
+    ("length", &["bytea"]),
+    ("length", &["tsvector"]),
+    ("lower", &["text"]),
+    ("now", &[]),
+    ("octet_length", &["bytea"]),
+    ("octet_length", &["text"]),
+    ("octet_length", &["character"]),
+    ("octet_length", &["bit"]),
+    ("statement_timestamp", &[]),
+    ("transaction_timestamp", &[]),
+    ("upper", &["text"]),
 ];
 
 /// The positions of the entry for the `pg_catalog` function `name` whose
-/// argument types, as `format_type` spells them, `matches` accepts.
+/// argument types, as `format_type` spells them without `VARIADIC`, `matches`
+/// accepts.
 pub(crate) fn null_returning_positions(
     name: &str,
     matches: impl Fn(&[&str]) -> bool,
@@ -36,6 +81,15 @@ pub(crate) fn null_returning_positions(
         .iter()
         .find(|entry| entry.name == name && matches(entry.argument_types))
         .map(|entry| entry.positions)
+}
+
+/// Whether the `pg_catalog` function `name` whose argument types, as
+/// `format_type` spells them without `VARIADIC`, `matches` accepts returns
+/// `NULL` only through a `NULL` argument.
+pub(crate) fn null_only_on_null_input(name: &str, matches: impl Fn(&[&str]) -> bool) -> bool {
+    NULL_ONLY_ON_NULL_INPUT
+        .iter()
+        .any(|(entry, argument_types)| *entry == name && matches(argument_types))
 }
 
 /// Returns the argument positions at which a `NULL` makes a call to a
@@ -69,20 +123,50 @@ pub fn postgres_null_returning_arguments(
     name: &str,
     argument_types: &[&str],
 ) -> &'static [usize] {
+    declared_as(schema, argument_types)
+        .and_then(|matches| null_returning_positions(name, matches))
+        .unwrap_or_default()
+}
+
+/// Returns whether a call to the PostgreSQL 18 builtin is `NULL` only when an
+/// argument its strictness or [`postgres_null_returning_arguments`] names is
+/// `NULL`, a fact `pg_proc` does not record.
+///
+/// `schema` and `name` name the function as `pg_proc` stores it, and
+/// `argument_types` its input argument types without `VARIADIC`, each in any
+/// spelling that parses as a type. A function PostgreSQL does not provide,
+/// or one that may return `NULL` on non-`NULL` input, answers false.
+///
+/// # Example
+///
+/// ```rust
+/// use sql_traits::utils::postgres_null_only_on_null_input;
+///
+/// assert!(postgres_null_only_on_null_input("pg_catalog", "now", &[]));
+/// assert!(postgres_null_only_on_null_input("pg_catalog", "current_setting", &["TEXT"]));
+/// // `current_setting(name, true)` is `NULL` for an unknown setting.
+/// assert!(!postgres_null_only_on_null_input("pg_catalog", "current_setting", &["text", "bool"]));
+/// assert!(!postgres_null_only_on_null_input("public", "now", &[]));
+/// ```
+#[must_use]
+pub fn postgres_null_only_on_null_input(schema: &str, name: &str, argument_types: &[&str]) -> bool {
+    declared_as(schema, argument_types)
+        .is_some_and(|matches| null_only_on_null_input(name, matches))
+}
+
+/// What accepts a `pg_catalog` signature declaring `argument_types`, `None`
+/// when `schema` is not `pg_catalog` or a type does not parse.
+fn declared_as(schema: &str, argument_types: &[&str]) -> Option<impl Fn(&[&str]) -> bool> {
     if schema != PG_CATALOG {
-        return &[];
+        return None;
     }
-    let Some(given) =
-        argument_types.iter().map(|name| PgType::parse(name)).collect::<Option<Vec<_>>>()
-    else {
-        return &[];
-    };
-    null_returning_positions(name, |declared| {
+    let given =
+        argument_types.iter().map(|name| PgType::parse(name)).collect::<Option<Vec<_>>>()?;
+    Some(move |declared: &[&str]| {
         declared.len() == given.len()
             && declared
                 .iter()
                 .zip(&given)
                 .all(|(declared, given)| PgType::parse(declared).as_ref() == Some(given))
     })
-    .unwrap_or_default()
 }

@@ -28,8 +28,10 @@ mod postgres_null_returning;
 pub(crate) mod postgres_types;
 pub(crate) mod quote_identifier;
 pub(crate) mod type_modifier;
-pub(crate) use postgres_null_returning::null_returning_positions;
-pub use postgres_null_returning::postgres_null_returning_arguments;
+pub(crate) use postgres_null_returning::{null_only_on_null_input, null_returning_positions};
+pub use postgres_null_returning::{
+    postgres_null_only_on_null_input, postgres_null_returning_arguments,
+};
 mod output_from_wildcard;
 pub(crate) use output_from_wildcard::output_from_wildcard;
 pub mod scalar_family;
