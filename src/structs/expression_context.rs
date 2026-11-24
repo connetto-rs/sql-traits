@@ -769,20 +769,17 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// ```
     /// use sql_traits::prelude::*;
     /// use sqlparser::{
-    ///     ast::{BinaryOperator, Expr, SetExpr, Statement},
+    ///     ast::{Expr, SetExpr, Statement},
     ///     dialect::PostgreSqlDialect,
     ///     parser::Parser,
     /// };
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (x INT, CHECK (x > 5));")?;
     /// let sql = "SELECT 1 FROM t AS a WHERE a.x > 3 AND x < 9";
-    /// let Statement::Query(query) = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0) else {
-    ///     unreachable!()
-    /// };
+    /// let statement = Parser::parse_sql(&PostgreSqlDialect {}, sql)?.remove(0);
+    /// let Statement::Query(query) = statement else { unreachable!() };
     /// let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
-    /// let Some(Expr::BinaryOp { left, op: BinaryOperator::And, right }) = &select.selection else {
-    ///     unreachable!()
-    /// };
+    /// let Some(Expr::BinaryOp { left, right, .. }) = &select.selection else { unreachable!() };
     /// let context = ExpressionContext::new(&query, &db, IdentifierCase::Folded)?;
     /// // The check of `t` holds on every row `a` reads, so `a.x > 3` is never false.
     /// let truth = context.truth_under(left, &[])?;

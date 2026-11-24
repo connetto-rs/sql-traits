@@ -473,6 +473,17 @@ fn sorting_and_grouping_keys_are_read_at_their_site() -> Result<(), Error> {
         (term, Some(assumed))
     })?;
     assert_eq!(truth, never_raising(Outcomes::TRUE));
+    let schema = "CREATE TABLE b (flag BOOL NOT NULL);";
+    let sql = "SELECT flag FROM b GROUP BY ROLLUP (flag) ORDER BY flag";
+    let truth = statement_truth(schema, sql, |statement| {
+        let Some(OrderByKind::Expressions(keys)) =
+            query_of(statement).order_by.as_ref().map(|order| &order.kind)
+        else {
+            panic!("an ORDER BY")
+        };
+        (&keys[0].expr, None)
+    })?;
+    assert!(truth.outcomes.null, "the grand total row sorts a NULL flag");
     let sql = "SELECT x FROM t GROUP BY ALL HAVING x > 5 AND x > 3";
     assert_eq!(query_truth(SCHEMA, sql)?, never_raising(Outcomes::TRUE));
     Ok(())
