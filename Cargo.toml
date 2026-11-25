@@ -25,6 +25,7 @@ std = [
     "sqlparser-plpgsql/std",
     "sqlparser-canonicalize?/std",
     "sqlparser-expr-eval/std",
+    "sqlparser-plpgsql-dataflow/std",
 ]
 # Adds git-backed construction: `ParserDB::from_git_url*` clones a remote
 # repository into a temporary directory and parses the SQL it contains.
@@ -61,6 +62,7 @@ serde = { version = "1.0", default-features = false, features = ["alloc", "deriv
 once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main", default-features = false, features = ["tzdb"] }
 sqlparser-expr-eval = { git = "https://github.com/connetto-rs/sqlparser-expr-eval", branch = "main", default-features = false }
+sqlparser-plpgsql-dataflow = { git = "https://github.com/connetto-rs/sqlparser-plpgsql-dataflow", branch = "main", default-features = false }
 # Lends a table attribute out of the shared table node, so the node holds the only copy.
 yoke = { version = "0.8.4", default-features = false, features = ["alloc"] }
 sqlparser-canonicalize = { git = "https://github.com/connetto-rs/sqlparser-canonicalize", branch = "main", default-features = false, optional = true }

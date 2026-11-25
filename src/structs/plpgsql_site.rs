@@ -2,11 +2,15 @@
 
 use alloc::{sync::Arc, vec::Vec};
 
+use sqlparser::ast::Expr;
+use sqlparser_plpgsql::{embedded::Case, namespace::Sql};
+
 use crate::{
     errors::LookupError,
     impls::{SiteSource, dql::scoped_roots::ScopedRoot},
     structs::{
-        EmbeddedSql, ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope, SiteFlow,
+        EmbeddedSql, ExpressionContext, ExpressionScope, ExpressionTruth, IdentifierCase,
+        PlPgSqlScope, SiteFlow,
         plpgsql_flow::{VariableRead, read_variables},
     },
     traits::DatabaseLike,
@@ -47,11 +51,79 @@ impl<'db, DB: DatabaseLike> PlPgSqlSites<'db, DB> {
     }
 }
 
+/// What a PL/pgSQL body does with the statement or expression of a
+/// [`PlPgSqlSite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlPgSqlSiteRole {
+    /// A statement the body runs.
+    Statement,
+    /// The condition of an `IF`.
+    IfCondition {
+        /// Whether an `ELSIF` or an `ELSE` holding a statement follows it.
+        followed: bool,
+    },
+    /// The condition of an `ELSIF`.
+    ElsifCondition {
+        /// Whether another `ELSIF` or an `ELSE` holding a statement follows
+        /// it.
+        followed: bool,
+    },
+    /// The subject of a simple `CASE`.
+    CaseSubject,
+    /// The values a `WHEN` of a simple `CASE` compares the subject with.
+    CaseValue,
+    /// The condition of a `WHEN` of a searched `CASE`.
+    CaseWhen {
+        /// Whether another `WHEN` or an `ELSE` follows it.
+        followed: bool,
+    },
+    /// The condition of a `WHILE` loop.
+    WhileCondition,
+    /// The `WHEN` condition of an `EXIT`.
+    ExitWhen,
+    /// The `WHEN` condition of a `CONTINUE`.
+    ContinueWhen,
+    /// The condition of an `ASSERT`.
+    AssertCondition,
+    /// The value of an assignment.
+    Assigned,
+    /// The default of a declared variable.
+    Default,
+    /// Any other expression: a returned value, a loop bound, an argument of
+    /// `RAISE`, a cursor argument, the command an `EXECUTE` runs or one of
+    /// its `USING` arguments, among others.
+    Expression,
+}
+
+impl PlPgSqlSiteRole {
+    /// Whether the body reads the site as a condition, converted to
+    /// `boolean` as PL/pgSQL converts it.
+    #[must_use]
+    pub const fn is_condition(self) -> bool {
+        matches!(
+            self,
+            Self::IfCondition { .. }
+                | Self::ElsifCondition { .. }
+                | Self::CaseWhen { .. }
+                | Self::WhileCondition
+                | Self::ExitWhen
+                | Self::ContinueWhen
+                | Self::AssertCondition
+        )
+    }
+}
+
 /// A statement or expression a PL/pgSQL body runs, with the variables in
 /// reach where PostgreSQL 18 compiles it and the path it runs under.
 #[derive(Debug, Clone)]
 pub struct PlPgSqlSite<'b, 'db, DB: DatabaseLike> {
     sql: EmbeddedSql<'b>,
+    /// The statement, expression or dynamic SQL of the body the site stands
+    /// at.
+    at: Sql<'b>,
+    role: PlPgSqlSiteRole,
+    /// The `CASE` without `ELSE` whose end the site stands for.
+    case: Option<&'b Case>,
     scope: PlPgSqlScope<'b, 'db, DB>,
     flow: Arc<SiteFlow<'b, 'db, DB>>,
     database: &'db DB,
@@ -60,11 +132,19 @@ pub struct PlPgSqlSite<'b, 'db, DB: DatabaseLike> {
 impl<'b, 'db, DB: DatabaseLike> PlPgSqlSite<'b, 'db, DB> {
     pub(crate) const fn new(
         sql: EmbeddedSql<'b>,
+        at: Sql<'b>,
+        (role, case): (PlPgSqlSiteRole, Option<&'b Case>),
         scope: PlPgSqlScope<'b, 'db, DB>,
         flow: Arc<SiteFlow<'b, 'db, DB>>,
         database: &'db DB,
     ) -> Self {
-        Self { sql, scope, flow, database }
+        Self { sql, at, role, case, scope, flow, database }
+    }
+
+    /// Returns what the body does with the [`sql`](Self::sql).
+    #[must_use]
+    pub const fn role(&self) -> PlPgSqlSiteRole {
+        self.role
     }
 
     /// Returns the SQL, a statement of the body or the `SELECT` evaluating
@@ -176,5 +256,117 @@ impl<'b, 'db, DB: DatabaseLike> PlPgSqlSite<'b, 'db, DB> {
         let mut variables = Vec::new();
         read_variables(&self.context(case)?, &self.scope, &self.sql, &mut variables)?;
         self.flow.reads(&self.scope, variables)
+    }
+
+    /// Returns whether a path from the start of the body reaches the site.
+    /// Identifiers compare under `case`.
+    ///
+    /// The walk follows the body as PostgreSQL 18 runs it, under what each
+    /// variable may hold, so a branch whose condition is never true there is
+    /// not taken. It runs once per body and `case`, for every site of one
+    /// [`PlPgSqlSites::sites`] call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`PlPgSqlSites::sites`] returns, the
+    /// relation-name lookup errors building the [`context`](Self::context)
+    /// of a site of the body runs into, and the lookup errors resolving a
+    /// reference or a call the body evaluates.
+    pub fn reached(&self, case: IdentifierCase) -> Result<bool, LookupError> {
+        Ok(self.flow.analysis(case)?.borrow().reached(self.at))
+    }
+
+    /// Returns what `expression`, a node of the [`context`](Self::context),
+    /// evaluates to where the body evaluates the site, under what each
+    /// variable may hold there, and `None` when no path reaches the site.
+    /// Identifiers compare under `case`.
+    ///
+    /// A variable holds what the paths reaching the site leave in it: its
+    /// declared type, what the body assigned, the conditions taken to get
+    /// there and, as the body starts, what
+    /// [`PlPgSqlScope`]'s variables hold on entry: a parameter of a strict
+    /// function a value, an `OUT` parameter `NULL`, and `NEW` and `OLD` the
+    /// rows the triggers executing the function fire with. Any other name
+    /// reads as [`ExpressionContext::truth_under`] reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
+    /// query, and the errors [`Self::reached`] returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::{
+    ///     ast::{SelectItem, SetExpr},
+    ///     dialect::PostgreSqlDialect,
+    /// };
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION sign_of(n integer) RETURNS text LANGUAGE plpgsql AS $$
+    ///      BEGIN
+    ///          IF n IS NULL THEN
+    ///              RETURN n > 3;
+    ///          END IF;
+    ///          RETURN 'set';
+    ///      END $$;",
+    /// )?;
+    /// let sign_of = db
+    ///     .function_by_target(TargetName::new("sign_of", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = sign_of.plpgsql_sites(&db)?;
+    /// let sites = body.sites()?;
+    /// let returned = &sites[1];
+    /// let EmbeddedSql::Expression(query) = returned.sql() else { panic!("RETURN n > 3") };
+    /// let SetExpr::Select(select) = &*query.body else { panic!("a SELECT") };
+    /// let SelectItem::UnnamedExpr(compared) = &select.projection[0] else { panic!("n > 3") };
+    /// let truth = returned.truth_under(compared, IdentifierCase::Folded)?;
+    /// assert_eq!(truth, Some(ExpressionTruth { outcomes: Outcomes::NULL, raising: Raising::Never }));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn truth_under(
+        &self,
+        expression: &Expr,
+        case: IdentifierCase,
+    ) -> Result<Option<ExpressionTruth>, LookupError> {
+        let context = self.context(case)?;
+        let mut analysis = self.flow.analysis(case)?.borrow_mut();
+        analysis.context_mut().bind(&context, expression)?;
+        Ok(analysis.truth_under(self.at, expression)?.as_ref().map(ExpressionTruth::from))
+    }
+
+    /// Returns what the condition the site evaluates is where the body
+    /// evaluates it, converted to `boolean` as PL/pgSQL converts it, which
+    /// tells whether it is always true, never true or always raising there.
+    /// `None` when no path reaches the site and for a site whose
+    /// [`role`](Self::role) is no condition. Identifiers compare under
+    /// `case`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`Self::reached`] returns.
+    pub fn condition(&self, case: IdentifierCase) -> Result<Option<ExpressionTruth>, LookupError> {
+        let (true, EmbeddedSql::Expression(query)) = (self.role.is_condition(), self.sql) else {
+            return Ok(None);
+        };
+        let mut analysis = self.flow.analysis(case)?.borrow_mut();
+        Ok(analysis.condition(query)?.as_ref().map(ExpressionTruth::from))
+    }
+
+    /// Returns, for the subject of a simple `CASE` without `ELSE` and the
+    /// first `WHEN` of a searched one, whether a path reaches the end of the
+    /// `CASE` with no `WHEN` matched, where PostgreSQL raises
+    /// `case_not_found`, and `None` for any other site. Identifiers compare
+    /// under `case`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`Self::reached`] returns.
+    pub fn unmatched(&self, case: IdentifierCase) -> Result<Option<bool>, LookupError> {
+        let Some(statement) = self.case else { return Ok(None) };
+        Ok(Some(self.flow.analysis(case)?.borrow().unmatched(statement)))
     }
 }
