@@ -109,10 +109,16 @@ fn a_search_path_is_stored_as_postgresql_quotes_its_entries() {
             (Some("t"), None, "search_path", "api, \"a, b\""),
         ]
     );
-    assert!(matches!(
-        RoleSetting::new(None, None, "search_path", "api, \"open"),
-        Err(Error::InvalidSearchPath { value }) if value == "api, \"open"
-    ));
+    // PostgreSQL 18.7 refused set_config('search_path', 'api, "open', false)
+    // with 22023 and this message.
+    let refused = RoleSetting::new(None, None, "search_path", "api, \"open")
+        .expect_err("PostgreSQL refuses the list");
+    assert!(matches!(&refused, Error::InvalidSearchPath { value } if value == "api, \"open"));
+    let postgres = refused.postgres_error().expect("a PostgreSQL refusal");
+    assert_eq!(
+        (postgres.sqlstate().as_str(), postgres.message()),
+        ("22023", "invalid value for parameter \"search_path\": \"api, \"open\"")
+    );
 }
 
 #[test]
@@ -402,4 +408,11 @@ fn from_current_is_refused_where_the_session_value_is_unknown() {
             "{sql} is refused"
         );
     }
+
+    // A list is printed with quoting rules of each setting's own, modelled
+    // for `search_path` alone.
+    assert!(matches!(
+        refusal("CREATE ROLE r; SET DateStyle = iso, mdy; ALTER ROLE r SET DateStyle FROM CURRENT;"),
+        Error::UnknownCurrentSetting { setting, .. } if setting == "datestyle"
+    ));
 }
