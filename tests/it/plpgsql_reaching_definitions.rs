@@ -34,6 +34,7 @@ fn rendered(definition: &Definition<'_, '_, ParserDB>) -> String {
     let source = match definition.source() {
         DefinitionSource::Incoming => "incoming".to_owned(),
         DefinitionSource::Null => "null".to_owned(),
+        DefinitionSource::False => "false".to_owned(),
         DefinitionSource::Value(value) => value.to_string(),
         DefinitionSource::QueryOutput { statement, output, rows } => {
             format!("{output:?} {rows:?} of {statement}")
@@ -54,6 +55,7 @@ fn rendered(definition: &Definition<'_, '_, ParserDB>) -> String {
         DefinitionSource::PortalName => "portal name".to_owned(),
         DefinitionSource::Diagnostics(item) => format!("{item:?}"),
         DefinitionSource::CallOutput { call, argument } => format!("argument {argument} of {call}"),
+        DefinitionSource::Found(found) => format!("found {found:?}"),
         DefinitionSource::Unknown => "unknown".to_owned(),
     };
     let part: String = definition
@@ -585,7 +587,8 @@ fn a_case_without_an_else_raises_where_no_when_holds() {
 }
 
 /// The `case_not_found` a `CASE` without an `ELSE` raises is still a raise,
-/// so a handler of it sees what reached the `CASE` and what a `WHEN` wrote.
+/// so a handler of it sees what reached the `CASE` where no `WHEN` matched,
+/// and not what a `WHEN` that completed wrote.
 #[test]
 fn a_handler_of_the_missing_else_sees_every_state_that_raised() {
     assert_eq!(
@@ -599,7 +602,7 @@ fn a_handler_of_the_missing_else_sees_every_state_that_raised() {
               END;
              END"
         ),
-        [vec![read("s", &["'SELECT 1'", "'SELECT 2'"])]]
+        [vec![read("s", &["'SELECT 1'"])]]
     );
 }
 
@@ -642,6 +645,25 @@ fn a_cursor_loop_names_its_portal_while_it_runs() {
     );
 }
 
+/// `EXIT` leaving a cursor loop for an enclosing one gives the cursor its
+/// null back, as leaving the cursor loop itself does.
+#[test]
+fn a_labelled_exit_through_a_cursor_loop_gives_its_null_back() {
+    assert_eq!(
+        reaching(
+            "DECLARE c CURSOR FOR SELECT name FROM t;
+             BEGIN
+              c := NULL;
+              <<outer>> LOOP
+               FOR r IN c LOOP EXIT outer; END LOOP;
+              END LOOP;
+              EXECUTE 'CLOSE ' || quote_ident(c);
+             END"
+        ),
+        [vec![read("c", &["NULL"])]]
+    );
+}
+
 /// A declaration in a loop runs its default on every iteration, so the
 /// default reads what the previous iteration left.
 #[test]
@@ -670,8 +692,9 @@ fn a_declaration_in_a_loop_reads_the_previous_iteration() {
     );
 }
 
-/// An element write keeps the rest of the array, a value nothing in the
-/// body tells is unknown, and nothing after `RAISE EXCEPTION` runs.
+/// An element write keeps the rest of the array, `FOUND` holds the `false`
+/// each call starts with until a statement sets it, and nothing after
+/// `RAISE EXCEPTION` runs.
 #[test]
 fn elements_unknowns_and_raises() {
     assert_eq!(
@@ -689,10 +712,27 @@ fn elements_unknowns_and_raises() {
         [
             vec![
                 read("a", &["ARRAY['SELECT 1']", "[q] p", "[:] ARRAY[p]", "[1].f p"]),
-                read("found", &["unknown"]),
+                read("found", &["false"]),
             ],
             vec![read("p", &["unreachable"])],
         ]
+    );
+}
+
+/// A statement processing rows and a loop ending both set `FOUND`, and a
+/// path setting neither keeps the `false` the call started with.
+#[test]
+fn found_holds_what_the_last_statement_setting_it_found() {
+    assert_eq!(
+        reaching(
+            "BEGIN
+              IF q > 0 THEN PERFORM 1; END IF;
+              EXECUTE 'SELECT 1' USING FOUND;
+              FOR i IN 1..q LOOP END LOOP;
+              EXECUTE 'SELECT 2' USING FOUND;
+             END"
+        ),
+        [vec![read("found", &["false", "found Rows"])], vec![read("found", &["found Iterated"])],]
     );
 }
 

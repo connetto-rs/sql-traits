@@ -1,22 +1,21 @@
 //! The values a PL/pgSQL body may give its variables, and which of them may
 //! reach each place the body reads one.
 
-use alloc::{
-    borrow::Cow,
-    boxed::Box,
-    collections::{BTreeMap, BTreeSet},
-    string::String,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::{fmt, ops::ControlFlow, sync::atomic::AtomicBool};
 
 use once_cell::race::OnceBox;
 use sqlparser::ast::{ArgMode, Expr, Statement, Value, Visit};
+use sqlparser_plpgsql::namespace::Sql;
+use sqlparser_plpgsql_dataflow::{
+    Flow,
+    reaching::{Slot, State},
+};
+pub use sqlparser_plpgsql_dataflow::{Found, Output, Rows};
 
 use crate::{
     errors::LookupError,
-    impls::{SiteKey, dql::scoped_roots::ScopedRoot},
+    impls::dql::scoped_roots::ScopedRoot,
     structs::{
         ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase, OperandType,
         PlPgSqlScope, PlPgSqlVariable, VariableKind, row_of,
@@ -34,36 +33,6 @@ pub(crate) fn is_record(variable: &PlPgSqlVariable<'_>) -> bool {
         Ok(OperandType::Known { type_name, .. })
             if type_name.name() == "record" && type_name.schema() == Some(PG_CATALOG)
     )
-}
-
-/// Which part of what a query or a dynamic command returns a definition
-/// assigns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Output {
-    /// The output column at this position, from 0, as each of several
-    /// targets and a lone scalar target take one.
-    Ordinal(usize),
-    /// The whole row, as a lone row or record target takes it.
-    Row,
-}
-
-/// Which rows of a query or a dynamic command a definition assigns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Rows {
-    /// The first row, as `INTO` assigns it. Without `STRICT`, a command
-    /// returning no row assigns a null instead, which this definition stands
-    /// for too. With `STRICT`, any row count but one raises an error and
-    /// assigns nothing, and so does more than one row of an `INSERT`,
-    /// `UPDATE`, `DELETE` or `MERGE` written in the body, `STRICT` or not.
-    First {
-        /// Whether `INTO STRICT` is written.
-        strict: bool,
-    },
-    /// Every row in turn, as a `FOR` loop assigns them to its targets.
-    Each,
-    /// No row, as a `FOR` loop over none leaves its targets: each a null, a
-    /// record taking the query's columns all the same.
-    Empty,
 }
 
 /// One step from a variable into the part of it a definition assigns.
@@ -134,6 +103,8 @@ pub enum DefinitionSource<'r, 'db> {
     /// The null a declaration without a default, an output argument and `$0`
     /// hold.
     Null,
+    /// The `false` PostgreSQL gives `FOUND` as each call starts.
+    False,
     /// The value of an expression, as an assignment or a declaration's
     /// default gives it.
     Value(Cow<'r, Expr>),
@@ -208,22 +179,11 @@ pub enum DefinitionSource<'r, 'db> {
         /// The argument's position among those written, from 0.
         argument: usize,
     },
-    /// A value nothing in the body tells, such as `FOUND` and a cursor
-    /// parameter.
+    /// Whether the step found a row, which a statement, `FETCH`, `MOVE`,
+    /// `PERFORM`, `RETURN QUERY` and a `FOR` or `FOREACH` loop give `FOUND`.
+    Found(Found),
+    /// A value nothing in the body tells, such as a cursor parameter.
     Unknown,
-}
-
-/// The definitions that may reach one point of a body, by variable id, a
-/// variable absent from the map holding only its entry definition.
-pub(crate) type State = BTreeMap<usize, BTreeSet<Slot>>;
-
-/// One definition a [`State`] holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Slot {
-    /// The value the variable holds before the body writes it.
-    Entry,
-    /// The written definition at this index of [`ValueFlow::definitions`].
-    Written(usize),
 }
 
 /// A definition a statement of the body writes.
@@ -235,19 +195,20 @@ pub(crate) struct Written<'r, 'db, DB: DatabaseLike> {
     /// The names and path the SQL of the source is evaluated under, `None`
     /// for a source without SQL.
     pub(crate) scope: Option<PlPgSqlScope<'r, 'db, DB>>,
-    /// The definitions reaching the point where the source is evaluated,
-    /// `None` while no path reaches it.
-    pub(crate) inputs: Option<State>,
+    /// The definitions reaching the point where the source is evaluated.
+    pub(crate) inputs: State,
 }
 
 /// Every definition of a body and the definitions reaching each statement,
 /// expression and dynamic SQL of it.
 #[derive(Debug)]
 pub(crate) struct ValueFlow<'r, 'db, DB: DatabaseLike> {
+    /// The written definitions, by their index among the walk's, which
+    /// [`Slot::Written`] names.
     pub(crate) definitions: Vec<Written<'r, 'db, DB>>,
     /// The definitions reaching each statement, expression and dynamic SQL
     /// some path reaches, where the body evaluates it.
-    pub(crate) points: BTreeMap<SiteKey, State>,
+    pub(crate) flow: Flow<'r, State>,
     /// The query each cursor declared with one opens, by the cursor
     /// variable's id.
     pub(crate) cursors: BTreeMap<usize, CursorQuery<'r, 'db, DB>>,
@@ -323,8 +284,9 @@ pub(crate) struct Round<'r> {
     pub(crate) untyped: AtomicBool,
 }
 
-/// The slot of [`ValueFlow::rows`] for `case`.
-const fn case_slot(case: IdentifierCase) -> usize {
+/// The slot of a value kept per identifier case, such as
+/// [`ValueFlow::rows`], for `case`.
+pub(crate) const fn case_slot(case: IdentifierCase) -> usize {
     match case {
         IdentifierCase::AsWritten => 0,
         IdentifierCase::Folded => 1,
@@ -337,9 +299,6 @@ const fn case_slot(case: IdentifierCase) -> usize {
 pub(crate) struct CursorQuery<'r, 'db, DB: DatabaseLike> {
     /// The query.
     pub(crate) statement: &'r Statement,
-    /// The query as a point of the flow, which every opening of the cursor
-    /// reaches.
-    pub(crate) key: SiteKey,
     /// The names and path the query is evaluated under.
     pub(crate) scope: PlPgSqlScope<'r, 'db, DB>,
 }
@@ -361,7 +320,7 @@ pub(crate) enum FlowPoint<'r, 'db, DB: DatabaseLike> {
         /// The flow, computed on first use.
         flow: Arc<dyn FlowSource<DB> + 'r>,
         /// The statement, expression or dynamic SQL.
-        key: SiteKey,
+        sql: Sql<'r>,
     },
     /// Where the definition at `index` evaluates its source.
     Definition {
@@ -378,7 +337,7 @@ pub(crate) enum FlowPoint<'r, 'db, DB: DatabaseLike> {
         /// The flow.
         flow: &'r ValueFlow<'r, 'db, DB>,
         /// The query.
-        key: SiteKey,
+        statement: &'r Statement,
         /// The round solving the rows.
         round: &'r Round<'r>,
     },
@@ -398,15 +357,15 @@ impl<DB: DatabaseLike> FlowPoint<'_, '_, DB> {
     /// What reaches the point.
     pub(crate) fn reaching(&self) -> Result<Reached<'_, DB>, LookupError> {
         Ok(match self {
-            Self::Site { flow, key } => {
+            Self::Site { flow, sql } => {
                 let flow = flow.flow()?;
-                Reached { flow, state: flow.points.get(key), round: None }
+                Reached { flow, state: flow.flow.at(*sql), round: None }
             }
             Self::Definition { flow, index, round } => {
-                Reached { flow, state: flow.definitions[*index].inputs.as_ref(), round: *round }
+                Reached { flow, state: Some(&flow.definitions[*index].inputs), round: *round }
             }
-            Self::Cursor { flow, key, round } => {
-                Reached { flow, state: flow.points.get(key), round: Some(round) }
+            Self::Cursor { flow, statement, round } => {
+                Reached { flow, state: flow.flow.at(Sql::Statement(statement)), round: Some(round) }
             }
         })
     }
@@ -436,7 +395,7 @@ impl<DB: DatabaseLike> ValueFlow<'_, '_, DB> {
                 ..
             } if written.scope.is_some() => Some(RowSource::Written(index)),
             DefinitionSource::CursorOutput { cursor, output: Output::Row } => {
-                let inputs = written.inputs.as_ref()?;
+                let inputs = &written.inputs;
                 let own = inputs.get(&cursor.id()).is_some_and(|slots| {
                     slots.iter().all(|slot| {
                         matches!(slot, Slot::Written(name) if matches!(
@@ -477,8 +436,8 @@ impl<DB: DatabaseLike> ValueFlow<'_, '_, DB> {
                     RowSource::Written(index) => {
                         FlowPoint::Definition { flow: self, index: *index, round: Some(&round) }
                     }
-                    RowSource::Cursor(id) => {
-                        FlowPoint::Cursor { flow: self, key: self.cursors[id].key, round: &round }
+                    RowSource::Cursor(_) => {
+                        FlowPoint::Cursor { flow: self, statement, round: &round }
                     }
                 };
                 let typed = row_of(statement, &(*scope).clone().at(point), case, &round);
@@ -568,10 +527,10 @@ fn entry_source(kind: &VariableKind) -> &'static DefinitionSource<'static, 'stat
         VariableKind::Parameter { .. } | VariableKind::Trigger | VariableKind::Handler => {
             &DefinitionSource::Incoming
         }
+        VariableKind::Found => &DefinitionSource::False,
         // A declared variable, cursor, loop index and loop record are
         // written where they are declared, before anything reads them.
-        VariableKind::Found
-        | VariableKind::Declared { .. }
+        VariableKind::Declared { .. }
         | VariableKind::Cursor
         | VariableKind::CursorParameter
         | VariableKind::LoopIndex
@@ -681,7 +640,8 @@ enum DefinitionIdKind {
 ///
 /// A variable's entry definition stands for the value it holds before the
 /// body writes it, as [`DefinitionSource::Incoming`],
-/// [`DefinitionSource::Null`] or [`DefinitionSource::Unknown`].
+/// [`DefinitionSource::Null`], [`DefinitionSource::False`] or
+/// [`DefinitionSource::Unknown`].
 #[derive(Debug, Clone)]
 pub struct Definition<'r, 'db, DB: DatabaseLike> {
     flow: &'r ValueFlow<'r, 'db, DB>,
@@ -794,10 +754,12 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
             }
             DefinitionSource::Incoming
             | DefinitionSource::Null
+            | DefinitionSource::False
             | DefinitionSource::CursorOutput { .. }
             | DefinitionSource::CursorName
             | DefinitionSource::PortalName
             | DefinitionSource::Diagnostics(_)
+            | DefinitionSource::Found(_)
             | DefinitionSource::Unknown => return Ok(Vec::new()),
         }
         let Some(scope) = &written.scope else { return Ok(Vec::new()) };
@@ -814,7 +776,7 @@ impl<'r, 'db, DB: DatabaseLike> Definition<'r, 'db, DB> {
             let context = ExpressionContext::for_root(root, &plpgsql, database, case)?;
             read_variables(&context, scope, expression, &mut variables)?;
         }
-        Ok(self.flow.reaching(variables, written.inputs.as_ref()))
+        Ok(self.flow.reaching(variables, Some(&written.inputs)))
     }
 }
 

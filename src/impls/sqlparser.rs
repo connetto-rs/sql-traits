@@ -32,6 +32,7 @@ mod plpgsql_body;
 mod role_membership;
 mod schema;
 mod sequence;
+mod site_roles;
 mod unique_constraint;
 mod user_defined_type;
 mod value_flow;
@@ -44,7 +45,7 @@ pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub(crate) use create_table::parameter_value;
 pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;
-pub(crate) use dynamic_sites::{BodyNames, SiteKey, SiteSource};
+pub(crate) use dynamic_sites::{BodyNames, SiteSource, plpgsql_sql_sites};
 pub(crate) use foreign_key_constraint::{foreign_key_enforced, foreign_keys_stored_alike};
 pub(crate) use function_body::{
     atomic_statements, body_calls, body_expression, body_reads, body_site_source,
@@ -61,4 +62,4 @@ pub(crate) use maintenance_body::maintenance_body;
 pub(crate) use user_defined_type::{
     bound_user_type, user_type_holds, user_type_in_schema, user_type_named,
 };
-pub(crate) use value_flow::value_flow;
+pub(crate) use value_flow::{value_analysis, value_flow};

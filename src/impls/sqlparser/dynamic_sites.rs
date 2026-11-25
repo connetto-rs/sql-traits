@@ -29,14 +29,15 @@ use super::{
     },
     function_body::{SqlBody, run_time_path},
     plpgsql_body::constant_command,
+    site_roles::site_roles,
 };
 use crate::{
     errors::LookupError,
     structs::{
         CallResolution, DynamicExecution, EmbeddedSql, ExpressionContext, ExpressionScope,
-        IdentifierCase, OperandType, PlPgSqlScope, PlPgSqlSite, PlPgSqlVariable, SiteFlow,
-        SiteScope, TargetName, TypeKind, VariableKind, array_of, column_type, declared_type,
-        declared_type_named, plpgsql_flow::FlowPoint,
+        IdentifierCase, OperandType, PlPgSqlScope, PlPgSqlSite, PlPgSqlSiteRole, PlPgSqlVariable,
+        SiteFlow, SiteScope, TargetName, TypeKind, VariableKind, array_of, column_type,
+        declared_type, declared_type_named, plpgsql_flow::FlowPoint,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike},
     utils::{
@@ -384,7 +385,8 @@ fn scoped_sites<'b, 'db, DB: DatabaseLike>(
             let key = SiteKey::of(site.sql);
             // Only a statement setting the path goes unrecorded.
             let path = paths.remove(&key)?;
-            let point = FlowPoint::Site { flow: Arc::<SiteFlow<'b, 'db, DB>>::clone(flow), key };
+            let point =
+                FlowPoint::Site { flow: Arc::<SiteFlow<'b, 'db, DB>>::clone(flow), sql: site.sql };
             Some((site.sql, PlPgSqlScope::new(names, site.namespace, path).at(point)))
         })
         .collect())
@@ -396,28 +398,34 @@ fn scoped_sites<'b, 'db, DB: DatabaseLike>(
 /// # Errors
 ///
 /// Returns the errors of [`scoped_sites`].
-fn plpgsql_sql_sites<'b, 'db, DB: DatabaseLike>(
+pub(crate) fn plpgsql_sql_sites<'b, 'db, DB: DatabaseLike>(
     names: &'b BodyNames<'db, DB>,
     block: &'b Block,
     hex_strings_may_be_integers: bool,
     flow: &Arc<SiteFlow<'b, 'db, DB>>,
 ) -> Result<Vec<PlPgSqlSite<'b, 'db, DB>>, LookupError> {
     let database = names.database;
+    let roles = site_roles(block);
     let mut found = Vec::new();
-    for (sql, scope) in scoped_sites(names, block, hex_strings_may_be_integers, flow)? {
-        match sql {
+    for (at, scope) in scoped_sites(names, block, hex_strings_may_be_integers, flow)? {
+        let site =
+            |sql, role, scope| PlPgSqlSite::new(sql, at, role, scope, Arc::clone(flow), database);
+        match at {
             Sql::Statement(statement) => {
-                let sql = EmbeddedSql::Statement(statement);
-                found.push(PlPgSqlSite::new(sql, scope, Arc::clone(flow), database));
+                let role = (PlPgSqlSiteRole::Statement, None);
+                found.push(site(EmbeddedSql::Statement(statement), role, scope));
             }
             Sql::Expression(query) => {
-                let sql = EmbeddedSql::Expression(query);
-                found.push(PlPgSqlSite::new(sql, scope, Arc::clone(flow), database));
+                let role = roles
+                    .get(&core::ptr::from_ref(query).addr())
+                    .copied()
+                    .unwrap_or((PlPgSqlSiteRole::Expression, None));
+                found.push(site(EmbeddedSql::Expression(query), role, scope));
             }
             Sql::Dynamic(dynamic) => {
                 for query in iter::once(&*dynamic.command).chain(&dynamic.arguments) {
-                    let sql = EmbeddedSql::Expression(query);
-                    found.push(PlPgSqlSite::new(sql, scope.clone(), Arc::clone(flow), database));
+                    let role = (PlPgSqlSiteRole::Expression, None);
+                    found.push(site(EmbeddedSql::Expression(query), role, scope.clone()));
                 }
             }
         }

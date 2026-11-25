@@ -175,6 +175,7 @@ mod persisted_names_and_collations;
 mod plpgsql_dynamic_execution;
 mod plpgsql_name_collisions;
 mod plpgsql_reaching_definitions;
+mod plpgsql_site_truth;
 mod policy_applies_to_role;
 mod policy_clause_analysis;
 mod policy_literals;

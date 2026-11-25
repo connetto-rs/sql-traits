@@ -92,7 +92,9 @@ pub(crate) use expression_context::{
 };
 pub use expression_scope::ExpressionScope;
 pub use expression_truth::{Assumption, ExpressionTruth, Raising};
-pub(crate) use expression_truth::{domain_truth, site_truth, table_truth, validated_checks};
+pub(crate) use expression_truth::{
+    BodyTruth, domain_truth, site_truth, table_truth, validated_checks,
+};
 pub use fingerprint::{AlgorithmId, FingerprintError, SchemaFingerprint, canonical_bytes_v1};
 pub use foreign_table_source::ForeignTableSource;
 pub use function_body::FunctionBody;
@@ -115,11 +117,11 @@ pub use operator_resolution::{
 };
 pub use partition_bound::{ListDatum, PartitionBound, RangeDatum};
 pub use plpgsql_flow::{
-    Definition, DefinitionId, DefinitionSource, DiagnosticsItem, Output, Reaching, Rows,
+    Definition, DefinitionId, DefinitionSource, DiagnosticsItem, Found, Output, Reaching, Rows,
     TargetStep, VariableRead,
 };
 pub use plpgsql_scope::{PlPgSqlScope, PlPgSqlVariable, VariableKind};
-pub use plpgsql_site::{PlPgSqlSite, PlPgSqlSites};
+pub use plpgsql_site::{PlPgSqlSite, PlPgSqlSiteRole, PlPgSqlSites};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;

@@ -1,17 +1,23 @@
 //! The places a function body runs SQL text it builds at run time.
 
 use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
+use core::{cell::RefCell, fmt};
 
 use once_cell::race::OnceBox;
 use sqlparser::ast::Expr;
 use sqlparser_plpgsql::embedded::Block;
+use sqlparser_plpgsql_dataflow::values::Analysis;
 
 use crate::{
     errors::LookupError,
-    impls::{BodyNames, SiteSource, dql::scoped_roots::ScopedRoot, value_flow},
+    impls::{
+        BodyNames, SiteSource, dql::scoped_roots::ScopedRoot, plpgsql_sql_sites, value_analysis,
+        value_flow,
+    },
     structs::{
-        ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope, PlPgSqlVariable,
-        plpgsql_flow::{FlowSource, ValueFlow, VariableRead, read_variables},
+        BodyTruth, ExpressionContext, ExpressionScope, IdentifierCase, PlPgSqlScope,
+        PlPgSqlVariable,
+        plpgsql_flow::{FlowSource, ValueFlow, VariableRead, case_slot, read_variables},
     },
     traits::DatabaseLike,
 };
@@ -87,13 +93,29 @@ impl<DB: DatabaseLike> Clone for SiteScope<'_, '_, DB> {
 /// The value flow of one PL/pgSQL body, which the sites of one
 /// [`DynamicExecutionSites::sites`] or
 /// [`PlPgSqlSites::sites`](crate::structs::PlPgSqlSites::sites) call share
-/// and the first read or record field typed computes.
-#[derive(Debug)]
+/// and the first read or record field typed computes, and the walk with the
+/// value guarantees domain under each identifier case, which the first truth
+/// read under that case computes.
 pub(crate) struct SiteFlow<'b, 'db, DB: DatabaseLike> {
     names: &'b BodyNames<'db, DB>,
     block: &'b Block,
     hex_strings_may_be_integers: bool,
     flow: OnceBox<Result<ValueFlow<'b, 'db, DB>, LookupError>>,
+    analyses: [OnceBox<Result<BodyAnalysis<'b, 'db, DB>, LookupError>>; 3],
+}
+
+/// The walk of a body with the value guarantees domain.
+pub(crate) type BodyAnalysis<'b, 'db, DB> = RefCell<Analysis<'b, BodyTruth<'b, 'db, DB>>>;
+
+impl<DB: DatabaseLike> fmt::Debug for SiteFlow<'_, '_, DB> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SiteFlow")
+            .field("names", self.names)
+            .field("block", self.block)
+            .field("flow", &self.flow)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'b, 'db, DB: DatabaseLike> SiteFlow<'b, 'db, DB> {
@@ -102,7 +124,13 @@ impl<'b, 'db, DB: DatabaseLike> SiteFlow<'b, 'db, DB> {
         block: &'b Block,
         hex_strings_may_be_integers: bool,
     ) -> Self {
-        Self { names, block, hex_strings_may_be_integers, flow: OnceBox::new() }
+        Self {
+            names,
+            block,
+            hex_strings_may_be_integers,
+            flow: OnceBox::new(),
+            analyses: [OnceBox::new(), OnceBox::new(), OnceBox::new()],
+        }
     }
 
     /// The value flow of the body, computed on the first call.
@@ -110,6 +138,33 @@ impl<'b, 'db, DB: DatabaseLike> SiteFlow<'b, 'db, DB> {
         self.flow
             .get_or_init(|| {
                 Box::new(value_flow(self.names, self.block, self.hex_strings_may_be_integers))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// The walk of the body with the value guarantees domain, its sites
+    /// compared under `case`, computed on the first call under `case`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors
+    /// [`PlPgSqlSites::sites`](crate::structs::PlPgSqlSites::sites)
+    /// returns, the relation-name lookup errors building the context of a
+    /// site runs into, and the lookup errors resolving a reference or a call
+    /// the walk reads.
+    pub(crate) fn analysis(
+        self: &Arc<Self>,
+        case: IdentifierCase,
+    ) -> Result<&BodyAnalysis<'b, 'db, DB>, LookupError> {
+        self.analyses[case_slot(case)]
+            .get_or_init(|| {
+                let (names, block, hex) =
+                    (self.names, self.block, self.hex_strings_may_be_integers);
+                let analyzed = plpgsql_sql_sites(names, block, hex, self)
+                    .and_then(|sites| BodyTruth::new(names, &sites, case))
+                    .and_then(|context| value_analysis(names, block, hex, context));
+                Box::new(analyzed.map(RefCell::new))
             })
             .as_ref()
             .map_err(Clone::clone)

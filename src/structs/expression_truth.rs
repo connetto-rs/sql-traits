@@ -55,6 +55,10 @@ use crate::{
     },
 };
 
+mod body;
+
+pub(crate) use body::BodyTruth;
+
 /// What an expression can evaluate to on the rows of a table.
 ///
 /// A `CHECK` admits a row when its expression is true or `NULL`, so it
@@ -221,7 +225,7 @@ pub(crate) fn table_truth<'a, DB: DatabaseLike>(
 /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another root,
 /// and the lookup errors resolving a reference, a call or a check raises.
 pub(crate) fn site_truth<'a, DB: DatabaseLike>(
-    context: &'a ExpressionContext<'_, '_, DB>,
+    context: &ExpressionContext<'_, 'a, DB>,
     expression: &Expr,
     assumptions: &[Assumption<'a, DB>],
 ) -> Result<ExpressionTruth, LookupError> {
@@ -314,6 +318,26 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         expression: &Expr,
         assumptions: &[Assumption<'a, DB>],
     ) -> Result<ExpressionTruth, LookupError> {
+        let guarantees = self.guarantees(dialect, options, assumptions)?;
+        // No row satisfies every guarantee, so the expression meets no row.
+        if guarantees.is_impossible() {
+            return Ok(ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Never });
+        }
+        self.reading = self.caller;
+        self.source = self.own.map_or_else(|| self.caller_source(), Source::Check);
+        let evaluation = evaluate(expression, dialect, options, &mut self, &guarantees)?;
+        Ok(ExpressionTruth::from(&evaluation))
+    }
+
+    /// What the domain checks, the generated columns, the checks of the
+    /// tables read and the `assumptions` guarantee about the values the read
+    /// names, under `dialect` and its `options`.
+    fn guarantees<D: EvalDialect>(
+        &mut self,
+        dialect: &D,
+        options: &D::Options,
+        assumptions: &[Assumption<'a, DB>],
+    ) -> Result<Guarantees<usize>, LookupError> {
         let database = self.database;
         let mut guarantees = self.domain_guarantees(dialect, options)?;
         self.value = self.read_value;
@@ -369,7 +393,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             for &(read, column, expression) in &generated {
                 self.reading = Some(read);
                 self.source = Source::Generated(column);
-                let evaluation = evaluate(expression, dialect, options, &mut self, &guarantees)?;
+                let evaluation = evaluate(expression, dialect, options, &mut *self, &guarantees)?;
                 let held = self.generated(column, evaluation)?;
                 if let Some(named) = self.column_named(read, column) {
                     guarantees.restrict(Subject::Reference(named), held);
@@ -388,20 +412,13 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                     }
                 };
                 guarantees =
-                    implied(expression, outcomes, dialect, options, &mut self, &guarantees)?;
+                    implied(expression, outcomes, dialect, options, &mut *self, &guarantees)?;
             }
             if guarantees == before || guarantees.is_impossible() {
                 break;
             }
         }
-        // No row satisfies every guarantee, so the expression meets no row.
-        if guarantees.is_impossible() {
-            return Ok(ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Never });
-        }
-        self.reading = self.caller;
-        self.source = self.own.map_or_else(|| self.caller_source(), Source::Check);
-        let evaluation = evaluate(expression, dialect, options, &mut self, &guarantees)?;
-        Ok(ExpressionTruth::from(&evaluation))
+        Ok(guarantees)
     }
 
     /// What the checks of the domains of every named value guarantee, each
@@ -506,15 +523,28 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// evaluator reads.
     fn bind_site(
         &mut self,
-        context: &'a ExpressionContext<'_, '_, DB>,
+        context: &ExpressionContext<'_, 'a, DB>,
         expression: &Expr,
         site: &mut Site<'a, DB>,
     ) -> Result<(), LookupError> {
         if !context.is_node(expression) {
             return Err(LookupError::ExpressionNotInQuery { expression: expression.to_string() });
         }
+        self.bind_nodes(context, expression, 0, site)
+    }
+
+    /// Binds into `site` the references and calls `root` writes as deep as
+    /// `depth` queries in it, and no deeper. `root` is `context`'s root.
+    fn bind_nodes<N: sqlparser::ast::Visit + ?Sized>(
+        &mut self,
+        context: &ExpressionContext<'_, 'a, DB>,
+        root: &N,
+        depth: usize,
+        site: &mut Site<'a, DB>,
+    ) -> Result<(), LookupError> {
         let mut visitor = TopLevel {
             depth: 0,
+            floor: depth,
             each: |node: &Expr| -> Result<(), LookupError> {
                 let named = match node {
                     Expr::Function(call) => {
@@ -535,7 +565,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                 Ok(())
             },
         };
-        match walk(expression, &mut visitor) {
+        match walk(root, &mut visitor) {
             ControlFlow::Break(error) => Err(error),
             ControlFlow::Continue(()) => Ok(()),
         }
@@ -543,7 +573,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
 
     /// The functions the call `node` runs, as `context` selects them.
     fn site_call(
-        context: &'a ExpressionContext<'_, '_, DB>,
+        context: &ExpressionContext<'_, 'a, DB>,
         node: &Expr,
     ) -> Result<Vec<&'a DB::Function>, LookupError> {
         let Some(application) = context.call(node)? else { return Ok(Vec::new()) };
@@ -564,7 +594,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// `context` resolves it.
     fn site_placeholder(
         &mut self,
-        context: &'a ExpressionContext<'_, '_, DB>,
+        context: &ExpressionContext<'_, 'a, DB>,
         node: &Expr,
         placeholder: &str,
     ) -> Result<usize, LookupError> {
@@ -585,7 +615,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// resolves it, `None` for a node the evaluator reads no value of.
     fn site_named(
         &mut self,
-        context: &'a ExpressionContext<'_, '_, DB>,
+        context: &ExpressionContext<'_, 'a, DB>,
         node: &Expr,
         parts: &[Ident],
     ) -> Result<Option<usize>, LookupError> {
@@ -622,8 +652,9 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         };
         let key = match definition {
             ColumnDefinition::Base { table, column, database: catalog } => {
-                let own_catalog = ptr::eq(catalog, database);
-                if own_catalog
+                let held =
+                    if ptr::eq(catalog, database) { self.held(table, column)? } else { None };
+                if let Some((table, column)) = held
                     && !built
                     && let Some(relation) = relation.filter(|slot| {
                         slot.relation.table
@@ -651,9 +682,9 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                     .engine
                     .column(column, catalog, &mut self.collations, &self.enums)?
                     .with_null(true);
-                let data_type = column.data_type(catalog);
-                let domain = own_catalog.then(|| data_type.domain(catalog)).flatten();
-                let type_name = Some(data_type.name(catalog).into_owned());
+                let type_name = Some(column.data_type(catalog).name(catalog).into_owned());
+                let domain =
+                    held.and_then(|(_, column)| column.data_type(database).domain(database));
                 return Ok(Some(self.named(key, evaluation, type_name, domain)));
             }
             ColumnDefinition::Parameter { function, ordinal } => {
@@ -675,7 +706,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// any, which `node` reads.
     fn variable(
         &mut self,
-        context: &'a ExpressionContext<'_, '_, DB>,
+        context: &ExpressionContext<'_, 'a, DB>,
         node: &Expr,
         variable: &PlPgSqlVariable<'_>,
         fields: Vec<String>,
@@ -692,6 +723,21 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             .operand(&context.type_of(node)?, self.database, &self.enums)
             .with_null(!never_null);
         Ok(self.named(Key::Variable { id: variable.id(), fields }, evaluation, None, None))
+    }
+
+    /// `table` and its `column` as the database holds them, `None` for a
+    /// table it does not hold.
+    fn held(
+        &self,
+        table: &DB::Table,
+        column: &DB::Column,
+    ) -> Result<Option<HeldColumn<'a, DB>>, LookupError> {
+        let database = self.database;
+        let Some(table) = database.tables().find(|held| ptr::eq(*held, table)) else {
+            return Ok(None);
+        };
+        let column = table.columns(database)?.find(|held| ptr::eq(*held, column));
+        Ok(column.map(|column| (table, column)))
     }
 
     /// The value `expression` reads, `None` for a node that is no reference
@@ -723,10 +769,15 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     }
 }
 
-/// Hands `each` every expression a node holds outside the queries in it,
-/// the nodes the evaluator reads, until `each` fails.
+/// A column of a table the database holds, with the table.
+type HeldColumn<'a, DB> = (&'a <DB as DatabaseLike>::Table, &'a <DB as DatabaseLike>::Column);
+
+/// Hands `each` every expression a node holds outside the queries nested
+/// deeper than `floor` in it, the nodes the evaluator reads, until `each`
+/// fails.
 struct TopLevel<F> {
     depth: usize,
+    floor: usize,
     each: F,
 }
 
@@ -744,7 +795,7 @@ impl<F: FnMut(&Expr) -> Result<(), LookupError>> Visitor for TopLevel<F> {
     }
 
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-        if self.depth > 0 {
+        if self.depth > self.floor {
             return ControlFlow::Continue(());
         }
         match (self.each)(expression) {
