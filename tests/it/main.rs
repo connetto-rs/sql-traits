@@ -21,6 +21,7 @@ mod binary_send;
 mod call_kind_rules;
 mod call_resolution;
 mod call_result_types;
+mod callable_functions;
 mod cast_metadata;
 mod catalog_navigation;
 mod check_constraint_columns;

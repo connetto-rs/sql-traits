@@ -90,6 +90,32 @@ fn a_value_is_stored_as_postgresql_prints_it() {
 }
 
 #[test]
+fn a_search_path_is_stored_as_postgresql_quotes_its_entries() {
+    // PostgreSQL 18.7 stored search_path="App", search_path="$user", public
+    // and search_path=api, "a, b", the last from the session's own `SET`.
+    let db = parse(
+        "CREATE ROLE r; CREATE ROLE s; CREATE ROLE t;
+         ALTER ROLE r SET search_path = 'App';
+         SET search_path = \"$user\", Public;
+         ALTER ROLE s SET search_path FROM CURRENT;
+         SET search_path = api, 'a, b';
+         ALTER ROLE t SET search_path FROM CURRENT;",
+    );
+    assert_eq!(
+        entries(&db),
+        [
+            (Some("r"), None, "search_path", "\"App\""),
+            (Some("s"), None, "search_path", "\"$user\", public"),
+            (Some("t"), None, "search_path", "api, \"a, b\""),
+        ]
+    );
+    assert!(matches!(
+        RoleSetting::new(None, None, "search_path", "api, \"open"),
+        Err(Error::InvalidSearchPath { value }) if value == "api, \"open"
+    ));
+}
+
+#[test]
 fn reset_default_and_reset_all_remove_entries_of_one_key() {
     let db = parse(
         "CREATE ROLE r;

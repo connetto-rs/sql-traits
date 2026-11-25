@@ -1,10 +1,10 @@
 //! One `ALTER ROLE ... SET` entry, keyed as `pg_db_role_setting` keys it.
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 
 use sql_values::postgres::PgTimeZone;
 
-use crate::errors::Error;
+use crate::{errors::Error, utils::search_path_text::split_search_path};
 
 /// The value a role, or every role, starts a session with in one database, or
 /// in every database, as `ALTER ROLE { name | ALL } [IN DATABASE d] SET`
@@ -45,6 +45,7 @@ pub struct RoleSetting {
     pub(crate) name: String,
     pub(crate) value: String,
     pub(crate) zone: Option<PgTimeZone>,
+    pub(crate) search_path: Option<Vec<(String, bool)>>,
 }
 
 impl RoleSetting {
@@ -55,7 +56,9 @@ impl RoleSetting {
     /// # Errors
     ///
     /// Returns [`Error::InvalidTimeZone`] for a `TimeZone` entry whose value
-    /// PostgreSQL refuses, as [`PgTimeZone::parse`] reads it.
+    /// PostgreSQL refuses, as [`PgTimeZone::parse`] reads it, and
+    /// [`Error::InvalidSearchPath`] for a `search_path` entry that is not a
+    /// list of schemas as PostgreSQL prints one, such as `"$user", public`.
     ///
     /// # Example
     ///
@@ -69,6 +72,8 @@ impl RoleSetting {
     /// assert_eq!(setting.database(), None);
     /// assert!(setting.is_named("timezone"));
     /// assert!(RoleSetting::new(None, None, "TimeZone", "bogus").is_err());
+    /// assert!(RoleSetting::new(None, None, "search_path", "\"$user\", public").is_ok());
+    /// assert!(RoleSetting::new(None, None, "search_path", "api,").is_err());
     /// # Ok(())
     /// # }
     /// ```
@@ -80,7 +85,8 @@ impl RoleSetting {
     ) -> Result<Self, Error> {
         let (name, value) = (name.into(), value.into());
         let zone = setting_zone(&name, &value)?;
-        Ok(Self { role, database, name, value, zone })
+        let search_path = setting_search_path(&name, &value)?;
+        Ok(Self { role, database, name, value, zone, search_path })
     }
 
     /// The role the entry applies to, by the name PostgreSQL stores, or
@@ -127,6 +133,12 @@ impl RoleSetting {
     pub(crate) fn time_zone(&self) -> Option<&PgTimeZone> {
         self.zone.as_ref()
     }
+
+    /// The schemas a `search_path` entry lists, each as stored and whether
+    /// it was quoted, or [`None`] for an entry of another name.
+    pub(crate) fn search_path(&self) -> Option<&[(String, bool)]> {
+        self.search_path.as_deref()
+    }
 }
 
 /// The zone PostgreSQL reads from `value` when `name` is `TimeZone`, or
@@ -142,4 +154,23 @@ pub(crate) fn setting_zone(name: &str, value: &str) -> Result<Option<PgTimeZone>
     PgTimeZone::parse(value)
         .map(Some)
         .map_err(|reason| Error::InvalidTimeZone { value: value.into(), reason })
+}
+
+/// The schemas PostgreSQL reads from `value` when `name` is `search_path`, or
+/// [`None`] for a setting of another name.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidSearchPath`] for a value PostgreSQL refuses as
+/// list syntax.
+pub(crate) fn setting_search_path(
+    name: &str,
+    value: &str,
+) -> Result<Option<Vec<(String, bool)>>, Error> {
+    if !name.eq_ignore_ascii_case("search_path") {
+        return Ok(None);
+    }
+    split_search_path(value)
+        .map(Some)
+        .ok_or_else(|| Error::InvalidSearchPath { value: value.into() })
 }
