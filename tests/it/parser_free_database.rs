@@ -550,6 +550,10 @@ impl DataTypeLike for MemoryDataType {
 impl TableLike for MemoryTable {
     type DB = MemoryCatalog;
 
+    fn has_exclusion_constraints(&self, _database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(false)
+    }
+
     fn table_name(&self) -> &str {
         &self.name
     }

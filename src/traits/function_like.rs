@@ -12,11 +12,12 @@ use crate::{
     errors::{HelperSetError, LookupError},
     impls::{
         atomic_statements, body_calls, body_expression, body_reads, body_site_source,
-        body_unqualified_names, helper_set,
+        body_unqualified_names, helper_set, unconfined_function_read,
     },
     structs::{
-        AggregateKind, ArmCondition, Deployment, DynamicExecutionSites, FunctionBody, FunctionKind,
-        HelperSet, PlPgSqlSites, PrivilegeHolder, TargetName, UnqualifiedName,
+        ActingRole, AggregateKind, ArmCondition, Deployment, DynamicExecutionSites, FunctionBody,
+        FunctionKind, HelperSet, PlPgSqlSites, PrivilegeHolder, TargetName, UnconfinedRead,
+        UnqualifiedName,
     },
     traits::{DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
@@ -1602,6 +1603,82 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         database: &'db Self::DB,
     ) -> Result<PlPgSqlSites<'db, Self::DB>, LookupError> {
         body_site_source(self, database).map(PlPgSqlSites::new)
+    }
+
+    /// Returns the first read the function makes, when each of `callers`
+    /// executes it, as the owner of a `SECURITY DEFINER` function, itself or
+    /// one it reaches, that may reach a row of a table with row-level
+    /// security the caller cannot read, or `None` when every such read
+    /// reaches only rows each caller's own `SELECT` policies admit, of which
+    /// it may select every column.
+    ///
+    /// A read is confined by the facts PostgreSQL holds of the rows it
+    /// reaches: the conditions of its `WHERE` and of the `ON` of the joins
+    /// that drop rows, those of the queries around it, a `LANGUAGE sql`
+    /// function's parameters, the sets a column is tested against, declared
+    /// through [`Deployment::with_set_within`] or inferred to lie within a
+    /// policy's set, and what the rows a helper draws a
+    /// tested value from meet, carried across the keys that hold them equal.
+    /// A `SECURITY DEFINER` function a caller may execute directly discloses
+    /// nothing a direct call does not, so its reads count only as the values
+    /// it hands on. A PL/pgSQL body is read statement by statement, a
+    /// parameter counting as one where the statement reads the argument
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup errors reading the schema runs into. A body that
+    /// cannot be read is an [`crate::structs::Unconfinement::Unfollowed`] read
+    /// instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app;
+    ///      CREATE TABLE notes (id INT PRIMARY KEY, team_id INT NOT NULL, body TEXT);
+    ///      ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+    ///      CREATE POLICY notes_select ON notes FOR SELECT TO app
+    ///          USING (team_id = current_setting('app.team_id')::INT);
+    ///      GRANT SELECT ON notes TO app;
+    ///      CREATE FUNCTION team_notes() RETURNS SETOF TEXT LANGUAGE sql STABLE
+    ///      SECURITY DEFINER SET search_path = pg_catalog AS $$
+    ///          SELECT body FROM public.notes WHERE team_id = current_setting('app.team_id')::INT
+    ///      $$;
+    ///      CREATE FUNCTION every_note() RETURNS SETOF TEXT LANGUAGE sql STABLE
+    ///      SECURITY DEFINER SET search_path = pg_catalog AS $$
+    ///          SELECT body FROM public.notes
+    ///      $$;",
+    /// )?;
+    /// let deployment = Deployment::new("app", ["app"], []).expect("a valid deployment");
+    /// let app = ActingRole::Declared(db.role("app").expect("the role exists"));
+    /// let function = |name| {
+    ///     db.function_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    /// };
+    /// let team_notes = function("team_notes")?.expect("the function exists");
+    /// assert!(team_notes.unconfined_definer_read(&db, &deployment, &[app])?.is_none());
+    ///
+    /// let every_note = function("every_note")?.expect("the function exists");
+    /// let read = every_note
+    ///     .unconfined_definer_read(&db, &deployment, &[app])?
+    ///     .expect("every row is read");
+    /// assert_eq!(read.table().map(TableLike::table_name), Some("notes"));
+    /// assert!(matches!(read.reason(), Unconfinement::Permissive(policies) if policies.len() == 1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn unconfined_definer_read<'db>(
+        &'db self,
+        database: &'db Self::DB,
+        deployment: &'db Deployment,
+        callers: &[ActingRole<'db, <Self::DB as DatabaseLike>::Role>],
+    ) -> Result<Option<UnconfinedRead<'db, Self::DB>>, LookupError> {
+        unconfined_function_read(database, deployment, self, callers)
     }
 
     /// Returns the triggers that execute the function, row-level and

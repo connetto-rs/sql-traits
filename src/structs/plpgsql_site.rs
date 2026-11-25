@@ -39,6 +39,12 @@ impl<'db, DB: DatabaseLike> PlPgSqlSites<'db, DB> {
     pub fn sites(&self) -> Result<Vec<PlPgSqlSite<'_, 'db, DB>>, LookupError> {
         self.source.plpgsql_sites()
     }
+
+    /// The parsed PL/pgSQL block the sites borrow from, `None` for a body
+    /// in another language.
+    pub(crate) const fn block(&self) -> Option<&sqlparser_plpgsql::embedded::Block> {
+        self.source.block()
+    }
 }
 
 /// A statement or expression a PL/pgSQL body runs, with the variables in

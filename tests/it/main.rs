@@ -52,6 +52,7 @@ mod default_column_references;
 mod default_privileges;
 mod deferrable_key_targets;
 mod definer_helpers;
+mod definer_reads;
 mod deployment;
 mod descendant_drops;
 mod discriminated_extensions;

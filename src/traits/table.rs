@@ -2597,6 +2597,28 @@ pub trait TableLike:
     where
         Self: 'db;
 
+    /// Returns whether the table has an exclusion constraint.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE reserved (period INT4RANGE, EXCLUDE USING gist (period WITH &&));
+    ///      CREATE TABLE unrestricted (period INT4RANGE);",
+    /// )?;
+    /// for table in database.tables() {
+    ///     assert_eq!(table.has_exclusion_constraints(&database)?, table.table_name() == "reserved");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a lookup error when the database does not hold the table.
+    fn has_exclusion_constraints(&self, database: &Self::DB) -> Result<bool, LookupError>;
+
     /// Iterates over the foreign keys of the table using the provided schema.
     ///
     /// # Arguments
@@ -4808,7 +4830,7 @@ pub trait TableLike:
     where
         Self: 'db,
     {
-        crate::traits::row_security::row_security(self, statement, &role.into(), database)
+        crate::traits::row_security::row_security(self, statement, role.into(), database)
     }
 
     /// Returns an iterator over the grants that apply to this table.
@@ -5421,6 +5443,10 @@ where
         Self: 'db,
     {
         T::unique_indices(self, database)
+    }
+
+    fn has_exclusion_constraints(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        T::has_exclusion_constraints(self, database)
     }
 
     fn indices<'db>(

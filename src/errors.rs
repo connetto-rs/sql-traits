@@ -1547,6 +1547,14 @@ pub enum TargetNameParseError {
 /// Why a [`Deployment`](crate::structs::Deployment) description is refused.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum DeploymentError {
+    /// A declared set expression cannot be parsed as PostgreSQL.
+    #[error("set expression `{expression}` cannot be parsed ({message})")]
+    InvalidSetExpression {
+        /// The refused expression.
+        expression: String,
+        /// The parser's message.
+        message: String,
+    },
     /// No acting role was named, so a request would run as nothing.
     #[error("a deployment needs at least one acting role")]
     NoActingRole,

@@ -528,6 +528,14 @@ impl<'db, DB: DatabaseLike> SiteSource<'db, DB> {
         Self { names, body, hex_strings_may_be_integers }
     }
 
+    /// The parsed PL/pgSQL block, `None` for a body in another language.
+    pub(crate) const fn block(&self) -> Option<&Block> {
+        match &self.body {
+            SqlBody::PlPgSql(block) => Some(block),
+            _ => None,
+        }
+    }
+
     /// Every dynamic-execution site of the body, in body order.
     ///
     /// # Errors

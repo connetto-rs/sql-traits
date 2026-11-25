@@ -41,6 +41,10 @@ impl TriggerLike for CreateTrigger {
         last_str(&self.name)
     }
 
+    fn name_is_quoted(&self) -> bool {
+        object_name_last_part(&self.name).is_some_and(|(_, quoted)| quoted)
+    }
+
     /// Ingestion bound the target to the relation it reached, so the name is
     /// read with no search path under the catalog's
     /// [`DatabaseLike::identifier_case`]. Only a table, a foreign table or a

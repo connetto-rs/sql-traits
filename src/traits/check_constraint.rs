@@ -25,7 +25,8 @@ use crate::{
     },
 };
 
-fn unnested(mut expr: &Expr) -> &Expr {
+/// Strips the parentheses around an expression.
+pub(crate) fn unnested(mut expr: &Expr) -> &Expr {
     while let Expr::Nested(inner) = expr {
         expr = inner;
     }

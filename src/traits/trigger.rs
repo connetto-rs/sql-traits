@@ -1,15 +1,17 @@
 //! Submodule providing a trait for describing SQL Trigger-like entities.
 
+use alloc::borrow::Cow;
 use core::fmt::Debug;
 
 use crate::{
     errors::LookupError,
-    impls::maintenance_body,
+    impls::{maintenance_body, unconfined_trigger_read},
     structs::{
-        ConstraintDeferral, MaintenanceRefusal, TargetName, TransitionTable, TriggerEnablement,
-        UndeclaredRowField,
+        ActingRole, ConstraintDeferral, DefinerReading, Deployment, MaintenanceRefusal, TargetName,
+        TransitionTable, TriggerEnablement, UnconfinedRead, UndeclaredRowField,
     },
     traits::{DatabaseLike, Metadata, Relation},
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// A trait for types that can be treated as SQL triggers.
@@ -67,6 +69,35 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// # }
     /// ```
     fn name(&self) -> &str;
+
+    /// Returns whether the trigger name was quoted in SQL.
+    ///
+    /// The default `false` folds every identifier to lowercase, so an
+    /// implementation over a source that preserves quoting must override it.
+    fn name_is_quoted(&self) -> bool {
+        false
+    }
+
+    /// Returns the trigger name PostgreSQL stores, folding unquoted identifiers
+    /// to lowercase.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE entries (id INT);
+    ///      CREATE FUNCTION guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+    ///      CREATE TRIGGER Entry_Guard BEFORE INSERT ON entries FOR EACH ROW EXECUTE FUNCTION guard();",
+    /// )?;
+    /// let trigger = database.triggers().next().expect("trigger exists");
+    /// assert_eq!(trigger.stored_name(), "entry_guard");
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn stored_name(&self) -> Cow<'_, str> {
+        stored_identifier(self.name(), self.name_is_quoted())
+    }
 
     /// Returns the table or view the trigger is defined on, the one its
     /// target reached when the trigger was created.
@@ -697,6 +728,105 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
         self.function_name().map(|name| (name, false))
     }
 
+    /// Returns the first read the trigger's function chain makes, when the
+    /// trigger fires on a write of `role`, as the owner of a `SECURITY
+    /// DEFINER` function that may reach a row of a table with row-level
+    /// security the role cannot read, among the reads `reading` asks of, or
+    /// `None` when every such read reaches only rows the role's own `SELECT`
+    /// policies admit and of which it may select every column.
+    ///
+    /// A read is confined by the facts
+    /// [`FunctionLike::unconfined_definer_read`](crate::traits::FunctionLike::unconfined_definer_read)
+    /// reads, and by what the trigger's own function knows of a row trigger's
+    /// `NEW` and `OLD` where it reads them unchanged: the trigger's `WHEN`,
+    /// the write policies of the firing events, and the foreign keys of the
+    /// trigger's table, which hold a row the read reaches by a unique key of
+    /// the referenced table equal to the row the key references, its other
+    /// columns included. A write policy or key holds under
+    /// [`DefinerReading::Disclosure`] only once PostgreSQL has checked it
+    /// when the function runs, and under [`DefinerReading::Outcome`] once it
+    /// holds of every write that commits, as [`DefinerReading`] describes. A
+    /// function the trigger runs as the acting role reads only what the role
+    /// reads, so only the `SECURITY DEFINER` functions its chain reaches
+    /// count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lookup errors reading the schema runs into. A body that
+    /// cannot be read is an [`crate::structs::Unconfinement::Unfollowed`] read
+    /// instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app;
+    ///      CREATE TABLE runs (id INT PRIMARY KEY, team_id INT NOT NULL, status TEXT NOT NULL,
+    ///          UNIQUE (id, team_id));
+    ///      ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
+    ///      CREATE POLICY runs_select ON runs FOR SELECT TO app
+    ///          USING (team_id = current_setting('app.team_id')::INT);
+    ///      CREATE TABLE bindings (id INT PRIMARY KEY, team_id INT NOT NULL,
+    ///          run_id INT NOT NULL, FOREIGN KEY (run_id, team_id) REFERENCES runs (id, team_id));
+    ///      ALTER TABLE bindings ENABLE ROW LEVEL SECURITY;
+    ///      CREATE POLICY bindings_insert ON bindings FOR INSERT TO app
+    ///          WITH CHECK (team_id = current_setting('app.team_id')::INT);
+    ///      GRANT SELECT ON runs TO app;
+    ///      GRANT INSERT ON bindings TO app;
+    ///      CREATE FUNCTION guard_binding() RETURNS trigger
+    ///      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+    ///      BEGIN
+    ///        IF EXISTS (SELECT 1 FROM public.runs
+    ///                   WHERE runs.id = NEW.run_id AND runs.status <> 'open') THEN
+    ///          RAISE EXCEPTION 'run % is closed', NEW.run_id;
+    ///        END IF;
+    ///        RETURN NEW;
+    ///      END
+    ///      $$;
+    ///      CREATE TRIGGER bindings_guard AFTER INSERT ON bindings
+    ///          FOR EACH ROW EXECUTE FUNCTION guard_binding();
+    ///      CREATE TRIGGER proposed_binding_guard BEFORE INSERT ON bindings
+    ///          FOR EACH ROW EXECUTE FUNCTION guard_binding();",
+    /// )?;
+    /// let deployment = Deployment::new("app", ["app"], []).expect("a valid deployment");
+    /// let app = ActingRole::Declared(db.role("app").expect("the role exists"));
+    /// let guard = db
+    ///     .triggers()
+    ///     .find(|trigger| trigger.name() == "bindings_guard")
+    ///     .expect("the trigger exists");
+    /// let outcome = guard.unconfined_definer_read(&db, &deployment, app, DefinerReading::Outcome)?;
+    /// assert!(outcome.is_none());
+    ///
+    /// // `ON CONFLICT` can skip a proposed row after its `BEFORE INSERT` guard runs.
+    /// let proposed = db
+    ///     .triggers()
+    ///     .find(|trigger| trigger.name() == "proposed_binding_guard")
+    ///     .expect("the trigger exists");
+    /// let unconfined = proposed
+    ///     .unconfined_definer_read(&db, &deployment, app, DefinerReading::Outcome)?
+    ///     .expect("the proposed row's key may never be checked");
+    /// assert_eq!(unconfined.table().map(TableLike::table_name), Some("runs"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn unconfined_definer_read<'db>(
+        &'db self,
+        database: &'db Self::DB,
+        deployment: &'db Deployment,
+        role: ActingRole<'db, <Self::DB as DatabaseLike>::Role>,
+        reading: DefinerReading,
+    ) -> Result<Option<UnconfinedRead<'db, Self::DB>>, LookupError>
+    where
+        Self: Sized + 'db,
+    {
+        unconfined_trigger_read(database, deployment, self, role, reading)
+    }
+
     /// Returns whether the trigger is a maintenance trigger.
     ///
     /// A maintenance trigger's PL/pgSQL body solely assigns fields of `NEW`,
@@ -976,6 +1106,10 @@ impl<T: TriggerLike> TriggerLike for &T {
 
     fn name(&self) -> &str {
         (*self).name()
+    }
+
+    fn name_is_quoted(&self) -> bool {
+        (*self).name_is_quoted()
     }
 
     fn relation<'db>(
