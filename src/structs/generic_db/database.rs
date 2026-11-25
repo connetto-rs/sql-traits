@@ -33,6 +33,7 @@ impl<P: SchemaProfile> DatabaseLike for GenericDB<P> {
     type Operator = P::Operator;
     type Cast = P::Cast;
     type UniqueIndex = P::UniqueIndex;
+    type ExclusionIndex = P::ExclusionIndex;
     type CheckConstraint = P::CheckConstraint;
     type Trigger = P::Trigger;
     type Rule = P::Rule;

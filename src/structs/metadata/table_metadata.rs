@@ -54,6 +54,9 @@ pub struct TableMetadata<T: TableLike> {
     indices: Vec<Arc<<T::DB as DatabaseLike>::Index>>,
     /// The unique indices of the table.
     unique_indices: Vec<Arc<<T::DB as DatabaseLike>::UniqueIndex>>,
+    /// The indexes the exclusion constraints of the table build, in the order
+    /// the table lists the constraints.
+    exclusion_indices: Vec<Arc<<T::DB as DatabaseLike>::ExclusionIndex>>,
     /// The index SQLite builds behind each unique index of the table, in the
     /// same order, [`None`] for the rowid alias, which has none. Empty under
     /// every other dialect.
@@ -147,9 +150,6 @@ pub struct TableMetadata<T: TableLike> {
     /// The calls of the partition key's expressions, bound when the table was
     /// written.
     partition_key_calls: ExpressionCalls<<T::DB as DatabaseLike>::Function>,
-    /// The calls of each exclusion constraint, in the order the table lists
-    /// them, bound when the constraint was written.
-    exclusion_calls: Vec<ExpressionCalls<<T::DB as DatabaseLike>::Function>>,
 }
 
 impl<T: TableLike> Default for TableMetadata<T> {
@@ -159,6 +159,7 @@ impl<T: TableLike> Default for TableMetadata<T> {
             check_constraints: Vec::new(),
             indices: Vec::new(),
             unique_indices: Vec::new(),
+            exclusion_indices: Vec::new(),
             sqlite_autoindexes: Vec::new(),
             foreign_keys: Vec::new(),
             pending_foreign_keys: Vec::new(),
@@ -185,7 +186,6 @@ impl<T: TableLike> Default for TableMetadata<T> {
             hidden_column_names: Vec::new(),
             shadow_suffixes: Vec::new(),
             partition_key_calls: ExpressionCalls::default(),
-            exclusion_calls: Vec::new(),
         }
     }
 }
@@ -586,6 +586,24 @@ impl<T: TableLike> TableMetadata<T> {
         self.unique_indices.iter()
     }
 
+    /// Returns an iterator over the indexes the exclusion constraints of the
+    /// table build.
+    #[inline]
+    pub fn exclusion_indices(
+        &self,
+    ) -> impl Iterator<Item = &<T::DB as DatabaseLike>::ExclusionIndex> {
+        self.exclusion_indices.iter().map(core::convert::AsRef::as_ref)
+    }
+
+    /// Returns an iterator over the Arc of the indexes the exclusion
+    /// constraints of the table build.
+    #[inline]
+    pub fn exclusion_index_arcs(
+        &self,
+    ) -> impl Iterator<Item = &Arc<<T::DB as DatabaseLike>::ExclusionIndex>> {
+        self.exclusion_indices.iter()
+    }
+
     /// Returns the index SQLite builds behind `index`, a unique index of the
     /// table, found by identity, or for a value not taken from the table by
     /// equality. [`None`] for the rowid alias, which has none, and under
@@ -772,31 +790,6 @@ impl<T: TableLike> TableMetadata<T> {
         self.partition_key_calls = calls;
     }
 
-    /// The calls of each exclusion constraint, in the order the table lists
-    /// them.
-    #[inline]
-    pub(crate) fn exclusion_calls(&self) -> &[ExpressionCalls<<T::DB as DatabaseLike>::Function>] {
-        &self.exclusion_calls
-    }
-
-    /// The calls of each exclusion constraint, for settling or re-pointing
-    /// them.
-    #[inline]
-    pub(crate) fn exclusion_calls_mut(
-        &mut self,
-    ) -> &mut [ExpressionCalls<<T::DB as DatabaseLike>::Function>] {
-        &mut self.exclusion_calls
-    }
-
-    /// Sets the calls of each exclusion constraint.
-    #[inline]
-    pub(crate) fn set_exclusion_calls(
-        &mut self,
-        calls: Vec<ExpressionCalls<<T::DB as DatabaseLike>::Function>>,
-    ) {
-        self.exclusion_calls = calls;
-    }
-
     /// Adds a column to the table metadata.
     ///
     /// # Arguments
@@ -838,6 +831,17 @@ impl<T: TableLike> TableMetadata<T> {
     #[inline]
     pub fn add_unique_index(&mut self, index: Arc<<T::DB as DatabaseLike>::UniqueIndex>) {
         self.unique_indices.push(index);
+    }
+
+    /// Adds the index an exclusion constraint of the table builds to the
+    /// table metadata.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The exclusion index to add.
+    #[inline]
+    pub fn add_exclusion_index(&mut self, index: Arc<<T::DB as DatabaseLike>::ExclusionIndex>) {
+        self.exclusion_indices.push(index);
     }
 
     /// Adds a foreign key to the table metadata.

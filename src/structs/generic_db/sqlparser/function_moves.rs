@@ -17,8 +17,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    CarriedCalls, ParserDB, ParserDBBuilder, StoredTable, constraint_names,
-    function_argument_types, partition_keys,
+    CarriedCalls, ParserDB, ParserDBBuilder, StoredTable, function_argument_types, partition_keys,
 };
 use crate::{
     errors::Error,
@@ -348,10 +347,13 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
             held(TableAttribute::table(unique_key.as_ref()));
         }
     }
+    for (exclusion, metadata) in builder.exclusion_indices() {
+        if moves.reached_by(metadata.calls()) {
+            held(exclusion.constraint().table());
+        }
+    }
     for (table, metadata, _) in builder.tables() {
-        if moves.reached_by(metadata.partition_key_calls())
-            || metadata.exclusion_calls().iter().any(|calls| moves.reached_by(calls))
-        {
+        if moves.reached_by(metadata.partition_key_calls()) {
             held(table);
         }
     }
@@ -383,16 +385,16 @@ fn respell_tables(mut builder: ParserDBBuilder, moves: &Moves) -> Result<ParserD
                 bound.record(unique_key.attribute(), metadata.calls());
             }
         }
+        for (exclusion, metadata) in builder.exclusion_indices() {
+            let declared = exclusion.constraint();
+            if stored.matches(declared.table(), case) {
+                bound.record(declared.attribute(), metadata.calls());
+            }
+        }
         for (table, metadata, _) in builder.tables() {
-            if !stored.matches(table, case) {
-                continue;
-            }
-            for (exclusion, calls) in
-                constraint_names::exclusions(table).zip(metadata.exclusion_calls())
+            if let (true, Some(entries)) =
+                (stored.matches(table, case), partition_keys::key_entries(table))
             {
-                bound.record(exclusion, calls);
-            }
-            if let Some(entries) = partition_keys::key_entries(table) {
                 bound.record(entries, metadata.partition_key_calls());
             }
         }

@@ -743,6 +743,12 @@ pub(super) fn partition_copy(
                 .map(|columns| generated_key_name(builder, child, Some(&columns), "key", taken));
             unique.index_name = None;
         }
+        TableConstraint::Exclude(exclusion) => {
+            let keys: Vec<_> =
+                exclusion.elements.iter().map(|element| element.column.clone()).collect();
+            exclusion.name = generated_names::index_columns_part(&keys, &exclusion.include)
+                .map(|columns| generated_key_name(builder, child, Some(&columns), "excl", taken));
+        }
         _ => {}
     }
     copy
@@ -764,6 +770,7 @@ fn without_generated_name(constraint: &TableConstraint) -> TableConstraint {
             unique.name = None;
             unique.index_name = None;
         }
+        TableConstraint::Exclude(exclusion) => exclusion.name = None,
         TableConstraint::Check(check) => stored_check(check),
         TableConstraint::NotNull(not_null) => not_null.name = None,
         _ => {}

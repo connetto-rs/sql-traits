@@ -94,10 +94,11 @@ pub trait IndexLike: Metadata + Ord + Eq + Debug + Clone + Send + Sync {
         false
     }
 
-    /// Returns the name of the constraint the index backs, a primary key or
-    /// unique constraint: the one written, or on PostgreSQL the one it was
-    /// given when it was created, which renaming the table or a column later
-    /// leaves alone. A written name is returned as PostgreSQL stores it.
+    /// Returns the name of the constraint the index backs, a primary key,
+    /// unique or exclusion constraint: the one written, or on PostgreSQL the
+    /// one it was given when it was created, which renaming the table or a
+    /// column later leaves alone. A written name is returned as PostgreSQL
+    /// stores it.
     ///
     /// [`None`] for an index backing no constraint.
     ///

@@ -65,6 +65,8 @@ pub trait SchemaProfile: Sized {
     type MaterializedViewIndex: IndexLike<DB = GenericDB<Self>>;
     /// The unique indexes the schema holds.
     type UniqueIndex: UniqueIndexLike<DB = GenericDB<Self>>;
+    /// The indexes the exclusion constraints of the schema build.
+    type ExclusionIndex: TableIndexLike<DB = GenericDB<Self>>;
     /// The foreign keys the schema holds.
     type ForeignKey: ForeignKeyLike<DB = GenericDB<Self>>;
     /// The functions the schema holds, owned so the functions an engine

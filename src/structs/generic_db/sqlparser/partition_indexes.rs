@@ -852,9 +852,9 @@ fn revalidate(
     }
 }
 
-/// Marks invalid the index of `constraint`, a primary key or unique
-/// constraint just added `ONLY` to `table`, when the table has a partition,
-/// since no index of a partition is attached to it yet.
+/// Marks invalid the index of `constraint`, a primary key, unique or
+/// exclusion constraint just added `ONLY` to `table`, when the table has a
+/// partition, since no index of a partition is attached to it yet.
 ///
 /// # Errors
 ///
@@ -864,10 +864,12 @@ pub(super) fn invalidate_key_above_partitions(
     table: &StoredTable,
     constraint: &TableConstraint,
 ) -> Result<(), Error> {
-    if !matches!(constraint, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_))
-        || !inheritance::direct_children(builder, table)
-            .iter()
-            .any(|(kind, _)| *kind == ParentKind::PartitionOf)
+    if !matches!(
+        constraint,
+        TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_) | TableConstraint::Exclude(_)
+    ) || !inheritance::direct_children(builder, table)
+        .iter()
+        .any(|(kind, _)| *kind == ParentKind::PartitionOf)
     {
         return Ok(());
     }

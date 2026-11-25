@@ -130,6 +130,8 @@ pub struct GenericDBBuilder<P: SchemaProfile> {
     materialized_view_indices: Vec<Stored<P::MaterializedViewIndex>>,
     /// List of unique indices in the database.
     unique_indices: Vec<Stored<P::UniqueIndex>>,
+    /// List of the indexes exclusion constraints build in the database.
+    exclusion_indices: Vec<Stored<P::ExclusionIndex>>,
     /// List of foreign keys in the database.
     foreign_keys: Vec<Stored<P::ForeignKey>>,
     /// PostgreSQL foreign keys with resolved columns and assigned names.
@@ -190,6 +192,7 @@ impl<P: SchemaProfile> Clone for GenericDBBuilder<P> {
             indices: self.indices.clone(),
             materialized_view_indices: self.materialized_view_indices.clone(),
             unique_indices: self.unique_indices.clone(),
+            exclusion_indices: self.exclusion_indices.clone(),
             foreign_keys: self.foreign_keys.clone(),
             installed_foreign_keys: self.installed_foreign_keys.clone(),
             functions: self.functions.clone(),
@@ -260,6 +263,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             indices: Vec::new(),
             materialized_view_indices: Vec::new(),
             unique_indices: Vec::new(),
+            exclusion_indices: Vec::new(),
             foreign_keys: Vec::new(),
             installed_foreign_keys: Vec::new(),
             functions: Vec::new(),
@@ -298,6 +302,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             indices: Vec::new(),
             materialized_view_indices: Vec::new(),
             unique_indices: Vec::new(),
+            exclusion_indices: Vec::new(),
             foreign_keys: Vec::new(),
             installed_foreign_keys: Vec::new(),
             functions: Vec::new(),
@@ -383,6 +388,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             + self.indices.len()
             + self.materialized_view_indices.len()
             + self.unique_indices.len()
+            + self.exclusion_indices.len()
     }
 
     /// Returns `saved` as the builder a rollback leaves, keeping this
@@ -533,6 +539,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         &self.unique_indices
     }
 
+    /// Returns a slice of the indexes exclusion constraints build, with their
+    /// metadata.
+    pub(crate) fn exclusion_indices(&self) -> &[Stored<P::ExclusionIndex>] {
+        &self.exclusion_indices
+    }
+
     /// Returns a slice of function Arc references with their metadata.
     pub(crate) fn functions(&self) -> &[Stored<P::Function>] {
         &self.functions
@@ -594,6 +606,12 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
     /// Returns a mutable reference to the unique indices list.
     pub(crate) fn unique_indices_mut(&mut self) -> &mut Vec<Stored<P::UniqueIndex>> {
         &mut self.unique_indices
+    }
+
+    /// Returns a mutable reference to the list of the indexes exclusion
+    /// constraints build.
+    pub(crate) fn exclusion_indices_mut(&mut self) -> &mut Vec<Stored<P::ExclusionIndex>> {
+        &mut self.exclusion_indices
     }
 
     /// Returns a mutable reference to the foreign keys list.
@@ -692,6 +710,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             indices: Vec::new(),
             materialized_view_indices: Vec::new(),
             unique_indices: Vec::new(),
+            exclusion_indices: Vec::new(),
             foreign_keys: Vec::new(),
             installed_foreign_keys: Vec::new(),
             functions: Vec::new(),
@@ -926,6 +945,19 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         indices: impl IntoIterator<Item = (Arc<P::UniqueIndex>, Meta<P::UniqueIndex>)>,
     ) -> Self {
         self.unique_indices.extend(indices);
+        self
+    }
+
+    /// Adds the index an exclusion constraint builds, with its metadata, to
+    /// the builder.
+    #[must_use]
+    #[inline]
+    pub fn add_exclusion_index(
+        mut self,
+        index: Arc<P::ExclusionIndex>,
+        metadata: Meta<P::ExclusionIndex>,
+    ) -> Self {
+        self.exclusion_indices.push((index, metadata));
         self
     }
 
@@ -1282,6 +1314,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             indices,
             materialized_view_indices,
             unique_indices,
+            exclusion_indices,
             foreign_keys,
             installed_foreign_keys,
             functions,
@@ -1320,6 +1353,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             indices,
             materialized_view_indices,
             unique_indices,
+            exclusion_indices,
             foreign_keys,
             installed_foreign_keys,
             functions,
@@ -1357,6 +1391,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
         self.indices.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         self.materialized_view_indices.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         self.unique_indices.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        self.exclusion_indices.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         self.foreign_keys.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         // Same-named declarations differ only in their arguments, so the node
         // itself breaks the tie and a lookup answers the same one every time.
@@ -1509,6 +1544,7 @@ impl<P: SchemaProfile> GenericDBBuilder<P> {
             indices: self.indices,
             materialized_view_indices: self.materialized_view_indices,
             unique_indices: self.unique_indices,
+            exclusion_indices: self.exclusion_indices,
             foreign_keys: self.foreign_keys,
             installed_foreign_keys: self.installed_foreign_keys,
             functions: self.functions,

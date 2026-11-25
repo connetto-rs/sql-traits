@@ -51,6 +51,7 @@ trait EmptyKinds:
         DataType = NoneKind<Self>,
         Index = NoneKind<Self>,
         UniqueIndex = NoneKind<Self>,
+        ExclusionIndex = NoneKind<Self>,
         ForeignKey = NoneKind<Self>,
         Function = NoneKind<Self>,
         CheckConstraint = NoneKind<Self>,
@@ -76,10 +77,6 @@ trait EmptyKinds:
 
 impl<P: EmptyKinds> TableLike for NoneKind<P> {
     type DB = GenericDB<P>;
-
-    fn has_exclusion_constraints(&self, _database: &Self::DB) -> Result<bool, LookupError> {
-        self.unreach()
-    }
 
     fn table_name(&self) -> &str {
         self.unreach()
@@ -207,6 +204,16 @@ impl<P: EmptyKinds> TableLike for NoneKind<P> {
         &'db self,
         _database: &'db Self::DB,
     ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::UniqueIndex>, LookupError>
+    where
+        Self: 'db,
+    {
+        self.unreach::<Result<core::iter::Empty<&'db Self>, LookupError>>()
+    }
+
+    fn exclusion_indices<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::ExclusionIndex>, LookupError>
     where
         Self: 'db,
     {
@@ -1173,6 +1180,7 @@ impl SchemaProfile for AlternateProfile {
     type Index = NoneKind<Self>;
     type MaterializedViewIndex = Absent<AlternateDB>;
     type UniqueIndex = NoneKind<Self>;
+    type ExclusionIndex = NoneKind<Self>;
     type ForeignKey = NoneKind<Self>;
     type Function = NoneKind<Self>;
     type Operator = CatalogOperator;
@@ -1248,6 +1256,7 @@ impl SchemaProfile for HooklessProfile {
     type Index = NoneKind<Self>;
     type MaterializedViewIndex = Absent<GenericDB<Self>>;
     type UniqueIndex = NoneKind<Self>;
+    type ExclusionIndex = NoneKind<Self>;
     type ForeignKey = NoneKind<Self>;
     type Function = NoneKind<Self>;
     type Operator = Absent<GenericDB<Self>>;

@@ -82,6 +82,8 @@ pub trait DatabaseLike: Clone + Debug + Send + Sync {
     type UserDefinedType: UserDefinedTypeLike<DB = Self>;
     /// Type of the unique indexes in the schema.
     type UniqueIndex: UniqueIndexLike<DB = Self>;
+    /// Type of the indexes the exclusion constraints in the schema build.
+    type ExclusionIndex: TableIndexLike<DB = Self>;
     /// Type of the check constraints in the schema.
     type CheckConstraint: CheckConstraintLike<DB = Self>;
     /// Type of the policies in the schema.

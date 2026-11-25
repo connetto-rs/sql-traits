@@ -133,6 +133,11 @@ impl<'node> Slot<'node> {
         ) || matches!(self, Self::Table(_, TableConstraint::ForeignKey(_)))
     }
 
+    /// Whether the slot holds an exclusion constraint.
+    pub(super) fn is_exclusion(self) -> bool {
+        matches!(self, Self::Table(_, TableConstraint::Exclude(_)))
+    }
+
     /// The column whose `NOT NULL` the slot holds.
     pub(super) fn not_null_of(self) -> Option<&'node Ident> {
         match self {

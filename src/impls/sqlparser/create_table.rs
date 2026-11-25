@@ -174,10 +174,6 @@ fn namespaced_parameters<'table>(
 impl TableLike for CreateTable {
     type DB = ParserDB;
 
-    fn has_exclusion_constraints(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(!table_metadata(self, database)?.exclusion_calls().is_empty())
-    }
-
     #[inline]
     fn table_name(&self) -> &str {
         last_str(&self.name)
@@ -397,6 +393,16 @@ impl TableLike for CreateTable {
         Self: 'db,
     {
         Ok(table_metadata(self, database)?.unique_indices())
+    }
+
+    fn exclusion_indices<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::ExclusionIndex>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(table_metadata(self, database)?.exclusion_indices())
     }
 
     fn indices<'db>(

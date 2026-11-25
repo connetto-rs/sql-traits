@@ -22,6 +22,7 @@ mod dialect;
 mod dml;
 pub(crate) mod dql;
 mod dynamic_sites;
+mod exclusion_index;
 mod foreign_key_constraint;
 mod function_body;
 mod grant;

@@ -33,8 +33,10 @@ pub(super) fn written_access_method<'a>(
 
 /// The keys a column list writes, in order, each with the sort direction, the
 /// null ordering and the operator class written for it.
-pub(super) fn written_keys(columns: &[IndexColumn]) -> impl Iterator<Item = IndexKey<'_>> {
-    columns.iter().map(|column| {
+pub(super) fn written_keys<'a>(
+    columns: impl IntoIterator<Item = &'a IndexColumn>,
+) -> impl Iterator<Item = IndexKey<'a>> {
+    columns.into_iter().map(|column| {
         let mut key = IndexKey::new(&column.column.expr);
         if let Some(order) = &column.column.options.sort {
             key = key.with_order(order);
