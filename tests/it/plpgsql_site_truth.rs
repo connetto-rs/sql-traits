@@ -251,6 +251,68 @@ fn a_strict_function_never_starts_with_a_null_argument() {
     assert_eq!(conditions(&database, "run")[0].2, Some(never_raising(Outcomes::FALSE)));
 }
 
+/// A call reads as in any query, `abs` raising on the least integer, and a
+/// name no variable answers is one value wherever the condition reads it.
+#[test]
+fn a_call_and_a_name_no_variable_answers_read_as_in_any_query() {
+    let database = database(
+        "CREATE TABLE log (v integer); \
+         CREATE FUNCTION run(n integer) RETURNS text LANGUAGE plpgsql STRICT AS $$ BEGIN \
+         INSERT INTO log VALUES (n); \
+         IF nowhere IS NULL AND nowhere IS NOT NULL THEN RETURN 'never'; END IF; \
+         IF abs(n) IS NOT NULL THEN RETURN 'set'; END IF; \
+         RETURN 'other'; END $$;",
+    );
+    let truths: Vec<Option<ExpressionTruth>> =
+        conditions(&database, "run").into_iter().map(|(.., truth)| truth).collect();
+    assert_eq!(
+        truths,
+        [
+            Some(never_raising(Outcomes::FALSE)),
+            Some(ExpressionTruth { outcomes: Outcomes::TRUE, raising: Raising::Sometimes }),
+        ]
+    );
+}
+
+#[test]
+fn an_out_parameter_starts_null_and_a_trigger_variable_set() {
+    let database = database(
+        "CREATE FUNCTION split(OUT o integer) LANGUAGE plpgsql AS $$ \
+         BEGIN IF o IS NULL THEN o := 1; END IF; END $$; \
+         CREATE FUNCTION fired() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN IF TG_OP IS NULL THEN RETURN NULL; END IF; RETURN NEW; END $$;",
+    );
+    assert_eq!(conditions(&database, "split")[0].2, Some(never_raising(Outcomes::TRUE)));
+    assert_eq!(conditions(&database, "fired")[0].2, Some(never_raising(Outcomes::FALSE)));
+}
+
+/// A row read into a variable of a table's type holds the table's columns,
+/// and reading a column the table does not have raises.
+#[test]
+fn a_row_variable_reads_the_columns_of_its_table() {
+    let database = database(
+        "CREATE TABLE items (amount integer); CREATE TABLE pairs (a integer, b integer); \
+         CREATE TYPE pair AS (a integer, b integer); \
+         CREATE FUNCTION run() RETURNS text LANGUAGE plpgsql AS $$ \
+         DECLARE r items; p pair; BEGIN \
+         SELECT * INTO r FROM items; SELECT a, b INTO p FROM pairs; \
+         IF r.amount > 0 THEN RETURN 'positive'; END IF; \
+         IF p.a > 0 THEN RETURN 'unset'; END IF; \
+         IF r.missing > 0 THEN RETURN 'unknown'; END IF; \
+         RETURN 'other'; END $$;",
+    );
+    let truths: Vec<Option<ExpressionTruth>> =
+        conditions(&database, "run").into_iter().map(|(.., truth)| truth).collect();
+    assert_eq!(
+        truths,
+        [
+            Some(never_raising(Outcomes::ANY)),
+            Some(never_raising(Outcomes::ANY)),
+            Some(ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Always }),
+        ]
+    );
+}
+
 #[test]
 fn a_statement_site_reads_a_lone_row_select() {
     let database = function(
@@ -338,4 +400,72 @@ fn new_is_null_where_a_delete_or_a_statement_fires_the_trigger() {
 fn a_trigger_function_no_trigger_executes_reads_new_by_its_type() {
     let untyped = Some(ExpressionTruth { outcomes: Outcomes::ANY, raising: Raising::Sometimes });
     assert_eq!(trigger_conditions(""), [untyped, untyped, untyped]);
+}
+
+#[test]
+fn a_function_several_triggers_execute_joins_their_rows() {
+    assert_eq!(
+        trigger_conditions(
+            "CREATE TABLE others (amount integer, tag integer, low integer, high integer); \
+             CREATE TRIGGER audited AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION audit(); \
+             CREATE TRIGGER copied AFTER INSERT ON others FOR EACH ROW EXECUTE FUNCTION audit();"
+        ),
+        [Some(never_raising(Outcomes::ANY)); 3]
+    );
+}
+
+/// A view has no column guarantees, so a field of the row of a trigger on it
+/// has no known type.
+#[test]
+fn a_trigger_on_a_view_reads_new_by_nothing() {
+    assert_eq!(
+        trigger_conditions(
+            "CREATE VIEW shown AS SELECT amount, tag, low, high FROM items; \
+             CREATE TRIGGER audited INSTEAD OF INSERT ON shown FOR EACH ROW \
+             EXECUTE FUNCTION audit();"
+        )[0],
+        Some(never_raising(Outcomes::ANY))
+    );
+}
+
+/// The value of each condition of `whole` when `trigger` executes it.
+fn whole_conditions(trigger: &str) -> Vec<Option<ExpressionTruth>> {
+    let database = database(&format!(
+        "{TRIGGER_SCHEMA} CREATE FUNCTION whole() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF NEW IS NULL THEN PERFORM 1; END IF; \
+         IF NEW.amount.inner IS NULL THEN PERFORM 2; END IF; \
+         IF NEW.missing IS NULL THEN PERFORM 3; END IF; \
+         RETURN NULL; END $$; {trigger}"
+    ));
+    conditions(&database, "whole").into_iter().map(|(.., truth)| truth).collect()
+}
+
+#[test]
+fn new_is_null_where_no_row_fires_and_a_column_it_lacks_raises() {
+    let known = Outcomes { truth: true, falsity: true, null: false };
+    assert_eq!(
+        whole_conditions(
+            "CREATE TRIGGER audited AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION whole();"
+        ),
+        [
+            Some(never_raising(Outcomes::FALSE)),
+            Some(ExpressionTruth { outcomes: known, raising: Raising::Sometimes }),
+            Some(ExpressionTruth { outcomes: Outcomes::NONE, raising: Raising::Always }),
+        ]
+    );
+    assert_eq!(
+        whole_conditions(
+            "CREATE TRIGGER audited AFTER INSERT ON items FOR EACH STATEMENT \
+             EXECUTE FUNCTION whole();"
+        )[0],
+        Some(never_raising(Outcomes::TRUE))
+    );
+}
+
+#[test]
+fn a_type_copied_from_nothing_fails_the_walk() {
+    let database = function("DECLARE x nowhere.col%TYPE; BEGIN x := 1; RETURN 'a'; END");
+    let body = named(&database, "run").plpgsql_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    assert!(sites[0].reached(IdentifierCase::Folded).is_err());
 }

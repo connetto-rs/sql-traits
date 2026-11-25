@@ -55,7 +55,7 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
         case: IdentifierCase,
     ) -> Result<Self, LookupError> {
         let mut truth = TruthContext::new(names.database(), case, None);
-        let mut site = Site { references: Vec::new(), calls: Vec::new() };
+        let mut site = Site::empty();
         for each in sites {
             let query = match each.sql() {
                 EmbeddedSql::Expression(query) => query,
@@ -82,11 +82,7 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
         context: &ExpressionContext<'_, 'db, DB>,
         expression: &Expr,
     ) -> Result<(), LookupError> {
-        let mut site = self
-            .truth
-            .site
-            .take()
-            .unwrap_or_else(|| Site { references: Vec::new(), calls: Vec::new() });
+        let mut site = self.truth.site.take().unwrap_or_else(Site::empty);
         let bound = self.truth.bind_site(context, expression, &mut site);
         self.truth.site = Some(site);
         bound
@@ -98,20 +94,16 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
     }
 
     /// What the column `field`, as PostgreSQL stores its name, of a row of
-    /// `table` holds by its type alone, `NULL` included, and `None` when the
-    /// table has no such column.
-    fn column_of(
-        &mut self,
-        table: &'db DB::Table,
-        field: &str,
-    ) -> Result<Option<Evaluation>, LookupError> {
+    /// `table` holds by its type alone, `NULL` included. Reading a column the
+    /// table does not have raises.
+    fn column_of(&mut self, table: &'db DB::Table, field: &str) -> Result<Evaluation, LookupError> {
         let Some(column) = stored_column(table, field, self.truth.database)? else {
-            return Ok(None);
+            return Ok(Evaluation::raising(ScalarType::Unknown));
         };
         let truth = &mut self.truth;
         let evaluation =
             truth.engine.column(column, truth.database, &mut truth.collations, &truth.enums)?;
-        Ok(Some(evaluation.with_null(true)))
+        Ok(evaluation.with_null(true))
     }
 
     /// What the field `field` of `variable`, a row of a table or of the
@@ -132,10 +124,9 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
                         self.column_of(table, field)?
                     }
                     Relation::View(_) | Relation::MaterializedView(_) | Relation::Sequence(_) => {
-                        None
+                        any(ScalarType::Unknown)
                     }
                 };
-                let evaluation = evaluation.unwrap_or_else(|| any(ScalarType::Unknown));
                 joined = Some(match joined {
                     Some(held) => held.join(&evaluation),
                     None => evaluation,
@@ -143,22 +134,19 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
             }
             return Ok(joined);
         }
-        let Ok(OperandType::Known { type_name, .. }) = variable.data_type() else {
-            return Ok(None);
-        };
-        let Some(table) =
-            database.table_by_target(type_name.clone(), database.identifier_case())?
-        else {
-            return Ok(None);
-        };
-        self.column_of(table, field)
+        if let Ok(OperandType::Known { type_name, .. }) = variable.data_type()
+            && let Some(table) =
+                database.table_by_target(type_name.clone(), database.identifier_case())?
+        {
+            return self.column_of(table, field).map(Some);
+        }
+        Ok(None)
     }
 
     /// What `NEW` or `OLD`, `row`, or its column `fields` name, holds as the
     /// body starts, joined over every trigger executing the function. `None`
-    /// when no trigger does, for a trigger on a relation other than a table
-    /// or `INSTEAD OF`, a column the table does not have and a field of a
-    /// field.
+    /// when no trigger does, for a trigger on a relation other than a table,
+    /// a column the table does not have and a field of a field.
     fn trigger_row(
         &mut self,
         name: &Name,
@@ -176,9 +164,6 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
                 }
             };
             let timing = trigger.timing();
-            if timing == Some(TriggerPeriod::InsteadOf) {
-                return Ok(None);
-            }
             let per_row = matches!(
                 trigger.orientation(),
                 Some(
@@ -214,10 +199,7 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
                         };
                         if absent { held.join(&Evaluation::null(held.ty().clone())) } else { held }
                     } else {
-                        let typed = self.column_of(table, field)?;
-                        Evaluation::null(
-                            typed.map_or(ScalarType::Unknown, |typed| typed.ty().clone()),
-                        )
+                        Evaluation::null(self.column_of(table, field)?.ty().clone())
                     }
                 }
                 _ => return Ok(None),
@@ -369,9 +351,8 @@ impl<DB: DatabaseLike> values::Context for BodyTruth<'_, '_, DB> {
     /// narrows no field, since a guarantee here holds of one field alone. The
     /// `NEW` a `BEFORE` trigger reads holds a row PostgreSQL has not checked
     /// yet, so a column of it may be `NULL` and holds only its type and,
-    /// when not `NULL`, its domain. A trigger on a view, an `INSTEAD OF`
-    /// trigger, a column the table does not have and a field of a field
-    /// leave only the type.
+    /// when not `NULL`, its domain. A trigger on a view, a column the table
+    /// does not have and a field of a field leave only the type.
     fn entry(
         &mut self,
         variable: &Name,

@@ -230,7 +230,7 @@ pub(crate) fn site_truth<'a, DB: DatabaseLike>(
     assumptions: &[Assumption<'a, DB>],
 ) -> Result<ExpressionTruth, LookupError> {
     let mut truth = TruthContext::new(context.database(), context.case(), None);
-    let mut site = Site { references: Vec::new(), calls: Vec::new() };
+    let mut site = Site::empty();
     truth.bind_site(context, expression, &mut site)?;
     for assumption in assumptions {
         if let Assumption::Expression { expression, .. } = assumption {
@@ -894,6 +894,11 @@ struct Site<'a, DB: DatabaseLike> {
 }
 
 impl<'a, DB: DatabaseLike> Site<'a, DB> {
+    /// A site binding nothing.
+    const fn empty() -> Self {
+        Self { references: Vec::new(), calls: Vec::new() }
+    }
+
     /// The value the reference `expression` reads, or that every reference
     /// equal to the copy `expression` is reads.
     fn named(&self, expression: &Expr) -> Option<usize> {
