@@ -2785,7 +2785,8 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
 /// so the columns a column grant covers are the ones
 /// `ColumnGrantLike::columns` answers, and the grant never holds on the
 /// table. `ALL PRIVILEGES` on a column gives the four privileges a column can
-/// carry and nothing table-wide.
+/// carry and nothing table-wide, and a privilege no column can carry gives
+/// nothing.
 #[test]
 fn a_column_grant_listing_no_columns_holds_on_its_own_columns() -> Result<(), LookupError> {
     let column_grant = |column_name: &str, privilege| {
@@ -2806,6 +2807,7 @@ fn a_column_grant_listing_no_columns_holds_on_its_own_columns() -> Result<(), Lo
             column_grant("id", Some(Action::Select { columns: None })),
             column_grant("quantity", Some(Action::Select { columns: None })),
             column_grant("status", None),
+            column_grant("price", Some(Action::Delete)),
         ],
         ..MemoryCatalog::default()
     };
