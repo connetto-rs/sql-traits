@@ -68,6 +68,30 @@ fn an_exclusion_constraint_builds_a_non_unique_index_of_its_own() {
     );
 }
 
+/// The `Arc`s the metadata hands out are the allocations the table answers
+/// with, in its order, so a builder handed their clones shares them.
+#[test]
+fn the_metadata_hands_out_the_arcs_the_table_answers_with() {
+    let database = parse(
+        "CREATE TABLE bookings (room INT, seat INT, EXCLUDE (room WITH =), EXCLUDE (seat WITH =));",
+    );
+    let bookings = table(&database, "bookings");
+    let held: Vec<_> = database
+        .table_metadata(bookings)
+        .expect("table belongs to database")
+        .exclusion_index_arcs()
+        .map(|index| core::ptr::from_ref(index.as_ref()))
+        .collect();
+    let answered: Vec<_> = bookings
+        .exclusion_indices(&database)
+        .expect("table belongs to database")
+        .map(core::ptr::from_ref)
+        .collect();
+
+    assert_eq!(held.len(), 2);
+    assert_eq!(held, answered);
+}
+
 #[test]
 fn an_added_exclusion_constraint_answers_every_clause_it_writes() {
     let database = parse(
