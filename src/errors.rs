@@ -1673,11 +1673,11 @@ pub enum CallableFunctionsError {
         /// Each function, schema-qualified with its argument types.
         functions: Vec<String>,
     },
-    /// A call of the function by its bare name, on the role's `search_path`,
-    /// reaches another function or none.
+    /// A call of a function on the role's `search_path` by its bare name
+    /// reaches another function.
     #[error(
         "a call of `{function}` by its bare name on search_path `{search_path}` reaches {}",
-        reached_functions(.reaches)
+        .reaches.join(", ")
     )]
     UnreachedByBareName {
         /// The function, schema-qualified with its argument types.
@@ -1688,11 +1688,6 @@ pub enum CallableFunctionsError {
         /// argument types.
         reaches: Vec<String>,
     },
-}
-
-/// The functions a bare call reaches, listed for an error message.
-fn reached_functions(reaches: &[String]) -> String {
-    if reaches.is_empty() { "no function".into() } else { reaches.join(", ") }
 }
 
 /// An illegal combination of a policy command and stored clauses.
