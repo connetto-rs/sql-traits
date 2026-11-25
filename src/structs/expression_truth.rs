@@ -1239,6 +1239,18 @@ impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
         }
         ScalarType::of(data_type)
     }
+
+    /// A custom plan binds a function parameter, a positional placeholder
+    /// and a PL/pgSQL variable or field of one as a constant, and inlining
+    /// a SQL function binds its parameters to the arguments. A name nothing
+    /// in reach binds may be any of them. A column and the value a domain
+    /// checks never are.
+    fn may_plan_as_constant(&self, reference: &usize) -> bool {
+        matches!(
+            self.named[*reference].key,
+            Key::Parameter { .. } | Key::Variable { .. } | Key::Placeholder(_) | Key::Name { .. }
+        )
+    }
 }
 
 impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {

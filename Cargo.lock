@@ -1021,7 +1021,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c3f0d8e076316a1581ebab839abc70bbf0338b4b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#af9872c5344b31c10dbf953ee684db61ff276394"
 dependencies = [
  "log",
  "recursive",
@@ -1042,7 +1042,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#bf8d41991d71c5947fe61a91b0f6341b577a4275"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#1e87038c58ca7ed3bc931a5f2efa08dc3ff54388"
 dependencies = [
  "rpds",
  "sql-values",
@@ -1062,7 +1062,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql-dataflow"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#a11eac4e8763ac8ea0b0cc842ae414859d0c789e"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#8e1ad97f3229fae337d015c39a668767acebd6a0"
 dependencies = [
  "sqlparser",
  "sqlparser-expr-eval",
@@ -1074,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#c3f0d8e076316a1581ebab839abc70bbf0338b4b"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#af9872c5344b31c10dbf953ee684db61ff276394"
 dependencies = [
  "proc-macro2",
  "quote",
