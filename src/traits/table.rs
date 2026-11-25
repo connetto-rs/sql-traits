@@ -4937,9 +4937,12 @@ pub trait TableLike:
     /// [`owner_privileges`](Self::owner_privileges) reports it, when the role
     /// or one it inherits from is the table's [`owner`](Self::owner). What a
     /// `REVOKE` took is gone from those entries already. A table-level
-    /// privilege holds on every column, while a column grant holds on the
-    /// columns it names and never on the table. A superuser holds every
-    /// privilege, and a role that is a member of a superuser does not.
+    /// privilege holds on every column. A column grant never holds on the
+    /// table. Its privilege holds on the columns it lists, or on the
+    /// grant's [`columns`](crate::traits::ColumnGrantLike::columns) when it
+    /// lists none, and `ALL PRIVILEGES` gives those columns every privilege
+    /// a column can carry. A superuser holds every privilege, and a role that
+    /// is a member of a superuser does not.
     /// [`ActingRole::Public`], a caller holding no role, holds what `PUBLIC`
     /// holds.
     ///
@@ -5000,11 +5003,11 @@ pub trait TableLike:
             && holders.iter().any(|holder| holder.stored_name() == owner)
         {
             for privilege in self.owner_privileges(database)? {
-                held.take(privilege, &columns);
+                held.take(privilege, &columns, None);
             }
         }
         for grant in self.grants(database)? {
-            held.take_grant(grant, &holders, &columns, database);
+            held.take_grant(grant, &holders, &columns, None, database);
         }
         let table: &<Self::DB as DatabaseLike>::Table = self.borrow();
         for grant in database.column_grants().filter(|grant| {
@@ -5014,7 +5017,13 @@ pub trait TableLike:
                     if core::ptr::eq(granted, table)
             )
         }) {
-            held.take_grant(grant, &holders, &columns, database);
+            let granted: Vec<&<Self::DB as DatabaseLike>::Column> =
+                grant.columns(table, database)?.collect();
+            let covered: Vec<bool> = columns
+                .iter()
+                .map(|column| granted.iter().any(|granted| core::ptr::eq(*granted, *column)))
+                .collect();
+            held.take_grant(grant, &holders, &columns, Some(&covered), database);
         }
         Ok(held.answer(&columns))
     }
@@ -5130,12 +5139,14 @@ impl HeldPrivileges {
     }
 
     /// Records what `grant` gives, when it reaches one of `holders`, or
-    /// `PUBLIC`.
+    /// `PUBLIC`. `covered` marks the columns a column grant covers, as
+    /// [`take`](Self::take) reads it.
     fn take_grant<G: GrantLike, C: ColumnLike>(
         &mut self,
         grant: &G,
         holders: &[&<G::DB as DatabaseLike>::Role],
         columns: &[&C],
+        covered: Option<&[bool]>,
         database: &G::DB,
     ) {
         if !(grant.applies_to_public()
@@ -5144,16 +5155,27 @@ impl HeldPrivileges {
             return;
         }
         if grant.is_all_privileges() {
-            self.table = [true; TABLE_PRIVILEGES];
+            match covered {
+                None => self.table = [true; TABLE_PRIVILEGES],
+                Some(covered) => self.columns.iter_mut().for_each(|held| mark(held, covered)),
+            }
             return;
         }
         for privilege in grant.privileges(database) {
-            self.take(privilege, columns);
+            self.take(privilege, columns, covered);
         }
     }
 
-    /// Records `privilege` on the table, or on the columns it lists.
-    fn take<C: ColumnLike>(&mut self, privilege: &sqlparser::ast::Action, columns: &[&C]) {
+    /// Records `privilege` on the columns it lists. A privilege listing no
+    /// columns holds on the table for a table-level entry, and on the
+    /// columns `covered` marks for a column grant, which never holds on the
+    /// table and carries no privilege a column cannot.
+    fn take<C: ColumnLike>(
+        &mut self,
+        privilege: &sqlparser::ast::Action,
+        columns: &[&C],
+        covered: Option<&[bool]>,
+    ) {
         use sqlparser::ast::Action;
         let Some(slot) = privilege_slot(privilege) else {
             return;
@@ -5165,19 +5187,25 @@ impl HeldPrivileges {
             | Action::References { columns: listed } => listed.as_deref(),
             _ => None,
         };
-        let Some(listed) = listed else {
-            self.table[slot] = true;
-            return;
-        };
-        for (held, column) in self.columns[slot].iter_mut().zip(columns) {
-            *held |= listed.iter().any(|ident| {
-                identifiers_match(
-                    &ident.value,
-                    ident.quote_style.is_some(),
-                    column.column_name(),
-                    column.column_name_is_quoted(),
-                )
-            });
+        match (listed, covered) {
+            (None, None) => self.table[slot] = true,
+            (None, Some(covered)) => {
+                if let Some(held) = self.columns.get_mut(slot) {
+                    mark(held, covered);
+                }
+            }
+            (Some(listed), _) => {
+                for (held, column) in self.columns[slot].iter_mut().zip(columns) {
+                    *held |= listed.iter().any(|ident| {
+                        identifiers_match(
+                            &ident.value,
+                            ident.quote_style.is_some(),
+                            column.column_name(),
+                            column.column_name_is_quoted(),
+                        )
+                    });
+                }
+            }
         }
     }
 
@@ -5207,6 +5235,13 @@ impl HeldPrivileges {
             trigger: self.table[6],
             maintain: self.table[7],
         }
+    }
+}
+
+/// Marks as held each column `covered` marks.
+fn mark(held: &mut [bool], covered: &[bool]) {
+    for (held, covered) in held.iter_mut().zip(covered) {
+        *held |= covered;
     }
 }
 
