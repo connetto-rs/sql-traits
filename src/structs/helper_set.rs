@@ -12,7 +12,7 @@ use crate::{
     traits::DatabaseLike,
 };
 
-/// A condition of a grant arm that
+/// A condition of an arm that
 /// [`FunctionLike::helper_set`](crate::traits::FunctionLike::helper_set)
 /// reads only where its consumer names it, refusing an arm writing it
 /// otherwise, so a consumer never keeps a row such a condition takes away.
@@ -24,6 +24,10 @@ pub enum ArmCondition {
     /// The settings a request has to leave unset (see
     /// [`GrantArm::unset_settings`]).
     UnsetSetting,
+    /// What an edge has to hold for a walk to follow it (see
+    /// [`WalkArm::restrictions`], [`WalkArm::time_bounds`] and
+    /// [`WalkArm::exclusions`]).
+    EdgeCondition,
 }
 
 /// The set a helper returns, the union of its arms kept to the rows its
@@ -94,8 +98,8 @@ pub enum HelperArm<'db, DB: DatabaseLike> {
     Parent(ParentArm<'db, DB>),
     /// The rows another helper returns.
     Called(CalledArm<'db, DB>),
-    /// The rows next to the ones the set itself holds, along one edge of a
-    /// tree, the set growing along every walk at once.
+    /// The rows next to the ones the set itself holds, along the edges one
+    /// table holds, the set growing along every walk at once.
     Walk(WalkArm<'db, DB>),
 }
 
@@ -1017,16 +1021,22 @@ impl<'db, DB: DatabaseLike> CalledArm<'db, DB> {
 
 /// One edge the recursive term of `WITH RECURSIVE <walk> (<column>) AS
 /// (<arms> UNION <term>) SELECT <column> FROM <walk>` follows, walking the
-/// tree whose edges the table holds until the set stops growing.
+/// rows of the [tree](Self::tree) along the edges the table holds until the
+/// set stops growing.
 ///
-/// Each row of the table is an edge from the tree's row its child column
-/// names to the one its parent column names. The table is the tree itself,
-/// its child column the primary key, where each row names its own parent,
-/// or an edge table, its child column its primary key or a column a unique
-/// key covers alone, holding one row per child that has a parent. A term
-/// reading a `LATERAL` union of edges answers one walk per edge, each
-/// adding to the one set every other one reads. The walk ends on a tree
-/// holding a cycle, as `UNION` keeps no row twice.
+/// Each row of the table meeting the [restrictions](Self::restrictions), the
+/// [time bounds](Self::time_bounds) and the [exclusions](Self::exclusions)
+/// is an edge from the tree's row its child column names to the one its
+/// parent column names. The table is the tree itself, its child column the
+/// primary key, where each row names its own parent, or an edge table
+/// holding any number of edges per child and per parent, so the edges may
+/// draw any graph. The child column of an edge table is the one of the two
+/// its primary key is, else the one a unique key covers alone, and the
+/// column the term adds where its keys tell neither apart, the walk then
+/// going [down](WalkDirection::Down). A term reading a `LATERAL` union of
+/// edges answers one walk per edge, each adding to the one set every other
+/// one reads. The walk ends on edges closing a cycle, as `UNION` keeps no
+/// row twice.
 #[derive(Debug)]
 pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
@@ -1036,6 +1046,9 @@ pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) column: &'db DB::Column,
     pub(crate) foreign_key: &'db DB::ForeignKey,
     pub(crate) direction: WalkDirection,
+    pub(crate) restrictions: Vec<Restriction<'db, DB>>,
+    pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
+    pub(crate) exclusions: Vec<ExcludedSet<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
@@ -1084,9 +1097,38 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
     pub fn direction(&self) -> WalkDirection {
         self.direction
     }
+
+    /// What columns of an edge have to hold for the walk to follow it, as
+    /// [`GrantArm::restrictions`] reads them. Empty where the term sets no
+    /// condition on the edge or one holding for every row, and in every
+    /// answer whose reading leaves [`ArmCondition::EdgeCondition`] unread,
+    /// which refuses a term setting one.
+    #[must_use]
+    pub fn restrictions(&self) -> &[Restriction<'db, DB>] {
+        &self.restrictions
+    }
+
+    /// The bounds an edge has to meet against the statement time for the
+    /// walk to follow it, every one of them, in the order the term writes
+    /// them. Empty in every answer whose reading leaves
+    /// [`ArmCondition::EdgeCondition`] unread.
+    #[must_use]
+    pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
+        &self.time_bounds
+    }
+
+    /// The sets of other helpers a column of an edge has to stay outside for
+    /// the walk to follow it, as [`GrantArm::exclusions`] reads them, every
+    /// one of them in the order the term writes them. Empty in every answer
+    /// whose reading leaves [`ArmCondition::EdgeCondition`] or
+    /// [`ArmCondition::Exclusion`] unread, which refuses a term writing one.
+    #[must_use]
+    pub fn exclusions(&self) -> &[ExcludedSet<'db, DB>] {
+        &self.exclusions
+    }
 }
 
-/// Which way a [`WalkArm`] follows its tree.
+/// Which way a [`WalkArm`] follows its edges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkDirection {
     /// `SELECT <child> FROM <table> JOIN <walk> ON <column> =
@@ -1101,6 +1143,7 @@ pub enum WalkDirection {
     /// whose child the set holds, so the set ends holding every row above its
     /// other arms. A root of a tree holding its own edges adds its parent
     /// column's `NULL`, which no `IN` matches, and a root of an edge table has
-    /// no edge.
+    /// no edge. A walk reads as one up only where a key of its table orients
+    /// its edges (see [`WalkArm`]).
     Up,
 }
