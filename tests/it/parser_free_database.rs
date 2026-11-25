@@ -236,6 +236,10 @@ struct MemoryTableGrant {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct MemoryColumnGrant {
     table_name: String,
+    column_name: String,
+    /// The privilege spelled with no column list, as a live catalog keeps
+    /// one entry per column, or `None` for `ALL PRIVILEGES`.
+    privilege: Option<Action>,
 }
 
 impl Metadata for MemoryCatalog {
@@ -1834,11 +1838,11 @@ impl GrantLike for MemoryColumnGrant {
     where
         Self: 'db,
     {
-        core::iter::empty()
+        self.privilege.iter()
     }
 
     fn is_all_privileges(&self) -> bool {
-        true
+        self.privilege.is_none()
     }
 
     fn grantees<'db>(&'db self, _database: &'db Self::DB) -> impl Iterator<Item = &'db Grantee>
@@ -1875,15 +1879,15 @@ impl ColumnGrantLike for MemoryColumnGrant {
         table: &'a MemoryTable,
         database: &'a Self::DB,
     ) -> Result<impl Iterator<Item = &'a MemoryColumn>, LookupError> {
-        table.columns(database)
+        Ok(table.columns(database)?.filter(move |column| column.name == self.column_name))
     }
 
     fn table<'a>(&'a self, database: &'a Self::DB) -> Option<&'a MemoryTable> {
         database.tables.iter().find(|table| table.name == self.table_name)
     }
 
-    fn relation<'a>(&'a self, _database: &'a Self::DB) -> Option<Relation<'a, Self::DB>> {
-        None
+    fn relation<'a>(&'a self, database: &'a Self::DB) -> Option<Relation<'a, Self::DB>> {
+        self.table(database).map(Relation::Table)
     }
 }
 
@@ -2774,6 +2778,51 @@ fn the_inherited_accessors_answer_from_the_catalog() -> Result<(), LookupError> 
     assert!(first_type.base_type(&catalog).is_none());
     assert!(first_type.domain(&catalog).is_none());
 
+    Ok(())
+}
+
+/// A live catalog keeps one entry per column with the privilege spelled bare,
+/// so the columns a column grant covers are the ones
+/// `ColumnGrantLike::columns` answers, and the grant never holds on the
+/// table. `ALL PRIVILEGES` on a column gives the four privileges a column can
+/// carry and nothing table-wide.
+#[test]
+fn a_column_grant_listing_no_columns_holds_on_its_own_columns() -> Result<(), LookupError> {
+    let column_grant = |column_name: &str, privilege| {
+        MemoryColumnGrant {
+            table_name: String::from("orders"),
+            column_name: String::from(column_name),
+            privilege,
+        }
+    };
+    let catalog = MemoryCatalog {
+        tables: vec![table(None, "orders")],
+        columns: ["id", "price", "quantity", "status"]
+            .into_iter()
+            .map(|name| column(None, "orders", name))
+            .collect(),
+        roles: vec![MemoryRole { name: String::from("anon"), name_is_quoted: false }],
+        column_grants: vec![
+            column_grant("id", Some(Action::Select { columns: None })),
+            column_grant("quantity", Some(Action::Select { columns: None })),
+            column_grant("status", None),
+        ],
+        ..MemoryCatalog::default()
+    };
+    let orders = &catalog.tables[0];
+    let named = |names: &[&str]| {
+        ColumnPrivilege::Columns(
+            catalog.columns.iter().filter(|column| names.contains(&column.name.as_str())).collect(),
+        )
+    };
+
+    let held = orders.privileges(&catalog.roles[0], &catalog)?;
+
+    assert_eq!(held.select, named(&["id", "quantity", "status"]));
+    assert_eq!(held.insert, named(&["status"]));
+    assert_eq!(held.update, named(&["status"]));
+    assert_eq!(held.references, named(&["status"]));
+    assert!(!(held.delete || held.truncate || held.trigger || held.maintain));
     Ok(())
 }
 
