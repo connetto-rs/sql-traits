@@ -141,22 +141,15 @@ mod tests {
         }
     }
 
-    /// What `SET search_path = ...` writes prints as PostgreSQL stores it,
-    /// and reads back as the schemas the statement named.
+    /// The values `SET search_path = ...` writes print as PostgreSQL stores
+    /// them, and read back as the schemas the statement named.
     #[test]
     fn prints_each_entry_as_postgres_stores_it() {
         let printed = |written: &str| {
-            let statement =
-                Parser::parse_sql(&PostgreSqlDialect {}, &format!("SET search_path = {written}"))
-                    .expect("the statement parses")
-                    .remove(0);
-            let sqlparser::ast::Statement::Set(sqlparser::ast::Set::SingleAssignment {
-                values,
-                ..
-            }) = statement
-            else {
-                unreachable!("a single assignment")
-            };
+            let values = Parser::new(&PostgreSqlDialect {})
+                .try_with_sql(written)
+                .and_then(|mut parser| parser.parse_comma_separated(Parser::parse_expr))
+                .expect("the values parse");
             printed_search_path(&values, false)
         };
         assert_eq!(printed("\"$user\", Public").as_deref(), Some("\"$user\", public"));

@@ -136,13 +136,18 @@ fn a_bare_name_shared_by_callable_functions_is_refused() {
 #[test]
 fn a_function_not_called_by_its_bare_name_is_refused() {
     let database = parse(API);
+    let unreached = callable(&database, None);
     assert_eq!(
-        callable(&database, None),
+        unreached,
         Err(CallableFunctionsError::UnreachedByBareName {
             function: "api.search(text)".into(),
             search_path: "public".into(),
             reaches: Vec::new(),
         })
+    );
+    assert_eq!(
+        unreached.expect_err("refused").to_string(),
+        "a call of `api.search(text)` by its bare name on search_path `public` reaches no function"
     );
 
     // `pg_catalog` comes first, so `lower` reaches the catalog's own.
