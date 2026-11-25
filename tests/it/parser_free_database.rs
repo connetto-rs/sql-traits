@@ -2189,6 +2189,19 @@ fn functions_without_aggregate_state_report_no_null_result() -> Result<(), Looku
     Ok(())
 }
 
+/// An engine that records nowhere a function's `NULL` results answers that it
+/// may return `NULL` on any input, so no call reads as never `NULL`.
+#[test]
+fn functions_without_null_result_records_may_return_null_on_any_input() -> Result<(), LookupError> {
+    let catalog = catalog();
+    let function = catalog
+        .resolve_target_function(TargetName::new("touch", false), IdentifierCase::AsWritten)?
+        .expect("the default schema holds one");
+
+    assert!(!function.returns_null_only_on_null_input(&catalog));
+    Ok(())
+}
+
 /// A body the catalog stores as text is parsed under the catalog's dialect
 /// and read under the path the function pins, as a parsed script reads it.
 #[test]
