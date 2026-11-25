@@ -33,6 +33,7 @@ mod column_definitions;
 mod column_identifier_rules;
 mod column_scope;
 mod column_scoped_grants;
+mod column_storage;
 mod column_type_change_dependents;
 mod column_written_constraints;
 mod comment_on_documentation;

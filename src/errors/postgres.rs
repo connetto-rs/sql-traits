@@ -317,6 +317,12 @@ impl Error {
                     "cannot specify USING when altering type of generated column",
                 ))
             }
+            Self::ColumnStorageOnlyPlain { type_description } => {
+                Some(PostgresError::new(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!("column data type {type_description} can only have storage PLAIN"),
+                ))
+            }
             Self::InheritedGeneratedKindConflict { column_name, .. } => {
                 Some(PostgresError::new(
                     pg::INVALID_COLUMN_DEFINITION,

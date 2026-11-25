@@ -524,8 +524,8 @@ pub(super) fn refuse_dropping_other_kind(
 /// PostgreSQL accepts `ALTER TABLE` against a view for the actions a view
 /// supports and refuses the rest naming the action. Of those the parser can
 /// read, this handles renaming the view or one of its columns, changing the
-/// owner, setting and resetting options, and setting or dropping a plain
-/// view's column default.
+/// owner, setting and resetting options, setting or dropping a plain view's
+/// column default, and setting a materialized view column's storage mode.
 ///
 /// Only called when [`holds_view`] answered, so the name is known to be a
 /// view's.
@@ -578,6 +578,14 @@ pub(super) fn alter_view(
             column_name,
             op: AlterColumnOperation::SetDefault { .. } | AlterColumnOperation::DropDefault,
         } if kind == ObjectKind::View => require_view_column(builder, name, column_name),
+        // A materialized view stores its rows, so its columns take a storage
+        // mode, which the model does not record.
+        AlterTableOperation::AlterColumn {
+            column_name,
+            op: AlterColumnOperation::SetStorage { .. },
+        } if kind == ObjectKind::MaterializedView => {
+            require_view_column(builder, name, column_name)
+        }
         other => {
             Err(Error::AlterActionUnsupportedOnRelation {
                 object_kind: kind,
@@ -757,6 +765,7 @@ fn column_action(operation: &AlterColumnOperation) -> &'static str {
         AlterColumnOperation::AddGenerated { .. } => "ALTER COLUMN ... ADD IDENTITY",
         AlterColumnOperation::GenericOptions { .. } => "ALTER COLUMN ... OPTIONS",
         AlterColumnOperation::DropExpression { .. } => "ALTER COLUMN ... DROP EXPRESSION",
+        AlterColumnOperation::SetStorage { .. } => "ALTER COLUMN ... SET STORAGE",
     }
 }
 
@@ -826,12 +835,13 @@ pub(super) fn alter_action(
     })
 }
 
-/// Checks that the plain view `name` exposes `column_name`, for a column
-/// default an `ALTER ... ALTER COLUMN` sets or drops on it.
+/// Checks that the view `name` exposes `column_name`, for a plain view's
+/// column default an `ALTER ... ALTER COLUMN` sets or drops, or a materialized
+/// view column's storage mode it sets.
 ///
-/// The default itself is not recorded. When the model cannot name every
-/// column the view exposes, a name it does not find is accepted, which never
-/// refuses input the server accepts.
+/// Neither is recorded. When the model cannot name every column the view
+/// exposes, a name it does not find is accepted, which never refuses input
+/// the server accepts.
 ///
 /// # Errors
 ///

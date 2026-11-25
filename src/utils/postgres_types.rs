@@ -164,6 +164,73 @@ static WITHOUT_SEND: &[&str] = &[
     "tsm_handler",
 ];
 
+/// The types of PostgreSQL 18's `pg_type` whose `typstorage` is `p`, sorted.
+static PLAIN_STORAGE: &[&str] = &[
+    "aclitem",
+    "any",
+    "anycompatible",
+    "anycompatiblenonarray",
+    "anyelement",
+    "anyenum",
+    "anynonarray",
+    "bool",
+    "box",
+    "char",
+    "cid",
+    "circle",
+    "cstring",
+    "date",
+    "event_trigger",
+    "fdw_handler",
+    "float4",
+    "float8",
+    "gtsvector",
+    "index_am_handler",
+    "int2",
+    "int2vector",
+    "int4",
+    "int8",
+    "internal",
+    "interval",
+    "language_handler",
+    "line",
+    "lseg",
+    "macaddr",
+    "macaddr8",
+    "money",
+    "name",
+    "oid",
+    "oidvector",
+    "pg_ddl_command",
+    "pg_lsn",
+    "point",
+    "regclass",
+    "regcollation",
+    "regconfig",
+    "regdictionary",
+    "regnamespace",
+    "regoper",
+    "regoperator",
+    "regproc",
+    "regprocedure",
+    "regrole",
+    "regtype",
+    "table_am_handler",
+    "tid",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "timetz",
+    "trigger",
+    "tsm_handler",
+    "tsquery",
+    "unknown",
+    "uuid",
+    "void",
+    "xid",
+    "xid8",
+];
+
 /// A type as PostgreSQL identifies it, without the length, precision or
 /// dimensions a declaration may add.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,6 +442,19 @@ impl PgType {
             Self::Named(_) | Self::Other(_) => None,
         }
     }
+
+    /// Whether PostgreSQL keeps every value of the type inline and
+    /// uncompressed, so a column of it takes no storage mode but `PLAIN`, or
+    /// `None` for a type the catalog tables do not hold.
+    pub(crate) fn stores_plain(&self) -> Option<bool> {
+        match self {
+            Self::Catalog(name) => {
+                catalog_row(name).map(|_| PLAIN_STORAGE.binary_search(name).is_ok())
+            }
+            Self::Array(_) => Some(false),
+            Self::Named(_) | Self::Other(_) => None,
+        }
+    }
 }
 
 /// The element of `record[]`.
@@ -572,6 +652,27 @@ mod tests {
         ] {
             let pg_type = PgType::parse(spelling).expect("parses");
             assert_eq!(pg_type.send_function(), send, "{spelling}");
+        }
+    }
+
+    /// The storage facts agree with PostgreSQL 18's `pg_type.typstorage`.
+    #[test]
+    fn catalog_types_answer_their_storage() {
+        assert!(super::PLAIN_STORAGE.is_sorted());
+        for (spelling, plain) in [
+            ("INT", Some(true)),
+            ("\"char\"", Some(true)),
+            ("TIMESTAMPTZ", Some(true)),
+            ("gtsvector", Some(true)),
+            ("TEXT", Some(false)),
+            ("NUMERIC", Some(false)),
+            ("_int4", Some(false)),
+            ("INT[]", Some(false)),
+            ("int4range", Some(false)),
+            ("TINYINT", None),
+        ] {
+            let pg_type = PgType::parse(spelling).expect("parses");
+            assert_eq!(pg_type.stores_plain(), plain, "{spelling}");
         }
     }
 

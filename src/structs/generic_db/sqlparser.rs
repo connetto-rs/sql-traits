@@ -102,6 +102,7 @@ mod index_opclasses;
 use calls_in_expression::CarriedCalls;
 mod column_copy;
 mod column_references;
+mod column_storage;
 mod column_texts;
 mod comment_on;
 mod constraint_names;
@@ -12264,6 +12265,9 @@ impl ParserDB {
             AlterColumnOperation::SetDataType { data_type, .. } => {
                 declared.data_type = data_type;
             }
+            // The model records no storage mode, so the column keeps all it
+            // declares.
+            AlterColumnOperation::SetStorage { .. } => {}
             AlterColumnOperation::AddGenerated { generated_as, sequence_options } => {
                 let generated_keyword = generated_as.is_some();
                 set(
@@ -12292,14 +12296,16 @@ impl ParserDB {
     /// either way: a table below that received the option receives its removal.
     fn altered_column_option(operation: &AlterColumnOperation) -> ColumnOption {
         match operation {
-            AlterColumnOperation::SetNotNull | AlterColumnOperation::DropNotNull => {
-                ColumnOption::NotNull
-            }
+            // A type change and a storage mode reach every table below, as a
+            // requirement to hold a value does.
+            AlterColumnOperation::SetNotNull
+            | AlterColumnOperation::DropNotNull
+            | AlterColumnOperation::SetDataType { .. }
+            | AlterColumnOperation::SetStorage { .. } => ColumnOption::NotNull,
             AlterColumnOperation::SetDefault { value } => ColumnOption::Default(value.clone()),
             AlterColumnOperation::DropDefault => {
                 ColumnOption::Default(Expr::Value(sqlparser::ast::Value::Null.with_empty_span()))
             }
-            AlterColumnOperation::SetDataType { .. } => ColumnOption::NotNull,
             AlterColumnOperation::DropExpression { .. } => {
                 ColumnOption::Generated {
                     generated_as: GeneratedAs::Always,
@@ -12364,7 +12370,8 @@ impl ParserDB {
     /// key, where a parent enforces it, which only the parent may lift, and
     /// where the column is in the table's replica identity index.
     /// Adding an identity is refused while the column may still hold nothing,
-    /// since an identity supplies a value on every row.
+    /// since an identity supplies a value on every row. A storage mode other
+    /// than `PLAIN` is refused for a column whose type keeps its values plain.
     fn refuse_alter_column(
         builder: &ParserDBBuilder,
         stored: &StoredTable,
@@ -12447,6 +12454,11 @@ impl ParserDB {
                             .stored_spelling(&stored.name, stored.name_quoted),
                         column_name: builder.dialect().stored_spelling(&column.name, column.quoted),
                     });
+                }
+            }
+            AlterColumnOperation::SetStorage { storage } => {
+                if let Some(declared) = declared {
+                    column_storage::refuse_storage(builder, declared, *storage)?;
                 }
             }
             // Tried on a copy, so a refused list leaves the column as it was.

@@ -2905,6 +2905,13 @@ pub enum Error {
     #[error("cannot specify USING when altering type of generated column")]
     /// A generated column type change specifies a conversion expression.
     GeneratedColumnTypeUsing,
+    #[error("column data type {type_description} can only have storage PLAIN")]
+    /// A column whose type keeps every value plain is given another storage
+    /// mode.
+    ColumnStorageOnlyPlain {
+        /// The diagnostic spelling of the column's type.
+        type_description: String,
+    },
     #[error("column \"{column_name}\" inherits from generated column of different kind")]
     /// A child changes the storage kind of an inherited generated column.
     InheritedGeneratedKindConflict {
