@@ -21,10 +21,14 @@ use sqlparser::ast::{
 use super::{ParserDBBuilder, SessionRoles, parse_options::WrittenTimeZone, stored_role_name};
 use crate::{
     errors::Error,
-    structs::{RoleSetting, role_setting::setting_zone},
+    structs::{
+        RoleSetting,
+        role_setting::{setting_search_path, setting_zone},
+    },
     utils::{
         identifier_resolution::{SessionPrincipal, session_principal, stored_identifier},
         object_name::{require_static_object_name, setting_value},
+        search_path_text::printed_search_path,
     },
 };
 
@@ -35,11 +39,13 @@ struct Held {
     value: Value,
 }
 
-/// A setting's value, with the zone PostgreSQL reads from a `TimeZone` one.
+/// A setting's value, with the zone PostgreSQL reads from a `TimeZone` one
+/// and the schemas it reads from a `search_path` one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Value {
     text: String,
     zone: Option<PgTimeZone>,
+    search_path: Option<Vec<(String, bool)>>,
 }
 
 /// The values a session's own `SET` statements leave, as `SET ... FROM
@@ -77,7 +83,7 @@ impl SessionSettings {
             .map(|WrittenTimeZone { written, zone }| {
                 Held {
                     name: "timezone".to_string(),
-                    value: Value { text: written, zone: Some(zone) },
+                    value: Value { text: written, zone: Some(zone), search_path: None },
                 }
             })
             .collect();
@@ -152,17 +158,13 @@ fn change_of(
     hex_strings_may_be_integers: bool,
 ) -> Result<Option<(Change, bool)>, Error> {
     let set = |name: String, values: &[Expr]| -> Result<Change, Error> {
-        let value = match values {
-            [Expr::Identifier(ident)]
-                if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT") =>
-            {
-                return Ok(Change::Reset { name });
-            }
-            [value] => literal(value, hex_strings_may_be_integers),
-            // A list such as a `search_path` is printed with quoting rules
-            // of its own, so its text stays unknown.
-            _ => None,
-        };
+        if let [Expr::Identifier(ident)] = values
+            && ident.quote_style.is_none()
+            && ident.value.eq_ignore_ascii_case("DEFAULT")
+        {
+            return Ok(Change::Reset { name });
+        }
+        let value = printed(&name, values, hex_strings_may_be_integers);
         let value = value.map(|text| valued(&name, text)).transpose()?;
         Ok(Change::Set { name, value })
     };
@@ -250,10 +252,28 @@ fn literal(value: &Expr, hex_strings_may_be_integers: bool) -> Option<String> {
         .map(|(text, exact)| if exact { text.into_owned() } else { text.to_ascii_lowercase() })
 }
 
+/// The text PostgreSQL stores for the setting `name` set to `values`, or
+/// [`None`] for a value its grammar refuses and for a list of any setting
+/// but `search_path`, whose quoting rules are not modelled.
+fn printed(name: &str, values: &[Expr], hex_strings_may_be_integers: bool) -> Option<String> {
+    if name.eq_ignore_ascii_case("search_path") {
+        return printed_search_path(values, hex_strings_may_be_integers);
+    }
+    match values {
+        [value] => literal(value, hex_strings_may_be_integers),
+        _ => None,
+    }
+}
+
 /// `text` as the value of the setting `name`, carrying the zone of a
-/// `TimeZone` setting and refused when PostgreSQL refuses that zone.
+/// `TimeZone` setting, refused when PostgreSQL refuses that zone, and the
+/// schemas of a `search_path` one.
 fn valued(name: &str, text: String) -> Result<Value, Error> {
-    Ok(Value { zone: setting_zone(name, &text)?, text })
+    Ok(Value {
+        zone: setting_zone(name, &text)?,
+        search_path: setting_search_path(name, &text)?,
+        text,
+    })
 }
 
 /// Records what an `ALTER ROLE ... SET` or `RESET` statement leaves in
@@ -299,7 +319,9 @@ pub(super) fn alter_role(
                     Some(value.clone())
                 }
                 SetConfigValue::Value(value) => {
-                    let Some(value) = literal(value, hex_strings_may_be_integers) else {
+                    let printed =
+                        printed(&name, core::slice::from_ref(value), hex_strings_may_be_integers);
+                    let Some(value) = printed else {
                         return Err(Error::NonLiteralSetting {
                             statement: statement.to_string(),
                             written_token: crate::utils::setting_syntax::setting_syntax_token(
@@ -315,16 +337,24 @@ pub(super) fn alter_role(
                 entry.is_keyed(role.as_deref(), database.as_deref()) && entry.is_named(&name)
             });
             match (position, value) {
-                (Some(position), Some(Value { text, zone })) => {
+                (Some(position), Some(Value { text, zone, search_path })) => {
                     let entry = &mut entries[position];
                     entry.value = text;
                     entry.zone = zone;
+                    entry.search_path = search_path;
                 }
                 (Some(position), None) => {
                     entries.remove(position);
                 }
-                (None, Some(Value { text, zone })) => {
-                    entries.push(RoleSetting { role, database, name, value: text, zone });
+                (None, Some(Value { text, zone, search_path })) => {
+                    entries.push(RoleSetting {
+                        role,
+                        database,
+                        name,
+                        value: text,
+                        zone,
+                        search_path,
+                    });
                 }
                 (None, None) => {}
             }

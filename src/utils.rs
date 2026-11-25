@@ -35,6 +35,7 @@ pub use postgres_null_returning::{
 mod output_from_wildcard;
 pub(crate) use output_from_wildcard::output_from_wildcard;
 pub mod scalar_family;
+pub(crate) mod search_path_text;
 pub(crate) mod setting_syntax;
 pub(crate) mod walk;
 pub(crate) mod with_scopes;

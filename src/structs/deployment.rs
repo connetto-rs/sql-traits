@@ -14,7 +14,12 @@ use sqlparser::{
     parser::Parser,
 };
 
-use crate::{errors::DeploymentError, traits::DatabaseLike};
+use crate::{
+    errors::DeploymentError, structs::RoleSetting, traits::DatabaseLike,
+    utils::search_path_text::split_search_path,
+};
+
+mod callable_functions;
 
 /// The roles a deployment's requests run as and the session settings its
 /// policies read.
@@ -71,6 +76,8 @@ pub struct Deployment {
     settings: Vec<SessionSetting>,
     database: Option<String>,
     default_time_zone: Option<(String, PgTimeZone)>,
+    /// The `search_path` each request sets itself, as written and as read.
+    search_path: Option<(String, Vec<(String, bool)>)>,
     acting_role_settings: bool,
     /// The declared narrower and wider sets, as written.
     sets_within: Vec<(Expr, Expr)>,
@@ -117,6 +124,7 @@ impl Deployment {
             settings: declared,
             database: None,
             default_time_zone: None,
+            search_path: None,
             acting_role_settings: false,
             sets_within: Vec::new(),
         })
@@ -143,6 +151,36 @@ impl Deployment {
         match PgTimeZone::parse(&zone) {
             Ok(parsed) => Ok(Self { default_time_zone: Some((zone, parsed)), ..self }),
             Err(reason) => Err(DeploymentError::InvalidTimeZone { zone, reason }),
+        }
+    }
+
+    /// The same deployment, each request setting its `search_path` to `path`
+    /// itself, as a client running `SET search_path` on every connection
+    /// does. `path` is written as `SHOW search_path` prints one, such as
+    /// `"$user", public`, and replaces the path any role setting gives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::InvalidSearchPath`] for a path PostgreSQL
+    /// refuses as list syntax.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    ///
+    /// # fn main() -> Result<(), sql_traits::errors::DeploymentError> {
+    /// let deployment = Deployment::new("login", ["reader"], [])?.with_search_path("api, public")?;
+    /// assert_eq!(deployment.search_path(), Some("api, public"));
+    /// assert!(Deployment::new("login", ["reader"], [])?.with_search_path("api,").is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_search_path(self, path: impl Into<String>) -> Result<Self, DeploymentError> {
+        let path = path.into();
+        match split_search_path(&path) {
+            Some(entries) => Ok(Self { search_path: Some((path, entries)), ..self }),
+            None => Err(DeploymentError::InvalidSearchPath { path }),
         }
     }
 
@@ -236,6 +274,12 @@ impl Deployment {
     #[must_use]
     pub fn default_time_zone(&self) -> Option<&str> {
         self.default_time_zone.as_ref().map(|(written, _)| written.as_str())
+    }
+
+    /// The `search_path` each request sets itself, as written, when declared.
+    #[must_use]
+    pub fn search_path(&self) -> Option<&str> {
+        self.search_path.as_ref().map(|(written, _)| written.as_str())
     }
 
     /// Whether each request applies the acting role's own settings.
@@ -388,11 +432,81 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     /// assert_eq!(zone, Ok(("America/New_York", TimeZoneSource::ActingRole)));
     /// ```
     pub fn time_zone(&self, acting_role: &str) -> Result<RequestTimeZone<'db>, DeploymentError> {
+        self.acting_role(acting_role)?;
+        self.time_zone_from(self.deployment.acting_role_settings.then_some(acting_role))
+    }
+
+    /// The `search_path` a request acting as `acting_role` resolves names
+    /// on, each schema as stored and whether it was quoted, `"$user"`
+    /// standing for the acting role as PostgreSQL reads it.
+    ///
+    /// A path the deployment declares with [`Deployment::with_search_path`]
+    /// wins, as the request sets it itself. Otherwise PostgreSQL takes the
+    /// first `search_path` entry [`Self::time_zone`] would take for
+    /// `TimeZone`, and then the database's own path,
+    /// [`DatabaseLike::search_path`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::NotAnActingRole`] for a role the
+    /// deployment does not act as, and [`DeploymentError::NoDatabase`] when
+    /// an entry set in one database is reached and the deployment names no
+    /// database.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::{errors::DeploymentError, prelude::*};
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// # fn main() -> Result<(), DeploymentError> {
+    /// let database = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE authenticator LOGIN NOINHERIT;
+    ///      CREATE ROLE web_user NOLOGIN;
+    ///      CREATE SCHEMA api;
+    ///      ALTER ROLE authenticator SET search_path = api;",
+    /// )
+    /// .expect("the schema parses");
+    /// let deployment = Deployment::new("authenticator", ["web_user"], [])?;
+    /// let path = deployment.resolve(&database)?.search_path("web_user")?;
+    /// assert_eq!(path, [("api", false)]);
+    ///
+    /// let declared = deployment.with_search_path("\"$user\", public")?;
+    /// let path = declared.resolve(&database)?.search_path("web_user")?;
+    /// assert_eq!(path, [("$user", true), ("public", false)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn search_path(&self, acting_role: &str) -> Result<Vec<(&'db str, bool)>, DeploymentError> {
+        self.acting_role(acting_role)?;
         let deployment = self.deployment;
-        if !deployment.acting_roles.iter().any(|role| role == acting_role) {
-            return Err(DeploymentError::NotAnActingRole { role: acting_role.into() });
+        let entries = |path: &'db [(String, bool)]| {
+            path.iter().map(|(schema, quoted)| (schema.as_str(), *quoted)).collect()
+        };
+        if let Some((_, declared)) = &deployment.search_path {
+            return Ok(entries(declared));
         }
-        self.time_zone_from(deployment.acting_role_settings.then_some(acting_role))
+        let acting = deployment.acting_role_settings.then_some(acting_role);
+        let reached = self.reached_setting(acting, "search_path")?;
+        if let Some(path) = reached.and_then(|(setting, _)| setting.search_path()) {
+            return Ok(entries(path));
+        }
+        Ok(self.database.search_path().collect())
+    }
+
+    /// The declared role a request acting as `name` runs as.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::NotAnActingRole`] for a role the
+    /// deployment does not act as.
+    fn acting_role(&self, name: &str) -> Result<&'db DB::Role, DeploymentError> {
+        self.deployment
+            .acting_roles
+            .iter()
+            .zip(&self.acting_roles)
+            .find_map(|(acting, role)| (acting == name).then_some(*role))
+            .ok_or_else(|| DeploymentError::NotAnActingRole { role: name.into() })
     }
 
     /// The `TimeZone` a request runs in before any `SET ROLE`, and the step
@@ -445,6 +559,35 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
         &self,
         acting_role: Option<&str>,
     ) -> Result<RequestTimeZone<'db>, DeploymentError> {
+        let reached =
+            self.reached_setting(acting_role, "TimeZone")?.and_then(|(setting, source)| {
+                Some(RequestTimeZone { name: setting.value(), zone: setting.time_zone()?, source })
+            });
+        if let Some(zone) = reached {
+            return Ok(zone);
+        }
+        self.deployment
+            .default_time_zone
+            .as_ref()
+            .map(|(name, zone)| {
+                RequestTimeZone { name, zone, source: TimeZoneSource::ServerDefault }
+            })
+            .ok_or(DeploymentError::NoDefaultTimeZone)
+    }
+
+    /// The first entry setting `name` that reaches a request reading
+    /// `acting_role`'s own settings, when given, ahead of the login role's
+    /// chain, and the step it is, or [`None`] when no role setting sets it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::NoDatabase`] when an entry set in one
+    /// database is reached and the deployment names no database.
+    fn reached_setting(
+        &self,
+        acting_role: Option<&str>,
+        name: &str,
+    ) -> Result<Option<(&'db RoleSetting, TimeZoneSource)>, DeploymentError> {
         let deployment = self.deployment;
         let database = self.database;
         let acting = acting_role.map(|role| {
@@ -459,34 +602,29 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
             (TimeZoneSource::Database, TimeZoneSource::AllRoles, None),
         ];
         for &(in_database, everywhere, role) in acting.iter().chain(&login) {
-            let zone_set = |set_in: Option<&str>, source| {
-                database.role_settings().find_map(|setting| {
-                    let zone = setting.time_zone().filter(|_| setting.is_keyed(role, set_in))?;
-                    Some(RequestTimeZone { name: setting.value(), zone, source })
-                })
+            let set = |set_in: Option<&str>, source| {
+                database
+                    .role_settings()
+                    .find(|setting| setting.is_named(name) && setting.is_keyed(role, set_in))
+                    .map(|setting| (setting, source))
             };
             if let Some(connected) = deployment.database.as_deref() {
-                if let Some(zone) = zone_set(Some(connected), in_database) {
-                    return Ok(zone);
+                if let Some(reached) = set(Some(connected), in_database) {
+                    return Ok(Some(reached));
                 }
             } else if database.role_settings().any(|setting| {
-                setting.role() == role
-                    && setting.database().is_some()
-                    && setting.is_named("timezone")
+                setting.role() == role && setting.database().is_some() && setting.is_named(name)
             }) {
-                return Err(DeploymentError::NoDatabase { role: role.map(Into::into) });
+                return Err(DeploymentError::NoDatabase {
+                    role: role.map(Into::into),
+                    setting: name.into(),
+                });
             }
-            if let Some(zone) = zone_set(None, everywhere) {
-                return Ok(zone);
+            if let Some(reached) = set(None, everywhere) {
+                return Ok(Some(reached));
             }
         }
-        deployment
-            .default_time_zone
-            .as_ref()
-            .map(|(name, zone)| {
-                RequestTimeZone { name, zone, source: TimeZoneSource::ServerDefault }
-            })
-            .ok_or(DeploymentError::NoDefaultTimeZone)
+        Ok(None)
     }
 }
 

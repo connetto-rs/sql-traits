@@ -1243,6 +1243,12 @@ impl Error {
             Self::InvalidTimeZone { value, reason } => {
                 Some(types_settings::timezone(value, *reason))
             }
+            Self::InvalidSearchPath { value } => {
+                Some(PostgresError::new(
+                    pg::INVALID_PARAMETER_VALUE,
+                    format!("invalid value for parameter \"search_path\": \"{value}\""),
+                ))
+            }
             Self::QualifiedDefaultPrivilegesSchema { .. } => {
                 Some(PostgresError::new(pg::SYNTAX_ERROR, "syntax error at or near \".\""))
             }

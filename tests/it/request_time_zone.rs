@@ -205,11 +205,11 @@ fn a_database_setting_needs_the_deployment_database() {
     );
     assert_eq!(
         zone(&parse("ALTER ROLE l IN DATABASE d SET timezone = 'Asia/Tokyo';"), &deployment),
-        Err(DeploymentError::NoDatabase { role: Some("l".into()) })
+        Err(DeploymentError::NoDatabase { role: Some("l".into()), setting: "TimeZone".into() })
     );
     assert_eq!(
         zone(&parse("ALTER ROLE ALL IN DATABASE d SET timezone = 'Asia/Tokyo';"), &deployment),
-        Err(DeploymentError::NoDatabase { role: None })
+        Err(DeploymentError::NoDatabase { role: None, setting: "TimeZone".into() })
     );
 }
 
@@ -279,21 +279,21 @@ fn a_request_without_set_role_needs_the_database_and_a_default() {
     assert_eq!(login_zone(&parse(""), &deployment), Err(DeploymentError::NoDefaultTimeZone));
     assert_eq!(
         login_zone(&parse("ALTER ROLE l IN DATABASE d SET timezone = 'Asia/Tokyo';"), &deployment),
-        Err(DeploymentError::NoDatabase { role: Some("l".into()) })
+        Err(DeploymentError::NoDatabase { role: Some("l".into()), setting: "TimeZone".into() })
     );
     assert_eq!(
         login_zone(
             &parse("ALTER ROLE ALL IN DATABASE d SET timezone = 'Asia/Tokyo';"),
             &deployment
         ),
-        Err(DeploymentError::NoDatabase { role: None })
+        Err(DeploymentError::NoDatabase { role: None, setting: "TimeZone".into() })
     );
 
     // The acting role's settings are never reached, so they need no database.
     let database = parse("ALTER ROLE a IN DATABASE d SET timezone = 'Asia/Tokyo';");
     assert_eq!(
         zone(&database, &deployment),
-        Err(DeploymentError::NoDatabase { role: Some("a".into()) })
+        Err(DeploymentError::NoDatabase { role: Some("a".into()), setting: "TimeZone".into() })
     );
     assert_eq!(login_zone(&database, &deployment), Err(DeploymentError::NoDefaultTimeZone));
 }

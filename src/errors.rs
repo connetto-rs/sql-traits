@@ -1634,13 +1634,65 @@ pub enum DeploymentError {
         "no role setting gives the request a `TimeZone` and the deployment declares no default"
     )]
     NoDefaultTimeZone,
-    /// A `TimeZone` set `IN DATABASE` may reach a request, and the deployment
+    /// A setting set `IN DATABASE` may reach a request, and the deployment
     /// names no database to match it against.
-    #[error("a `TimeZone` set in one database reaches the request, and the deployment names none")]
+    #[error("a `{setting}` set in one database reaches the request, and the deployment names none")]
     NoDatabase {
         /// The role the setting is for, [`None`] for every role.
         role: Option<String>,
+        /// The setting's name.
+        setting: String,
     },
+    /// The declared `search_path` is not a list of schemas as PostgreSQL
+    /// reads one.
+    #[error("`{path}` is no `search_path` list PostgreSQL reads")]
+    InvalidSearchPath {
+        /// The refused path.
+        path: String,
+    },
+}
+
+/// Why [`ResolvedDeployment::callable_functions`] refuses to list the
+/// functions a role may call.
+///
+/// [`ResolvedDeployment::callable_functions`]: crate::structs::ResolvedDeployment::callable_functions
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum CallableFunctionsError {
+    /// The role or its `search_path` cannot be settled.
+    #[error(transparent)]
+    Deployment(#[from] DeploymentError),
+    /// A function's privileges or metadata cannot be read.
+    #[error(transparent)]
+    Lookup(#[from] LookupError),
+    /// The role may call several functions whose bare names compare equal
+    /// without case, such as overloads or one name in several schemas.
+    #[error("the role may call {} by the one bare name `{name}`", .functions.join(", "))]
+    SharedBareName {
+        /// The bare name, as PostgreSQL stores it.
+        name: String,
+        /// Each function, schema-qualified with its argument types.
+        functions: Vec<String>,
+    },
+    /// A call of the function by its bare name, on the role's `search_path`,
+    /// reaches another function or none.
+    #[error(
+        "a call of `{function}` by its bare name on search_path `{search_path}` reaches {}",
+        reached_functions(.reaches)
+    )]
+    UnreachedByBareName {
+        /// The function, schema-qualified with its argument types.
+        function: String,
+        /// The role's `search_path`, as PostgreSQL prints it.
+        search_path: String,
+        /// Each function the bare call reaches, schema-qualified with its
+        /// argument types.
+        reaches: Vec<String>,
+    },
+}
+
+/// The functions a bare call reaches, listed for an error message.
+fn reached_functions(reaches: &[String]) -> String {
+    if reaches.is_empty() { "no function".into() } else { reaches.join(", ") }
 }
 
 /// An illegal combination of a policy command and stored clauses.
@@ -4639,6 +4691,13 @@ pub enum Error {
         /// Why PostgreSQL refuses it.
         #[source]
         reason: sql_values::postgres::TimeZoneError,
+    },
+    #[error("`{value}` is no `search_path` list PostgreSQL reads")]
+    /// Error indicating that a [`RoleSetting`](crate::structs::RoleSetting) of
+    /// `search_path` is not a list of schemas as PostgreSQL prints one.
+    InvalidSearchPath {
+        /// The refused value.
+        value: String,
     },
     #[error("`{statement}` names the role the session runs as, which the input never names.")]
     /// Error indicating that `ALTER ROLE CURRENT_USER`, `CURRENT_ROLE` or
