@@ -31,6 +31,19 @@ struct WithFrame {
     recursive: bool,
     /// How many items, from the first, the walk currently sees.
     visible: usize,
+    /// The item whose body the walk stands in.
+    current: Option<usize>,
+}
+
+/// The `WITH` item a relation name reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ItemBinding {
+    /// The address of the query whose `WITH` clause holds the item.
+    pub(crate) owner: *const Query,
+    /// The item's position in that clause.
+    pub(crate) item: usize,
+    /// Whether the name stands inside the item's own body.
+    pub(crate) in_own_body: bool,
 }
 
 impl WithScopes {
@@ -39,6 +52,7 @@ impl WithScopes {
             && let Some(position) = frame.bodies.iter().position(|body| core::ptr::eq(*body, query))
         {
             frame.visible = if frame.recursive { frame.names.len() } else { position };
+            frame.current = Some(position);
         }
         if let Some(with) = &query.with {
             self.frames.push(WithFrame {
@@ -47,6 +61,7 @@ impl WithScopes {
                 names: with.cte_tables.iter().map(|cte| cte.alias.name.clone()).collect(),
                 recursive: with.recursive,
                 visible: 0,
+                current: None,
             });
         }
     }
@@ -56,28 +71,51 @@ impl WithScopes {
             self.frames.pop();
         }
         if let Some(frame) = self.frames.last_mut()
-            && !frame.recursive
             && let Some(position) = frame.bodies.iter().position(|body| core::ptr::eq(*body, query))
         {
-            frame.visible = position + 1;
+            frame.current = None;
+            if !frame.recursive {
+                frame.visible = position + 1;
+            }
         }
     }
 
     /// Whether `name` reads a visible `WITH` item rather than a stored
     /// relation.
     pub(crate) fn reads_item(&self, name: &ObjectName) -> bool {
+        self.binding(name).is_some()
+    }
+
+    /// The visible `WITH` item `name` reads, or `None` for a stored relation.
+    /// A schema-qualified name never reads an item.
+    pub(crate) fn binding(&self, name: &ObjectName) -> Option<ItemBinding> {
         let [ObjectNamePart::Identifier(written)] = name.0.as_slice() else {
-            return false;
+            return None;
         };
-        self.frames.iter().any(|frame| {
-            frame.names[..frame.visible].iter().any(|item| {
-                identifiers_match(
-                    item.value.as_str(),
-                    item.quote_style.is_some(),
-                    written.value.as_str(),
-                    written.quote_style.is_some(),
-                )
-            })
+        self.unqualified_binding(written)
+    }
+
+    /// The visible `WITH` item the unqualified name `written` reads, or
+    /// `None` for a stored relation.
+    pub(crate) fn unqualified_binding(&self, written: &Ident) -> Option<ItemBinding> {
+        self.frames.iter().rev().find_map(|frame| {
+            frame.names[..frame.visible]
+                .iter()
+                .position(|item| {
+                    identifiers_match(
+                        &item.value,
+                        item.quote_style.is_some(),
+                        &written.value,
+                        written.quote_style.is_some(),
+                    )
+                })
+                .map(|item| {
+                    ItemBinding {
+                        owner: frame.owner,
+                        item,
+                        in_own_body: frame.current == Some(item),
+                    }
+                })
         })
     }
 }

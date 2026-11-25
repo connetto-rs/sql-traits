@@ -23,6 +23,14 @@ impl<'db, R> From<&'db R> for ActingRole<'db, R> {
     }
 }
 
+impl<R> Clone for ActingRole<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for ActingRole<'_, R> {}
+
 /// The shape of a statement, as far as row-level security tells shapes apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RowStatement {

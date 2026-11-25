@@ -1,9 +1,18 @@
 //! What a deployment runs its requests as, which the schema cannot say.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 use sql_values::postgres::PgTimeZone;
-use sqlparser::ast::DataType;
+use sqlparser::{
+    ast::{DataType, Expr},
+    dialect::PostgreSqlDialect,
+    parser::Parser,
+};
 
 use crate::{errors::DeploymentError, traits::DatabaseLike};
 
@@ -63,6 +72,8 @@ pub struct Deployment {
     database: Option<String>,
     default_time_zone: Option<(String, PgTimeZone)>,
     acting_role_settings: bool,
+    /// The declared narrower and wider sets, as written.
+    sets_within: Vec<(Expr, Expr)>,
 }
 
 impl Deployment {
@@ -107,6 +118,7 @@ impl Deployment {
             database: None,
             default_time_zone: None,
             acting_role_settings: false,
+            sets_within: Vec::new(),
         })
     }
 
@@ -140,6 +152,78 @@ impl Deployment {
     #[must_use]
     pub fn with_acting_role_settings(self) -> Self {
         Self { acting_role_settings: true, ..self }
+    }
+
+    /// Declares that every value `narrower` yields is also a value `wider`
+    /// yields.
+    ///
+    /// Declarations compose, and expressions match as written after unfolding
+    /// eligible `LANGUAGE sql` helpers. An eligible helper takes no inputs, is
+    /// non-volatile, and has a single query body that projects one set without
+    /// filtering or limiting it. The projected set must be a schema-qualified
+    /// call with literal positional arguments to a non-volatile `SECURITY
+    /// DEFINER` function, both functions must set no configuration except
+    /// `search_path`, and their return types and set-returning flags must
+    /// match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::InvalidSetExpression`] when either expression
+    /// cannot be parsed as PostgreSQL.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use sql_traits::prelude::*;
+    ///
+    /// # fn main() -> Result<(), sql_traits::errors::DeploymentError> {
+    /// let deployment = Deployment::new("login", ["reader"], [])?
+    ///     .with_set_within("authz.capped('writer')", "authz.capped('reader')")?;
+    /// assert!(deployment.with_set_within("authz.capped(", "authz.capped('reader')").is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_set_within(mut self, narrower: &str, wider: &str) -> Result<Self, DeploymentError> {
+        self.sets_within.push((parse_expression(narrower)?, parse_expression(wider)?));
+        Ok(self)
+    }
+
+    /// Returns whether every value `narrower` yields is one `wider` yields,
+    /// where `unfolded` gives another spelling of the set an expression
+    /// yields, such as the set a helper's body selects for a call to it, or
+    /// `None`, and `inferred` tells whether one set lies within another as
+    /// the rule reads the schema. Expressions and declarations compare once
+    /// fully unfolded.
+    pub(crate) fn is_set_within<E>(
+        &self,
+        narrower: &Expr,
+        wider: &Expr,
+        mut unfolded: impl FnMut(&Expr) -> Result<Option<Expr>, E>,
+        mut inferred: impl FnMut(&Expr, &Expr) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        let wider = fully_unfolded(wider, &mut unfolded)?;
+        let mut declared = Vec::with_capacity(self.sets_within.len());
+        for (inner, outer) in &self.sets_within {
+            declared.push((
+                fully_unfolded(inner, &mut unfolded)?,
+                fully_unfolded(outer, &mut unfolded)?,
+            ));
+        }
+        let narrower = fully_unfolded(narrower, &mut unfolded)?;
+        let mut reached: Vec<&Expr> = vec![&narrower];
+        let mut next = 0;
+        while let Some(&set) = reached.get(next) {
+            if *set == *wider || inferred(set, &wider)? {
+                return Ok(true);
+            }
+            for (inner, outer) in &declared {
+                if (**inner == *set || inferred(set, inner)?) && !reached.contains(&&**outer) {
+                    reached.push(outer);
+                }
+            }
+            next += 1;
+        }
+        Ok(false)
     }
 
     /// The database the deployment connects to, when declared.
@@ -201,6 +285,35 @@ impl Deployment {
             self.acting_roles.iter().map(|role| declared(role)).collect::<Result<Vec<_>, _>>()?;
         Ok(ResolvedDeployment { deployment: self, database, login_role, acting_roles })
     }
+}
+
+/// Parses one PostgreSQL expression.
+fn parse_expression(expression: &str) -> Result<Expr, DeploymentError> {
+    Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(expression)
+        .and_then(|mut parser| parser.parse_expr())
+        .map_err(|error| {
+            DeploymentError::InvalidSetExpression {
+                expression: expression.into(),
+                message: error.to_string(),
+            }
+        })
+}
+
+/// `set` unfolded by `unfolded` until it gives no other spelling or one it
+/// gave before, as a helper calling itself does.
+fn fully_unfolded<'expression, E>(
+    set: &'expression Expr,
+    unfolded: &mut impl FnMut(&Expr) -> Result<Option<Expr>, E>,
+) -> Result<Cow<'expression, Expr>, E> {
+    let mut spellings: Vec<Expr> = Vec::new();
+    while let Some(next) = unfolded(spellings.last().unwrap_or(set))? {
+        if next == *set || spellings.contains(&next) {
+            break;
+        }
+        spellings.push(next);
+    }
+    Ok(spellings.pop().map_or(Cow::Borrowed(set), Cow::Owned))
 }
 
 /// A [`Deployment`]'s roles as declared in one database.
@@ -714,4 +827,56 @@ pub enum SettingPresence {
     /// `NULL` on a connection that never set it and `''` once a transaction
     /// that set it has ended.
     MayBeUnset,
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::{ast::Expr, dialect::PostgreSqlDialect, parser::Parser};
+
+    use super::Deployment;
+    use crate::errors::DeploymentError;
+
+    /// Parses a set expression for a containment assertion.
+    fn expression(written: &str) -> Expr {
+        #[expect(clippy::expect_used, reason = "The test supplies a valid expression.")]
+        Parser::new(&PostgreSqlDialect {})
+            .try_with_sql(written)
+            .and_then(|mut parser| parser.parse_expr())
+            .expect("valid set expression")
+    }
+
+    /// Declared containment composes in its declared direction.
+    #[test]
+    fn declarations_compose() -> Result<(), DeploymentError> {
+        let deployment = Deployment::new("login", ["reader"], [])?
+            .with_set_within("authz.capped('writer')", "authz.capped('reader')")?
+            .with_set_within("authz.capped('reader')", "authz.capped('guest')")?;
+        let writer = expression("authz.capped('writer')");
+        let guest = expression("authz.capped('guest')");
+        let within = |narrower: &Expr, wider: &Expr| {
+            deployment.is_set_within(
+                narrower,
+                wider,
+                |_| Ok::<_, DeploymentError>(None),
+                |_, _| Ok(false),
+            )
+        };
+        assert_eq!(within(&writer, &guest), Ok(true));
+        assert_eq!(within(&guest, &writer), Ok(false));
+        Ok(())
+    }
+
+    /// Either malformed expression retains its spelling and parser message.
+    #[test]
+    fn malformed_declarations_are_refused() -> Result<(), DeploymentError> {
+        for (narrower, wider) in [("authz.capped(", "1"), ("1", "authz.capped(")] {
+            let result = Deployment::new("login", ["reader"], [])?.with_set_within(narrower, wider);
+            assert!(matches!(
+                result,
+                Err(DeploymentError::InvalidSetExpression { expression, message })
+                    if expression == "authz.capped(" && !message.is_empty()
+            ));
+        }
+        Ok(())
+    }
 }

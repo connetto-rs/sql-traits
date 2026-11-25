@@ -7,6 +7,7 @@ mod column_scope;
 mod constraint_deferral;
 mod declared_virtual_table;
 mod default_privilege;
+mod definer_read;
 mod deployment;
 mod dynamic_execution;
 mod embedded_sql;
@@ -74,6 +75,7 @@ pub use column_scope::{
 pub use constraint_deferral::ConstraintDeferral;
 pub use declared_virtual_table::{DeclaredColumn, DeclaredVirtualTable};
 pub use default_privilege::{DefaultGrant, DefaultGrantee, DefaultPrivilege, DefaultPrivilegeKind};
+pub use definer_read::{DefinerReading, UnconfinedRead, Unconfinement};
 pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,

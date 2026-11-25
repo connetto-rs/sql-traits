@@ -111,7 +111,7 @@ fn specs(statement: RowStatement) -> Vec<Spec> {
 /// which name whoever ran `CREATE POLICY`.
 fn applies<DB: DatabaseLike>(
     policy: &DB::Policy,
-    role: &ActingRole<'_, DB::Role>,
+    role: ActingRole<'_, DB::Role>,
     database: &DB,
 ) -> Result<bool, RowSecurityError> {
     if policy.applies_to_public() {
@@ -148,13 +148,13 @@ fn applies<DB: DatabaseLike>(
 /// Why `role` is exempt from `table`'s policies, if it is.
 fn exemption<T: TableLike>(
     table: &T,
-    role: &ActingRole<'_, <T::DB as DatabaseLike>::Role>,
+    role: ActingRole<'_, <T::DB as DatabaseLike>::Role>,
     database: &T::DB,
 ) -> Result<Option<RowSecurityExemption>, RowSecurityError> {
     if !table.has_row_level_security(database)? {
         return Ok(Some(RowSecurityExemption::Disabled));
     }
-    let &ActingRole::Declared(role) = role else { return Ok(None) };
+    let ActingRole::Declared(role) = role else { return Ok(None) };
     if role.is_superuser() {
         return Ok(Some(RowSecurityExemption::Superuser));
     }
@@ -174,7 +174,7 @@ fn exemption<T: TableLike>(
 pub(crate) fn row_security<'db, T: TableLike>(
     table: &'db T,
     statement: RowStatement,
-    role: &ActingRole<'db, <T::DB as DatabaseLike>::Role>,
+    role: ActingRole<'db, <T::DB as DatabaseLike>::Role>,
     database: &'db T::DB,
 ) -> Result<RowSecurity<'db, <T::DB as DatabaseLike>::Policy>, RowSecurityError> {
     if let Some(exemption) = exemption(table, role, database)? {
@@ -310,7 +310,7 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
         &mut self,
         table: &'db DB::Table,
         expressions: Vec<&'db Expr>,
-        role: &ActingRole<'db, DB::Role>,
+        role: ActingRole<'db, DB::Role>,
     ) -> Result<Option<String>, RowSecurityError> {
         let mut collector = SubqueryReads { database: self.database, depth: 0, reads: None };
         for expression in expressions {
@@ -341,7 +341,7 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
     fn relation(
         &mut self,
         relation: Relation<'db, DB>,
-        role: &ActingRole<'db, DB::Role>,
+        role: ActingRole<'db, DB::Role>,
     ) -> Result<Option<String>, RowSecurityError> {
         match relation {
             Relation::Table(table) => {
@@ -366,20 +366,17 @@ impl<'db, DB: DatabaseLike> Expansion<'db, DB> {
                 self.table(table, expressions, role)
             }
             Relation::View(view) => {
-                let owner;
                 let reader = if view.is_security_invoker() {
                     role
                 } else {
-                    owner = view
-                        .owner(self.database)?
+                    view.owner(self.database)?
                         .and_then(|owner| self.database.role(owner))
                         .map(ActingRole::Declared)
                         .ok_or_else(|| {
                             RowSecurityError::UnsettledViewOwner {
                                 view: view.view_name().to_string(),
                             }
-                        })?;
-                    &owner
+                        })?
                 };
                 let reads = <Query as DataStatementLike<DB>>::referenced_relations(
                     view.definition(),

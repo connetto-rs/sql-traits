@@ -174,6 +174,10 @@ fn namespaced_parameters<'table>(
 impl TableLike for CreateTable {
     type DB = ParserDB;
 
+    fn has_exclusion_constraints(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(!table_metadata(self, database)?.exclusion_calls().is_empty())
+    }
+
     #[inline]
     fn table_name(&self) -> &str {
         last_str(&self.name)

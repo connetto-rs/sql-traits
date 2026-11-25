@@ -5,6 +5,7 @@ pub(crate) mod column_nullability;
 pub(crate) mod column_type_probes;
 #[cfg(not(coverage))]
 pub(crate) mod counting_allocator;
+pub(crate) mod definer_reads;
 pub(crate) mod function_overloads;
 pub(crate) mod privilege_listing;
 pub(crate) mod query_parsing;

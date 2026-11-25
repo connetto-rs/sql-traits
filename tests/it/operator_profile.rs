@@ -77,6 +77,10 @@ trait EmptyKinds:
 impl<P: EmptyKinds> TableLike for NoneKind<P> {
     type DB = GenericDB<P>;
 
+    fn has_exclusion_constraints(&self, _database: &Self::DB) -> Result<bool, LookupError> {
+        self.unreach()
+    }
+
     fn table_name(&self) -> &str {
         self.unreach()
     }
