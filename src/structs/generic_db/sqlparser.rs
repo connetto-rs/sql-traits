@@ -23,8 +23,8 @@ use sqlparser::{
         ColumnOption, ColumnOptionDef, CreateCollation, CreateCollationDefinition, CreateDomain,
         CreateExtension, CreateForeignTable, CreateFunction, CreateFunctionBody, CreateIndex,
         CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
-        DataType, DeferrableInitial, DropBehavior, DropDomain, DropFunction, Expr,
-        ForeignKeyConstraint, FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue,
+        DataType, DeferrableInitial, DropBehavior, DropDomain, DropFunction, ExcludeConstraint,
+        Expr, ForeignKeyConstraint, FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue,
         GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn,
         MySQLColumnPosition, NotNullConstraint, ObjectName, ObjectNamePart, OperateFunctionArg,
         OrderByExpr, OrderByOptions, Owner, PrimaryKeyConstraint, Privileges, Query,
@@ -8717,30 +8717,20 @@ impl ParserDB {
         table_metadata: &mut TableMetadata<CreateTable>,
         carried: &mut CarriedCalls,
     ) -> ParserDBBuilder {
-        let mut names = constraint_names::exclusion_names(
+        let names = constraint_names::exclusion_names(
             create_table,
             table_metadata.recorded_constraint_names(),
-        )
-        .into_iter();
-        let positions =
-            create_table.constraints.iter().enumerate().filter_map(|(position, held)| {
-                matches!(held, TableConstraint::Exclude(_)).then_some(position)
-            });
-        for position in positions {
-            let Some(exclusion) = Self::lend_constraint(create_table, position, |constraint| {
-                match constraint {
-                    TableConstraint::Exclude(exclusion) => Some(exclusion),
-                    _ => None,
-                }
-            }) else {
-                continue;
-            };
-            let name = names.next().flatten();
-            let Some(expression) = Self::key_list_expression(
+        );
+        let exclusions = (0..create_table.constraints.len()).filter_map(|position| {
+            Self::lend_constraint(create_table, position, exclude_constraint)
+        });
+        for (exclusion, name) in exclusions.zip(names) {
+            // The parser reads at least one element, so only a built node
+            // writes the empty key list.
+            let expression = Self::key_list_expression(
                 exclusion.attribute().elements.iter().map(|element| &element.column.column.expr),
-            ) else {
-                continue;
-            };
+            )
+            .unwrap_or(Expr::Tuple(Vec::new()));
             let mut calls = builder.calls_carried(exclusion.attribute(), carried);
             let (owner, kind) = (operator_carry::Owner::Table, operator_carry::Kind::Exclusion);
             carried.operators.take(owner, kind, name.as_deref(), exclusion.attribute(), &mut calls);
@@ -15244,6 +15234,14 @@ const fn check_constraint(constraint: &TableConstraint) -> Option<&CheckConstrai
 const fn unique_constraint(constraint: &TableConstraint) -> Option<&UniqueConstraint> {
     match constraint {
         TableConstraint::Unique(unique) => Some(unique),
+        _ => None,
+    }
+}
+
+/// The exclusion `constraint` is, if it is one.
+const fn exclude_constraint(constraint: &TableConstraint) -> Option<&ExcludeConstraint> {
+    match constraint {
+        TableConstraint::Exclude(exclusion) => Some(exclusion),
         _ => None,
     }
 }

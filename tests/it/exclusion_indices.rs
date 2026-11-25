@@ -2,7 +2,7 @@
 //! PostgreSQL 18.7 through `pg_constraint.conindid` and `pg_index`.
 #![expect(clippy::expect_used, clippy::panic, reason = "a test fails loudly on a broken premise")]
 
-use sql_traits::prelude::*;
+use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{ast::IndexType, dialect::PostgreSqlDialect};
 
 /// Parses PostgreSQL schema statements.
@@ -213,4 +213,113 @@ fn a_call_in_an_exclusion_key_reaches_its_function() {
         .map(FunctionLike::name)
         .collect();
     assert_eq!(reached, ["bucket"]);
+}
+
+#[test]
+fn a_call_outside_the_key_is_refused() {
+    let database = parse(
+        "CREATE FUNCTION bucket(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x / 10';
+         CREATE TABLE readings (x INT, EXCLUDE ((bucket(x)) WITH =));
+         CREATE TABLE samples (x INT, EXCLUDE ((bucket(x)) WITH =));",
+    );
+    let index_of = |name| {
+        table(&database, name)
+            .exclusion_indices(&database)
+            .expect("table belongs to database")
+            .next()
+            .expect("one exclusion index")
+    };
+    let sqlparser::ast::Expr::Nested(nested) = index_of("samples")
+        .keys(&database)
+        .expect("index belongs to database")
+        .next()
+        .expect("one key")
+        .expression()
+    else {
+        panic!("the key is parenthesized");
+    };
+    let sqlparser::ast::Expr::Function(call) = nested.as_ref() else {
+        panic!("the key is a call");
+    };
+    assert!(matches!(
+        index_of("readings").functions_reached_by(call, &database).map(Iterator::count),
+        Err(LookupError::CallNotInExpression { .. })
+    ));
+}
+
+#[test]
+fn renaming_the_function_of_a_key_respells_only_the_keys_calling_it() {
+    let database = parse(
+        "CREATE FUNCTION bucket(x INT) RETURNS INT LANGUAGE sql IMMUTABLE AS 'SELECT x / 10';
+         CREATE TABLE readings (x INT, EXCLUDE ((bucket(x)) WITH =));
+         CREATE TABLE magnitudes (x INT, EXCLUDE ((abs(x)) WITH =));
+         ALTER FUNCTION bucket(INT) RENAME TO bin;",
+    );
+    for (name, expected) in [("readings", "(bin(x))"), ("magnitudes", "(abs(x))")] {
+        let index = table(&database, name)
+            .exclusion_indices(&database)
+            .expect("table belongs to database")
+            .next()
+            .expect("one exclusion index");
+        let key =
+            index.keys(&database).expect("index belongs to database").next().expect("one key");
+        assert_eq!(key.expression().to_string(), expected, "{name}");
+    }
+}
+
+#[test]
+fn an_exclusion_index_answers_only_the_database_holding_it() {
+    let database = parse(
+        "CREATE SCHEMA app;
+         CREATE TABLE app.rooms (room INT, CONSTRAINT \"Rooms_X\" EXCLUDE (room WITH =));
+         CREATE TABLE app.halls (room INT, EXCLUDE (room WITH =));",
+    );
+    let other = parse("CREATE TABLE unrelated (room INT);");
+    let index_of = |name: &str| {
+        database
+            .tables()
+            .find(|table| table.table_name() == name)
+            .expect("table exists")
+            .exclusion_indices(&database)
+            .expect("table belongs to database")
+            .next()
+            .expect("one exclusion index")
+    };
+    let (rooms, halls) = (index_of("rooms"), index_of("halls"));
+
+    assert!(rooms.name_is_quoted());
+    assert!(!halls.name_is_quoted());
+    assert_eq!((rooms.schema(), rooms.schema_is_quoted()), (Some("app"), false));
+    assert!(matches!(
+        rooms.relation(&database),
+        Ok(Relation::Table(table)) if table.table_name() == "rooms"
+    ));
+    let missing = |result: Result<_, LookupError>| {
+        match result {
+            Err(LookupError::ObjectNotInDatabase { object, .. }) => object,
+            Ok(()) => panic!("the other database answered"),
+            Err(error) => panic!("unexpected error {error}"),
+        }
+    };
+    assert_eq!(missing(rooms.relation(&other).map(drop)), "`Rooms_X`");
+    assert_eq!(missing(halls.expression(&other).map(drop)), "declared on table `halls`");
+}
+
+#[test]
+fn outside_postgresql_an_exclusion_index_answers_its_written_name() {
+    let database = ParserDB::parse::<sqlparser::dialect::GenericDialect>(
+        "CREATE TABLE slots (x INT, CONSTRAINT slots_x EXCLUDE (x WITH =), EXCLUDE (x WITH <>));",
+    )
+    .expect("schema parses");
+    let names: Vec<_> = table(&database, "slots")
+        .exclusion_indices(&database)
+        .expect("table belongs to database")
+        .map(|index| {
+            index
+                .backing_index_name(&database)
+                .expect("index belongs to database")
+                .map(std::borrow::Cow::into_owned)
+        })
+        .collect();
+    assert_eq!(names, [Some("slots_x".to_owned()), None]);
 }

@@ -595,15 +595,6 @@ impl<T: TableLike> TableMetadata<T> {
         self.exclusion_indices.iter().map(core::convert::AsRef::as_ref)
     }
 
-    /// Returns an iterator over the Arc of the indexes the exclusion
-    /// constraints of the table build.
-    #[inline]
-    pub fn exclusion_index_arcs(
-        &self,
-    ) -> impl Iterator<Item = &Arc<<T::DB as DatabaseLike>::ExclusionIndex>> {
-        self.exclusion_indices.iter()
-    }
-
     /// Returns the index SQLite builds behind `index`, a unique index of the
     /// table, found by identity, or for a value not taken from the table by
     /// equality. [`None`] for the rowid alias, which has none, and under
