@@ -71,6 +71,7 @@ mod duplicate_keys;
 mod duplicate_object_names;
 mod duplicate_referenced_columns;
 mod enumerated_types;
+mod exclusion_indices;
 mod exhaustive_alter_table;
 mod explicit_revokes;
 mod expression_context;

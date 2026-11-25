@@ -2597,6 +2597,44 @@ pub trait TableLike:
     where
         Self: 'db;
 
+    /// Iterates over the indexes the table's exclusion constraints build, one
+    /// per `EXCLUDE` constraint, as `pg_index` lists them with
+    /// `indisexclusion` set.
+    ///
+    /// Such an index never makes its keys unique, so [`Self::unique_indices`]
+    /// leaves it out, and [`Self::indices`] lists only the indexes
+    /// `CREATE INDEX` builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this table.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE reserved (period INT4RANGE, EXCLUDE USING gist (period WITH &&));",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("reserved", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let index = table.exclusion_indices(&db)?.next().unwrap();
+    /// assert_eq!(index.backing_index_name(&db)?.as_deref(), Some("reserved_period_excl"));
+    /// assert!(!index.is_unique());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn exclusion_indices<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::ExclusionIndex>, LookupError>
+    where
+        Self: 'db;
+
     /// Returns whether the table has an exclusion constraint.
     ///
     /// ```
@@ -2617,7 +2655,10 @@ pub trait TableLike:
     /// # Errors
     ///
     /// Returns a lookup error when the database does not hold the table.
-    fn has_exclusion_constraints(&self, database: &Self::DB) -> Result<bool, LookupError>;
+    #[inline]
+    fn has_exclusion_constraints(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        Ok(self.exclusion_indices(database)?.next().is_some())
+    }
 
     /// Iterates over the foreign keys of the table using the provided schema.
     ///
@@ -5445,8 +5486,14 @@ where
         T::unique_indices(self, database)
     }
 
-    fn has_exclusion_constraints(&self, database: &Self::DB) -> Result<bool, LookupError> {
-        T::has_exclusion_constraints(self, database)
+    fn exclusion_indices<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::ExclusionIndex>, LookupError>
+    where
+        Self: 'db,
+    {
+        T::exclusion_indices(self, database)
     }
 
     fn indices<'db>(

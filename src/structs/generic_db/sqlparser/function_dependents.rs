@@ -256,19 +256,20 @@ impl ParserDBBuilder {
             return Some(holder);
         }
         for (table, metadata, _) in self.tables() {
-            let positions = table
-                .constraints
-                .iter()
-                .enumerate()
-                .filter(|(_, constraint)| {
-                    matches!(constraint, sqlparser::ast::TableConstraint::Exclude(_))
-                })
-                .map(|(position, _)| position);
-            if let Some(((exclusion, position), _)) = constraint_names::exclusions(table)
-                .zip(positions)
-                .zip(metadata.exclusion_calls())
-                .find(|(_, calls)| dropped.is_held_by(calls))
-            {
+            let held_exclusion =
+                table.constraints.iter().enumerate().find_map(|(position, constraint)| {
+                    let sqlparser::ast::TableConstraint::Exclude(exclusion) = constraint else {
+                        return None;
+                    };
+                    self.exclusion_indices()
+                        .iter()
+                        .any(|(index, metadata)| {
+                            core::ptr::eq(index.constraint().attribute(), exclusion)
+                                && dropped.is_held_by(metadata.calls())
+                        })
+                        .then_some((exclusion, position))
+                });
+            if let Some((exclusion, position)) = held_exclusion {
                 // An exclusion constraint is backed by an index of its name.
                 let name = constraint_names::exclusion_name(self, table, exclusion)
                     .unwrap_or_else(|| exclusion.to_string());

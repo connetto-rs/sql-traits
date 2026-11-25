@@ -23,8 +23,8 @@ use sqlparser::{
         ColumnOption, ColumnOptionDef, CreateCollation, CreateCollationDefinition, CreateDomain,
         CreateExtension, CreateForeignTable, CreateFunction, CreateFunctionBody, CreateIndex,
         CreatePolicy, CreateRole, CreateRule, CreateTable, CreateTableOptions, CreateTrigger,
-        DataType, DeferrableInitial, DropBehavior, DropDomain, DropFunction, Expr,
-        ForeignKeyConstraint, FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue,
+        DataType, DeferrableInitial, DropBehavior, DropDomain, DropFunction, ExcludeConstraint,
+        Expr, ForeignKeyConstraint, FunctionDefinitionSetParam, FunctionDesc, FunctionSetValue,
         GeneratedAs, Grant, GrantObjects, Grantee, GranteeName, GranteesType, Ident, IndexColumn,
         MySQLColumnPosition, NotNullConstraint, ObjectName, ObjectNamePart, OperateFunctionArg,
         OrderByExpr, OrderByOptions, Owner, PrimaryKeyConstraint, Privileges, Query,
@@ -41,10 +41,10 @@ use crate::{
     impls::{PrivilegeKind, SqlparserDialect},
     structs::{
         ColumnIdentity, ColumnMetadata, ConstraintDeferral, DeclaredVirtualTable, DefaultPrivilege,
-        DefaultPrivilegeKind, ForeignTableSource, FunctionKind, GenericDB, IdentifierCase,
-        KeyIdentity, MaterializedView, MaterializedViewIndex, RelationIdentity, RoleMembership,
-        Schema, SchemaProfile, Sequence, StoredReplicaIdentity, TableAttribute, TableMetadata,
-        TriggerEnablement, UserDefinedType, View, VirtualTableSource,
+        DefaultPrivilegeKind, ExclusionIndex, ForeignTableSource, FunctionKind, GenericDB,
+        IdentifierCase, KeyIdentity, MaterializedView, MaterializedViewIndex, RelationIdentity,
+        RoleMembership, Schema, SchemaProfile, Sequence, StoredReplicaIdentity, TableAttribute,
+        TableMetadata, TriggerEnablement, UserDefinedType, View, VirtualTableSource,
         metadata::{
             CheckMetadata, ClauseLiterals, ColumnCreation, ExpressionCalls, IndexMetadata,
             PolicyMetadata, UniqueIndexMetadata,
@@ -218,6 +218,7 @@ impl SchemaProfile for SqlparserProfile {
     type Index = TableAttribute<CreateTable, CreateIndex>;
     type MaterializedViewIndex = MaterializedViewIndex;
     type UniqueIndex = TableAttribute<CreateTable, UniqueConstraint>;
+    type ExclusionIndex = ExclusionIndex;
     type ForeignKey = TableAttribute<CreateTable, ForeignKeyConstraint>;
     type Function = CreateFunction;
     type Operator = PostgresCatalogOperator;
@@ -1465,9 +1466,9 @@ impl ParserDBBuilder {
         }
         for (_, metadata, _) in self.tables_mut() {
             metadata.partition_key_calls_mut().replace_function(stale, fresh);
-            for calls in metadata.exclusion_calls_mut() {
-                calls.replace_function(stale, fresh);
-            }
+        }
+        for (_, metadata) in self.exclusion_indices_mut() {
+            metadata.replace_function(stale, fresh);
         }
     }
 
@@ -1597,6 +1598,7 @@ impl ParserDBBuilder {
         self.columns_mut().retain(|(column, _, _)| !is_target(TableAttribute::table(column)));
         self.indices_mut().retain(|(index, _)| !is_target(TableAttribute::table(index)));
         self.unique_indices_mut().retain(|(index, _)| !is_target(TableAttribute::table(index)));
+        self.exclusion_indices_mut().retain(|(index, _)| !is_target(index.constraint().table()));
         self.foreign_keys_mut().retain(|(key, ())| !is_target(TableAttribute::table(key)));
         self.installed_foreign_keys_mut().retain(|key| !is_target(key.binding.key.table()));
         self.check_constraints_mut()
@@ -1858,17 +1860,18 @@ impl ParserDBBuilder {
     /// objects follow from the node and are recomputed, while `CREATE INDEX`
     /// indexes do not and are returned with their expressions and operator
     /// selections so the caller can re-attach them. The calls of the
-    /// columns, checks, unique keys and indexes are returned with the
-    /// bindings they held, and their operator selections by the object
+    /// columns, checks, unique keys, exclusions and indexes are returned with
+    /// the bindings they held, and their operator selections by the object
     /// owning each, each check answering to the name of `check_names` at its
-    /// position, which the rebuilt objects keep.
+    /// position and each exclusion to the one of `exclusion_names`, which the
+    /// rebuilt objects keep.
     fn take_table_derived_objects(
         &mut self,
         table_name: &str,
         table_name_quoted: bool,
         schema_name: Option<&str>,
         schema_quoted: bool,
-        mut check_names: Vec<Option<String>>,
+        (mut check_names, exclusion_names): (Vec<Option<String>>, Vec<Option<String>>),
     ) -> (Vec<DetachedIndex>, CarriedCalls) {
         let case = self.identifier_case();
         let belongs_to = |table: &CreateTable| {
@@ -1933,6 +1936,7 @@ impl ParserDBBuilder {
             }
             !detached
         });
+        self.take_table_exclusions(&belongs_to, &exclusion_names, &mut carried);
         self.foreign_keys_mut().retain(|(fk, ())| !belongs_to(TableAttribute::table(fk)));
         self.installed_foreign_keys_mut().retain(|key| !belongs_to(key.binding.key.table()));
         let mut position = 0;
@@ -1966,6 +1970,36 @@ impl ParserDBBuilder {
         });
 
         (detached_indices, carried)
+    }
+
+    /// Removes the exclusion indexes of the tables `belongs_to` selects,
+    /// recording their calls and operator selections into `carried`, each
+    /// under the name of `exclusion_names` at its position in its table.
+    fn take_table_exclusions(
+        &mut self,
+        belongs_to: &impl Fn(&CreateTable) -> bool,
+        exclusion_names: &[Option<String>],
+        carried: &mut CarriedCalls,
+    ) {
+        self.exclusion_indices_mut().retain_mut(|(index, metadata)| {
+            let declared = index.constraint();
+            let table = TableAttribute::table(declared);
+            if !belongs_to(table) {
+                return true;
+            }
+            carried.record(declared.attribute(), metadata.calls());
+            let name = constraint_names::exclusions(table)
+                .position(|held| core::ptr::eq(held, declared.attribute()))
+                .and_then(|ordinal| exclusion_names.get(ordinal).cloned().flatten());
+            carried.operators.record(
+                operator_carry::Owner::Table,
+                operator_carry::Kind::Exclusion,
+                name,
+                declared.attribute(),
+                metadata.calls_mut(),
+            );
+            false
+        });
     }
 
     /// Returns whether a modeled blocking dependency names the role.
@@ -6720,8 +6754,22 @@ pub(crate) enum ConstraintObject {
     Check,
     /// A primary key or unique constraint.
     UniqueKey,
+    /// An exclusion constraint.
+    Exclusion,
     /// A foreign key.
     ForeignKey,
+}
+
+impl ConstraintObject {
+    /// Whether `slot` holds a constraint object of this kind.
+    fn holds(self, slot: constraint_names::Slot<'_>) -> bool {
+        match self {
+            Self::Check => slot.is_check(),
+            Self::UniqueKey => slot.is_unique_key(),
+            Self::Exclusion => slot.is_exclusion(),
+            Self::ForeignKey => slot.is_foreign_key(),
+        }
+    }
 }
 
 impl ParserDB {
@@ -6738,26 +6786,25 @@ impl ParserDB {
             self.table_metadata(table).map_or(&[][..], TableMetadata::recorded_constraint_names);
         constraint_names::names(table, recorded, self.identifier_case())
             .into_iter()
-            .filter(|(slot, _)| {
-                match kind {
-                    ConstraintObject::Check => slot.is_check(),
-                    ConstraintObject::UniqueKey => slot.is_unique_key(),
-                    ConstraintObject::ForeignKey => slot.is_foreign_key(),
-                }
-            })
+            .filter(|(slot, _)| kind.holds(*slot))
             .nth(position)
             .and_then(|(_, name)| name)
     }
 
-    /// Whether the index of the key at `position` among the primary keys and
-    /// unique constraints of `table` is valid.
-    pub(crate) fn constraint_index_is_valid(&self, table: &CreateTable, position: usize) -> bool {
+    /// Whether the index of the `position`-th constraint of `kind`, a key or
+    /// an exclusion, on `table` is valid.
+    pub(crate) fn constraint_index_is_valid(
+        &self,
+        table: &CreateTable,
+        kind: ConstraintObject,
+        position: usize,
+    ) -> bool {
         let Some(metadata) = self.table_metadata(table) else {
             return true;
         };
         constraint_names::keyed_slots(table)
             .into_iter()
-            .filter(|(slot, _)| slot.is_unique_key())
+            .filter(|(slot, _)| kind.holds(*slot))
             .nth(position)
             .is_none_or(|(_, key)| {
                 metadata.key_creations().iter().all(|created| created.slot != key || created.valid)
@@ -7232,13 +7279,18 @@ impl ParserDB {
     /// a key rather than forming part of the expression, so neither appears
     /// here, and [`crate::traits::IndexLike::keys`] reports them.
     fn create_index_expression(columns: &[IndexColumn]) -> Option<Expr> {
-        match columns {
-            [] => None,
-            [single] => Some(Expr::Nested(Box::new(single.column.expr.clone()))),
-            _ => {
-                Some(Expr::Tuple(columns.iter().map(|column| column.column.expr.clone()).collect()))
-            }
-        }
+        Self::key_list_expression(columns.iter().map(|column| &column.column.expr))
+    }
+
+    /// The expression of an index over `keys`, shaped as
+    /// [`Self::create_index_expression`] describes.
+    fn key_list_expression<'key>(keys: impl IntoIterator<Item = &'key Expr>) -> Option<Expr> {
+        let mut keys = keys.into_iter();
+        let first = keys.next()?;
+        Some(match keys.next() {
+            None => Expr::Nested(Box::new(first.clone())),
+            Some(second) => Expr::Tuple([first, second].into_iter().chain(keys).cloned().collect()),
+        })
     }
 
     /// Adds the index backing `unique_key`, binding the calls of its key, a
@@ -7663,16 +7715,17 @@ impl ParserDB {
             preserved_column_metadata_for_table(&builder, &previous_node);
         preserve(&mut preserved_collations);
 
-        let check_names = constraint_names::check_names(
-            &previous_node,
-            previous_metadata.recorded_constraint_names(),
+        let recorded = previous_metadata.recorded_constraint_names();
+        let names = (
+            constraint_names::check_names(&previous_node, recorded),
+            constraint_names::exclusion_names(&previous_node, recorded),
         );
         let (detached_indices, mut carried) = builder.take_table_derived_objects(
             &stored.name,
             stored.name_quoted,
             stored.schema.as_deref(),
             stored.schema_quoted,
-            check_names,
+            names,
         );
         Self::carry_table_operators(
             &mut carried,
@@ -7793,27 +7846,15 @@ impl ParserDB {
         metadata
     }
 
-    /// Has `carried` hold the operator selections of the exclusions and the
-    /// partition key of `previous`, and read the rebuilt expressions over the
-    /// columns `preserved` keeps and the check names `replacement` gives.
+    /// Has `carried` hold the operator selections of the partition key of
+    /// `previous`, and read the rebuilt expressions over the columns
+    /// `preserved` keeps and the check names `replacement` gives.
     fn carry_table_operators(
         carried: &mut CarriedCalls,
         (previous, previous_metadata): (&CreateTable, &mut TableMetadata<CreateTable>),
         (replacement, metadata): (&CreateTable, &TableMetadata<CreateTable>),
         preserved: &[PreservedColumnMetadata],
     ) {
-        let names = constraint_names::exclusion_names(
-            previous,
-            previous_metadata.recorded_constraint_names(),
-        );
-        for ((exclusion, name), calls) in constraint_names::exclusions(previous)
-            .zip(names)
-            .zip(previous_metadata.exclusion_calls_mut())
-        {
-            carried.record(exclusion, calls);
-            let (owner, kind) = (operator_carry::Owner::Table, operator_carry::Kind::Exclusion);
-            carried.operators.record(owner, kind, name, exclusion, calls);
-        }
         if let Some(entries) = partition_keys::key_entries(previous) {
             let calls = previous_metadata.partition_key_calls_mut();
             carried.record(entries, calls);
@@ -8653,7 +8694,12 @@ impl ParserDB {
             builder,
             origin.key_targets(),
         )?;
-        Self::record_table_expressions(&builder, &create_table, &mut table_metadata, &mut carried);
+        builder = Self::record_table_expressions(
+            builder,
+            &create_table,
+            &mut table_metadata,
+            &mut carried,
+        );
         sqlite_autoindex::record_autoindexes(&builder, &create_table, &mut table_metadata);
         table_metadata.set_documentation(documentation);
         table_metadata.set_constraint_names_pending(true);
@@ -8662,34 +8708,43 @@ impl ParserDB {
         Ok(builder.insert_table_with_identity(create_table, table_metadata, identity))
     }
 
-    /// Records on `table_metadata` the calls and operator selections of the
-    /// exclusions and the partition key of `create_table`, a binding or a
-    /// selection `carried` holds kept.
+    /// Adds the index each exclusion of `create_table` builds and records on
+    /// `table_metadata` the calls and operator selections of its partition
+    /// key, a binding or a selection `carried` holds kept.
     fn record_table_expressions(
-        builder: &ParserDBBuilder,
-        create_table: &CreateTable,
+        mut builder: ParserDBBuilder,
+        create_table: &Arc<CreateTable>,
         table_metadata: &mut TableMetadata<CreateTable>,
         carried: &mut CarriedCalls,
-    ) {
+    ) -> ParserDBBuilder {
         let names = constraint_names::exclusion_names(
             create_table,
             table_metadata.recorded_constraint_names(),
         );
-        let exclusion_calls = constraint_names::exclusions(create_table)
-            .zip(names)
-            .map(|(exclusion, name)| {
-                let mut calls = builder.calls_carried(exclusion, carried);
-                let (owner, kind) = (operator_carry::Owner::Table, operator_carry::Kind::Exclusion);
-                carried.operators.take(owner, kind, name.as_deref(), exclusion, &mut calls);
-                calls
-            })
-            .collect();
-        table_metadata.set_exclusion_calls(exclusion_calls);
+        let exclusions = (0..create_table.constraints.len()).filter_map(|position| {
+            Self::lend_constraint(create_table, position, exclude_constraint)
+        });
+        for (exclusion, name) in exclusions.zip(names) {
+            // The parser reads at least one element, so only a built node
+            // writes the empty key list.
+            let expression = Self::key_list_expression(
+                exclusion.attribute().elements.iter().map(|element| &element.column.column.expr),
+            )
+            .unwrap_or(Expr::Tuple(Vec::new()));
+            let mut calls = builder.calls_carried(exclusion.attribute(), carried);
+            let (owner, kind) = (operator_carry::Owner::Table, operator_carry::Kind::Exclusion);
+            carried.operators.take(owner, kind, name.as_deref(), exclusion.attribute(), &mut calls);
+            let index = Arc::new(ExclusionIndex::new(exclusion));
+            table_metadata.add_exclusion_index(Arc::clone(&index));
+            builder = builder
+                .add_exclusion_index(index, IndexMetadata::new(expression).with_calls(calls));
+        }
         if let Some(entries) = partition_keys::key_entries(create_table) {
             let mut calls = builder.calls_carried(entries, carried);
             carried.operators.take_partition_key(&mut calls);
             table_metadata.set_partition_key_calls(calls);
         }
+        builder
     }
 
     /// Applies `edit` to the constraint list of the table an `ALTER TABLE`
@@ -15179,6 +15234,14 @@ const fn check_constraint(constraint: &TableConstraint) -> Option<&CheckConstrai
 const fn unique_constraint(constraint: &TableConstraint) -> Option<&UniqueConstraint> {
     match constraint {
         TableConstraint::Unique(unique) => Some(unique),
+        _ => None,
+    }
+}
+
+/// The exclusion `constraint` is, if it is one.
+const fn exclude_constraint(constraint: &TableConstraint) -> Option<&ExcludeConstraint> {
+    match constraint {
+        TableConstraint::Exclude(exclusion) => Some(exclusion),
         _ => None,
     }
 }

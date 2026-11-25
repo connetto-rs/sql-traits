@@ -11,6 +11,7 @@ mod definer_read;
 mod deployment;
 mod dynamic_execution;
 mod embedded_sql;
+mod exclusion_index;
 mod expression_context;
 mod expression_scope;
 mod expression_truth;
@@ -83,6 +84,7 @@ pub use deployment::{
 pub use dynamic_execution::{DynamicExecution, DynamicExecutionSites};
 pub(crate) use dynamic_execution::{SiteFlow, SiteScope};
 pub use embedded_sql::EmbeddedSql;
+pub use exclusion_index::ExclusionIndex;
 pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };

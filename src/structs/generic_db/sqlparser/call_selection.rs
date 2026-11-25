@@ -34,8 +34,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    ParserDB, ParserDBBuilder, PostgresCatalogOperator, constraint_names, partition_keys,
-    stored_expressions,
+    ParserDB, ParserDBBuilder, PostgresCatalogOperator, partition_keys, stored_expressions,
 };
 use crate::{
     errors::{Error, RefusedCall},
@@ -165,6 +164,7 @@ impl ParserDBBuilder {
         let view_indices =
             self.materialized_view_indices().iter().map(|(_, metadata)| metadata.calls());
         let unique_keys = self.unique_indices().iter().map(|(_, metadata)| metadata.calls());
+        let exclusions = self.exclusion_indices().iter().map(|(_, metadata)| metadata.calls());
         let views = self.views().iter().map(|(_, metadata, _)| metadata.calls());
         let materialized =
             self.materialized_views().iter().map(|(_, metadata, _)| metadata.calls());
@@ -176,14 +176,13 @@ impl ParserDBBuilder {
         let triggers = self.triggers().iter().map(|(_, metadata)| metadata.calls());
         let functions = self.functions().iter().map(|(_, metadata)| metadata.body_calls());
         let domains = self.domains().iter().map(|(_, metadata)| metadata.calls());
-        let tables = self.tables().iter().flat_map(|(_, metadata, _)| {
-            core::iter::once(metadata.partition_key_calls()).chain(metadata.exclusion_calls())
-        });
+        let tables = self.tables().iter().map(|(_, metadata, _)| metadata.partition_key_calls());
         checks
             .chain(columns)
             .chain(indices)
             .chain(view_indices)
             .chain(unique_keys)
+            .chain(exclusions)
             .chain(views)
             .chain(materialized)
             .chain(policies)
@@ -219,6 +218,9 @@ impl ParserDBBuilder {
         for (_, metadata) in self.unique_indices_mut() {
             metadata.calls_mut().settle_on_built_ins();
         }
+        for (_, metadata) in self.exclusion_indices_mut() {
+            metadata.calls_mut().settle_on_built_ins();
+        }
         for (_, metadata, _) in self.views_mut() {
             metadata.calls_mut().settle_on_built_ins();
         }
@@ -244,9 +246,6 @@ impl ParserDBBuilder {
         }
         for (_, metadata, _) in self.tables_mut() {
             metadata.partition_key_calls_mut().settle_on_built_ins();
-            for calls in metadata.exclusion_calls_mut() {
-                calls.settle_on_built_ins();
-            }
         }
     }
 
@@ -281,6 +280,9 @@ impl ParserDBBuilder {
         for (unique_key, metadata) in self.unique_indices_mut() {
             settle(metadata.calls_mut(), unique_key.attribute(), selections, refuse)?;
         }
+        for (exclusion, metadata) in self.exclusion_indices_mut() {
+            settle(metadata.calls_mut(), exclusion.constraint().attribute(), selections, refuse)?;
+        }
         for (view, metadata, _) in self.views_mut() {
             settle(metadata.calls_mut(), view.declaration().query(), selections, refuse)?;
         }
@@ -307,10 +309,6 @@ impl ParserDBBuilder {
         for (table, metadata, _) in self.tables_mut() {
             if let Some(entries) = partition_keys::key_entries(table) {
                 settle(metadata.partition_key_calls_mut(), entries, selections, refuse)?;
-            }
-            let exclusions = constraint_names::exclusions(table);
-            for (exclusion, calls) in exclusions.zip(metadata.exclusion_calls_mut()) {
-                settle(calls, exclusion, selections, refuse)?;
             }
         }
         Ok(())
@@ -377,6 +375,13 @@ impl ParserDBBuilder {
                 select.roots(unique_key.attribute(), &scope);
             });
         }
+        for (exclusion, metadata) in self.exclusion_indices() {
+            let declared = exclusion.constraint();
+            let scope = ExpressionScope::Table(declared.table());
+            select.typed(declared.attribute(), metadata.calls(), |select| {
+                select.roots(declared.attribute(), &scope);
+            });
+        }
         for (trigger, metadata) in self.triggers() {
             // A trigger on a view sees rows the typing scopes do not describe,
             // as a rule on one does.
@@ -398,11 +403,6 @@ impl ParserDBBuilder {
                 (is_waiting(metadata.partition_key_calls()), partition_keys::key_entries(table))
             {
                 select.roots(entries, &scope);
-            }
-            for (exclusion, calls) in
-                constraint_names::exclusions(table).zip(metadata.exclusion_calls())
-            {
-                select.typed(exclusion, calls, |select| select.roots(exclusion, &scope));
             }
         }
         select.stored = false;

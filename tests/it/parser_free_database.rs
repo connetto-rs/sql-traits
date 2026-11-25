@@ -289,6 +289,7 @@ impl DatabaseLike for MemoryCatalog {
     type Operator = sql_traits::structs::Absent<Self>;
     type Cast = sql_traits::structs::Absent<Self>;
     type UniqueIndex = MemoryUniqueIndex;
+    type ExclusionIndex = MemoryIndex;
     type CheckConstraint = MemoryCheckConstraint;
     type Trigger = MemoryTrigger;
     type Rule = MemoryRule;
@@ -550,10 +551,6 @@ impl DataTypeLike for MemoryDataType {
 impl TableLike for MemoryTable {
     type DB = MemoryCatalog;
 
-    fn has_exclusion_constraints(&self, _database: &Self::DB) -> Result<bool, LookupError> {
-        Ok(false)
-    }
-
     fn table_name(&self) -> &str {
         &self.name
     }
@@ -705,6 +702,16 @@ impl TableLike for MemoryTable {
         Self: 'db,
     {
         Ok(database.unique_indexes.iter().filter(|index| index.0.table_name == self.name))
+    }
+
+    fn exclusion_indices<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db MemoryIndex>, LookupError>
+    where
+        Self: 'db,
+    {
+        Ok(core::iter::empty())
     }
 
     fn foreign_keys<'db>(

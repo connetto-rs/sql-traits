@@ -380,6 +380,7 @@ fn is_key(constraint: &TableConstraint) -> bool {
         constraint,
         TableConstraint::PrimaryKey(_)
             | TableConstraint::Unique(_)
+            | TableConstraint::Exclude(_)
             | TableConstraint::ForeignKey(_)
     )
 }
@@ -448,15 +449,20 @@ fn compared_ident(ident: &Ident, case: IdentifierCase) -> Ident {
 /// The key with the columns it names in their compared form.
 fn compared_key(key: &TableConstraint, case: IdentifierCase) -> TableConstraint {
     let mut compared = key.clone();
-    let columns = match &mut compared {
-        TableConstraint::PrimaryKey(primary_key) => &mut primary_key.columns,
-        TableConstraint::Unique(unique) => &mut unique.columns,
-        _ => return compared,
-    };
-    for column in columns {
+    let compare = |column: &mut IndexColumn| {
         if let Expr::Identifier(ident) = &mut column.column.expr {
             *ident = compared_ident(ident, case);
         }
+    };
+    match &mut compared {
+        TableConstraint::PrimaryKey(primary_key) => {
+            primary_key.columns.iter_mut().for_each(compare);
+        }
+        TableConstraint::Unique(unique) => unique.columns.iter_mut().for_each(compare),
+        TableConstraint::Exclude(exclusion) => {
+            exclusion.elements.iter_mut().for_each(|element| compare(&mut element.column));
+        }
+        _ => {}
     }
     compared
 }

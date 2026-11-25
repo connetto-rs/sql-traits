@@ -101,6 +101,8 @@ pub struct GenericDB<P: SchemaProfile> {
     materialized_view_indices: Vec<Stored<P::MaterializedViewIndex>>,
     /// List of unique indices in the database.
     unique_indices: Vec<Stored<P::UniqueIndex>>,
+    /// List of the indexes exclusion constraints build in the database.
+    exclusion_indices: Vec<Stored<P::ExclusionIndex>>,
     /// List of foreign keys in the database.
     foreign_keys: Vec<Stored<P::ForeignKey>>,
     /// PostgreSQL foreign keys with resolved columns and assigned names.
@@ -170,6 +172,7 @@ impl<P: SchemaProfile> Debug for GenericDB<P> {
             .field("indices", &self.indices.len())
             .field("materialized_view_indices", &self.materialized_view_indices.len())
             .field("unique_indices", &self.unique_indices.len())
+            .field("exclusion_indices", &self.exclusion_indices.len())
             .field("foreign_keys", &self.foreign_keys.len())
             .field("installed_foreign_keys", &self.installed_foreign_keys.len())
             .field("functions", &self.functions.len())
@@ -216,6 +219,7 @@ impl<P: SchemaProfile> Clone for GenericDB<P> {
             indices: self.indices.clone(),
             materialized_view_indices: self.materialized_view_indices.clone(),
             unique_indices: self.unique_indices.clone(),
+            exclusion_indices: self.exclusion_indices.clone(),
             foreign_keys: self.foreign_keys.clone(),
             installed_foreign_keys: self.installed_foreign_keys.clone(),
             functions: self.functions.clone(),
@@ -400,6 +404,34 @@ impl<P: SchemaProfile> GenericDB<P> {
             .binary_search_by(|(i, _)| i.as_ref().cmp(index))
             .ok()
             .map(|index| &self.unique_indices[index].1)
+    }
+
+    /// Returns a reference to the metadata of the index an exclusion
+    /// constraint builds, if it exists in the database.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (id INT, EXCLUDE (id WITH =));")?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let index = table.exclusion_indices(&db)?.next().unwrap();
+    /// assert_eq!(db.exclusion_index_metadata(index).unwrap().expression().to_string(), "(id)");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn exclusion_index_metadata(
+        &self,
+        index: &P::ExclusionIndex,
+    ) -> Option<&Meta<P::ExclusionIndex>> {
+        self.exclusion_indices
+            .binary_search_by(|(held, _)| held.as_ref().cmp(index))
+            .ok()
+            .map(|position| &self.exclusion_indices[position].1)
     }
 
     /// Returns a reference to the metadata of the specified check constraint,
