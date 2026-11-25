@@ -6210,33 +6210,40 @@ fn a_self_referencing_walk_reads_its_key_as_the_child() {
 #[test]
 fn an_edge_table_of_any_other_shape_refuses_the_walk() {
     let deployment = deployment();
-    let parent = "parent_id TEXT NOT NULL REFERENCES folders (id),";
-    for (term, from, to) in [
-        (EDGE_DOWN, parent, "parent_id TEXT NOT NULL REFERENCES organizations (id),"),
+    let organization_parent: &[(&str, &str)] = &[
+        (
+            "parent_id TEXT NOT NULL REFERENCES folders (id),",
+            "parent_id TEXT NOT NULL REFERENCES organizations (id),",
+        ),
+        (
+            "FOREIGN KEY (organization_id, parent_id) REFERENCES folders (organization_id, id)",
+            "FOREIGN KEY (organization_id) REFERENCES organizations (id)",
+        ),
+    ];
+    for (term, replacements) in [
+        (EDGE_DOWN, organization_parent),
         (
             "SELECT fp.parent_id FROM public.folder_parents fp JOIN reached ON fp.parent_id = reached.id",
-            "",
-            "",
+            &[],
         ),
         (
             "SELECT fp.folder_id FROM public.folder_parents fp JOIN reached ON fp.folder_id = reached.id",
-            "",
-            "",
+            &[],
         ),
         (
             "SELECT fp.organization_id FROM public.folder_parents fp JOIN reached ON fp.folder_id = reached.id",
-            "",
-            "",
+            &[],
         ),
     ] {
-        let sql = edges(term, "").replace(from, to);
+        let sql =
+            replacements.iter().fold(edges(term, ""), |sql, (from, to)| sql.replace(from, to));
         let database = postgres(&sql);
         assert!(
             matches!(
                 answer(&database, &deployment, "authz", "folders_reached", &[]),
                 Err(HelperSetError::ArmShape { function, .. }) if function == "authz.folders_reached"
             ),
-            "{term} with {to}"
+            "{term} with {replacements:?}"
         );
     }
 }
@@ -6873,6 +6880,67 @@ fn an_edge_column_reaches_the_tree_through_any_foreign_key_naming_its_key() {
         assert_eq!(walk.tree().table_name(), "folders", "{to}");
         let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
         assert_eq!(referenced.table_name(), "folders", "{to}");
+    }
+}
+
+/// [`edges`] with `resources` beside the folders and a tenant key holding each
+/// of `keyed` at the position of `resources.id`, its one-column primary key.
+fn tenant_keyed(term: &str, keyed: &[&str]) -> String {
+    use core::fmt::Write as _;
+    let keys = keyed.iter().fold(String::new(), |mut keys, column| {
+        write!(
+            keys,
+            "ALTER TABLE folder_parents ADD FOREIGN KEY (organization_id, {column}) \
+             REFERENCES resources (organization_id, id);"
+        )
+        .expect("writing to a String succeeds");
+        keys
+    });
+    edges(
+        term,
+        &format!(
+            "CREATE TABLE resources (
+               id TEXT PRIMARY KEY,
+               organization_id TEXT NOT NULL,
+               UNIQUE (organization_id, id)
+             );
+             {keys}"
+        ),
+    )
+}
+
+#[test]
+fn a_walk_is_over_the_one_tree_both_edge_columns_reference() {
+    let deployment = deployment();
+    for (term, rendered, direction) in [
+        (EDGE_DOWN, "folder_parents.folder_id WHERE parent_id IN itself", WalkDirection::Down),
+        (EDGE_UP, "folder_parents.parent_id WHERE folder_id IN itself", WalkDirection::Up),
+    ] {
+        for keyed in ["parent_id", "folder_id"] {
+            let database = postgres(&tenant_keyed(term, &[keyed]));
+            let set =
+                answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+            assert_eq!(render(&set), format!("{FOLDER_GRANT_ARM} UNION {rendered}"), "{keyed}");
+            assert_eq!(covered(&set), Some("folders"), "{keyed}");
+            let HelperArm::Walk(walk) = &set.arms()[1] else {
+                panic!("the second arm is the walk")
+            };
+            assert_eq!(walk.tree().table_name(), "folders", "{keyed}");
+            let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
+            assert_eq!(referenced.table_name(), "folders", "{keyed}");
+            let measured =
+                EDGES_MEASURED.iter().map(|&(rows, caller, down, up, _)| (rows, caller, down, up));
+            assert_walked(&set, direction, term, measured);
+        }
+
+        let database = postgres(&tenant_keyed(term, &["parent_id", "folder_id"]));
+        assert!(
+            matches!(
+                answer(&database, &deployment, "authz", "folders_reached", &[]),
+                Err(HelperSetError::ArmShape { function, .. }) if function == "authz.folders_reached"
+            ),
+            "{term} with both edge columns naming folders and resources"
+        );
     }
 }
 
