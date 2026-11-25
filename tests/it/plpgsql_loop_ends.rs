@@ -109,6 +109,9 @@ fn every_loop_comes_in_body_order_wherever_it_nests() {
                  WHEN 1 THEN <<in_when>> LOOP EXIT; END LOOP;
                  ELSE <<in_case_else>> LOOP EXIT; END LOOP;
              END CASE;
+             CASE
+                 WHEN n = 2 THEN <<in_searched_when>> LOOP EXIT; END LOOP;
+             END CASE;
              BEGIN
                  <<in_block>> FOR i IN 1 .. n LOOP
                      <<in_for>> WHILE i > 0 LOOP EXIT; END LOOP;
@@ -130,12 +133,18 @@ fn every_loop_comes_in_body_order_wherever_it_nests() {
             "in_else",
             "in_when",
             "in_case_else",
+            "in_searched_when",
             "in_block",
             "in_for",
             "in_handler"
         ]
         .map(|label| Some(label.into())),
     );
+}
+
+#[test]
+fn a_plpgsql_body_without_loops_has_none() {
+    assert_eq!(ends_of("flat", "BEGIN PERFORM 1; END"), []);
 }
 
 #[test]
