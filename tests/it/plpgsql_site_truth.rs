@@ -469,3 +469,16 @@ fn a_type_copied_from_nothing_fails_the_walk() {
     let sites = body.sites().unwrap();
     assert!(sites[0].reached(IdentifierCase::Folded).is_err());
 }
+
+/// A site formats its body after a truth read without the walk it ran.
+#[test]
+fn a_site_formats_its_body_after_a_truth_read() {
+    let database = function("BEGIN IF n > 0 THEN RETURN 'positive'; END IF; RETURN 'other'; END");
+    let body = named(&database, "run").plpgsql_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    assert!(sites[0].reached(IdentifierCase::Folded).unwrap());
+    let formatted = format!("{:?}", sites[0]);
+    assert!(formatted.contains("SiteFlow { names: "), "{formatted}");
+    assert!(formatted.contains("block: "), "{formatted}");
+    assert!(formatted.contains("flow: "), "{formatted}");
+}
