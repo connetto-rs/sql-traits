@@ -159,10 +159,10 @@ impl<'a, DB: DatabaseLike> Record<'a, DB> {
                     } else {
                         gate_facts(database, *table, RowStatement::Update { reads: false }, role)?
                     };
-                    match event {
-                        TriggerEvent::Insert => new.push(updated),
-                        TriggerEvent::Delete => old.push(replaced),
-                        _ => {}
+                    if matches!(event, TriggerEvent::Insert) {
+                        new.push(updated);
+                    } else {
+                        old.push(replaced);
                     }
                 }
             }

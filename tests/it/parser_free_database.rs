@@ -2370,6 +2370,16 @@ fn domains_without_quoting_records_store_folded_names() {
     assert_eq!(domain.stored_schema().as_deref(), Some("units"));
 }
 
+/// A trigger that keeps no quoting reads as unquoted, so its stored name
+/// folds to lowercase.
+#[test]
+fn triggers_without_quoting_records_store_folded_names() {
+    let trigger =
+        MemoryTrigger { name: String::from("Guard_Runs"), table_name: String::from("runs") };
+
+    assert_eq!(trigger.stored_name(), "guard_runs");
+}
+
 /// A catalog that keeps no `NOT VALID` or `NOT ENFORCED` state reports every
 /// constraint enforced and validated.
 #[test]

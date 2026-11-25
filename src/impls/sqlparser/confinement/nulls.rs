@@ -29,7 +29,6 @@ pub(super) fn rejects_null<DB: DatabaseLike>(
                 _ => null_when(inner, bound, database, types)?,
             }
         }
-        Expr::Nested(inner) => rejects_null(inner, bound, database, types)?,
         // A `NULL` left operand makes the comparison `NULL`, or `false` over
         // no element, and neither is true.
         Expr::AnyOp { left, compare_op, .. } => {

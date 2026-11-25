@@ -237,11 +237,7 @@ fn cascade_tables<'db, DB: DatabaseLike>(
                 if has_writing_action::<DB>(key, database)
                     && ptr::eq(key.referenced_table(database)?, parent)
                 {
-                    for member in table_family(database, &child)?.iter() {
-                        if !cascades.iter().any(|seen| ptr::eq(*seen, *member)) {
-                            cascades.push(*member);
-                        }
-                    }
+                    cascades.extend(table_family(database, &child)?.iter().copied());
                     break;
                 }
             }

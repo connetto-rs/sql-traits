@@ -853,18 +853,16 @@ mod tests {
             .with_set_within("authz.capped('reader')", "authz.capped('guest')")?;
         let writer = expression("authz.capped('writer')");
         let guest = expression("authz.capped('guest')");
-        assert!(deployment.is_set_within(
-            &writer,
-            &guest,
-            |_| Ok::<_, DeploymentError>(None),
-            |_, _| Ok(false),
-        )?);
-        assert!(!deployment.is_set_within(
-            &guest,
-            &writer,
-            |_| Ok::<_, DeploymentError>(None),
-            |_, _| Ok(false),
-        )?);
+        let within = |narrower: &Expr, wider: &Expr| {
+            deployment.is_set_within(
+                narrower,
+                wider,
+                |_| Ok::<_, DeploymentError>(None),
+                |_, _| Ok(false),
+            )
+        };
+        assert_eq!(within(&writer, &guest), Ok(true));
+        assert_eq!(within(&guest, &writer), Ok(false));
         Ok(())
     }
 

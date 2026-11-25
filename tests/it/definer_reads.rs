@@ -4,61 +4,8 @@
 #![expect(clippy::expect_used, reason = "a test fails loudly on a broken premise")]
 
 use sql_traits::prelude::*;
-use sqlparser::dialect::PostgreSqlDialect;
 
-/// The deployment whose acting role is `app`.
-fn deployment() -> Deployment {
-    Deployment::new("app", ["app"], []).expect("a valid deployment")
-}
-
-/// The schema of `sql`, parsed as PostgreSQL.
-fn schema(sql: &str) -> ParserDB {
-    ParserDB::parse::<PostgreSqlDialect>(sql).expect("the schema parses")
-}
-
-/// The name of the table and the reason of the read `trigger` leaves
-/// unconfined when `app` writes, under `reading`, or `None`.
-fn trigger_read(db: &ParserDB, trigger: &str, reading: DefinerReading) -> Option<(String, String)> {
-    let deployment = deployment();
-    let app = ActingRole::Declared(db.role("app").expect("the role exists"));
-    let trigger =
-        db.triggers().find(|candidate| candidate.name() == trigger).expect("the trigger exists");
-    trigger
-        .unconfined_definer_read(db, &deployment, app, reading)
-        .expect("the schema reads")
-        .map(|read| described(&read))
-}
-
-/// The name of the table and the reason of the read `function`, in `schema`
-/// or the default one, leaves unconfined when `app` executes it, or `None`.
-fn function_read(db: &ParserDB, schema: Option<&str>, function: &str) -> Option<(String, String)> {
-    let deployment = deployment();
-    let app = ActingRole::Declared(db.role("app").expect("the role exists"));
-    let mut name = TargetName::new(function, false);
-    if let Some(schema) = schema {
-        name = name.with_schema(schema, false);
-    }
-    db.function_by_target(name, IdentifierCase::AsWritten)
-        .expect("the name resolves")
-        .expect("the function exists")
-        .unconfined_definer_read(db, &deployment, &[app])
-        .expect("the schema reads")
-        .map(|read| described(&read))
-}
-
-/// The table `read` reads and why it may reach a hidden row, by name.
-fn described(read: &UnconfinedRead<'_, ParserDB>) -> (String, String) {
-    let table = read.table().map_or_else(String::new, |table| table.table_name().to_owned());
-    let reason = match read.reason() {
-        Unconfinement::Restrictive(policy) => policy.name().to_owned(),
-        Unconfinement::Permissive(policies) => {
-            policies.iter().map(PolicyLike::name).collect::<Vec<_>>().join(", ")
-        }
-        Unconfinement::HiddenColumn(column) => column.column_name().to_owned(),
-        Unconfinement::Unfollowed => "unfollowed".to_owned(),
-    };
-    (table, reason)
-}
+use crate::support::definer_reads::{deployment, described, function_read, schema, trigger_read};
 
 /// The schema of the request's reproduction, the guard reading `runs` by
 /// `keyed`, a field of `NEW`, and `bindings` declaring `keys`.

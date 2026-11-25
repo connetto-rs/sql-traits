@@ -18,12 +18,13 @@ use core::{
 
 use sqlparser::{
     ast::{
-        ArgMode, BinaryOperator, CascadeOption, CopySource, Expr, FromTable, Function, FunctionArg,
-        FunctionArgExpr, FunctionArguments, FunctionBehavior, FunctionCalledOnNull,
-        FunctionSecurity, Ident, InTarget, JoinConstraint, JoinOperator, MergeAction, ObjectName,
-        ObjectNamePart, OnConflictAction, OnInsert, Query, ReferentialAction, Select, SelectItem,
-        SetExpr, SetOperator, SetQuantifier, Statement, TableAliasColumnDef, TableFactor,
-        TableInheritance, TableObject, TableWithJoins, TriggerEvent, Value, Visit, Visitor, With,
+        ArgMode, BinaryOperator, CascadeOption, CopySource, DoUpdate, Expr, FromTable, Function,
+        FunctionArg, FunctionArgExpr, FunctionArguments, FunctionBehavior, FunctionCalledOnNull,
+        FunctionSecurity, Ident, InTarget, Insert, JoinConstraint, JoinOperator, MergeAction,
+        ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, ReferentialAction, Select,
+        SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableAlias,
+        TableAliasColumnDef, TableFactor, TableInheritance, TableObject, TableWithJoins,
+        TriggerEvent, Update, UpdateTableFromKind, Value, Visit, Visitor, With,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -56,7 +57,7 @@ use crate::{
     },
     structs::{
         ActingRole, ColumnBinding, ColumnDefinition, DefinerReading, DefinitionSource, Deployment,
-        EmbeddedSql, ExpressionContext, ExpressionScope, IdentifierCase, OperandType,
+        EmbeddedSql, ExpressionContext, ExpressionScope, IdentifierCase, OperandType, PlPgSqlScope,
         PlPgSqlVariable, Reaching, RowStatement, Unconfinement, VariableKind, WrittenCall,
     },
     traits::{
@@ -163,15 +164,9 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
     }
 
     /// The last read found unconfined, clearing the record.
+    #[expect(clippy::expect_used, reason = "every refused proof records its reason")]
     pub(super) fn take_refusal(&self) -> Refusal<'a, DB> {
-        self.refusal.take().unwrap_or_else(|| {
-            Refusal {
-                through: vec![self.exposed],
-                table: None,
-                statement: None,
-                reason: Unconfinement::Unfollowed,
-            }
-        })
+        self.refusal.take().expect("an unconfined proof records its refusal")
     }
 
     /// Whether every row of a table with row-level security that `function`
@@ -376,14 +371,11 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
     fn confines_sql_site(
         &self,
         function: &'a DB::Function,
-        sql: EmbeddedSql<'_>,
+        statement: &Statement,
         path: &BodyPath<'_>,
     ) -> Result<bool, LookupError> {
         let scope = ExpressionScope::FunctionBody(function);
-        let root = match sql {
-            EmbeddedSql::Expression(query) => ScopedRoot::Query(query),
-            EmbeddedSql::Statement(statement) => ScopedRoot::Statement(statement),
-        };
+        let root = ScopedRoot::Statement(statement);
         let Ok(context) =
             ExpressionContext::for_root(root, &scope, self.database, IdentifierCase::AsWritten)
         else {
@@ -399,18 +391,12 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
             lineage: &lineage,
             known: None,
         };
-        let confined = match sql {
-            EmbeddedSql::Expression(query) => reads.confines_query(query, &[], &[])?,
-            EmbeddedSql::Statement(Statement::Query(query)) => {
-                reads.confines_query(query, &[], &[])?
-            }
-            EmbeddedSql::Statement(statement) => reads.confines_write(statement)?,
+        let confined = match statement {
+            Statement::Query(query) => reads.confines_query(query, &[], &[])?,
+            statement => reads.confines_write(statement, false)?,
         };
         if !confined {
-            match sql {
-                EmbeddedSql::Expression(query) => self.refused_in(query),
-                EmbeddedSql::Statement(statement) => self.refused_in(statement),
-            }
+            self.refused_in(statement);
         }
         Ok(confined)
     }
@@ -618,23 +604,21 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                 if !ptr::eq(foreign_key.referenced_table(self.database)?, table) {
                     continue;
                 }
-                let next = match event {
-                    WriteEvent::Truncate { cascade: true } => event,
-                    WriteEvent::Update | WriteEvent::Delete => {
-                        let action = if event == WriteEvent::Update {
-                            foreign_key.on_update(self.database)
-                        } else {
-                            foreign_key.on_delete(self.database)
-                        };
-                        match action {
-                            ReferentialAction::Cascade => event,
-                            ReferentialAction::SetNull | ReferentialAction::SetDefault => {
-                                WriteEvent::Update
-                            }
-                            _ => continue,
+                let next = if event == (WriteEvent::Truncate { cascade: true }) {
+                    event
+                } else {
+                    let action = if event == WriteEvent::Update {
+                        foreign_key.on_update(self.database)
+                    } else {
+                        foreign_key.on_delete(self.database)
+                    };
+                    match action {
+                        ReferentialAction::Cascade => event,
+                        ReferentialAction::SetNull | ReferentialAction::SetDefault => {
+                            WriteEvent::Update
                         }
+                        _ => continue,
                     }
-                    WriteEvent::Insert | WriteEvent::Truncate { cascade: false } => continue,
                 };
                 if !self.confines_written_table(host, next, visited)? {
                     return Ok(false);
@@ -699,7 +683,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                 continue;
             }
             let context = site.context(case)?;
-            let known = Known { record, unchanged, function };
+            let known = Known { record, unchanged, function, scope: site.plpgsql_scope() };
             let mut reads = Reads {
                 body: Body { parameters: &parameters, confinement: self, function },
                 context: &context,
@@ -713,7 +697,9 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                 EmbeddedSql::Statement(Statement::Query(query)) => {
                     reads.confines_query(query, &[], &[])?
                 }
-                EmbeddedSql::Statement(statement) => reads.confines_write(statement)?,
+                EmbeddedSql::Statement(statement) => {
+                    reads.confines_write(statement, found || kinds.diagnostics)?
+                }
             };
             if !confined {
                 match sql {
@@ -1254,7 +1240,7 @@ impl<DB: DatabaseLike> Visitor for CallerBound<'_, DB> {
         let Expr::Function(call) = expression else {
             return ControlFlow::Continue(());
         };
-        if is_role_read(expression) || reads_session_state(call) {
+        if is_role_read(call) || reads_session_state(call) {
             return ControlFlow::Break(None);
         }
         Self::verdict(self.runs_as_caller(call))
@@ -1369,6 +1355,9 @@ struct Known<'k, 'a, DB: DatabaseLike> {
     unchanged: Vec<usize>,
     /// The function whose body holds the statement.
     function: &'a DB::Function,
+    /// The procedural variables available to a synthesized conflict-update
+    /// context.
+    scope: &'k PlPgSqlScope<'k, 'a, DB>,
 }
 
 impl<DB: DatabaseLike> Known<'_, '_, DB> {
@@ -1432,10 +1421,53 @@ struct Reads<'c, 'q, 'a, DB: DatabaseLike> {
 }
 
 impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
-    /// Whether `statement`, a write, confines the reads besides the rows it
-    /// writes: the queries it holds, and the other relations its `FROM` or
-    /// `USING` joins, which none may read with row-level security.
-    fn confines_write(&mut self, statement: &Statement) -> Result<bool, LookupError> {
+    /// Proves joined reads and any target rows exposed through a write's
+    /// result.
+    fn confines_write(
+        &mut self,
+        statement: &Statement,
+        observed: bool,
+    ) -> Result<bool, LookupError> {
+        if observed || returns_rows(statement) {
+            match statement {
+                Statement::Update(update) => {
+                    let others = match &update.from {
+                        Some(
+                            UpdateTableFromKind::BeforeSet(from)
+                            | UpdateTableFromKind::AfterSet(from),
+                        ) => from.as_slice(),
+                        None => &[],
+                    };
+                    return self.confines_returned_write(
+                        statement,
+                        FromItems { first: slice::from_ref(&update.table), second: others },
+                        update.selection.as_ref(),
+                    );
+                }
+                Statement::Delete(delete) => {
+                    let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) =
+                        &delete.from;
+                    return self.confines_returned_write(
+                        statement,
+                        FromItems { first: from, second: delete.using.as_deref().unwrap_or(&[]) },
+                        delete.selection.as_ref(),
+                    );
+                }
+                Statement::Insert(insert) => {
+                    if let Some(OnInsert::OnConflict(conflict)) = &insert.on
+                        && let OnConflictAction::DoUpdate(update) = &conflict.action
+                        && !self.confines_conflict(insert, update)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                Statement::Merge(merge) if !matches!(self.read(&merge.table)?, Read::Open) => {
+                    let table = self.stored(&merge.table);
+                    return Ok(self.body.confinement.refuse(table, Unconfinement::Unfollowed));
+                }
+                _ => {}
+            }
+        }
         let written = match statement {
             Statement::Update(update) => Some(&update.table.relation),
             Statement::Delete(delete) => {
@@ -1469,6 +1501,110 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
             ControlFlow::Break(None) => return Ok(false),
             ControlFlow::Break(Some(error)) => return Err(error),
         }
+        self.confines_write_queries(statement)
+    }
+
+    /// Proves the target selection of a write whose affected rows are observed.
+    fn confines_returned_write(
+        &mut self,
+        statement: &Statement,
+        from: FromItems<'_>,
+        selection: Option<&Expr>,
+    ) -> Result<bool, LookupError> {
+        let filters = self.filters_from(from, selection, &[], &[])?;
+        if !self.confines_sources(&filters, None)? {
+            return Ok(false);
+        }
+        self.confines_write_queries(statement)
+    }
+
+    /// Proves the existing rows returned by a conflict update in its own target
+    /// scope.
+    fn confines_conflict(&self, insert: &Insert, conflict: &DoUpdate) -> Result<bool, LookupError> {
+        let TableObject::TableName(name) = &insert.table else {
+            return Ok(self.body.confinement.unfollowed());
+        };
+        let Some(Relation::Table(table)) = self.resolved_relation(name) else {
+            return Ok(self.body.confinement.unfollowed());
+        };
+        if !table.has_row_level_security(self.body.confinement.database)? {
+            return Ok(true);
+        }
+        let target = TableWithJoins {
+            relation: TableFactor::Table {
+                name: name.clone(),
+                alias: insert.table_alias.as_ref().map(|alias| {
+                    TableAlias {
+                        explicit: alias.explicit,
+                        name: alias.alias.clone(),
+                        columns: Vec::new(),
+                        at: None,
+                    }
+                }),
+                args: None,
+                with_hints: Vec::new(),
+                version: None,
+                with_ordinality: false,
+                partitions: Vec::new(),
+                json_path: None,
+                sample: None,
+                index_directives: Vec::new(),
+                inheritance: None,
+            },
+            joins: Vec::new(),
+        };
+        let statement = Statement::Update(Update {
+            update_token: insert.insert_token.clone(),
+            optimizer_hints: Vec::new(),
+            table: target,
+            on_cluster: None,
+            assignments: Vec::new(),
+            from: None,
+            selection: conflict.selection.clone(),
+            returning: None,
+            output: None,
+            or: None,
+            order_by: Vec::new(),
+            limit: None,
+            settings: None,
+        });
+        let scope = self.known.map_or(ExpressionScope::FunctionBody(self.body.function), |known| {
+            ExpressionScope::PlPgSql(known.scope)
+        });
+        let Ok(context) = ExpressionContext::for_statement(
+            &statement,
+            &scope,
+            self.body.confinement.database,
+            IdentifierCase::AsWritten,
+        ) else {
+            return Ok(self.body.confinement.unfollowed());
+        };
+        let reads = Reads {
+            body: Body {
+                parameters: self.body.parameters,
+                confinement: self.body.confinement,
+                function: self.body.function,
+            },
+            context: &context,
+            path: self.path,
+            items: WithScopes::default(),
+            lineage: self.lineage,
+            known: self.known,
+        };
+        let Statement::Update(update) = &statement else {
+            return Ok(self.body.confinement.unfollowed());
+        };
+        let filters = reads.filters_from(
+            FromItems { first: slice::from_ref(&update.table), second: &[] },
+            update.selection.as_ref(),
+            &[],
+            &[],
+        )?;
+        reads.confines_sources(&filters, None)
+    }
+
+    /// Proves subqueries evaluated by a write statement.
+    fn confines_write_queries(&mut self, statement: &Statement) -> Result<bool, LookupError> {
         let outcome = nested_queries(statement, 0, |nested| {
             match self.confines_query(nested, &[], &[]) {
                 Ok(true) => ControlFlow::Continue(()),
@@ -1566,7 +1702,17 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
         owners: &[&Query],
     ) -> Result<bool, LookupError> {
         let filters = self.filters(select, held, owners)?;
-        for from in &select.from {
+        self.confines_sources(&filters, Some(select))
+    }
+
+    /// Proves every source row using its predicates and optional query-result
+    /// lineage.
+    fn confines_sources(
+        &self,
+        filters: &Filters<'_>,
+        select: Option<&Select>,
+    ) -> Result<bool, LookupError> {
+        for from in filters.from.iter() {
             for (position, relation) in relations(from).enumerate() {
                 let table = match self.read(relation)? {
                     Read::Open => continue,
@@ -1574,27 +1720,23 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
                     Read::Protected(table) => table,
                 };
                 let Stated { resolver, equalities, mut conditions, caller_bound, .. } =
-                    self.stated(&filters, from, position)?;
+                    self.stated(filters, from, position)?;
                 let mut drawn = Vec::new();
                 for condition in conditions.iter().chain(&caller_bound) {
                     drawn.extend(self.drawn_condition(table, condition, &conditions)?);
                 }
                 conditions.extend(drawn);
-                let witnessed = self.witnessed_sets(
-                    select,
-                    &filters,
-                    table,
-                    relation,
-                    &equalities,
-                    &conditions,
-                )?;
+                let witnessed =
+                    self.witnessed_sets(filters, table, relation, &equalities, &conditions)?;
                 conditions.extend(witnessed);
-                if let Some(membership) = self.lineage.membership(select, |column| {
-                    match term(&resolver, column, relation, &equalities)? {
-                        Term::Column(column) => Some(column),
-                        Term::Parameter(_) => None,
-                    }
-                }) {
+                if let Some(select) = select
+                    && let Some(membership) = self.lineage.membership(select, |column| {
+                        match term(&resolver, column, relation, &equalities)? {
+                            Term::Column(column) => Some(column),
+                            Term::Parameter(_) => None,
+                        }
+                    })
+                {
                     conditions.push(membership);
                 }
                 if !self.body.admits_every_caller(table, &conjunction(conditions))? {
@@ -1613,8 +1755,24 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
         held: &'e [&'e Expr],
         owners: &[&'e Query],
     ) -> Result<Filters<'e>, LookupError> {
-        let filter: Vec<&Expr> = select.selection.iter().flat_map(conjuncts).collect();
-        let sources = self.sources(select, owners);
+        self.filters_from(
+            FromItems { first: &select.from, second: &[] },
+            select.selection.as_ref(),
+            held,
+            owners,
+        )
+    }
+
+    /// Collects predicates over borrowed read or write sources.
+    fn filters_from<'e>(
+        &self,
+        from: FromItems<'e>,
+        selection: Option<&'e Expr>,
+        held: &'e [&'e Expr],
+        owners: &[&'e Query],
+    ) -> Result<Filters<'e>, LookupError> {
+        let filter: Vec<&Expr> = selection.into_iter().flat_map(conjuncts).collect();
+        let sources = self.sources(from, owners);
         let witnessed = filter
             .iter()
             .copied()
@@ -1622,12 +1780,12 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
             .chain(sources.iter().map(|source| source.body))
             .flat_map(|found| found.selection.iter().flat_map(conjuncts))
             .collect();
-        let mut rejected = Vec::with_capacity(select.from.len());
-        for from in &select.from {
-            rejected.push(self.rejected(from, &filter)?);
+        let mut rejected = Vec::with_capacity(from.len());
+        for item in from.iter() {
+            rejected.push(self.rejected(item, &filter)?);
         }
-        let merges = self.merges(select, &sources)?;
-        Ok(Filters { held, filter, witnessed, sources, from: &select.from, rejected, merges })
+        let merges = self.merges(from, &sources)?;
+        Ok(Filters { held, filter, witnessed, sources, from, rejected, merges })
     }
 
     /// What the filters of the relation at `position` of `from` state of it.
@@ -1841,7 +1999,6 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
     /// and the filters hold the column the arm returns equal to `column`.
     fn witnessed_sets(
         &self,
-        select: &Select,
         filters: &Filters<'_>,
         table: &'a DB::Table,
         relation: &TableFactor,
@@ -1857,7 +2014,7 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
             .iter()
             .map(|set| set.literals.then(|| listed_arguments(&set.call)).flatten())
             .collect();
-        for from in &select.from {
+        for from in filters.from.iter() {
             for (position, joined) in relations(from).enumerate() {
                 let same = ptr::eq(joined, relation);
                 let Some(joined_table) = self.stored(joined) else {
@@ -2112,10 +2269,14 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
             .collect()
     }
 
-    /// The columns the `USING` joins of `select` merge.
-    fn merges(&self, select: &Select, sources: &[Source<'_>]) -> Result<Vec<Merge>, LookupError> {
+    /// The columns merged by the sources' `USING` joins.
+    fn merges(
+        &self,
+        from: FromItems<'_>,
+        sources: &[Source<'_>],
+    ) -> Result<Vec<Merge>, LookupError> {
         let mut merges: Vec<Merge> = Vec::new();
-        for from in &select.from {
+        for from in from.iter() {
             let natural = from.joins.iter().any(|join| {
                 matches!(join_constraint(&join.join_operator), Some(JoinConstraint::Natural))
             });
@@ -2199,9 +2360,9 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
     /// or a subquery whose body yields each of its rows from a row passing
     /// its `WHERE`. A body two of them read is left out, since their rows
     /// come from different rows of it.
-    fn sources<'s>(&self, select: &'s Select, owners: &[&'s Query]) -> Vec<Source<'s>> {
+    fn sources<'s>(&self, from: FromItems<'s>, owners: &[&'s Query]) -> Vec<Source<'s>> {
         let mut sources: Vec<Source<'_>> = Vec::new();
-        for from in &select.from {
+        for from in from.iter() {
             for (position, relation) in relations(from).enumerate() {
                 if !present(from, position) {
                     continue;
@@ -2655,7 +2816,7 @@ struct Filters<'e> {
     /// every row of which comes from a row of its body.
     sources: Vec<Source<'e>>,
     /// The `FROM` items of the `SELECT`.
-    from: &'e [TableWithJoins],
+    from: FromItems<'e>,
     /// For each join of each item of `from`, whether the `WHERE` drops the
     /// rows it extends with nulls.
     rejected: Vec<Vec<bool>>,
@@ -3628,9 +3789,11 @@ impl<'path, DB: DatabaseLike> BodyWalk<'path> for SqlProof<'_, 'path, '_, DB> {
     }
 
     fn walk(&mut self, sql: EmbeddedSql<'_>) -> Result<(), LookupError> {
-        if self.confined {
+        if self.confined
+            && let EmbeddedSql::Statement(statement) = sql
+        {
             self.confined = if self.reads {
-                self.confinement.confines_sql_site(self.function, sql, &self.path)?
+                self.confinement.confines_sql_site(self.function, statement, &self.path)?
             } else {
                 self.confinement.confines_writes(&sql, &self.path, self.bound)?
             };
@@ -3660,4 +3823,34 @@ fn written_table<'db, DB: DatabaseLike>(
         Some(Relation::Table(table)) => Some(table),
         _ => None,
     })
+}
+
+/// Borrows the target and auxiliary source lists of a read or write.
+#[derive(Clone, Copy)]
+struct FromItems<'source> {
+    first: &'source [TableWithJoins],
+    second: &'source [TableWithJoins],
+}
+
+impl<'source> FromItems<'source> {
+    /// Iterates the source lists without copying their syntax trees.
+    fn iter(self) -> impl Iterator<Item = &'source TableWithJoins> {
+        self.first.iter().chain(self.second.iter())
+    }
+
+    /// Counts the sources across both lists.
+    fn len(self) -> usize {
+        self.first.len() + self.second.len()
+    }
+}
+
+/// Whether a mutation exposes rows through a result clause.
+fn returns_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Update(update) => update.returning.is_some() || update.output.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some() || delete.output.is_some(),
+        Statement::Insert(insert) => insert.returning.is_some() || insert.output.is_some(),
+        Statement::Merge(merge) => merge.output.is_some(),
+        _ => false,
+    }
 }

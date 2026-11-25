@@ -183,14 +183,12 @@ fn enumeration<'db, DB: DatabaseLike>(
 ) -> Result<Option<&'db DB::UserDefinedType>, LookupError> {
     let placeholder = parameter(position);
     let scope = ExpressionScope::FunctionBody(function);
-    let Ok(context) = ExpressionContext::for_expression(
+    let context = ExpressionContext::for_expression(
         &placeholder,
         &scope,
         database,
         IdentifierCase::AsWritten,
-    ) else {
-        return Ok(None);
-    };
+    )?;
     let OperandType::Known { type_name, .. } = context.type_of(&placeholder)? else {
         return Ok(None);
     };
@@ -229,8 +227,8 @@ impl<'a, DB: DatabaseLike> Descent<'_, '_, '_, 'a, DB> {
         }
         match self.context.reference(expression) {
             Ok(Some((ColumnDefinition::Parameter { ordinal, .. }, _))) => ordinal == self.position,
-            Ok(_) => false,
-            Err(_) => true,
+            Ok(Some(_)) => false,
+            Ok(None) | Err(_) => true,
         }
     }
 

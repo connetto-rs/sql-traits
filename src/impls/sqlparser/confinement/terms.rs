@@ -3,7 +3,7 @@
 use alloc::{borrow::Cow, string::ToString, vec, vec::Vec};
 
 use sqlparser::{
-    ast::{BinaryOperator, Expr, FunctionArguments, Query, Statement, Value},
+    ast::{BinaryOperator, Expr, Function, FunctionArguments, Query, Statement, Value},
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
@@ -96,23 +96,13 @@ pub(super) fn is_column_reference(expression: &Expr) -> bool {
 
 /// Whether the expression reads the current or session role, `user` being
 /// PostgreSQL's spelling of `current_user`.
-pub(super) fn is_role_read(expression: &Expr) -> bool {
-    is_call_to(expression, &["current_user", "current_role", "session_user", "user"], true)
-}
-
-/// Whether the expression calls one of `names`, written without parentheses
-/// when `bare`.
-fn is_call_to(expression: &Expr, names: &[&str], bare: bool) -> bool {
-    let Expr::Function(function) = expression else {
-        return false;
-    };
-    matches!(function.args, FunctionArguments::None) == bare
-        && function
-            .name
-            .0
-            .last()
-            .and_then(|part| part.as_ident())
-            .is_some_and(|ident| names.iter().any(|name| ident.value.eq_ignore_ascii_case(name)))
+pub(super) fn is_role_read(function: &Function) -> bool {
+    matches!(function.args, FunctionArguments::None)
+        && function.name.0.last().and_then(|part| part.as_ident()).is_some_and(|ident| {
+            ["current_user", "current_role", "session_user", "user"]
+                .iter()
+                .any(|name| ident.value.eq_ignore_ascii_case(name))
+        })
 }
 
 /// Returns whether PostgreSQL can prove the expression true for every row.
