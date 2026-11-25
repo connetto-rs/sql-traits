@@ -6747,6 +6747,24 @@ fn an_edge_exclusion_reaching_the_walking_helper_is_a_call_cycle() {
 }
 
 #[test]
+fn an_edge_exclusion_of_a_set_holding_nothing_keeps_every_edge() {
+    let term = format!(
+        "{STEP_DOWN} WHERE ts.organization_id NOT IN (SELECT authz.blocking_organizations())"
+    );
+    let condition = "WHERE ob.user_id = current_setting('app.user_id', true)";
+    let fixture = templates(&term, "");
+    let empty = fixture.replace(condition, &format!("{condition} AND false"));
+    assert_ne!(empty, fixture, "the excluded helper keeps no row");
+    let database = postgres(&empty);
+    let deployment = deployment();
+    let set = templates_reached(&database, &deployment, "into").expect("answered");
+    assert_eq!(
+        render(&set),
+        format!("{TEMPLATE_GRANT_ARM} UNION template_steps.child_id WHERE parent_id IN itself")
+    );
+}
+
+#[test]
 fn an_edge_condition_needs_the_owner_to_read_the_columns_it_names() {
     let deployment = deployment();
     let term = format!("{STEP_DOWN} WHERE {COMPLETED_INTO}");
