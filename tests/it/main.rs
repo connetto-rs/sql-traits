@@ -175,6 +175,7 @@ mod partitioned_index_copies;
 mod per_object_grants;
 mod persisted_names_and_collations;
 mod plpgsql_dynamic_execution;
+mod plpgsql_loop_ends;
 mod plpgsql_name_collisions;
 mod plpgsql_reaching_definitions;
 mod plpgsql_site_truth;

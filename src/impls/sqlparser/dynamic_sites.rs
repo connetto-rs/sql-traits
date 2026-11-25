@@ -13,7 +13,7 @@ use core::iter;
 
 use sqlparser::ast::{ArgMode, Expr, ObjectName, Query, Statement};
 use sqlparser_plpgsql::{
-    embedded::{Block, DeclarationKind, DeclaredType, Dynamic, expression},
+    embedded::{Block, DeclarationKind, DeclaredType, Dynamic, Loop, Node, NodeKind, expression},
     namespace::{self, FunctionKind, Name, NameKind, Signature, Site, Sql, TriggerVariable},
 };
 
@@ -35,9 +35,9 @@ use crate::{
     errors::LookupError,
     structs::{
         CallResolution, DynamicExecution, EmbeddedSql, ExpressionContext, ExpressionScope,
-        IdentifierCase, OperandType, PlPgSqlScope, PlPgSqlSite, PlPgSqlSiteRole, PlPgSqlVariable,
-        SiteFlow, SiteScope, TargetName, TypeKind, VariableKind, array_of, column_type,
-        declared_type, declared_type_named, plpgsql_flow::FlowPoint,
+        IdentifierCase, OperandType, PlPgSqlLoop, PlPgSqlScope, PlPgSqlSite, PlPgSqlSiteRole,
+        PlPgSqlVariable, SiteFlow, SiteScope, TargetName, TypeKind, VariableKind, array_of,
+        column_type, declared_type, declared_type_named, plpgsql_flow::FlowPoint,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, Relation, TableLike},
     utils::{
@@ -590,6 +590,31 @@ impl<'db, DB: DatabaseLike> SiteSource<'db, DB> {
         }
     }
 
+    /// Every loop of a PL/pgSQL body, in body order, with whether control
+    /// leaves it under `case`, and none for a body in another language.
+    ///
+    /// # Errors
+    ///
+    /// Returns, for a body holding a loop, the errors of
+    /// [`SiteFlow::analysis`].
+    pub(crate) fn plpgsql_loops(
+        &self,
+        case: IdentifierCase,
+    ) -> Result<Vec<PlPgSqlLoop<'_>>, LookupError> {
+        let Some(block) = self.block() else { return Ok(Vec::new()) };
+        let mut loops = Vec::new();
+        block_loops(block, &mut loops);
+        if loops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let flow = Arc::new(SiteFlow::new(&self.names, block, self.hex_strings_may_be_integers));
+        let analysis = flow.analysis(case)?.borrow();
+        Ok(loops
+            .into_iter()
+            .map(|repeated| PlPgSqlLoop::new(repeated, analysis.ends(repeated)))
+            .collect())
+    }
+
     /// The sites of the SQL body whose statements or expression are
     /// `roots`, each call typed with the function's input parameters in
     /// reach.
@@ -608,6 +633,60 @@ impl<'db, DB: DatabaseLike> SiteSource<'db, DB> {
             }
         }
         Ok(sites)
+    }
+}
+
+/// Pushes every loop of the statements and handlers of `block` to `loops`,
+/// in body order, each before the loops it holds.
+fn block_loops<'b>(block: &'b Block, loops: &mut Vec<&'b Loop>) {
+    nodes_loops(&block.statements, loops);
+    for handler in &block.handlers {
+        nodes_loops(&handler.statements, loops);
+    }
+}
+
+/// Pushes every loop of `nodes` and of the statements nested in them to
+/// `loops`, in body order, each before the loops it holds.
+fn nodes_loops<'b>(nodes: &'b [Node], loops: &mut Vec<&'b Loop>) {
+    for node in nodes {
+        match &node.kind {
+            NodeKind::Block(block) => block_loops(block, loops),
+            NodeKind::If(conditional) => {
+                for branch in &conditional.branches {
+                    nodes_loops(&branch.statements, loops);
+                }
+                nodes_loops(&conditional.otherwise, loops);
+            }
+            NodeKind::Case(case) => {
+                for branch in &case.branches {
+                    nodes_loops(&branch.statements, loops);
+                }
+                if let Some(otherwise) = &case.otherwise {
+                    nodes_loops(otherwise, loops);
+                }
+            }
+            NodeKind::Loop(repeated) => {
+                loops.push(repeated);
+                nodes_loops(&repeated.statements, loops);
+            }
+            NodeKind::Statement { .. }
+            | NodeKind::Perform { .. }
+            | NodeKind::Assignment { .. }
+            | NodeKind::Dynamic { .. }
+            | NodeKind::Fetch { .. }
+            | NodeKind::Move { .. }
+            | NodeKind::Diagnostics { .. }
+            | NodeKind::Open { .. }
+            | NodeKind::Close { .. }
+            | NodeKind::Commit { .. }
+            | NodeKind::Rollback { .. }
+            | NodeKind::Exit { .. }
+            | NodeKind::Return { .. }
+            | NodeKind::ReturnNext { .. }
+            | NodeKind::ReturnQuery { .. }
+            | NodeKind::Raise { .. }
+            | NodeKind::Assert { .. } => {}
+        }
     }
 }
 

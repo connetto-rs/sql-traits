@@ -123,7 +123,7 @@ pub use plpgsql_flow::{
     TargetStep, VariableRead,
 };
 pub use plpgsql_scope::{PlPgSqlScope, PlPgSqlVariable, VariableKind};
-pub use plpgsql_site::{PlPgSqlSite, PlPgSqlSiteRole, PlPgSqlSites};
+pub use plpgsql_site::{PlPgSqlLoop, PlPgSqlSite, PlPgSqlSiteRole, PlPgSqlSites};
 pub use policy_analysis::{MissingPolicyClause, PolicyAnalysis, PolicyTarget};
 pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;

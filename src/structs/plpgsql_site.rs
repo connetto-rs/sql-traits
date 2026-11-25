@@ -3,7 +3,10 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use sqlparser::ast::Expr;
-use sqlparser_plpgsql::{embedded::Case, namespace::Sql};
+use sqlparser_plpgsql::{
+    embedded::{Case, Loop},
+    namespace::Sql,
+};
 
 use crate::{
     errors::LookupError,
@@ -44,10 +47,93 @@ impl<'db, DB: DatabaseLike> PlPgSqlSites<'db, DB> {
         self.source.plpgsql_sites()
     }
 
+    /// Returns every loop of the body, in body order, each before the loops
+    /// it holds, with whether control leaves it once a path enters it.
+    /// Identifiers compare under `case`, and a body in another language
+    /// holds none.
+    ///
+    /// The walk is the one [`PlPgSqlSite::reached`] reads, and it runs once
+    /// per call and `case`.
+    ///
+    /// # Errors
+    ///
+    /// Returns, for a body holding a loop, the errors
+    /// [`PlPgSqlSite::reached`] returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION poll() RETURNS void LANGUAGE plpgsql AS $$
+    ///      DECLARE n integer := 0;
+    ///      BEGIN
+    ///          <<waiting>> WHILE n < 10 LOOP
+    ///              EXIT WHEN n > 3;
+    ///          END LOOP;
+    ///          <<counting>> WHILE n < 10 LOOP
+    ///              n := n + 1;
+    ///          END LOOP;
+    ///      END $$;",
+    /// )?;
+    /// let poll = db
+    ///     .function_by_target(TargetName::new("poll", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let body = poll.plpgsql_sites(&db)?;
+    /// let loops = body.loops(IdentifierCase::Folded)?;
+    /// let [waiting, counting] = loops.as_slice() else { panic!("two loops") };
+    /// assert_eq!(waiting.repeated().label.as_deref(), Some("waiting"));
+    /// assert_eq!(waiting.ends(), Some(false));
+    /// assert_eq!(counting.ends(), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn loops(&self, case: IdentifierCase) -> Result<Vec<PlPgSqlLoop<'_>>, LookupError> {
+        self.source.plpgsql_loops(case)
+    }
+
     /// The parsed PL/pgSQL block the sites borrow from, `None` for a body
     /// in another language.
     pub(crate) const fn block(&self) -> Option<&sqlparser_plpgsql::embedded::Block> {
         self.source.block()
+    }
+}
+
+/// A loop of a PL/pgSQL body, with whether control leaves it once a path
+/// enters it.
+#[derive(Debug, Clone, Copy)]
+pub struct PlPgSqlLoop<'b> {
+    repeated: &'b Loop,
+    ends: Option<bool>,
+}
+
+impl<'b> PlPgSqlLoop<'b> {
+    pub(crate) const fn new(repeated: &'b Loop, ends: Option<bool>) -> Self {
+        Self { repeated, ends }
+    }
+
+    /// Returns the loop, with its label, what controls it and the
+    /// statements each iteration runs.
+    #[must_use]
+    pub const fn repeated(&self) -> &'b Loop {
+        self.repeated
+    }
+
+    /// Returns whether control may leave the loop once a path enters it,
+    /// and `None` when no path reaches it.
+    ///
+    /// Control leaves a loop when its condition is false or `NULL`, its
+    /// range, rows or elements run out, an `EXIT` ends it, an `EXIT` or
+    /// `CONTINUE` inside it reaches a block or loop around it, a `RETURN`
+    /// inside it runs, or a step inside it surely raises an error no handler
+    /// inside it catches, as PostgreSQL 18 runs the body under what each
+    /// variable may hold. A step that only may raise leaves no loop.
+    #[must_use]
+    pub const fn ends(&self) -> Option<bool> {
+        self.ends
     }
 }
 
