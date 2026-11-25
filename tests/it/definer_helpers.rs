@@ -403,17 +403,7 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
             conditions.join(" AND ")
         )
     });
-    let exclusions = grant.exclusions().iter().map(|exclusion| {
-        let arguments: Vec<String> =
-            exclusion.arguments().iter().map(ToString::to_string).collect();
-        format!(
-            "{} NOT IN {}({}) {{{}}}",
-            exclusion.column().column_name(),
-            exclusion.function().target_name(),
-            arguments.join(", "),
-            render(exclusion.set()),
-        )
-    });
+    let exclusions = grant.exclusions().iter().map(render_exclusion);
     let conditions: Vec<String> = granted_to
         .into_iter()
         .chain(gate)
@@ -432,6 +422,18 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
     };
     let returned = render_returned(grant.returned(), |column| column.column_name().to_string());
     format!("{}.{returned}{filter}", grant.table().table_name())
+}
+
+/// `<column> NOT IN <helper>(<arguments>) {<set>}`.
+fn render_exclusion(exclusion: &ExcludedSet<'_, ParserDB>) -> String {
+    let arguments: Vec<String> = exclusion.arguments().iter().map(ToString::to_string).collect();
+    format!(
+        "{} NOT IN {}({}) {{{}}}",
+        exclusion.column().column_name(),
+        exclusion.function().target_name(),
+        arguments.join(", "),
+        render(exclusion.set()),
+    )
 }
 
 /// The columns an arm returns, one bare and several in parentheses, each
@@ -469,12 +471,23 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         WalkDirection::Down => (walk.child(), walk.column()),
                         WalkDirection::Up => (walk.column(), walk.child()),
                     };
-                    format!(
+                    let mut rendered = format!(
                         "{}.{} WHERE {} IN itself",
                         walk.table().table_name(),
                         returned.column_name(),
                         compared.column_name(),
-                    )
+                    );
+                    let conditions = walk
+                        .restrictions()
+                        .iter()
+                        .map(render_restriction)
+                        .chain(walk.time_bounds().iter().map(render_bound))
+                        .chain(walk.exclusions().iter().map(render_exclusion));
+                    for condition in conditions {
+                        rendered.push_str(" AND ");
+                        rendered.push_str(&condition);
+                    }
+                    rendered
                 }
                 HelperArm::Parent(parent) => {
                     let arguments: Vec<String> =
@@ -690,8 +703,20 @@ fn evaluate(
                 WalkDirection::Down => (walk.column(), walk.child()),
                 WalkDirection::Up => (walk.child(), walk.column()),
             };
+            let excluded: Vec<_> = walk
+                .exclusions()
+                .iter()
+                .map(|exclusion| (exclusion, evaluate(exclusion.set(), request, fixture)))
+                .collect();
             for row in rows(fixture, walk.table().table_name()) {
+                // `NOT IN` is `NULL` for a `NULL` compared with any value.
+                let outside = excluded.iter().all(|(exclusion, excluded)| {
+                    nullable(row, exclusion.column().column_name())
+                        .map_or(excluded.is_empty(), |value| !excluded.contains(value))
+                });
                 if nullable(row, reached.column_name()).is_some_and(|held| returned.contains(held))
+                    && walk.restrictions().iter().all(|restriction| restricts(restriction, row))
+                    && outside
                     && let Some(added) = nullable(row, added.column_name())
                 {
                     grew |= returned.insert(added);
@@ -2910,8 +2935,6 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
             "SELECT child.label FROM public.groups child JOIN reached ON child.id = reached.id",
         ),
         walking(&format!("{CHILD_JOIN} JOIN public.group_grants g ON g.group_id = child.id")),
-        walking(&format!("{CHILD_JOIN} WHERE child.id <> 'x'")),
-        walking(&format!("{CHILD_JOIN} AND child.id <> 'x'")),
         walking(&CHILD_JOIN.replace(" JOIN ", " LEFT JOIN ")),
         walking(&CHILD_JOIN.replace(" JOIN ", " GLOBAL JOIN ")),
         walking(&format!("{CHILD_JOIN} GROUP BY child.id")),
@@ -6187,31 +6210,8 @@ fn a_self_referencing_walk_reads_its_key_as_the_child() {
 #[test]
 fn an_edge_table_of_any_other_shape_refuses_the_walk() {
     let deployment = deployment();
-    let unique = "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);";
     let parent = "parent_id TEXT NOT NULL REFERENCES folders (id),";
-    let both = format!(
-        "{unique} CREATE UNIQUE INDEX folder_parents_parent ON folder_parents (parent_id);"
-    );
     for (term, from, to) in [
-        (EDGE_DOWN, unique, ""),
-        (EDGE_UP, unique, ""),
-        (
-            EDGE_DOWN,
-            unique,
-            "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id) WHERE parent_id <> 'x';",
-        ),
-        (
-            EDGE_DOWN,
-            unique,
-            "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (lower(folder_id));",
-        ),
-        (
-            EDGE_DOWN,
-            unique,
-            "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id, parent_id);",
-        ),
-        (EDGE_DOWN, unique, "CREATE INDEX folder_parents_folder ON folder_parents (folder_id);"),
-        (EDGE_DOWN, unique, &both),
         (EDGE_DOWN, parent, "parent_id TEXT NOT NULL REFERENCES organizations (id),"),
         (
             "SELECT fp.parent_id FROM public.folder_parents fp JOIN reached ON fp.parent_id = reached.id",
@@ -6254,6 +6254,533 @@ fn an_edge_walk_needs_the_owner_to_read_both_edge_columns() {
     assert!(matches!(
         answer(&database, &deployment, "authz", "folders_reached", &[]),
         Err(HelperSetError::MissingSelect { table, .. }) if table == "folder_parents"
+    ));
+}
+
+fn templates(term: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TABLE templates (id TEXT PRIMARY KEY);
+         CREATE TABLE template_grants (
+           template_id TEXT NOT NULL REFERENCES templates (id),
+           user_id TEXT NOT NULL,
+           PRIMARY KEY (template_id, user_id)
+         );
+         CREATE TABLE template_steps (
+           parent_id TEXT NOT NULL REFERENCES templates (id),
+           child_id TEXT NOT NULL REFERENCES templates (id),
+           kind TEXT NOT NULL,
+           completed BOOLEAN NOT NULL,
+           retired_at TIMESTAMPTZ,
+           organization_id TEXT,
+           PRIMARY KEY (parent_id, child_id)
+         );
+         CREATE TABLE organization_blocks (organization_id TEXT NOT NULL, user_id TEXT NOT NULL);
+         GRANT SELECT ON templates, template_grants, template_steps TO authz_owner;
+         GRANT SELECT ON organization_blocks TO authz_owner;
+         CREATE FUNCTION authz.blocking_organizations() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT ob.organization_id FROM public.organization_blocks ob
+           WHERE ob.user_id = current_setting('app.user_id', true)
+         $$;
+         ALTER FUNCTION authz.blocking_organizations() OWNER TO authz_owner;
+         CREATE FUNCTION authz.templates_reached(wanted TEXT) RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           WITH RECURSIVE reached (id) AS (
+             SELECT tg.template_id FROM public.template_grants tg
+             WHERE tg.user_id = current_setting('app.user_id', true)
+             UNION {term}
+           ) SELECT id FROM reached
+         $$;
+         ALTER FUNCTION authz.templates_reached(TEXT) OWNER TO authz_owner;
+         {after}"
+    )
+}
+
+const STEP_DOWN: &str =
+    "SELECT ts.child_id FROM public.template_steps ts JOIN reached ON ts.parent_id = reached.id";
+const STEP_UP: &str =
+    "SELECT ts.parent_id FROM public.template_steps ts JOIN reached ON ts.child_id = reached.id";
+const COMPLETED_INTO: &str = "ts.completed AND ts.kind = 'into'";
+const TEMPLATE_GRANT_ARM: &str = "template_grants.template_id WHERE user_id = app.user_id";
+
+// The edges carry the organization owning them, alice blocking `org_b`.
+const TEMPLATE_DAG: Rows = &[
+    ("template_grants", &[("template_id", "root"), ("user_id", "alice")]),
+    ("template_grants", &[("template_id", "mid_a"), ("user_id", "bob")]),
+    ("organization_blocks", &[("organization_id", "org_b"), ("user_id", "alice")]),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "root"),
+            ("child_id", "mid_a"),
+            ("kind", "into"),
+            ("completed", "true"),
+            ("organization_id", "org_a"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "root"),
+            ("child_id", "mid_b"),
+            ("kind", "into"),
+            ("completed", "false"),
+            ("organization_id", "org_b"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "mid_a"),
+            ("child_id", "leaf"),
+            ("kind", "into"),
+            ("completed", "true"),
+            ("organization_id", "org_b"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "mid_b"),
+            ("child_id", "leaf"),
+            ("kind", "into"),
+            ("completed", "true"),
+            ("organization_id", "org_a"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[("parent_id", "mid_a"), ("child_id", "side"), ("kind", "out"), ("completed", "true")],
+    ),
+];
+
+const CYCLIC_TEMPLATE_DAG: Rows = &[
+    ("template_grants", &[("template_id", "root"), ("user_id", "alice")]),
+    ("template_grants", &[("template_id", "mid_a"), ("user_id", "bob")]),
+    ("organization_blocks", &[("organization_id", "org_b"), ("user_id", "alice")]),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "root"),
+            ("child_id", "mid_a"),
+            ("kind", "into"),
+            ("completed", "true"),
+            ("organization_id", "org_a"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "root"),
+            ("child_id", "mid_b"),
+            ("kind", "into"),
+            ("completed", "false"),
+            ("organization_id", "org_b"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "mid_a"),
+            ("child_id", "leaf"),
+            ("kind", "into"),
+            ("completed", "true"),
+            ("organization_id", "org_b"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "mid_b"),
+            ("child_id", "leaf"),
+            ("kind", "into"),
+            ("completed", "true"),
+            ("organization_id", "org_a"),
+        ],
+    ),
+    (
+        "template_steps",
+        &[("parent_id", "mid_a"), ("child_id", "side"), ("kind", "out"), ("completed", "true")],
+    ),
+    (
+        "template_steps",
+        &[
+            ("parent_id", "leaf"),
+            ("child_id", "root"),
+            ("kind", "into"),
+            ("completed", "true"),
+            ("organization_id", "org_a"),
+        ],
+    ),
+];
+
+/// `(rows, caller, wanted, returned)` as PostgreSQL 18.6 answers
+/// `authz.templates_reached(wanted)`.
+type TemplatesMeasured = &'static [(Rows, &'static str, &'static str, &'static [&'static str])];
+
+/// `authz.templates_reached(wanted)`, read with the conditions and the
+/// exclusions its walk sets on its edges.
+fn templates_reached<'db>(
+    database: &'db ParserDB,
+    deployment: &'db Deployment,
+    wanted: &str,
+) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    function(database, "authz", "templates_reached").helper_set(
+        &[text(wanted)],
+        deployment,
+        database,
+        &[ArmCondition::EdgeCondition, ArmCondition::Exclusion],
+    )
+}
+
+/// Checks `authz.templates_reached`, written with the walk `term`, against
+/// what PostgreSQL returns for each case of `measured`.
+fn assert_templates_measured(term: &str, measured: TemplatesMeasured) {
+    let database = postgres(&templates(term, ""));
+    let deployment = deployment();
+    for &(fixture, caller, wanted, expected) in measured {
+        let set = templates_reached(&database, &deployment, wanted).expect("answered");
+        let returned: Vec<_> = evaluate(&set, Request::of(caller), fixture).into_iter().collect();
+        assert_eq!(
+            returned, expected,
+            "{caller} calling templates_reached('{wanted}') over {term}"
+        );
+    }
+}
+
+#[test]
+fn a_walk_follows_an_edge_table_no_unique_key_orients() {
+    let deployment = deployment();
+    for (term, rendered) in [
+        (STEP_DOWN, "template_steps.child_id WHERE parent_id IN itself"),
+        (STEP_UP, "template_steps.parent_id WHERE child_id IN itself"),
+    ] {
+        let database = postgres(&templates(term, ""));
+        let set = answer(&database, &deployment, "authz", "templates_reached", &[text("into")])
+            .expect("answered");
+        assert_eq!(render(&set), format!("{TEMPLATE_GRANT_ARM} UNION {rendered}"), "{term}");
+        assert_eq!(covered(&set), Some("templates"), "{term}");
+        let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+        assert_eq!(walk.tree().table_name(), "templates", "{term}");
+        assert_eq!(walk.direction(), WalkDirection::Down, "{term}");
+    }
+    assert_templates_measured(
+        STEP_DOWN,
+        &[
+            (TEMPLATE_DAG, "alice", "into", &["leaf", "mid_a", "mid_b", "root", "side"]),
+            (TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "side"]),
+            (CYCLIC_TEMPLATE_DAG, "alice", "into", &["leaf", "mid_a", "mid_b", "root", "side"]),
+            (CYCLIC_TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "mid_b", "root", "side"]),
+        ],
+    );
+    assert_templates_measured(
+        STEP_UP,
+        &[
+            (TEMPLATE_DAG, "alice", "into", &["root"]),
+            (TEMPLATE_DAG, "bob", "into", &["mid_a", "root"]),
+            (CYCLIC_TEMPLATE_DAG, "alice", "into", &["leaf", "mid_a", "mid_b", "root"]),
+            (CYCLIC_TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "mid_b", "root"]),
+        ],
+    );
+
+    let unique = "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);";
+    for index in [
+        "",
+        "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id) WHERE parent_id <> 'x';",
+        "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (lower(folder_id));",
+        "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id, parent_id);",
+        "CREATE INDEX folder_parents_folder ON folder_parents (folder_id);",
+        "CREATE UNIQUE INDEX folder_parents_folder ON folder_parents (folder_id);
+         CREATE UNIQUE INDEX folder_parents_parent ON folder_parents (parent_id);",
+    ] {
+        let database = postgres(&edges(EDGE_UP, "").replace(unique, index));
+        let set =
+            answer(&database, &deployment, "authz", "folders_reached", &[]).expect("answered");
+        assert_eq!(
+            render(&set),
+            format!("{FOLDER_GRANT_ARM} UNION folder_parents.parent_id WHERE folder_id IN itself"),
+            "{index}"
+        );
+    }
+}
+
+#[test]
+fn a_walk_follows_only_the_edges_its_conditions_keep() {
+    let deployment = deployment();
+    let filtered = "template_steps.child_id WHERE parent_id IN itself \
+                    AND completed IN (true) AND kind IN ('into')";
+    let lateral = format!(
+        "SELECT step.id FROM reached CROSS JOIN LATERAL (SELECT ts.child_id \
+         FROM public.template_steps ts WHERE ts.parent_id = reached.id AND {COMPLETED_INTO}) step (id)"
+    );
+    let terms = [
+        format!("{STEP_DOWN} WHERE {COMPLETED_INTO}"),
+        format!("{STEP_DOWN} AND {COMPLETED_INTO}"),
+        format!("{STEP_DOWN} AND ts.completed WHERE ts.kind = 'into'"),
+        "SELECT ts.child_id FROM public.template_steps ts \
+         JOIN reached ON ts.completed AND reached.id = ts.parent_id WHERE ts.kind IN ('into')"
+            .to_string(),
+        lateral,
+    ];
+    for term in &terms {
+        let database = postgres(&templates(term, ""));
+        let set = templates_reached(&database, &deployment, "into").expect("answered");
+        assert_eq!(render(&set), format!("{TEMPLATE_GRANT_ARM} UNION {filtered}"), "{term}");
+        assert_eq!(covered(&set), Some("templates"), "{term}");
+        assert_templates_measured(
+            term,
+            &[
+                (TEMPLATE_DAG, "alice", "into", &["leaf", "mid_a", "root"]),
+                (TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a"]),
+                (CYCLIC_TEMPLATE_DAG, "alice", "into", &["leaf", "mid_a", "root"]),
+                (CYCLIC_TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "root"]),
+            ],
+        );
+    }
+
+    let wanted = format!("{STEP_DOWN} AND ts.kind = wanted");
+    let database = postgres(&templates(&wanted, ""));
+    let set = templates_reached(&database, &deployment, "out").expect("answered");
+    assert_eq!(
+        render(&set),
+        format!(
+            "{TEMPLATE_GRANT_ARM} UNION template_steps.child_id WHERE parent_id IN itself \
+             AND kind IN ('out')"
+        )
+    );
+    assert_templates_measured(
+        &wanted,
+        &[
+            (TEMPLATE_DAG, "alice", "into", &["leaf", "mid_a", "mid_b", "root"]),
+            (TEMPLATE_DAG, "alice", "out", &["root"]),
+            (TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a"]),
+            (TEMPLATE_DAG, "bob", "out", &["mid_a", "side"]),
+            (CYCLIC_TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "mid_b", "root"]),
+            (CYCLIC_TEMPLATE_DAG, "bob", "out", &["mid_a", "side"]),
+        ],
+    );
+
+    let retired = format!(
+        "{STEP_DOWN} WHERE ts.completed AND (ts.retired_at IS NULL OR ts.retired_at > now())"
+    );
+    let database = postgres(&templates(&retired, ""));
+    let set = templates_reached(&database, &deployment, "into").expect("answered");
+    assert_eq!(
+        render(&set),
+        format!(
+            "{TEMPLATE_GRANT_ARM} UNION template_steps.child_id WHERE parent_id IN itself \
+             AND completed IN (true) AND (retired_at IS NULL OR retired_at > now)"
+        )
+    );
+}
+
+#[test]
+fn a_walk_whose_conditions_keep_no_edge_is_left_out() {
+    let term = format!("{STEP_DOWN} WHERE wanted = 'into'");
+    let database = postgres(&templates(&term, ""));
+    let deployment = deployment();
+    let set = templates_reached(&database, &deployment, "out").expect("answered");
+    assert_eq!(render(&set), TEMPLATE_GRANT_ARM);
+    assert_eq!(covered(&set), Some("templates"));
+    let set = templates_reached(&database, &deployment, "into").expect("answered");
+    assert_eq!(
+        render(&set),
+        format!("{TEMPLATE_GRANT_ARM} UNION template_steps.child_id WHERE parent_id IN itself")
+    );
+    assert_templates_measured(
+        &term,
+        &[
+            (TEMPLATE_DAG, "alice", "into", &["leaf", "mid_a", "mid_b", "root", "side"]),
+            (TEMPLATE_DAG, "alice", "out", &["root"]),
+            (TEMPLATE_DAG, "bob", "out", &["mid_a"]),
+            (CYCLIC_TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "mid_b", "root", "side"]),
+        ],
+    );
+}
+
+#[test]
+fn an_edge_condition_reading_the_walk_or_reducing_to_nothing_refuses_the_answer() {
+    let deployment = deployment();
+    for (term, condition) in [
+        (format!("{STEP_DOWN} WHERE reached.id <> 'x'"), "reached.id <> 'x'"),
+        (format!("{STEP_DOWN} AND reached.id = 'x'"), "reached.id = 'x'"),
+        (format!("{STEP_DOWN} WHERE id = 'x'"), "id = 'x'"),
+        (format!("{STEP_DOWN} AND ts.child_id = reached.id"), "ts.child_id = reached.id"),
+        (format!("{STEP_DOWN} WHERE ts.kind <> 'x'"), "ts.kind <> 'x'"),
+        (
+            format!("{STEP_DOWN} WHERE ts.kind = current_setting('app.user_id', true)"),
+            "ts.kind = current_setting('app.user_id', true)",
+        ),
+        (
+            "SELECT step.id FROM reached CROSS JOIN LATERAL (SELECT ts.child_id \
+             FROM public.template_steps ts WHERE ts.parent_id = reached.id AND id = 'x') step (id)"
+                .to_string(),
+            "id = 'x'",
+        ),
+        (
+            "SELECT step.id FROM reached CROSS JOIN LATERAL (SELECT ts.child_id \
+             FROM public.template_steps ts WHERE ts.parent_id = reached.id \
+             AND ts.child_id <> reached.id) step (id)"
+                .to_string(),
+            "ts.child_id <> reached.id",
+        ),
+    ] {
+        let database = postgres(&templates(&term, ""));
+        let refused = templates_reached(&database, &deployment, "into");
+        assert!(
+            matches!(
+                &refused,
+                Err(HelperSetError::Irreducible { function, condition: refusing })
+                    if function == "authz.templates_reached" && refusing == condition
+            ),
+            "{term}: {refused:?}"
+        );
+    }
+
+    let lateral = "SELECT step.id FROM reached CROSS JOIN LATERAL (SELECT ts.child_id \
+                   FROM public.template_steps ts WHERE ts.parent_id = reached.id) step (id) \
+                   WHERE step.id <> 'x'";
+    let database = postgres(&templates(lateral, ""));
+    assert!(matches!(
+        templates_reached(&database, &deployment, "into"),
+        Err(HelperSetError::ArmShape { function, .. }) if function == "authz.templates_reached"
+    ));
+}
+
+#[test]
+fn an_edge_condition_is_read_only_where_the_consumer_names_it() {
+    let deployment = deployment();
+    for (term, first) in [
+        (format!("{STEP_DOWN} WHERE {COMPLETED_INTO}"), "ts.completed"),
+        (format!("{STEP_DOWN} WHERE wanted = 'into'"), "wanted = 'into'"),
+    ] {
+        let database = postgres(&templates(&term, ""));
+        let unread = answer(&database, &deployment, "authz", "templates_reached", &[text("out")]);
+        assert!(
+            matches!(
+                &unread,
+                Err(HelperSetError::UnreadCondition {
+                    function,
+                    condition,
+                    kind: ArmCondition::EdgeCondition,
+                }) if function == "authz.templates_reached" && condition == first
+            ),
+            "{term}: {unread:?}"
+        );
+    }
+    let database = postgres(&templates(STEP_DOWN, ""));
+    answer(&database, &deployment, "authz", "templates_reached", &[text("into")])
+        .expect("a walk setting no condition on its edges needs none read");
+}
+
+#[test]
+fn a_walk_follows_only_the_edges_outside_what_another_helper_excludes() {
+    let deployment = deployment();
+    let excluded = "organization_id NOT IN authz.blocking_organizations() \
+                    {organization_blocks.organization_id WHERE user_id = app.user_id}";
+    let measured: [(String, String, TemplatesMeasured); 2] = [
+        (
+            format!(
+                "{STEP_DOWN} WHERE NOT (ts.organization_id = ANY \
+                 (ARRAY(SELECT authz.blocking_organizations())))"
+            ),
+            format!("template_steps.child_id WHERE parent_id IN itself AND {excluded}"),
+            &[
+                (TEMPLATE_DAG, "alice", "into", &["mid_a", "root"]),
+                (TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "side"]),
+                (CYCLIC_TEMPLATE_DAG, "alice", "into", &["mid_a", "root"]),
+                (CYCLIC_TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "mid_b", "root", "side"]),
+            ],
+        ),
+        (
+            format!(
+                "{STEP_DOWN} WHERE ts.completed \
+                 AND ts.organization_id NOT IN (SELECT authz.blocking_organizations())"
+            ),
+            format!(
+                "template_steps.child_id WHERE parent_id IN itself AND completed IN (true) \
+                 AND {excluded}"
+            ),
+            &[
+                (TEMPLATE_DAG, "alice", "into", &["mid_a", "root"]),
+                (TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "side"]),
+                (CYCLIC_TEMPLATE_DAG, "alice", "into", &["mid_a", "root"]),
+                (CYCLIC_TEMPLATE_DAG, "bob", "into", &["leaf", "mid_a", "root", "side"]),
+            ],
+        ),
+    ];
+    for (term, rendered, measured) in measured {
+        let database = postgres(&templates(&term, ""));
+        let set = templates_reached(&database, &deployment, "into").expect("answered");
+        assert_eq!(render(&set), format!("{TEMPLATE_GRANT_ARM} UNION {rendered}"), "{term}");
+        assert_templates_measured(&term, measured);
+
+        let unread = function(&database, "authz", "templates_reached").helper_set(
+            &[text("into")],
+            &deployment,
+            &database,
+            &[ArmCondition::EdgeCondition],
+        );
+        assert!(
+            matches!(
+                &unread,
+                Err(HelperSetError::UnreadCondition { kind: ArmCondition::Exclusion, .. })
+            ),
+            "{term}: {unread:?}"
+        );
+    }
+}
+
+#[test]
+fn an_edge_exclusion_reaching_the_walking_helper_is_a_call_cycle() {
+    let term =
+        format!("{STEP_DOWN} WHERE ts.child_id NOT IN (SELECT authz.templates_reached(wanted))");
+    let database = postgres(&templates(&term, ""));
+    let deployment = deployment();
+    assert!(matches!(
+        templates_reached(&database, &deployment, "into"),
+        Err(HelperSetError::CallCycle { function }) if function == "authz.templates_reached"
+    ));
+}
+
+#[test]
+fn an_edge_exclusion_of_a_set_holding_nothing_keeps_every_edge() {
+    let term = format!(
+        "{STEP_DOWN} WHERE ts.organization_id NOT IN (SELECT authz.blocking_organizations())"
+    );
+    let condition = "WHERE ob.user_id = current_setting('app.user_id', true)";
+    let fixture = templates(&term, "");
+    let empty = fixture.replace(condition, &format!("{condition} AND false"));
+    assert_ne!(empty, fixture, "the excluded helper keeps no row");
+    let database = postgres(&empty);
+    let deployment = deployment();
+    let set = templates_reached(&database, &deployment, "into").expect("answered");
+    assert_eq!(
+        render(&set),
+        format!("{TEMPLATE_GRANT_ARM} UNION template_steps.child_id WHERE parent_id IN itself")
+    );
+}
+
+#[test]
+fn an_edge_condition_needs_the_owner_to_read_the_columns_it_names() {
+    let deployment = deployment();
+    let term = format!("{STEP_DOWN} WHERE {COMPLETED_INTO}");
+    let columns = |granted: &str| {
+        templates(&term, &format!("GRANT SELECT ({granted}) ON template_steps TO authz_owner;"))
+            .replace(
+                "GRANT SELECT ON templates, template_grants, template_steps",
+                "GRANT SELECT ON templates, template_grants",
+            )
+    };
+    let database = postgres(&columns("parent_id, child_id, completed, kind"));
+    templates_reached(&database, &deployment, "into").expect("answered");
+    let database = postgres(&columns("parent_id, child_id, completed"));
+    assert!(matches!(
+        templates_reached(&database, &deployment, "into"),
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "template_steps"
     ));
 }
 
@@ -6545,9 +7072,6 @@ fn a_lateral_step_of_any_other_shape_refuses_the_answer() {
         format!(
             "SELECT child.id FROM reached CROSS JOIN LATERAL \
              ({edge} EXCEPT SELECT g.id FROM public.groups g WHERE g.parent_id = reached.id) child"
-        ),
-        format!(
-            "SELECT child.id FROM reached CROSS JOIN LATERAL ({edge} AND g.id <> reached.id) child"
         ),
         "SELECT child.id FROM reached CROSS JOIN LATERAL \
          (SELECT reached.id FROM public.groups reached WHERE reached.parent_id = reached.id) child"

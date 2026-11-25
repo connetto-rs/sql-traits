@@ -2013,8 +2013,8 @@ pub enum HelperSetError {
         /// The condition, as written.
         condition: String,
     },
-    /// A grant arm writes a condition read only where the consumer names it
-    /// (see [`ArmCondition`]), and the consumer does not.
+    /// An arm writes a condition read only where the consumer names it (see
+    /// [`ArmCondition`]), and the consumer does not.
     #[error(
         "helper `{function}` filters by `{condition}`, which only a reading naming `ArmCondition::{kind:?}` reads"
     )]
