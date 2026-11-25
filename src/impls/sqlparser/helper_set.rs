@@ -1623,10 +1623,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ///
     /// The child is the table's primary key where one of the two is, else the
     /// one a unique key covers alone, and `returned` where neither or both
-    /// are, the edge then walking down. The parent column names a row of the
-    /// tree as [`tree_reference`](Self::tree_reference) reads it. The child is
-    /// the tree's primary key where the table is the tree, and otherwise names
-    /// a row of the same tree from an edge table.
+    /// are, the edge then walking down. The tree is the one table whose
+    /// one-column primary key both columns hold through foreign keys checking
+    /// every row, the child holding it as that key itself where the table is
+    /// the tree. A key into a table only one of the two columns references
+    /// constrains the edge without changing the rows it joins.
     fn edge(
         &self,
         table: &'db DB::Table,
@@ -1656,16 +1657,33 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             WalkDirection::Down => (returned, compared),
             WalkDirection::Up => (compared, returned),
         };
-        let Some((tree, key, foreign_key)) = self.tree_reference(table, column)? else {
+        let mut drawn: Option<ReferencedKey<'db, DB>> = None;
+        for foreign_key in table.foreign_keys(database)? {
+            let Some((tree, key, _)) = primary_reference(foreign_key, column, database)? else {
+                continue;
+            };
+            if drawn.is_some_and(|(drawn, _, _)| core::ptr::eq(drawn, tree))
+                || !checks_every_row(foreign_key, column, database)?
+            {
+                continue;
+            }
+            let names_tree = if core::ptr::eq(tree, table) {
+                core::ptr::eq(child, key)
+            } else {
+                self.names_row_of(table, child, tree)?
+            };
+            if !names_tree {
+                continue;
+            }
+            if drawn.is_some() {
+                return Ok(None);
+            }
+            drawn = Some((tree, key, foreign_key));
+        }
+        let Some((tree, key, foreign_key)) = drawn else {
             return Ok(None);
         };
-        let drawn = if core::ptr::eq(tree, table) {
-            core::ptr::eq(child, key)
-        } else {
-            self.tree_reference(table, child)?
-                .is_some_and(|(referenced, _, _)| core::ptr::eq(referenced, tree))
-        };
-        Ok(drawn.then_some(WalkArm {
+        Ok(Some(WalkArm {
             table,
             tree,
             key,
@@ -1677,6 +1695,26 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             time_bounds: Vec::new(),
             exclusions: Vec::new(),
         }))
+    }
+
+    /// Whether `column` of `table` holds the one-column primary key of `tree`
+    /// through a foreign key checking every row whose column is not `NULL`.
+    fn names_row_of(
+        &self,
+        table: &'db DB::Table,
+        column: &'db DB::Column,
+        tree: &'db DB::Table,
+    ) -> Result<bool, LookupError> {
+        let database = self.database;
+        for foreign_key in table.foreign_keys(database)? {
+            if primary_reference(foreign_key, column, database)?
+                .is_some_and(|(referenced, _, _)| core::ptr::eq(referenced, tree))
+                && checks_every_row(foreign_key, column, database)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The table whose row `column` of `table` names, its one-column primary
@@ -1695,18 +1733,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut tree: Option<&'db DB::Table> = None;
         let mut checked = None;
         for foreign_key in table.foreign_keys(database)? {
-            let Some(referenced_column) =
-                foreign_key.referenced_column_for_host_column(database, column)?
+            let Some((referenced, referenced_column, _)) =
+                primary_reference(foreign_key, column, database)?
             else {
                 continue;
             };
-            let referenced = foreign_key.referenced_table(database)?;
-            if !referenced
-                .primary_key_column(database)?
-                .is_some_and(|primary| core::ptr::eq(primary, referenced_column))
-            {
-                continue;
-            }
             if tree.is_some_and(|tree| !core::ptr::eq(tree, referenced)) {
                 return Ok(None);
             }
@@ -4201,6 +4232,27 @@ fn single_column_foreign_keys<'db, DB: DatabaseLike>(
         }
     }
     Ok(foreign_keys)
+}
+
+/// The table `foreign_key` references, its one-column primary key and the key
+/// itself, where the key holds `column` at the position of that primary key.
+fn primary_reference<'db, DB: DatabaseLike>(
+    foreign_key: &'db DB::ForeignKey,
+    column: &'db DB::Column,
+    database: &'db DB,
+) -> Result<Option<ReferencedKey<'db, DB>>, LookupError> {
+    let Some(referenced_column) =
+        foreign_key.referenced_column_for_host_column(database, column)?
+    else {
+        return Ok(None);
+    };
+    let referenced = foreign_key.referenced_table(database)?;
+    let primary = referenced.primary_key_column(database)?;
+    Ok(primary.is_some_and(|primary| core::ptr::eq(primary, referenced_column)).then_some((
+        referenced,
+        referenced_column,
+        foreign_key,
+    )))
 }
 
 /// Whether `foreign_key` checks every row whose `column` is not `NULL`.

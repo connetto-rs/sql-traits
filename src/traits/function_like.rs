@@ -2356,27 +2356,29 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// of `SELECT <child> FROM <table> WHERE <parent column> =
     /// <walk>.<column>` walking down and `SELECT <parent column> FROM <table>
     /// WHERE <child> = <walk>.<column>` walking up. `<parent column>` names a
-    /// row of the tree through foreign keys holding it at the position of the
-    /// tree's one-column primary key, alone or among other columns, all of
-    /// them referencing the same table and one checking every row naming one,
-    /// its match `FULL` or its other columns `NOT NULL`. The table is the tree
-    /// itself, with `<child>` its primary key, or an edge table, with
-    /// `<child>` naming a row of the tree the same way, its primary key or a
-    /// column a unique key covers alone where one of the two columns is, and
-    /// otherwise the column the term adds, the walk then going down. The term
-    /// may follow only the edges meeting conditions beside its comparison
-    /// with the walk, in `ON` and in `WHERE` of a join and in `WHERE` of a
-    /// `LATERAL` edge. They name columns of the edge table alone, never the
-    /// walk's row, and reduce to restrictions and bounds against the statement
-    /// time the way a grant arm's do, or exclude a column from another
-    /// helper's set the way a grant arm's exclusion does, a set reaching the
-    /// walking helper again being a call cycle. They are read where
-    /// `conditions` names [`ArmCondition::EdgeCondition`], and for an
-    /// exclusion [`ArmCondition::Exclusion`] as well, refusing the answer
-    /// otherwise. The walk answers a [`WalkArm`](crate::structs::WalkArm) per
-    /// edge after the arms, and none for an edge whose conditions keep no
-    /// row. `UNION ALL` between the arms and the term is refused, since it
-    /// never ends on edges closing a cycle.
+    /// row of the tree through a foreign key holding it at the position of the
+    /// tree's one-column primary key, alone or among other columns, and
+    /// checking every row naming one, its match `FULL` or its other columns
+    /// `NOT NULL`. The table is the tree itself, with `<child>` its primary
+    /// key, or an edge table, with `<child>` naming a row of the tree the same
+    /// way. The tree is the one table the two columns name a row of, so a key
+    /// into a table only one of them names constrains the edge without
+    /// changing the tree, and two tables both name refuse the walk. `<child>`
+    /// is the table's primary key or a column a unique key covers alone where
+    /// one of the two columns is, and otherwise the column the term adds, the
+    /// walk then going down. The term may follow only the edges meeting
+    /// conditions beside its comparison with the walk, in `ON` and in `WHERE`
+    /// of a join and in `WHERE` of a `LATERAL` edge. They name columns of the
+    /// edge table alone, never the walk's row, and reduce to restrictions and
+    /// bounds against the statement time the way a grant arm's do, or exclude
+    /// a column from another helper's set the way a grant arm's exclusion
+    /// does, a set reaching the walking helper again being a call cycle. They
+    /// are read where `conditions` names [`ArmCondition::EdgeCondition`], and
+    /// for an exclusion [`ArmCondition::Exclusion`] as well, refusing the
+    /// answer otherwise. The walk answers a
+    /// [`WalkArm`](crate::structs::WalkArm) per edge after the arms, and none
+    /// for an edge whose conditions keep no row. `UNION ALL` between the arms
+    /// and the term is refused, since it never ends on edges closing a cycle.
     ///
     /// The final query may instead reselect what the walk reached, `SELECT
     /// <key> FROM <table> WHERE <key> IN (SELECT <column> FROM <walk>) [AND
