@@ -213,6 +213,32 @@ fn a_parameter_is_one_value_of_its_type() -> Result<(), Error> {
     Ok(())
 }
 
+/// Inlining or a custom plan binds a parameter of a SQL function as a
+/// constant, which PostgreSQL folds a strict operator over to `NULL` before
+/// the operand dividing by zero runs, while a column is read on each row.
+#[test]
+fn a_comparison_over_a_parameter_may_fold_before_raising() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(&format!(
+        "{SCHEMA} CREATE FUNCTION f(p INT) RETURNS BIGINT LANGUAGE sql RETURN 1;"
+    ))?;
+    let function = db.functions().find(|function| function.name() == "f").unwrap();
+    for (operand, raising) in
+        [("p", Raising::Sometimes), ("$1", Raising::Sometimes), ("y", Raising::Always)]
+    {
+        let sql = format!("SELECT count(*) FROM t WHERE x / 0 > {operand}");
+        let body = Parser::parse_sql(&PostgreSqlDialect {}, &sql)?.remove(0);
+        let context = ExpressionContext::for_statement(
+            &body,
+            &ExpressionScope::FunctionBody(function),
+            &db,
+            IdentifierCase::Folded,
+        )?;
+        let condition = select_of(query_of(&body)).selection.as_ref().unwrap();
+        assert_eq!(context.truth_under(condition, &[])?.raising, raising, "{sql}");
+    }
+    Ok(())
+}
+
 #[test]
 fn a_variable_declared_not_null_is_never_null() -> Result<(), Error> {
     let db = ParserDB::parse::<PostgreSqlDialect>(

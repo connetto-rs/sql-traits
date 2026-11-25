@@ -841,6 +841,18 @@ fn a_check_under_no_assumption_is_read_on_its_own() -> Result<(), Error> {
     Ok(())
 }
 
+/// A column is read on each row, so a strict comparison over it raises where
+/// the operand dividing by zero raises, whether the column is `NULL` or not.
+#[test]
+fn a_comparison_over_a_column_raises_with_its_raising_operand() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE TABLE r (a INT NOT NULL, c INT, CHECK (a / 0 > c));",
+    )?;
+    let check = db.tables().next().unwrap().check_constraints(&db)?.next().unwrap();
+    assert_eq!(check.truth_under(&db, &[])?.raising, Raising::Always);
+    Ok(())
+}
+
 #[test]
 fn assumptions_narrow_the_rows_an_expression_is_read_on() -> Result<(), Error> {
     let db = ParserDB::parse::<PostgreSqlDialect>(

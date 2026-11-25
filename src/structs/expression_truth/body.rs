@@ -324,6 +324,10 @@ impl<DB: DatabaseLike> eval::Context for BodyTruth<'_, '_, DB> {
     fn data_type(&self, data_type: &DataType) -> ScalarType {
         self.truth.data_type(data_type)
     }
+
+    fn may_plan_as_constant(&self, reference: &usize) -> bool {
+        self.truth.may_plan_as_constant(reference)
+    }
 }
 
 impl<DB: DatabaseLike> values::Context for BodyTruth<'_, '_, DB> {

@@ -482,3 +482,63 @@ fn a_site_formats_its_body_after_a_truth_read() {
     assert!(formatted.contains("block: "), "{formatted}");
     assert!(formatted.contains("flow: "), "{formatted}");
 }
+
+/// The truth of the comparison the `IS NULL` test tests in the `WHERE` of
+/// the `SELECT INTO` of `body`, the body of `nulls(y int)` over `r`.
+fn raising_comparison(body: &str) -> Option<ExpressionTruth> {
+    let database = database(&format!(
+        "CREATE TABLE r (a int NOT NULL, c int); \
+         CREATE FUNCTION nulls(y int) RETURNS bigint LANGUAGE plpgsql AS $$ {body} $$;"
+    ));
+    let body = named(&database, "nulls").plpgsql_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let (site, query) = sites
+        .iter()
+        .find_map(|site| {
+            match site.sql() {
+                EmbeddedSql::Statement(Statement::Query(query)) => Some((site, query)),
+                _ => None,
+            }
+        })
+        .expect("the SELECT INTO");
+    let SetExpr::Select(select) = &*query.body else { panic!("a SELECT") };
+    let Some(Expr::IsNull(tested)) = &select.selection else { panic!("an IS NULL test") };
+    let Expr::Nested(compared) = &**tested else { panic!("a parenthesized comparison") };
+    site.truth_under(compared, IdentifierCase::Folded).unwrap()
+}
+
+/// PostgreSQL plans a parameter, a variable and a field of a row variable
+/// as constants in a custom plan, and folds a strict operator over a `NULL`
+/// one to `NULL` before the operand dividing by zero runs.
+#[test]
+fn a_comparison_over_a_body_name_may_fold_before_raising() {
+    let folded = |body: &str| raising_comparison(body).map(|truth| truth.raising);
+    assert_eq!(
+        folded(
+            "DECLARE n bigint; BEGIN \
+             SELECT count(*) INTO n FROM r WHERE (a / 0 > y) IS NULL; RETURN n; END"
+        ),
+        Some(Raising::Sometimes)
+    );
+    assert_eq!(
+        folded(
+            "DECLARE n bigint; v int; BEGIN \
+             SELECT count(*) INTO n FROM r WHERE (a / 0 > v) IS NULL; RETURN n; END"
+        ),
+        Some(Raising::Sometimes)
+    );
+    assert_eq!(
+        folded(
+            "DECLARE n bigint; row r; BEGIN \
+             SELECT count(*) INTO n FROM r WHERE (a / 0 > row.c) IS NULL; RETURN n; END"
+        ),
+        Some(Raising::Sometimes)
+    );
+    assert_eq!(
+        folded(
+            "DECLARE n bigint; BEGIN \
+             SELECT count(*) INTO n FROM r WHERE (a / 0 > c) IS NULL; RETURN n; END"
+        ),
+        Some(Raising::Always)
+    );
+}
