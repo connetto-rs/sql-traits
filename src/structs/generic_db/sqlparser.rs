@@ -11985,7 +11985,8 @@ impl ParserDB {
             }
             let node = Self::stored_node(&builder, &stored)?;
             let column = NamedColumn::of(column_name, builder.identifier_case());
-            if column.declared_by(node) {
+            let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
+            if let Some(declared) = declared {
                 if matches!(operation, AlterColumnOperation::AddGenerated { .. }) {
                     Self::refuse_partition_identity(
                         *builder.dialect(),
@@ -11995,12 +11996,11 @@ impl ParserDB {
                         &column,
                     )?;
                 }
-                Self::refuse_alter_column(&builder, &stored, node, &column, &operation)?;
+                Self::refuse_alter_column(&builder, &stored, node, &column, declared, &operation)?;
                 if matches!(operation, AlterColumnOperation::SetDataType { .. }) {
                     Self::refuse_type_change_under_dependents(&builder, &stored, scope, &column)?;
                 }
             }
-            let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
             if let AlterColumnOperation::SetDefault { value } = &mut operation {
                 sequences::bind_default(&builder, &stored, column_name, value)?;
             }
@@ -12363,7 +12363,8 @@ impl ParserDB {
         }
     }
 
-    /// Refuses an `ALTER COLUMN` operation PostgreSQL will not perform.
+    /// Refuses an `ALTER COLUMN` operation PostgreSQL will not perform on
+    /// `declared`, the declaration `node` holds for the column.
     ///
     /// Removing the requirement to hold a value is refused where a key covers
     /// the column, which PostgreSQL reports as the column being in a primary
@@ -12377,20 +12378,16 @@ impl ParserDB {
         stored: &StoredTable,
         node: &CreateTable,
         column: &NamedColumn,
+        declared: &ColumnDef,
         operation: &AlterColumnOperation,
     ) -> Result<(), crate::errors::Error> {
-        let declared = node.columns.iter().find(|declared| column.matches(&declared.name));
-        if let Some(declared) = declared {
-            Self::refuse_generated_column_change(builder, stored, column, declared, operation)?;
-        }
+        Self::refuse_generated_column_change(builder, stored, column, declared, operation)?;
 
         match operation {
             AlterColumnOperation::DropExpression { if_exists }
                 if matches!(builder.dialect(), SqlparserDialect::PostgreSql) =>
             {
-                let generated = declared.and_then(|declared| {
-                    crate::impls::generation_storage(declared, *builder.dialect())
-                });
+                let generated = crate::impls::generation_storage(declared, *builder.dialect());
                 let reason = match generated {
                     Some(sqlparser::ast::GeneratedExpressionMode::Virtual) => {
                         Some(crate::errors::GenerationExpressionRefusal::Virtual)
@@ -12412,12 +12409,11 @@ impl ParserDB {
                 if node.constraints.iter().any(|constraint| {
                     matches!(constraint, TableConstraint::PrimaryKey(_))
                         && table_constraint_covers_column(constraint, column)
-                }) || declared.is_some_and(|declared| {
-                    declared
-                        .options
-                        .iter()
-                        .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
-                }) {
+                }) || declared
+                    .options
+                    .iter()
+                    .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+                {
                     return Err(crate::errors::Error::RequiredValueNotDroppable {
                         table_name: builder
                             .dialect()
@@ -12457,24 +12453,18 @@ impl ParserDB {
                 }
             }
             AlterColumnOperation::SetStorage { storage } => {
-                if let Some(declared) = declared {
-                    column_storage::refuse_storage(builder, declared, *storage)?;
-                }
+                column_storage::refuse_storage(builder, declared, *storage)?;
             }
             // Tried on a copy, so a refused list leaves the column as it was.
             AlterColumnOperation::GenericOptions { options } => {
-                if let Some(declared) = declared {
-                    foreign_options::change_column(&mut declared.clone(), options).map_err(
-                        |refusal| {
-                            refusal.into_error(
-                                builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
-                                Some(
-                                    builder.dialect().stored_spelling(&column.name, column.quoted),
-                                ),
-                            )
-                        },
-                    )?;
-                }
+                foreign_options::change_column(&mut declared.clone(), options).map_err(
+                    |refusal| {
+                        refusal.into_error(
+                            builder.dialect().stored_spelling(&stored.name, stored.name_quoted),
+                            Some(builder.dialect().stored_spelling(&column.name, column.quoted)),
+                        )
+                    },
+                )?;
             }
             _ => {}
         }

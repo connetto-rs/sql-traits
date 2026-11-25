@@ -112,6 +112,7 @@ fn a_toastable_type_takes_every_storage() {
         ("CREATE TYPE mood AS ENUM ('calm');", "mood[]"),
         ("CREATE TYPE pair AS (x INT);", "pair"),
         ("CREATE TYPE span AS RANGE (SUBTYPE = float8);", "span"),
+        ("CREATE TYPE span AS RANGE (SUBTYPE = float8);", "span_multirange"),
         ("CREATE TABLE row_source (x INT);", "row_source"),
         (BASE_TYPES, "toasted"),
         (BASE_TYPES, "flat[]"),
