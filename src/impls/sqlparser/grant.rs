@@ -808,15 +808,7 @@ fn listed_columns(grant: &Grant) -> impl Iterator<Item = &Ident> {
         Privileges::All { .. } => &[],
         Privileges::Actions(actions) => actions,
     };
-    actions.iter().flat_map(|action| {
-        match action {
-            Action::Select { columns }
-            | Action::Insert { columns }
-            | Action::Update { columns }
-            | Action::References { columns } => columns.as_deref().unwrap_or_default(),
-            _ => &[],
-        }
-    })
+    actions.iter().filter_map(action_columns).flatten()
 }
 
 impl ColumnGrantLike for Grant {
