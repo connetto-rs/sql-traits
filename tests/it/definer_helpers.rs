@@ -3366,6 +3366,14 @@ fn a_walk_over_a_composite_key_follows_each_edge_by_the_whole_key() {
             team_parents,
         ),
         (
+            pair_walking(PAIR_UP)
+                .replace("reached (namespace_id, id) AS", "reached AS")
+                .replace("SELECT grantee.namespace_id, grantee.id", "SELECT namespace_id, id"),
+            up,
+            WalkDirection::Up,
+            team_parents,
+        ),
+        (
             pair_walking(
                 "SELECT step.parent_namespace_id, step.parent_id FROM reached CROSS JOIN LATERAL \
                  (SELECT parent.parent_namespace_id, parent.parent_id FROM public.team_parents parent \
@@ -3441,10 +3449,43 @@ fn a_walk_pairing_its_columns_with_other_key_columns_refuses_the_answer() {
             "parent.child_id = reached.id",
         )),
         pair_walking(&PAIR_UP.replace(") = (reached", ") <> (reached")),
+        pair_walking(&PAIR_UP.replace(
+            "(parent.child_namespace_id, parent.child_id)",
+            "(parent.child_id, parent.child_id)",
+        )),
         pair_walking(PAIR_UP)
             .replace(PAIR_LAST, "SELECT reached.id, reached.namespace_id FROM reached"),
         pair_walking(PAIR_UP)
             .replace(PAIR_LAST, "SELECT reached.namespace_id, reached.namespace_id FROM reached"),
+    ] {
+        let database = postgres(&namespaced(&body));
+        assert!(
+            matches!(
+                caller_grantees(&database, &deployment),
+                Err(HelperSetError::ArmShape { function, .. }) if function == "authz.caller_grantees"
+            ),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_walk_column_without_a_name_or_typed_refuses_the_answer() {
+    let deployment = deployment();
+    let unlisted = |first: &str| {
+        pair_walking(PAIR_UP)
+            .replace("reached (namespace_id, id) AS", "reached AS")
+            .replace("SELECT grantee.namespace_id, grantee.id", first)
+    };
+    for body in [
+        unlisted("SELECT grantee.namespace_id, lower(grantee.id)"),
+        unlisted("SELECT grantee.*"),
+        pair_walking(
+            "SELECT s.ns, s.node FROM reached, LATERAL \
+             (SELECT parent_namespace_id, parent_id FROM public.team_parents \
+             WHERE child_id = reached.id AND child_namespace_id = reached.namespace_id) \
+             AS s (ns TEXT, node TEXT)",
+        ),
     ] {
         let database = postgres(&namespaced(&body));
         assert!(
