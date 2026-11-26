@@ -26,7 +26,7 @@ use crate::{
         TableAttribute, UserDefinedType,
         metadata::{BoundCall, ExpressionCalls},
     },
-    utils::call_sites::{call_reaches, for_each_call_name_mut},
+    utils::call_sites::{call_reaches, respell_calls},
 };
 
 /// The functions a statement moves, each with the name it is stored under
@@ -189,14 +189,9 @@ fn respell_each<N: VisitMut + ?Sized>(
     node: &mut N,
     mut renamed: impl FnMut(&ObjectName, usize) -> Result<Option<ObjectName>, Error>,
 ) -> Result<(), Error> {
-    let flow = for_each_call_name_mut(node, |name, arguments| {
+    let flow = respell_calls(node, |name, arguments| {
         match renamed(name, arguments) {
-            Ok(respelled) => {
-                if let Some(respelled) = respelled {
-                    *name = respelled;
-                }
-                ControlFlow::Continue(())
-            }
+            Ok(respelled) => ControlFlow::Continue(respelled),
             Err(error) => ControlFlow::Break(error),
         }
     });

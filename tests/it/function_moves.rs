@@ -150,6 +150,26 @@ fn a_function_set_into_another_schema_is_called_there() {
     assert!(trigger.contains("EXECUTE FUNCTION app.trg()"), "{trigger}");
 }
 
+/// `FLOOR(a, 2)` is a call PostgreSQL resolves by name, so it binds the
+/// function it reaches and calls it by its new name once it moves.
+#[test]
+fn a_keyword_spelled_call_is_bound_and_respelled() {
+    let base = "CREATE SCHEMA app;
+         CREATE FUNCTION floor(x INT, places INT) RETURNS INT LANGUAGE sql IMMUTABLE
+             AS 'SELECT x';
+         CREATE TABLE t (a INT CHECK (FLOOR(a, 2) > 0));";
+    assert!(in_use(&format!("{base} DROP FUNCTION floor(INT, INT);")));
+
+    let db = parse(&format!("{base} ALTER FUNCTION floor(INT, INT) SET SCHEMA app;"))
+        .expect("the move is accepted");
+    let table = db
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("t is held")
+        .to_string();
+    assert!(table.contains("app.floor(a, 2)"), "{table}");
+}
+
 /// An unqualified call names its function by schema once it moves, since the
 /// path it was written under may no longer reach it.
 #[test]
