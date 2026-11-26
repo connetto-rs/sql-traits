@@ -522,6 +522,27 @@ fn stable_calls_answer_alike_within_a_statement() -> Result<(), Error> {
     Ok(())
 }
 
+/// PostgreSQL inlines a `LANGUAGE sql` call and folds the constants of the
+/// inlined body while planning, so `1 / 0` there raises before `OR true`
+/// leaves the call unrun. A call in another language runs only when reached.
+#[test]
+fn inlined_calls_may_raise_while_planning() -> Result<(), Error> {
+    let schema = "CREATE FUNCTION inv(INT) RETURNS INT LANGUAGE sql STABLE AS 'SELECT 1 / $1';
+         CREATE FUNCTION standard_inv(x INT) RETURNS INT STABLE RETURN 1 / x;
+         CREATE FUNCTION procedural_inv(x INT) RETURNS INT LANGUAGE plpgsql STABLE
+             AS 'BEGIN RETURN 1 / x; END';
+         CREATE TABLE invoices (id INT, owner TEXT);";
+    for sql in ["id = inv(0) OR true", "id = standard_inv(0) OR true"] {
+        assert_eq!(truth_in(schema, "invoices", sql)?, sometimes_raising(Outcomes::TRUE), "{sql}");
+    }
+    for sql in
+        ["id = procedural_inv(0) OR true", "owner = current_setting('app.user_id', true) OR true"]
+    {
+        assert_eq!(truth_in(schema, "invoices", sql)?, never_raising(Outcomes::TRUE), "{sql}");
+    }
+    Ok(())
+}
+
 #[test]
 fn checks_writing_coalesce_or_nullif_seed() -> Result<(), Error> {
     for check in ["n > 0 AND coalesce(n, 1) IS NOT NULL", "n > 0 AND nullif(n, 5) IS NOT NULL"] {
