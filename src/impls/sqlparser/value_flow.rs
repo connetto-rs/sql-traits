@@ -13,7 +13,7 @@ use sqlparser_plpgsql::{
     namespace::{Name, Namespace, Site, Sql},
 };
 use sqlparser_plpgsql_dataflow::{
-    Catalog, Error, Part, Source, Transactions,
+    Catalog, Ending, Error, Part, Source, Transactions,
     reaching::{Definition, ReachingDefinitions},
     values::{Analysis, analyze},
     walk,
@@ -34,6 +34,7 @@ use crate::{
     utils::{
         call_typing::called_object_name,
         object_name::{RoutinePath, reaches_unheld_schema},
+        postgres_types::PgType,
     },
 };
 
@@ -52,12 +53,20 @@ pub(crate) fn value_flow<'b, 'db, DB: DatabaseLike>(
     hex_strings_may_be_integers: bool,
 ) -> Result<ValueFlow<'b, 'db, DB>, LookupError> {
     let function = names.function().name();
-    let transactions = transactions(names)?;
+    let kind = names.function().kind(names.database())?;
+    let transactions = transactions(names, kind);
     let (sites, paths) = body_sql(names, block, hex_strings_may_be_integers)?;
     let mut catalog = BodyCatalog { names, paths: &paths };
     let mut domain = ReachingDefinitions::new();
-    let flow = walk(block, &names.signature(), transactions, &mut catalog, &mut domain)
-        .map_err(|error| walk_error(function, error, |never: Infallible| match never {}))?;
+    let flow = walk(
+        block,
+        &names.signature(),
+        transactions,
+        ending(names, kind),
+        &mut catalog,
+        &mut domain,
+    )
+    .map_err(|error| walk_error(function, error, |never: Infallible| match never {}))?;
     let namespaces: BTreeMap<SiteKey, Namespace> =
         sites.into_iter().map(|Site { sql, namespace }| (SiteKey::of(sql), namespace)).collect();
     // Each definition owns the scope of the SQL it reads, which several
@@ -93,32 +102,44 @@ pub(crate) fn value_analysis<'b, 'db, DB: DatabaseLike>(
     context: BodyTruth<'b, 'db, DB>,
 ) -> Result<Analysis<'b, BodyTruth<'b, 'db, DB>>, LookupError> {
     let function = names.function().name();
-    let transactions = transactions(names)?;
+    let kind = names.function().kind(names.database())?;
+    let transactions = transactions(names, kind);
     let (_, paths) = body_sql(names, block, hex_strings_may_be_integers)?;
     let mut catalog = BodyCatalog { names, paths: &paths };
-    analyze(block, &names.signature(), transactions, &mut catalog, context)
+    analyze(block, &names.signature(), transactions, ending(names, kind), &mut catalog, context)
         .map_err(|error| walk_error(function, error, |error| error))
 }
 
-/// Whether the body of the function `names` belongs to may end and start
-/// transactions, which a procedure with neither a `SET` clause nor
-/// `SECURITY DEFINER` may.
-///
-/// # Errors
-///
-/// Returns the errors [`FunctionLike::kind`] returns.
-fn transactions<DB: DatabaseLike>(names: &BodyNames<'_, DB>) -> Result<Transactions, LookupError> {
+/// Whether the body of the function `names` belongs to, of kind `kind`, may
+/// end and start transactions, which a procedure with neither a `SET` clause
+/// nor `SECURITY DEFINER` may.
+fn transactions<DB: DatabaseLike>(names: &BodyNames<'_, DB>, kind: FunctionKind) -> Transactions {
     let routine = names.function();
-    Ok(
-        if routine.kind(names.database())? == FunctionKind::Procedure
-            && routine.configuration_parameters().is_empty()
-            && routine.security_mode() != FunctionSecurity::Definer
-        {
-            Transactions::Controlled
-        } else {
-            Transactions::Refused
-        },
-    )
+    if kind == FunctionKind::Procedure
+        && routine.configuration_parameters().is_empty()
+        && routine.security_mode() != FunctionSecurity::Definer
+    {
+        Transactions::Controlled
+    } else {
+        Transactions::Refused
+    }
+}
+
+/// What control reaching the end of the body of the function `names` belongs
+/// to, of kind `kind`, does. PostgreSQL compiles an implicit `RETURN` after
+/// the body of a procedure and of a function with `OUT` or `INOUT`
+/// parameters, returning a set, `void` or `event_trigger`, and any other
+/// function raises `2F005` there.
+fn ending<DB: DatabaseLike>(names: &BodyNames<'_, DB>, kind: FunctionKind) -> Ending {
+    let routine = names.function();
+    let returns = kind == FunctionKind::Procedure
+        || routine.returns_set()
+        || routine.argument_modes().any(|mode| matches!(mode, ArgMode::Out | ArgMode::InOut))
+        || matches!(
+            routine.return_type_name(names.database()).as_deref().and_then(PgType::parse),
+            Some(PgType::Catalog("void" | "event_trigger"))
+        );
+    if returns { Ending::Returns } else { Ending::Raises }
 }
 
 /// The error the body of `function` answers for what stopped the walk, the
@@ -348,5 +369,58 @@ const fn diagnostics_item(kind: DiagnosticsKind) -> DiagnosticsItem {
         DiagnosticsKind::ExceptionDetail => DiagnosticsItem::ExceptionDetail,
         DiagnosticsKind::ExceptionHint => DiagnosticsItem::ExceptionHint,
         DiagnosticsKind::ExceptionContext => DiagnosticsItem::ExceptionContext,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser_plpgsql_dataflow::Ending;
+
+    use super::{BodyNames, ending};
+    use crate::{
+        prelude::ParserDB,
+        traits::{DatabaseLike, FunctionLike},
+    };
+
+    const ROUTINES: &str = "
+        CREATE FUNCTION scalar() RETURNS int LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION fires() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION nothing() RETURNS void LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION qualified_nothing() RETURNS pg_catalog.void LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION outputs(OUT result int) LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION passes(INOUT result int) LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION many() RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION rows() RETURNS TABLE(id int) LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE PROCEDURE run() LANGUAGE plpgsql AS $$ BEGIN END $$;
+    ";
+
+    /// What control reaching the end of the body of `name` does.
+    fn ending_of(database: &ParserDB, name: &str) -> Ending {
+        let function = database
+            .functions()
+            .find(|function| function.name() == name)
+            .expect("the routine is declared");
+        let names = BodyNames::new(function, database).expect("the body path resolves");
+        ending(&names, function.kind(database).expect("the kind is known"))
+    }
+
+    #[test]
+    fn routines_given_an_implicit_return_return_at_the_end_of_their_body() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(ROUTINES).expect("routines parse");
+        for name in
+            ["nothing", "qualified_nothing", "ddl", "outputs", "passes", "many", "rows", "run"]
+        {
+            assert_eq!(ending_of(&database, name), Ending::Returns, "{name}");
+        }
+    }
+
+    #[test]
+    fn other_functions_raise_at_the_end_of_their_body() {
+        let database = ParserDB::parse::<PostgreSqlDialect>(ROUTINES).expect("routines parse");
+        for name in ["scalar", "fires"] {
+            assert_eq!(ending_of(&database, name), Ending::Raises, "{name}");
+        }
     }
 }

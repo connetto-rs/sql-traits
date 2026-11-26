@@ -768,6 +768,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
+name = "quine-mc_cluskey"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07589615d719a60c8dd8a4622e7946465dfef20d1a428f969e3443e7386d5f45"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1021,7 +1027,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#af9872c5344b31c10dbf953ee684db61ff276394"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#590c51ba5741df9a60403cc125c6e4d269f4bcb7"
 dependencies = [
  "log",
  "recursive",
@@ -1042,8 +1048,9 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#1e87038c58ca7ed3bc931a5f2efa08dc3ff54388"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#4eacc847e524bfcc79f9b8e9721995ba89a69f59"
 dependencies = [
+ "quine-mc_cluskey",
  "rpds",
  "sql-values",
  "sqlparser",
@@ -1062,7 +1069,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql-dataflow"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#8e1ad97f3229fae337d015c39a668767acebd6a0"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#3e8a628f23449e6114d6fe0cf4b699b55771e07f"
 dependencies = [
  "sqlparser",
  "sqlparser-expr-eval",
@@ -1074,7 +1081,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#af9872c5344b31c10dbf953ee684db61ff276394"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#590c51ba5741df9a60403cc125c6e4d269f4bcb7"
 dependencies = [
  "proc-macro2",
  "quote",
