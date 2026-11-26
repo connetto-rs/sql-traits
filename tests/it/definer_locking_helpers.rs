@@ -108,6 +108,7 @@ fn helper_called_in_expression_is_confined() {
         "IF (SELECT public.lock_run(NEW.run_id)) IS NULL THEN NULL; END IF;",
         "PERFORM 1 FROM public.lock_run(NEW.run_id);",
         "PERFORM public.lock_run(NEW.run_id), public.lock_run(NEW.run_id);",
+        "PERFORM length('run'), public.lock_run(NEW.run_id);",
     ] {
         let database = guarded(" FOR NO KEY UPDATE", first, "");
         assert_eq!(guard_read(&database), None, "{first}");
@@ -199,11 +200,51 @@ fn helper_proof_is_not_reused_without_facts() {
     assert_eq!(guard_read(&database), Some(refused_run()));
 }
 
+/// A helper reached again through its own call proves nothing.
+#[test]
+fn recursive_helper_is_unfollowed() {
+    let database = guarded(
+        "",
+        "PERFORM public.lock_again(NEW.run_id);",
+        "CREATE FUNCTION lock_again(again_run_id INT) RETURNS VOID
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+         BEGIN
+           PERFORM run.id FROM public.runs run WHERE run.id = again_run_id FOR UPDATE;
+           PERFORM public.lock_again(again_run_id);
+         END;
+         $$;
+         ALTER FUNCTION lock_again(INT) OWNER TO guard_owner;",
+    );
+    assert_eq!(guard_read(&database), Some((String::new(), "unfollowed".into())));
+}
+
+/// A `LANGUAGE sql` helper learns no field, so neither does the helper it
+/// passes its parameter on to.
+#[test]
+fn sql_helper_passes_no_field() {
+    let database = guarded(
+        " FOR UPDATE",
+        "PERFORM public.lock_in_sql(NEW.run_id);",
+        "CREATE FUNCTION lock_in_sql(sql_run_id INT) RETURNS VOID
+         LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+           SELECT public.lock_run(sql_run_id)
+         $$;
+         ALTER FUNCTION lock_in_sql(INT) OWNER TO guard_owner;",
+    );
+    assert_eq!(guard_read(&database), Some(refused_run()));
+}
+
 /// A parameter whose type `=` compares otherwise than the field's column,
-/// as `CHAR` ignores trailing spaces, may match a row the field does not.
+/// as `CHAR` ignores trailing spaces, or a field whose column has its own
+/// collation, may match a row the field does not.
 #[test]
 fn helper_parameter_comparing_otherwise_is_refused() {
-    for (parameter, confined) in [("TEXT", true), ("VARCHAR(8)", true), ("CHAR(8)", false)] {
+    for (collation, parameter, confined) in [
+        ("", "TEXT", true),
+        ("", "VARCHAR(8)", true),
+        ("", "CHAR(8)", false),
+        (" COLLATE \"C\"", "TEXT", false),
+    ] {
         let database = schema(&format!(
             "CREATE ROLE app;
              CREATE ROLE guard_owner;
@@ -213,7 +254,7 @@ fn helper_parameter_comparing_otherwise_is_refused() {
              CREATE POLICY runs_select ON runs FOR SELECT TO app
                  USING (team_id = current_setting('app.team_id')::INT);
              CREATE TABLE bindings (id INT PRIMARY KEY, team_id INT NOT NULL,
-                 run_code TEXT NOT NULL,
+                 run_code TEXT{collation} NOT NULL,
                  FOREIGN KEY (run_code, team_id) REFERENCES runs (code, team_id));
              ALTER TABLE bindings ENABLE ROW LEVEL SECURITY;
              CREATE POLICY bindings_insert ON bindings FOR INSERT TO app
@@ -239,6 +280,6 @@ fn helper_parameter_comparing_otherwise_is_refused() {
                  FOR EACH ROW EXECUTE FUNCTION guard_binding();"
         ));
         let expected = (!confined).then(refused_run);
-        assert_eq!(guard_read(&database), expected, "{parameter}");
+        assert_eq!(guard_read(&database), expected, "{collation} {parameter}");
     }
 }
