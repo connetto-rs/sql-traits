@@ -715,9 +715,60 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// a database reference, making it useful for dependency checking during
     /// schema construction.
     ///
-    /// Returns `None` for triggers that don't execute a function (e.g., SQLite
-    /// triggers with inline statements).
+    /// Returns `None` for triggers that don't execute a function, such as
+    /// SQLite triggers whose body [`Self::statements`] returns.
     fn function_name(&self) -> Option<&str>;
+
+    /// Returns the statements the trigger body runs inline, in order, such
+    /// as those SQLite writes between `BEGIN` and `END`, and none for a
+    /// trigger that executes a function.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "
+    /// CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER);
+    /// CREATE TABLE records (key INTEGER);
+    /// CREATE TRIGGER record AFTER INSERT ON child FOR EACH ROW BEGIN
+    ///     INSERT INTO records (key) VALUES (NEW.parent);
+    ///     DELETE FROM records WHERE key IS NULL;
+    /// END;
+    /// ",
+    /// )?;
+    /// let trigger = db.triggers().next().unwrap();
+    /// assert_eq!(
+    ///     trigger.statements().iter().map(ToString::to_string).collect::<Vec<_>>(),
+    ///     ["INSERT INTO records (key) VALUES (NEW.parent)", "DELETE FROM records WHERE key IS NULL",]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A trigger that executes a function runs no statement inline.
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    ///
+    /// let db = ParserDB::parse::<GenericDialect>(
+    ///     "
+    /// CREATE TABLE my_table (id INT);
+    /// CREATE FUNCTION my_function() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
+    /// CREATE TRIGGER my_trigger AFTER INSERT ON my_table
+    /// FOR EACH ROW EXECUTE FUNCTION my_function();
+    /// ",
+    /// )?;
+    /// let trigger = db.triggers().next().unwrap();
+    /// assert!(trigger.statements().is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn statements(&self) -> &[sqlparser::ast::Statement];
 
     /// Returns the trigger function identifier and its quotedness.
     ///
@@ -1178,6 +1229,10 @@ impl<T: TriggerLike> TriggerLike for &T {
         (*self).function_name()
     }
 
+    fn statements(&self) -> &[sqlparser::ast::Statement] {
+        (*self).statements()
+    }
+
     fn function_name_ident(&self) -> Option<(&str, bool)> {
         (*self).function_name_ident()
     }
@@ -1369,6 +1424,29 @@ mod tests {
                 (crate::structs::TriggerRow::Old, "before_rows".to_owned()),
                 (crate::structs::TriggerRow::New, "after_rows".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn statements_through_a_reference_answer_the_referenced_trigger() {
+        let db = ParserDB::parse::<sqlparser::dialect::SQLiteDialect>(
+            r"
+            CREATE TABLE child (id INTEGER PRIMARY KEY, parent INTEGER);
+            CREATE TABLE records (key INTEGER);
+            CREATE TRIGGER record AFTER INSERT ON child FOR EACH ROW BEGIN
+                INSERT INTO records (key) SELECT NEW.parent WHERE NEW.parent > 0;
+            END;
+        ",
+        )
+        .expect("Failed to parse SQL");
+        let trigger = db.triggers().next().expect("No trigger found");
+
+        assert_eq!(
+            <&_ as TriggerLike>::statements(&trigger)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["INSERT INTO records (key) SELECT NEW.parent WHERE NEW.parent > 0"]
         );
     }
 

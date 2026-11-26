@@ -1453,6 +1453,10 @@ impl TriggerLike for MemoryTrigger {
     fn function_name(&self) -> Option<&str> {
         None
     }
+
+    fn statements(&self) -> &[Statement] {
+        &[]
+    }
 }
 
 impl ExtensionLike for MemoryExtension {

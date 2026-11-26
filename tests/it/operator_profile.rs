@@ -846,6 +846,10 @@ impl<P: EmptyKinds> TriggerLike for NoneKind<P> {
     fn function_name(&self) -> Option<&str> {
         self.unreach()
     }
+
+    fn statements(&self) -> &[sqlparser::ast::Statement] {
+        self.unreach()
+    }
 }
 
 impl<P: EmptyKinds> RoleLike for NoneKind<P> {
