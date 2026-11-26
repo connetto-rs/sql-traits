@@ -10,7 +10,7 @@
 use sql_traits::prelude::*;
 use sqlparser::dialect::PostgreSqlDialect;
 
-use crate::support::privilege_listing::{EVERYTHING, view_privilege_names};
+use crate::support::privilege_listing::{EVERYTHING, privilege_names, view_privilege_names};
 
 fn parse(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema builds")
@@ -149,6 +149,59 @@ fn a_grant_reaches_only_the_relation_it_names() {
 }
 
 #[test]
+fn a_revoke_naming_the_materialized_view_owner_takes_from_its_entry() {
+    let db = parse(&format!(
+        "{ROLES}
+         CREATE TABLE t (id INT, x INT);
+         CREATE MATERIALIZED VIEW mv AS SELECT id, x FROM t;
+         ALTER MATERIALIZED VIEW mv OWNER TO own;
+         REVOKE UPDATE, TRUNCATE ON mv FROM own;"
+    ));
+    let owned = db
+        .materialized_view_by_target(TargetName::new("mv", false), IdentifierCase::AsWritten)
+        .expect("the lookup is unambiguous")
+        .expect("the materialized view exists")
+        .privileges(db.role("own").expect("the role exists"), &db)
+        .expect("the materialized view is in the database");
+
+    assert_eq!(
+        view_privilege_names(&owned, &["id", "x"]),
+        ["SELECT", "INSERT", "REFERENCES", "DELETE", "TRIGGER", "MAINTAIN"]
+    );
+}
+
+/// The columns `grant` lists, read through generic code that holds grants by
+/// reference.
+fn listed<G: ColumnGrantLike>(grant: G) -> Vec<(String, bool)> {
+    grant.column_names().map(|(name, quoted)| (name.to_owned(), quoted)).collect()
+}
+
+#[test]
+fn only_column_privileges_list_column_names() {
+    let db = parse(&format!(
+        "{ROLES}
+         CREATE TABLE t (id INT, x INT);
+         CREATE VIEW v AS SELECT id, x FROM t;
+         GRANT ALL ON v TO r;
+         GRANT SELECT (x), DELETE ON v TO grp;"
+    ));
+
+    assert!(db.table_grants().map(listed).all(|names| names.is_empty()));
+    assert_eq!(db.column_grants().map(listed).collect::<Vec<_>>(), [[("x".to_owned(), false)]]);
+}
+
+#[test]
+fn a_declared_name_holds_where_the_definition_names_no_output() {
+    let db = parse(&format!(
+        "{ROLES}
+         CREATE VIEW s (n) AS SELECT * FROM generate_series(1, 3);
+         GRANT SELECT (n) ON s TO r;"
+    ));
+
+    assert_eq!(held(&db, "s", "r", &["n"]), ["SELECT (n)"]);
+}
+
+#[test]
 fn a_superuser_holds_every_privilege_on_a_view() {
     let db = parse(&format!(
         "{ROLES}
@@ -244,6 +297,28 @@ fn a_column_grant_follows_a_view_column_rename() {
     ));
 
     assert_eq!(held(&db, "v", "r", &["id", "y"]), ["SELECT (y)", "INSERT (id)", "UPDATE (y)"]);
+}
+
+#[test]
+fn a_view_column_rename_leaves_grants_on_other_relations() {
+    let db = parse(&format!(
+        "{ROLES}
+         CREATE TABLE t (id INT, x INT);
+         CREATE TABLE u (id INT, x INT);
+         CREATE VIEW v AS SELECT id, x FROM u;
+         GRANT UPDATE (x) ON t TO r;
+         GRANT UPDATE (x) ON v TO r;
+         ALTER VIEW v RENAME COLUMN x TO y;"
+    ));
+    let table = db
+        .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)
+        .expect("the lookup is unambiguous")
+        .expect("the table exists")
+        .privileges(db.role("r").expect("the role exists"), &db)
+        .expect("the table is in the database");
+
+    assert_eq!(privilege_names(&table), ["UPDATE (x)"]);
+    assert_eq!(held(&db, "v", "r", &["id", "y"]), ["UPDATE (y)"]);
 }
 
 #[test]
