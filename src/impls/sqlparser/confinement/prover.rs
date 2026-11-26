@@ -31,7 +31,9 @@ use sqlparser::{
 };
 
 use super::{
-    identity::{Identity, fixed_by, held_values, identity, pin, same_identity, stored_name},
+    identity::{
+        Identity, fixed_by, held_values, identity, pin, same_identity, stored_name, type_identity,
+    },
     implication::{
         Columns, Condition, ParameterValues, Refused, Term, admits, clause_implies, membership,
         parameter, parameter_ordinal, renamed,
@@ -50,6 +52,7 @@ use super::{
 use crate::{
     errors::{LookupError, RowSecurityError},
     impls::sqlparser::{
+        body_calls::reaches_on_path,
         callee_path::calls_path_changer,
         data_statement::{BodyPath, BodyWalk, RunTimeBody, resolve_on_body_path, walk_body},
         dql::{join_constraint, scoped_roots::ScopedRoot},
@@ -58,13 +61,15 @@ use crate::{
     structs::{
         ActingRole, ColumnBinding, ColumnDefinition, DefinerReading, DefinitionSource, Deployment,
         EmbeddedSql, ExpressionContext, ExpressionScope, IdentifierCase, OperandType, PlPgSqlScope,
-        PlPgSqlVariable, Reaching, RowStatement, Unconfinement, VariableKind, WrittenCall,
+        PlPgSqlVariable, Reaching, RowStatement, Unconfinement, VariableKind, VariableRead,
+        WrittenCall,
     },
     traits::{
         ColumnLike, DatabaseLike, ForeignKeyLike, FunctionLike, PolicyLike, Relation, TableLike,
         TriggerLike, UserDefinedTypeLike, foreign_key::checks_rows_holding,
     },
     utils::{
+        call_sites::for_each_call,
         identifier_resolution::normalize_identifier,
         object_name::resolve_bound_relation_object_name,
         walk::{walk, walk_expressions, walk_expressions_mut},
@@ -204,7 +209,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
         }
         self.proving.push(function);
         let confined = if function.security_mode() == FunctionSecurity::Definer {
-            self.confines_body(function, record)
+            self.confines_body(function, record.map(|record| Firing { record, passed: &[] }))
         } else {
             self.confines_invoker(function)
         };
@@ -236,11 +241,14 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
 
     /// Whether the functions `function` calls confine their reads, and its
     /// own body reads no table with row-level security or confines each
-    /// read, knowing of the trigger's rows what `record` holds.
+    /// read, knowing of the trigger's rows what `firing` holds. A function
+    /// it calls that confines its reads knowing nothing of them may confine
+    /// them knowing what each call passes it, as [`Self::confines_passing`]
+    /// reads the calls.
     fn confines_body(
         &mut self,
         function: &'a DB::Function,
-        record: Option<&Record<'a, DB>>,
+        firing: Option<Firing<'_, 'a, DB>>,
     ) -> Result<bool, LookupError> {
         if !self.confines_body_writes(function)? {
             return Ok(false);
@@ -259,6 +267,12 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                     && self.runs_for_every_caller(callee)?)
                 || self.confines(callee)?
             {
+                continue;
+            }
+            if let Some(firing) = firing
+                && self.confines_passing(function, callee, firing)?
+            {
+                self.refusal.take();
                 continue;
             }
             let refused = self.refusal.take();
@@ -280,7 +294,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
             return Ok(self.unfollowed());
         }
         if function.stored_language().as_deref() == Some("plpgsql") {
-            return self.confines_sites(function, record);
+            return self.confines_sites(function, firing);
         }
         let confined = self.read_body(
             function,
@@ -630,13 +644,13 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
 
     /// Whether each statement and expression of the PL/pgSQL body of
     /// `function` the proof asks of confines its reads, knowing of the
-    /// trigger's rows what `record` holds where the body reads them
-    /// unchanged. Under [`DefinerReading::Outcome`] only the reads deciding
-    /// an outcome count.
+    /// trigger's rows what `firing` holds where the body reads them, or a
+    /// parameter passed one of their fields, unchanged. Under
+    /// [`DefinerReading::Outcome`] only the reads deciding an outcome count.
     fn confines_sites(
         &self,
         function: &'a DB::Function,
-        record: Option<&Record<'a, DB>>,
+        firing: Option<Firing<'_, 'a, DB>>,
     ) -> Result<bool, LookupError> {
         let case = IdentifierCase::AsWritten;
         let body = match function.plpgsql_sites(self.database) {
@@ -657,23 +671,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
         for site in &sites {
             let reads = site.reads(case)?;
             found |= reads.iter().any(|read| *read.variable().kind() == VariableKind::Found);
-            unchanged.push(
-                reads
-                    .iter()
-                    .filter(|read| {
-                        match read.reaching() {
-                            Reaching::Definitions(definitions) => {
-                                definitions.iter().all(|definition| {
-                                    definition.part().is_empty()
-                                        && matches!(definition.source(), DefinitionSource::Incoming)
-                                })
-                            }
-                            Reaching::Unreachable => false,
-                        }
-                    })
-                    .map(|read| read.variable().id())
-                    .collect::<Vec<_>>(),
-            );
+            unchanged.push(unchanged_variables(&reads));
         }
         let parameters = self.parameter_values(function)?;
         let lineage = Lineage::default();
@@ -683,7 +681,13 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                 continue;
             }
             let context = site.context(case)?;
-            let known = Known { record, unchanged, function, scope: site.plpgsql_scope() };
+            let known = Known {
+                record: firing.map(|firing| firing.record),
+                passed: firing.map_or(&[], |firing| firing.passed),
+                unchanged,
+                function,
+                scope: site.plpgsql_scope(),
+            };
             let mut reads = Reads {
                 body: Body { parameters: &parameters, confinement: self, function },
                 context: &context,
@@ -710,6 +714,142 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
             }
         }
         Ok(true)
+    }
+
+    /// [`Self::confines`] for `callee` knowing of the trigger's rows what
+    /// `firing` holds, proved anew for each firing.
+    fn confines_firing(
+        &mut self,
+        callee: &'a DB::Function,
+        firing: Firing<'_, 'a, DB>,
+    ) -> Result<bool, LookupError> {
+        if self.proving.iter().any(|proving| ptr::eq(*proving, callee)) {
+            return Ok(self.unfollowed());
+        }
+        self.proving.push(callee);
+        let confined = self.confines_body(callee, Some(firing));
+        self.proving.pop();
+        confined
+    }
+
+    /// Whether `callee` confines its reads at each call of it the PL/pgSQL
+    /// body of `function` makes, knowing of the trigger's rows what `firing`
+    /// holds and of each parameter of `callee` the field of the rows the
+    /// call passes it. A field the body reads unchanged, passed by position
+    /// to a parameter of a type `=` compares alike to the field's column, is
+    /// the value the parameter holds where `callee` reads it unchanged.
+    fn confines_passing(
+        &mut self,
+        function: &'a DB::Function,
+        callee: &'a DB::Function,
+        firing: Firing<'_, 'a, DB>,
+    ) -> Result<bool, LookupError> {
+        let database = self.database;
+        let case = IdentifierCase::AsWritten;
+        let body = match function.plpgsql_sites(database) {
+            Ok(body) => body,
+            Err(error) if unreadable_body(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let sites = match body.sites() {
+            Ok(sites) => sites,
+            Err(error) if unreadable_body(&error) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let inputs: Vec<Option<Identity>> = callee
+            .argument_modes()
+            .zip(callee.argument_types(database))
+            .filter(|(mode, _)| !matches!(mode, ArgMode::Out))
+            .map(|(_, declared)| type_identity(declared, database))
+            .collect();
+        let mut passings: Vec<Vec<Option<(Row, String)>>> = Vec::new();
+        for site in &sites {
+            let sql = site.sql();
+            let path = site.plpgsql_scope().path();
+            let reached = for_each_call(&sql, |call| {
+                if reaches_on_path(database, callee, call, path) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            if reached.is_continue() {
+                continue;
+            }
+            let context = site.context(case)?;
+            let reads = site.reads(case)?;
+            let known = Known {
+                record: Some(firing.record),
+                passed: firing.passed,
+                unchanged: unchanged_variables(&reads),
+                function,
+                scope: site.plpgsql_scope(),
+            };
+            let walked = for_each_call(&sql, |call| {
+                if !reaches_on_path(database, callee, call, path) {
+                    return ControlFlow::Continue(());
+                }
+                let arguments = call
+                    .node
+                    .and_then(|written| {
+                        match (written.function(), written.factor()) {
+                            (Some(expression), _) => positional_arguments(expression, callee),
+                            (None, Some(factor)) => relation_arguments(factor, callee),
+                            (None, None) => None,
+                        }
+                    })
+                    .unwrap_or_default();
+                let mut passed = Vec::with_capacity(arguments.len());
+                for (argument, input) in arguments.into_iter().zip(&inputs) {
+                    match self.passed_field(&context, &known, argument, input.as_ref()) {
+                        Ok(field) => passed.push(field),
+                        Err(error) => return ControlFlow::Break(error),
+                    }
+                }
+                if !passings.contains(&passed) {
+                    passings.push(passed);
+                }
+                ControlFlow::Continue(())
+            });
+            if let ControlFlow::Break(error) = walked {
+                return Err(error);
+            }
+        }
+        if passings.is_empty() {
+            return Ok(false);
+        }
+        for passed in &passings {
+            if !self.confines_firing(callee, Firing { record: firing.record, passed })? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The field of the trigger's rows that `argument`, read in `context`
+    /// knowing what `known` holds, passes a parameter of a type `=` compares
+    /// by `input`, when the field's column compares alike.
+    fn passed_field(
+        &self,
+        context: &ExpressionContext<'_, 'a, DB>,
+        known: &Known<'_, 'a, DB>,
+        argument: &Expr,
+        input: Option<&Identity>,
+    ) -> Result<Option<(Row, String)>, LookupError> {
+        let (Some(input), Some(record)) = (input, known.record) else {
+            return Ok(None);
+        };
+        let Some((definition, _)) = context.reference(unnested(argument)).ok().flatten() else {
+            return Ok(None);
+        };
+        let Some((row, name)) = known.field(&definition, argument) else {
+            return Ok(None);
+        };
+        let Some(column) = column_named(self.database, record.table, &name)? else {
+            return Ok(None);
+        };
+        Ok((identity(column, self.database)?.as_ref() == Some(input))
+            .then(|| (row, name.into_owned())))
     }
 
     /// Whether `callee`, a `SECURITY DEFINER` function that neither writes
@@ -1346,10 +1486,32 @@ enum Read<'a, DB: DatabaseLike> {
     Unconfined,
 }
 
+/// What a function of a row trigger's chain knows of the trigger's rows.
+struct Firing<'f, 'a, DB: DatabaseLike> {
+    /// What the trigger's rows hold.
+    record: &'f Record<'a, DB>,
+    /// The field of the trigger's rows each input parameter holds, by the
+    /// ordinal `$n` counts it with, for a function a call passes them, and
+    /// none for the trigger's own function.
+    passed: &'f [Option<(Row, String)>],
+}
+
+#[expect(clippy::expl_impl_clone_on_copy, reason = "derive would require DB: Clone")]
+impl<DB: DatabaseLike> Clone for Firing<'_, '_, DB> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<DB: DatabaseLike> Copy for Firing<'_, '_, DB> {}
+
 /// What a statement of a PL/pgSQL body knows of the variables it reads.
 struct Known<'k, 'a, DB: DatabaseLike> {
-    /// What the trigger's rows hold, in the trigger's own function.
+    /// What the trigger's rows hold, in a function of the trigger's chain.
     record: Option<&'k Record<'a, DB>>,
+    /// The field of the trigger's rows each input parameter holds, as
+    /// [`Firing::passed`] gives it.
+    passed: &'k [Option<(Row, String)>],
     /// The variables the statement reads holding the value they enter the
     /// body with, by id.
     unchanged: Vec<usize>,
@@ -1360,7 +1522,28 @@ struct Known<'k, 'a, DB: DatabaseLike> {
     scope: &'k PlPgSqlScope<'k, 'a, DB>,
 }
 
-impl<DB: DatabaseLike> Known<'_, '_, DB> {
+impl<'k, DB: DatabaseLike> Known<'k, '_, DB> {
+    /// The row of the trigger and the stored name of the field `reference`,
+    /// which `definition` defines, holds the value of: a field of `NEW` or
+    /// `OLD`, or a parameter passed one, holding the value it entered the
+    /// function with.
+    fn field(
+        &self,
+        definition: &ColumnDefinition<'_, '_, '_, DB>,
+        reference: &Expr,
+    ) -> Option<(Row, Cow<'k, str>)> {
+        match definition {
+            ColumnDefinition::VariableField(variable) => {
+                self.record_field(variable, reference).map(|(row, name)| (row, Cow::Owned(name)))
+            }
+            ColumnDefinition::Variable(variable) => {
+                let (row, name) = self.passed.get(self.parameter(variable)?)?.as_ref()?;
+                Some((*row, Cow::Borrowed(name.as_str())))
+            }
+            _ => None,
+        }
+    }
+
     /// The ordinal among the input parameters, as `$n` counts them, of the
     /// parameter `variable` names, when it holds the argument the call
     /// passed.
@@ -1629,9 +1812,6 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
         held: &[&Expr],
         owners: &[&Query],
     ) -> Result<bool, LookupError> {
-        if !query.locks.is_empty() {
-            return Ok(self.body.confinement.unfollowed());
-        }
         let mut owners = owners.to_vec();
         if query.with.is_some() {
             owners.push(query);
@@ -2518,6 +2698,26 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
     }
 }
 
+/// The ids of the variables `reads` read holding the value they enter the
+/// body with.
+fn unchanged_variables<DB: DatabaseLike>(reads: &[VariableRead<'_, '_, DB>]) -> Vec<usize> {
+    reads
+        .iter()
+        .filter(|read| {
+            match read.reaching() {
+                Reaching::Definitions(definitions) => {
+                    definitions.iter().all(|definition| {
+                        definition.part().is_empty()
+                            && matches!(definition.source(), DefinitionSource::Incoming)
+                    })
+                }
+                Reaching::Unreachable => false,
+            }
+        })
+        .map(|read| read.variable().id())
+        .collect()
+}
+
 /// Records, for each query nested in a condition of a `WHERE` of a `SELECT`
 /// of `body`, outside nested queries, the other conditions of that `WHERE`.
 fn conditions_beside<'q>(body: &'q SetExpr, beside: &mut Vec<(*const Query, Vec<&'q Expr>)>) {
@@ -2901,20 +3101,16 @@ impl<'r, 'q, 'a, DB: DatabaseLike> Resolver<'r, 'q, 'a, DB> {
         })
     }
 
-    /// The field of the trigger's row `reference` reads, with the column of
-    /// the trigger's table it holds the value of, when it reads one the row
-    /// entered the function with.
+    /// The field of the trigger's row `reference` reads, itself or through a
+    /// parameter passed it, with the column of the trigger's table it holds
+    /// the value of, when it reads one the row entered the function with.
     fn record_field(&self, reference: &Expr) -> Option<(Node<'r>, &'a DB::Column)> {
         let known = self.known?;
         let record = known.record?;
-        let (ColumnDefinition::VariableField(variable), _) =
-            self.context.reference(unnested(reference)).ok()??
-        else {
-            return None;
-        };
-        let (row, name) = known.record_field(&variable, reference)?;
+        let (definition, _) = self.context.reference(unnested(reference)).ok()??;
+        let (row, name) = known.field(&definition, reference)?;
         let column = column_named(self.context.database(), record.table, &name).ok()??;
-        Some((Node::Record { row, name: Cow::Owned(name) }, column))
+        Some((Node::Record { row, name }, column))
     }
 
     /// The definition and binding of the column `reference` names. A column
@@ -3639,10 +3835,10 @@ fn term<'r, DB: DatabaseLike>(
     relation: &TableFactor,
     equalities: &Equalities<'r>,
 ) -> Option<Term> {
-    if let Some((node, _)) = resolver.record_field(reference) {
-        return equalities
-            .of_relation(&node, relation)
-            .map(|column| Term::Column(column.to_owned()));
+    if let Some((node, _)) = resolver.record_field(reference)
+        && let Some(column) = equalities.of_relation(&node, relation)
+    {
+        return Some(Term::Column(column.to_owned()));
     }
     match resolver.reference(reference)? {
         (ColumnDefinition::Parameter { ordinal, .. }, _) => Some(Term::Parameter(ordinal)),

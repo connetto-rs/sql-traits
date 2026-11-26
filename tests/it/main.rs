@@ -54,6 +54,7 @@ mod default_column_references;
 mod default_privileges;
 mod deferrable_key_targets;
 mod definer_helpers;
+mod definer_locking_helpers;
 mod definer_lookup_errors;
 mod definer_policy_implication;
 mod definer_read_sources;

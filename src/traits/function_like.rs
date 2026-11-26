@@ -1696,7 +1696,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// nothing a direct call does not, so its reads count only as the values
     /// it hands on. A PL/pgSQL body is read statement by statement, a
     /// parameter counting as one where the statement reads the argument
-    /// unchanged.
+    /// unchanged. A locking clause such as `FOR UPDATE` leaves the rows a
+    /// read reaches as they are without it.
     ///
     /// # Errors
     ///
