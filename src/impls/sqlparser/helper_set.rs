@@ -68,6 +68,7 @@ pub(crate) fn helper_set<'db, DB: DatabaseLike>(
         reads_exclusions: conditions.contains(&ArmCondition::Exclusion),
         reads_unset_settings: conditions.contains(&ArmCondition::UnsetSetting),
         reads_edge_conditions: conditions.contains(&ArmCondition::EdgeCondition),
+        reads_parent_conditions: conditions.contains(&ArmCondition::ParentCondition),
         answering: Vec::new(),
         answered: BTreeMap::new(),
     }
@@ -688,6 +689,10 @@ impl SetRead<'_> {
 /// one, beside the arms it answers, none where its condition keeps no row.
 type ReadArm<'db, DB> = (Option<&'db <DB as DatabaseLike>::Table>, Vec<HelperArm<'db, DB>>);
 
+/// A parent arm's comparison of a column with a helper's set, beside its
+/// other conjuncts.
+type ParentConjuncts<'q> = (&'q Expr, &'q Query, Vec<&'q Expr>);
+
 /// Whose rows one arm a grant arm answers keeps, with what keeping them
 /// adds to the arm's other conditions.
 type Grantee<'db, DB> = (GrantedTo<'db, DB>, Kept<'db, DB>);
@@ -807,6 +812,9 @@ struct Reader<'db, DB: DatabaseLike> {
     /// Whether the conditions a walk's term sets on its edges are read
     /// rather than refused, in every helper answered.
     reads_edge_conditions: bool,
+    /// Whether the conditions a parent arm sets beside its comparison with
+    /// the set are read rather than refused, in every helper answered.
+    reads_parent_conditions: bool,
     /// The helpers being answered, outermost first.
     answering: Vec<&'db DB::Function>,
     /// The sets answered so far, by helper, which every later call of the
@@ -1010,16 +1018,18 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let child = self.child_table(table.table, column)?;
         if let Some(child) = child
             && from.joins.is_empty()
-            && let Some(Expr::In {
-                expr, target: InTarget::Subquery(called), negated: false, ..
-            }) = select.selection.as_ref().map(unnest)
-            && !matches!(unnest(expr), Expr::Tuple(_))
-            && self.set_elements(scope, called)?.is_none()
-            && self.parent_comparison(table, column, child, expr)?
-            && self.capping_key(table, &returned, expr)?.is_none()
+            && let Some((compared, called, conditions)) =
+                self.parent_conjuncts(scope, table, (column, child), &returned, select)?
         {
-            let arm = self.parent_arm(scope, select, table, (column, child), expr, called)?;
-            return Ok((keyed, vec![arm]));
+            let arms = self.parent_arm(
+                scope,
+                select,
+                table,
+                (column, child),
+                (compared, called),
+                conditions,
+            )?;
+            return Ok((keyed, arms));
         }
         Ok((keyed, self.grant_arm(scope, select, &rows, &returned, child, None)?))
     }
@@ -1901,17 +1911,60 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(ArmTable { table, qualifier, columns, case: database.identifier_case() })
     }
 
+    /// The conjuncts of `select` read as a parent arm returning `key`, a row
+    /// of `child`: its one comparison of a column with a helper's set the arm
+    /// reads as a parent comparison, beside every other conjunct. `None`
+    /// where it writes no such comparison or another one comparing a set, or
+    /// names a grantee by a value of the request, which makes it a grant arm.
+    fn parent_conjuncts<'q>(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        (key, child): (&'db DB::Column, &'db DB::Table),
+        returned: &[Returned<&'db DB::Column>],
+        select: &'q Select,
+    ) -> Result<Option<ParentConjuncts<'q>>, HelperSetError> {
+        let Some(selection) = &select.selection else { return Ok(None) };
+        let mut conjuncts = Vec::new();
+        conjunction(selection, &mut conjuncts);
+        let mut membership = None;
+        let mut conditions = Vec::new();
+        for conjunct in conjuncts {
+            if let Expr::In { expr, target: InTarget::Subquery(called), negated: false, .. } =
+                conjunct
+            {
+                if membership.is_some()
+                    || matches!(unnest(expr), Expr::Tuple(_))
+                    || self.set_elements(scope, called)?.is_some()
+                    || !self.parent_comparison(table, key, child, expr)?
+                    || self.capping_key(table, returned, expr)?.is_some()
+                {
+                    return Ok(None);
+                }
+                membership = Some((expr.as_ref(), called.as_ref()));
+            } else if self.setting_comparison(scope, table, conjunct)?.is_some()
+                || self.request_list(scope, table, conjunct)?.is_some()
+            {
+                return Ok(None);
+            } else {
+                conditions.push(conjunct);
+            }
+        }
+        Ok(membership.map(|(compared, called)| (compared, called, conditions)))
+    }
+
     /// Reads `<column> IN (SELECT <helper>(<arguments>))` in an arm returning
-    /// `key`, which names a row of `child_table`.
+    /// `key`, which names a row of `child_table`, keeping the rows
+    /// `conditions` keep, none where they keep no row.
     fn parent_arm(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         table: &ArmTable<'_, 'db, DB>,
         (key, child_table): (&'db DB::Column, &'db DB::Table),
-        compared: &Expr,
-        subquery: &Query,
-    ) -> Result<HelperArm<'db, DB>, HelperSetError> {
+        (compared, subquery): (&Expr, &Query),
+        conditions: Vec<&Expr>,
+    ) -> Result<Vec<HelperArm<'db, DB>>, HelperSetError> {
         let database = self.database;
         let shape = || scope.arm_shape(select);
         let Some(column) = table.column(compared) else {
@@ -1924,6 +1977,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             [] if !core::ptr::eq(column, key) => None,
             _ => return Err(shape()),
         };
+        if let Some(condition) = conditions.first() {
+            self.require_read(scope, condition, ArmCondition::ParentCondition)?;
+        }
         let call = projected_call(subquery).ok_or_else(shape)?;
         let Called { function: callee, arguments, set } =
             self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
@@ -1939,7 +1995,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 })?
             }
         };
-        Ok(HelperArm::Parent(ParentArm {
+        let mut exclusions = Vec::new();
+        let mut filters = Vec::new();
+        for condition in conditions {
+            match self.exclusion(scope, select, table, condition)? {
+                // `NOT IN` an empty set holds for every row, `NULL` too.
+                Some(exclusion) => {
+                    if !exclusion.set.arms.is_empty() {
+                        exclusions.push(exclusion);
+                    }
+                }
+                None => filters.push(condition),
+            }
+        }
+        let (kept, time_bounds) = self.filter(scope, table, filters)?;
+        let Some(restrictions) = kept.restrictions() else { return Ok(Vec::new()) };
+        Ok(vec![HelperArm::Parent(ParentArm {
             table: table.table,
             key,
             child_table,
@@ -1949,7 +2020,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             function: callee,
             arguments,
             set,
-        }))
+            restrictions,
+            time_bounds,
+            exclusions,
+        })])
     }
 
     /// Reads `<column> IN (SELECT <helper>(<arguments>))` in a grant arm,
@@ -2377,6 +2451,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             ArmCondition::Exclusion => self.reads_exclusions,
             ArmCondition::UnsetSetting => self.reads_unset_settings,
             ArmCondition::EdgeCondition => self.reads_edge_conditions,
+            ArmCondition::ParentCondition => self.reads_parent_conditions,
         };
         if reads {
             return Ok(());

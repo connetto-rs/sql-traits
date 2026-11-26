@@ -28,6 +28,10 @@ pub enum ArmCondition {
     /// [`WalkArm::restrictions`], [`WalkArm::time_bounds`] and
     /// [`WalkArm::exclusions`]).
     EdgeCondition,
+    /// What a row has to hold for a parent arm to return it (see
+    /// [`ParentArm::restrictions`], [`ParentArm::time_bounds`] and
+    /// [`ParentArm::exclusions`]).
+    ParentCondition,
 }
 
 /// The set a helper returns, the union of its arms kept to the rows its
@@ -904,8 +908,8 @@ impl<'db, DB: DatabaseLike> Correlation<'db, DB> {
 }
 
 /// `SELECT <key> FROM <table> WHERE <column> IN (SELECT
-/// <function>(<arguments>))`, the key naming a row of the child table and
-/// the column naming a row of the parent table.
+/// <function>(<arguments>)) [AND <conditions>]`, the key naming a row of the
+/// child table and the column naming a row of the parent table.
 ///
 /// The key is the table's primary key, the table then being the child table,
 /// or a column a unique key covers alone whose one single-column foreign key
@@ -927,6 +931,9 @@ pub struct ParentArm<'db, DB: DatabaseLike> {
     pub(crate) function: &'db DB::Function,
     pub(crate) arguments: Vec<Value>,
     pub(crate) set: Arc<HelperSet<'db, DB>>,
+    pub(crate) restrictions: Vec<Restriction<'db, DB>>,
+    pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
+    pub(crate) exclusions: Vec<ExcludedSet<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
@@ -990,6 +997,36 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
     #[must_use]
     pub fn set(&self) -> &Arc<HelperSet<'db, DB>> {
         &self.set
+    }
+
+    /// What columns of a row have to hold for the arm to return it, as
+    /// [`GrantArm::restrictions`] reads them. Empty where the arm sets no
+    /// condition beside its comparison with the set or one holding for every
+    /// row, and in every answer whose reading leaves
+    /// [`ArmCondition::ParentCondition`] unread, which refuses an arm setting
+    /// one.
+    #[must_use]
+    pub fn restrictions(&self) -> &[Restriction<'db, DB>] {
+        &self.restrictions
+    }
+
+    /// The bounds a row has to meet against the statement time for the arm
+    /// to return it, every one of them, in the order the arm writes them.
+    /// Empty in every answer whose reading leaves
+    /// [`ArmCondition::ParentCondition`] unread.
+    #[must_use]
+    pub fn time_bounds(&self) -> &[TimeBound<'db, DB>] {
+        &self.time_bounds
+    }
+
+    /// The sets of other helpers a column of a row has to stay outside for
+    /// the arm to return it, as [`GrantArm::exclusions`] reads them, every
+    /// one of them in the order the arm writes them. Empty in every answer
+    /// whose reading leaves [`ArmCondition::ParentCondition`] or
+    /// [`ArmCondition::Exclusion`] unread, which refuses an arm writing one.
+    #[must_use]
+    pub fn exclusions(&self) -> &[ExcludedSet<'db, DB>] {
+        &self.exclusions
     }
 }
 
