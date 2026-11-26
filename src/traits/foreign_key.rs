@@ -1,13 +1,13 @@
 //! Submodule definining the `ForeignKeyLike` trait for SQL referenced keys.
 
-use alloc::{borrow::Cow, vec::Vec};
+use alloc::{borrow::Cow, boxed::Box, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug};
 
-use sqlparser::ast::{ConstraintReferenceMatchKind, Expr, ReferentialAction};
+use sqlparser::ast::{ConstraintReferenceMatchKind, Expr, Ident, ReferentialAction};
 
 use crate::{
     errors::LookupError,
-    structs::{ConstraintDeferral, TargetName},
+    structs::{Assumption, ConstraintDeferral, Outcomes, TargetName, validated_checks},
     traits::{ColumnLike, DatabaseLike, Metadata, TableIndexLike, TableLike},
 };
 
@@ -1820,4 +1820,55 @@ pub trait ForeignKeyLike:
             .zip(self.referenced_columns(database)?)
             .find_map(|(hc, rc)| if hc == host_column { Some(rc) } else { None }))
     }
+}
+
+/// Whether `foreign_key` checks every row of its host table in which each of
+/// `columns` holds a value, matching `FULL` or holding a value in each other
+/// host column on every such row, as `NOT NULL` or the table's validated
+/// checks require. `MATCH SIMPLE` skips a row with a `NULL` in its key.
+///
+/// # Errors
+///
+/// Returns the lookup errors reading the host columns and checks raises.
+pub(crate) fn checks_rows_holding<DB: DatabaseLike>(
+    foreign_key: &DB::ForeignKey,
+    columns: &[&DB::Column],
+    database: &DB,
+) -> Result<bool, LookupError> {
+    if foreign_key.match_full(database) {
+        return Ok(true);
+    }
+    let mut nullable = Vec::new();
+    for host in foreign_key.host_columns(database)? {
+        if !columns.iter().any(|column| core::ptr::eq(host, *column))
+            && host.is_nullable(database)?
+        {
+            nullable.push(host);
+        }
+    }
+    if nullable.is_empty() {
+        return Ok(true);
+    }
+    let named = |column: &DB::Column| {
+        Box::new(Expr::Identifier(Ident {
+            quote_style: column.column_name_is_quoted().then_some('"'),
+            ..Ident::new(column.column_name())
+        }))
+    };
+    let set: Vec<Expr> = columns.iter().map(|column| Expr::IsNotNull(named(column))).collect();
+    let table = foreign_key.host_table(database);
+    let mut assumptions: Vec<_> =
+        validated_checks(table, database, None)?.into_iter().map(Assumption::Check).collect();
+    assumptions.extend(
+        set.iter()
+            .map(|expression| Assumption::Expression { expression, outcomes: Outcomes::TRUE }),
+    );
+    let case = database.identifier_case();
+    for host in nullable {
+        let unset = Expr::IsNull(named(host));
+        if table.truth_under(database, &unset, case, &assumptions)?.outcomes.truth {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }

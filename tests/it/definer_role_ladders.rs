@@ -308,14 +308,16 @@ fn only_plain_unconditional_unique_indexes_pin_read_rows() {
     }
 }
 
-/// Nullable companion columns require `MATCH FULL` to bind every nonnull
-/// foreign key.
+/// Nullable companion columns require `MATCH FULL`, or a check setting them
+/// on every row, to bind every nonnull foreign key.
 #[test]
 fn nullable_foreign_key_companions_require_full_matching() {
-    for (matching, enforcement, confined) in [
-        ("MATCH SIMPLE", "", false),
-        ("MATCH FULL", "", true),
-        ("MATCH FULL", "NOT ENFORCED", false),
+    for (matching, enforcement, check, confined) in [
+        ("MATCH SIMPLE", "", "", false),
+        ("MATCH SIMPLE", "", "CHECK (partition_id IS NOT NULL OR team_id IS NULL),", true),
+        ("MATCH SIMPLE", "", "CHECK (partition_id IS NOT NULL OR team_id > 0),", false),
+        ("MATCH FULL", "", "", true),
+        ("MATCH FULL", "NOT ENFORCED", "", false),
     ] {
         let database = schema(&format!(
             "CREATE ROLE app;
@@ -326,7 +328,7 @@ fn nullable_foreign_key_companions_require_full_matching() {
              CREATE POLICY runs_select ON runs FOR SELECT TO app
                USING (team_id = current_setting('app.team_id')::INT);
              CREATE TABLE bindings (
-               run_id INT NOT NULL, team_id INT NOT NULL, partition_id INT,
+               run_id INT NOT NULL, team_id INT NOT NULL, partition_id INT, {check}
                FOREIGN KEY (run_id, team_id, partition_id)
                  REFERENCES runs (id, team_id, partition_id) {matching} {enforcement});
              ALTER TABLE bindings ENABLE ROW LEVEL SECURITY;
@@ -349,7 +351,7 @@ fn nullable_foreign_key_companions_require_full_matching() {
         assert_eq!(
             trigger_read(&database, "binding_guard", DefinerReading::Outcome),
             (!confined).then(|| ("runs".to_owned(), "runs_select".to_owned())),
-            "{matching}, {enforcement}"
+            "{matching}, {enforcement}, {check}"
         );
     }
 }

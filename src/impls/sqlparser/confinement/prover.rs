@@ -62,7 +62,7 @@ use crate::{
     },
     traits::{
         ColumnLike, DatabaseLike, ForeignKeyLike, FunctionLike, PolicyLike, Relation, TableLike,
-        TriggerLike, UserDefinedTypeLike,
+        TriggerLike, UserDefinedTypeLike, foreign_key::checks_rows_holding,
     },
     utils::{
         identifier_resolution::normalize_identifier,
@@ -1853,8 +1853,8 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
     /// fields of the trigger's row that a foreign key of `record` holds
     /// equal to them, once `equalities` hold the key's columns of a unique
     /// key of `table` equal to their fields. The row the read reaches is then
-    /// the one the key references, when every other column of the key is
-    /// `NOT NULL` or the key is `MATCH FULL`.
+    /// the one the key references, when the key checks every row holding a
+    /// value in the columns held equal.
     fn link_keys<'r>(
         &self,
         record: &'r Record<'a, DB>,
@@ -1877,28 +1877,17 @@ impl<'c, 'q, 'a, DB: DatabaseLike> Reads<'c, 'q, 'a, DB> {
             };
             let field =
                 |column: &'a DB::Column| Node::Record { row, name: column.stored_column_name() };
-            let bound: Vec<&DB::Column> = pairs
+            let (bound, held): (Vec<&DB::Column>, Vec<&DB::Column>) = pairs
                 .iter()
                 .filter(|(host, referenced)| equalities.same(&field(host), &node(referenced)))
-                .map(|(_, referenced)| *referenced)
-                .collect();
+                .map(|(host, referenced)| (*referenced, *host))
+                .unzip();
             if !unique.iter().any(|columns| {
                 columns.iter().all(|column| bound.iter().any(|bound| ptr::eq(*bound, *column)))
             }) {
                 continue;
             }
-            let mut checked = key.match_full(database);
-            if !checked {
-                checked = true;
-                for (host, referenced) in &pairs {
-                    if !bound.iter().any(|bound| ptr::eq(*bound, *referenced))
-                        && host.is_nullable(database)?
-                    {
-                        checked = false;
-                    }
-                }
-            }
-            if !checked {
+            if !checks_rows_holding(key, &held, database)? {
                 continue;
             }
             for (host, referenced) in &pairs {
