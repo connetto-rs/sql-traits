@@ -1069,7 +1069,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql-dataflow"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#3e8a628f23449e6114d6fe0cf4b699b55771e07f"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#33371f448377f181403f77917f3bc09f68648125"
 dependencies = [
  "sqlparser",
  "sqlparser-expr-eval",
