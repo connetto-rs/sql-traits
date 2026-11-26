@@ -1019,31 +1019,33 @@ impl<'db, DB: DatabaseLike> CalledArm<'db, DB> {
     }
 }
 
-/// One edge the recursive term of `WITH RECURSIVE <walk> (<column>) AS
-/// (<arms> UNION <term>) SELECT <column> FROM <walk>` follows, walking the
+/// One edge the recursive term of `WITH RECURSIVE <walk> (<columns>) AS
+/// (<arms> UNION <term>) SELECT <columns> FROM <walk>` follows, walking the
 /// rows of the [tree](Self::tree) along the edges the table holds until the
 /// set stops growing.
 ///
+/// The walk's columns hold the tree's primary key, one column of the key
+/// each, so a tree keyed by several columns is walked by its whole key.
 /// Each row of the table meeting the [restrictions](Self::restrictions), the
 /// [time bounds](Self::time_bounds) and the [exclusions](Self::exclusions)
-/// is an edge from the tree's row its child column names to the one its
-/// parent column names. The table is the tree itself, its child column the
-/// primary key, where each row names its own parent, or an edge table
-/// holding any number of edges per child and per parent, so the edges may
-/// draw any graph. The child column of an edge table is the one of the two
-/// its primary key is, else the one a unique key covers alone, and the
-/// column the term adds where its keys tell neither apart, the walk then
-/// going [down](WalkDirection::Down). A term reading a `LATERAL` union of
-/// edges answers one walk per edge, each adding to the one set every other
-/// one reads. The walk ends on edges closing a cycle, as `UNION` keeps no
-/// row twice.
+/// is an edge from the tree's row its [child columns](Self::child) name to
+/// the one its [parent columns](Self::parent) name. The table is the tree
+/// itself, its child columns the primary key, where each row names its own
+/// parent, or an edge table holding any number of edges per child and per
+/// parent, so the edges may draw any graph. The child columns of an edge
+/// table are the ones of the two lists its primary key is, else the ones a
+/// unique key covers alone, and the columns the term adds where its keys
+/// tell neither apart, the walk then going [down](WalkDirection::Down). A
+/// term reading a `LATERAL` union of edges answers one walk per edge, each
+/// adding to the one set every other one reads. The walk ends on edges
+/// closing a cycle, as `UNION` keeps no row twice.
 #[derive(Debug)]
 pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
     pub(crate) tree: &'db DB::Table,
-    pub(crate) key: &'db DB::Column,
-    pub(crate) child: &'db DB::Column,
-    pub(crate) column: &'db DB::Column,
+    pub(crate) key: Vec<&'db DB::Column>,
+    pub(crate) child: Vec<&'db DB::Column>,
+    pub(crate) parent: Vec<&'db DB::Column>,
     pub(crate) foreign_key: &'db DB::ForeignKey,
     pub(crate) direction: WalkDirection,
     pub(crate) restrictions: Vec<Restriction<'db, DB>>,
@@ -1065,28 +1067,32 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
         self.tree
     }
 
-    /// The tree's one-column primary key.
+    /// The columns of the tree's primary key, in the order of the walk's
+    /// columns.
     #[must_use]
-    pub fn key(&self) -> &'db DB::Column {
-        self.key
+    pub fn key(&self) -> &[&'db DB::Column] {
+        &self.key
     }
 
-    /// The column naming the child of each edge, [`key`](Self::key) where
-    /// the tree holds its own edges.
+    /// The columns naming the child of each edge, each holding the column of
+    /// [`key`](Self::key) at its position, which they are where the tree
+    /// holds its own edges.
     #[must_use]
-    pub fn child(&self) -> &'db DB::Column {
-        self.child
+    pub fn child(&self) -> &[&'db DB::Column] {
+        &self.child
     }
 
-    /// The column naming the parent of each edge.
+    /// The columns naming the parent of each edge, each holding the column
+    /// of [`key`](Self::key) at its position.
     #[must_use]
-    pub fn column(&self) -> &'db DB::Column {
-        self.column
+    pub fn parent(&self) -> &[&'db DB::Column] {
+        &self.parent
     }
 
-    /// The first foreign key the table declares through which
-    /// [`column`](Self::column) names a row of the tree, holding the column
-    /// alone or at the position of [`key`](Self::key) among others.
+    /// The first foreign key the table declares through which the
+    /// [parent columns](Self::parent) name a row of the tree, holding each
+    /// at the position of its column of [`key`](Self::key), alone or among
+    /// other columns.
     #[must_use]
     pub fn foreign_key(&self) -> &'db DB::ForeignKey {
         self.foreign_key
@@ -1131,19 +1137,19 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
 /// Which way a [`WalkArm`] follows its edges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkDirection {
-    /// `SELECT <child> FROM <table> JOIN <walk> ON <column> =
-    /// <walk>.<column>`, or a `LATERAL` edge `SELECT <child> FROM <table>
-    /// WHERE <column> = <walk>.<column>`, which adds the child of every edge
-    /// whose parent the set holds, so the set ends holding every row below its
-    /// other arms.
+    /// `SELECT <children> FROM <table> JOIN <walk> ON <parents> =
+    /// <walk>.<columns>`, or a `LATERAL` edge `SELECT <children> FROM <table>
+    /// WHERE <parents> = <walk>.<columns>`, which adds the child of every edge
+    /// whose parent the set holds, so the set ends holding every row below
+    /// its other arms.
     Down,
-    /// `SELECT <column> FROM <table> JOIN <walk> ON <child> =
-    /// <walk>.<column>`, or a `LATERAL` edge `SELECT <column> FROM <table>
-    /// WHERE <child> = <walk>.<column>`, which adds the parent of every edge
-    /// whose child the set holds, so the set ends holding every row above its
-    /// other arms. A root of a tree holding its own edges adds its parent
-    /// column's `NULL`, which no `IN` matches, and a root of an edge table has
-    /// no edge. A walk reads as one up only where a key of its table orients
-    /// its edges (see [`WalkArm`]).
+    /// `SELECT <parents> FROM <table> JOIN <walk> ON <children> =
+    /// <walk>.<columns>`, or a `LATERAL` edge `SELECT <parents> FROM <table>
+    /// WHERE <children> = <walk>.<columns>`, which adds the parent of every
+    /// edge whose child the set holds, so the set ends holding every row
+    /// above its other arms. A root of a tree holding its own edges adds its
+    /// parent columns' `NULL`, which no `IN` matches, and a root of an edge
+    /// table has no edge. A walk reads as one up only where a key of its
+    /// table orients its edges (see [`WalkArm`]).
     Up,
 }

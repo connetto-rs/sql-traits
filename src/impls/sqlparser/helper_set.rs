@@ -303,26 +303,15 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
         }) {
             return Err(shape());
         }
-        let column = match cte.alias.columns.as_slice() {
-            [] => arms.first().and_then(|first| output_name(first)).ok_or_else(shape)?,
-            [TableAliasColumnDef { name, data_type: None }] => name,
-            _ => return Err(shape()),
-        };
+        let columns = walk_columns(&cte.alias.columns, arms.first().copied()).ok_or_else(shape)?;
         let SetExpr::Select(last) = query.body.as_ref() else { return Err(shape()) };
         let [from] = last.from.as_slice() else { return Err(shape()) };
         let reselection = match walk_qualifier(&from.relation, name) {
             Some(qualifier) => {
-                let ([item], None) = (last.projection.as_slice(), &last.selection) else {
-                    return Err(shape());
-                };
-                let (SelectItem::UnnamedExpr(returned)
-                | SelectItem::ExprWithAlias { expr: returned, .. }) = item
-                else {
-                    return Err(shape());
-                };
                 if !plain_select(last)
                     || !from.joins.is_empty()
-                    || !names_column(returned, qualifier, column, true)
+                    || last.selection.is_some()
+                    || !returns_walk(&last.projection, qualifier, &columns)
                 {
                     return Err(shape());
                 }
@@ -330,7 +319,7 @@ impl<DB: DatabaseLike> Scope<'_, DB> {
             }
             None => Some(last.as_ref()),
         };
-        Ok(Body { arms, walk: Some(Walk { name, column, term, reselection }) })
+        Ok(Body { arms, walk: Some(Walk { name, columns, term, reselection }) })
     }
 
     /// The parameter `expression` names, if it names one.
@@ -711,6 +700,19 @@ type ReferencedKey<'db, DB> = (
     &'db <DB as DatabaseLike>::ForeignKey,
 );
 
+/// A table, its primary key beside the columns naming its row, column by
+/// column, and the foreign key they name it through.
+type DrawnKey<'db, DB> = (
+    &'db <DB as DatabaseLike>::Table,
+    Vec<&'db <DB as DatabaseLike>::Column>,
+    &'db <DB as DatabaseLike>::ForeignKey,
+);
+
+/// A table and its primary key beside the columns naming its row, column by
+/// column.
+type PrimaryReference<'db, DB> =
+    (&'db <DB as DatabaseLike>::Table, Vec<&'db <DB as DatabaseLike>::Column>);
+
 /// A column of an arm's own table beside the column of a joined table it
 /// equals.
 type JoinedColumns<'db, DB> =
@@ -753,12 +755,12 @@ struct Body<'q> {
     walk: Option<Walk<'q>>,
 }
 
-/// The recursive term of a body, with the name and the one column it reads
-/// the set by, and the final query where it reselects what the walk reached
-/// rather than return it as `SELECT <column> FROM <walk>`.
+/// The recursive term of a body, with the name and the columns it reads the
+/// set by, and the final query where it reselects what the walk reached
+/// rather than return it as `SELECT <columns> FROM <walk>`.
 struct Walk<'q> {
     name: &'q Ident,
-    column: &'q Ident,
+    columns: Vec<&'q Ident>,
     term: &'q Select,
     reselection: Option<&'q Select>,
 }
@@ -767,15 +769,15 @@ struct Walk<'q> {
 /// where the conditions the term sets on the edge keep no edge.
 type Walked<'db, DB> = (&'db <DB as DatabaseLike>::Table, Option<WalkArm<'db, DB>>);
 
-/// One edge a walk's term writes, the column it adds and the one it compares
-/// with the walk's column, beside the name the walk is qualified by and its
-/// column. `hides_walk` holds for a `LATERAL` edge, whose table's columns
-/// hide the walk's column named bare.
-struct Edge<'q> {
-    returned: &'q Expr,
-    compared: &'q Expr,
-    qualifier: &'q Ident,
-    column: &'q Ident,
+/// One edge a walk's term writes, the columns it adds and the ones it
+/// compares with the walk's columns, position by position, beside the name
+/// the walk is qualified by and its columns. `hides_walk` holds for a
+/// `LATERAL` edge, whose table's columns hide the walk's columns named bare.
+struct Edge<'e> {
+    returned: &'e [&'e Expr],
+    compared: &'e [&'e Expr],
+    qualifier: &'e Ident,
+    columns: &'e [&'e Ident],
     hides_walk: bool,
 }
 
@@ -874,9 +876,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(scope.arm_shape(&written(written_body)));
         };
         let body = scope.body(query)?;
-        // A walk adds one column, so a helper walking a tree returns one.
+        // A walk compares the set's rows column by column, so it reads every
+        // column the helper returns.
         if let Some(walk) = &body.walk
-            && arity != 1
+            && walk.columns.len() != arity
         {
             return Err(scope.arm_shape(walk.term));
         }
@@ -1375,16 +1378,17 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// Reads the recursive term of a walk, one arm per edge it follows.
     ///
     /// The term joins the walk to one edge, walking down as
-    /// `SELECT <child> FROM <table> JOIN <walk> ON <parent column> =
-    /// <walk>.<column>` and up as
-    /// `SELECT <parent column> FROM <table> JOIN <walk> ON <child> =
-    /// <walk>.<column>`, the join either way round and the conditions beside
-    /// the comparison in `ON` and in `WHERE` set on the edge, or reads a
-    /// `UNION` of edges from a `LATERAL` subquery after the walk, each
-    /// `SELECT <added> FROM <table> WHERE <compared> = <walk>.<column> [AND
-    /// <conditions>]`. PostgreSQL refuses the walk's name twice in the term
-    /// and in a subquery of it, so a step over several edges compares each
-    /// with the walk's column from inside a `LATERAL` subquery.
+    /// `SELECT <children> FROM <table> JOIN <walk> ON <parents> =
+    /// <walk>.<columns>` and up as `SELECT <parents> FROM <table> JOIN
+    /// <walk> ON <children> = <walk>.<columns>`, each comparing a column of
+    /// the table with the walk's column at its position, the join either
+    /// way round and the conditions beside the comparisons in `ON` and in
+    /// `WHERE` set on the edge, or reads a `UNION` of edges from a `LATERAL`
+    /// subquery after the walk, each `SELECT <added> FROM <table> WHERE
+    /// <compared> = <walk>.<columns> [AND <conditions>]`. PostgreSQL refuses
+    /// the walk's name twice in the term and in a subquery of it, so a step
+    /// over several edges compares each with the walk's columns from inside
+    /// a `LATERAL` subquery.
     fn walk_arms(
         &mut self,
         scope: &Scope<'db, DB>,
@@ -1392,12 +1396,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     ) -> Result<Vec<Walked<'db, DB>>, HelperSetError> {
         let term = walk.term;
         let shape = || scope.arm_shape(term);
-        let [item] = term.projection.as_slice() else { return Err(shape()) };
-        let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
-            item
-        else {
-            return Err(shape());
-        };
+        let returned = projected_expressions(term)
+            .filter(|returned| returned.len() == walk.columns.len())
+            .ok_or_else(shape)?;
+        let returned = returned.as_slice();
         if !plain_select(term) {
             return Err(shape());
         }
@@ -1435,16 +1437,16 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
     }
 
-    /// Reads the edge a term joining the walk to one table follows, a
-    /// conjunct of `ON` comparing a column of the table with the walk's
-    /// column and every other conjunct of `ON` and of `WHERE` a condition on
-    /// the edge.
+    /// Reads the edge a term joining the walk to one table follows, the
+    /// conjuncts of `ON` comparing columns of the table with the walk's
+    /// columns and every other conjunct of `ON` and of `WHERE` a condition
+    /// on the edge.
     fn joined_edge(
         &mut self,
         scope: &Scope<'db, DB>,
         walk: &Walk<'_>,
         (from, joined): (&TableFactor, &TableFactor),
-        returned: &Expr,
+        returned: &[&Expr],
         (on, selection): (&Expr, Option<&Expr>),
     ) -> Result<Walked<'db, DB>, HelperSetError> {
         let term = walk.term;
@@ -1457,37 +1459,36 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             };
         let mut conditions = Vec::new();
         conjunction(on, &mut conditions);
-        let Some((position, compared)) =
-            conditions.iter().enumerate().find_map(|(position, condition)| {
-                Some((position, compared_with_walk(condition, qualifier, walk.column)?))
-            })
-        else {
-            return Err(shape());
-        };
-        conditions.remove(position);
+        let compared =
+            walk_comparisons(&mut conditions, qualifier, &walk.columns).ok_or_else(shape)?;
         if let Some(selection) = selection {
             conjunction(selection, &mut conditions);
         }
-        // A bare name the walk's column shares is ambiguous in the join.
-        let ambiguous = |expression: &Expr| matches!(unnest(expression), Expr::Identifier(ident) if same_ident(ident, walk.column));
-        if ambiguous(compared) || ambiguous(returned) {
+        // A bare name a column of the walk shares is ambiguous in the join.
+        let ambiguous = |expression: &&Expr| matches!(unnest(expression), Expr::Identifier(ident) if walk.columns.iter().any(|column| same_ident(ident, column)));
+        if compared.iter().chain(returned).any(ambiguous) {
             return Err(shape());
         }
         let table = self.arm_table(scope, relation, true, shape)?;
-        let column = walk.column;
-        let edge = Edge { returned, compared, qualifier, column, hides_walk: false };
+        let edge = Edge {
+            returned,
+            compared: &compared,
+            qualifier,
+            columns: &walk.columns,
+            hides_walk: false,
+        };
         self.edge_arm(scope, term, &table, &edge, conditions)
     }
 
     /// Reads the edges `FROM <walk> CROSS JOIN LATERAL (<edges>) <step>`
-    /// follows, the term returning the step's one column.
+    /// follows, the term returning the step's columns in order.
     fn lateral_edges(
         &mut self,
         scope: &Scope<'db, DB>,
         walk: &Walk<'_>,
         walked: &TableFactor,
         step: &TableFactor,
-        returned: &Expr,
+        returned: &[&Expr],
     ) -> Result<Vec<Walked<'db, DB>>, HelperSetError> {
         let shape = || scope.arm_shape(walk.term);
         let (
@@ -1502,42 +1503,39 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         let mut edges = Vec::new();
         union_arms(subquery, &mut edges).map_err(|edge| scope.arm_shape(&edge))?;
-        let column = match alias.columns.as_slice() {
-            [] => edges.first().and_then(|first| output_name(first)).ok_or_else(shape)?,
-            [TableAliasColumnDef { name, data_type: None }] => name,
-            _ => return Err(shape()),
+        let columns = walk_columns(&alias.columns, edges.first().copied()).ok_or_else(shape)?;
+        // A bare name a column of the walk shares is ambiguous beside the walk.
+        let named = |(returned, column): (&&Expr, &&Ident)| {
+            let bare = !walk.columns.iter().any(|walked| same_ident(column, walked));
+            names_column(returned, &alias.name, column, bare)
         };
-        // A bare name the walk's column shares is ambiguous beside the walk.
-        if !names_column(returned, &alias.name, column, !same_ident(column, walk.column)) {
+        if returned.len() != columns.len() || !returned.iter().zip(&columns).all(named) {
             return Err(shape());
         }
         edges
             .into_iter()
-            .map(|edge| self.lateral_edge(scope, edge, qualifier, walk.column))
+            .map(|edge| self.lateral_edge(scope, edge, qualifier, &walk.columns))
             .collect()
     }
 
     /// Reads one edge of a `LATERAL` step, `SELECT <added> FROM <table> WHERE
-    /// <compared> = <walk>.<column>` either way round, every other conjunct
-    /// of `WHERE` a condition on the edge, where `qualifier` names the walk.
+    /// <compared> = <walk>.<columns>`, each column compared either way round
+    /// or the columns together as a row, every other conjunct of `WHERE` a
+    /// condition on the edge, where `qualifier` names the walk.
     fn lateral_edge(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         qualifier: &Ident,
-        column: &Ident,
+        columns: &[&Ident],
     ) -> Result<Walked<'db, DB>, HelperSetError> {
         let shape = || scope.arm_shape(select);
-        let ([item], [from], Some(selection)) =
-            (select.projection.as_slice(), select.from.as_slice(), &select.selection)
-        else {
+        let ([from], Some(selection)) = (select.from.as_slice(), &select.selection) else {
             return Err(shape());
         };
-        let (SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }) =
-            item
-        else {
-            return Err(shape());
-        };
+        let returned = projected_expressions(select)
+            .filter(|returned| returned.len() == columns.len())
+            .ok_or_else(shape)?;
         if !plain_select(select) {
             return Err(shape());
         }
@@ -1548,15 +1546,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         let mut conditions = Vec::new();
         conjunction(selection, &mut conditions);
-        let Some((position, compared)) =
-            conditions.iter().enumerate().find_map(|(position, condition)| {
-                Some((position, compared_with_walk(condition, qualifier, column)?))
-            })
-        else {
-            return Err(shape());
-        };
-        conditions.remove(position);
-        let edge = Edge { returned, compared, qualifier, column, hides_walk: true };
+        let compared = walk_comparisons(&mut conditions, qualifier, columns).ok_or_else(shape)?;
+        let edge =
+            Edge { returned: &returned, compared: &compared, qualifier, columns, hides_walk: true };
         self.edge_arm(scope, select, &table, &edge, conditions)
     }
 
@@ -1571,8 +1563,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         conditions: Vec<&Expr>,
     ) -> Result<Walked<'db, DB>, HelperSetError> {
         let shape = || scope.arm_shape(select);
-        let (Some(returned), Some(compared)) =
-            (table.column(edge.returned), table.column(edge.compared))
+        let columns = |expressions: &[&Expr]| -> Option<Vec<&'db DB::Column>> {
+            expressions.iter().map(|expression| table.column(expression)).collect()
+        };
+        let (Some(returned), Some(compared)) = (columns(edge.returned), columns(edge.compared))
         else {
             return Err(shape());
         };
@@ -1582,7 +1576,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let hiding = edge.hides_walk.then_some(table);
         if let Some(condition) = conditions
             .iter()
-            .find(|condition| reads_walk_row(condition, edge.qualifier, edge.column, hiding))
+            .find(|condition| reads_walk_row(condition, edge.qualifier, edge.columns, hiding))
         {
             return Err(scope.irreducible(condition));
         }
@@ -1590,7 +1584,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             self.require_read(scope, condition, ArmCondition::EdgeCondition)?;
         }
         self.require_select(scope, table.table, || {
-            let mut read = vec![walk.child, walk.column];
+            let mut read: Vec<_> = walk.child.iter().chain(&walk.parent).copied().collect();
             for condition in &conditions {
                 read.extend(table.columns_read(*condition));
             }
@@ -1619,33 +1613,40 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// The walk adding `returned` of each row of `table` whose `compared` the
-    /// set holds, `None` where the two columns draw no edge of a tree.
+    /// set holds, column by column, `None` where the two lists of columns
+    /// draw no edge of a tree.
     ///
     /// The child is the table's primary key where one of the two is, else the
     /// one a unique key covers alone, and `returned` where neither or both
     /// are, the edge then walking down. The tree is the one table whose
-    /// one-column primary key both columns hold through foreign keys checking
+    /// primary key both lists hold, each column at the position of the
+    /// key's column the walk compares it with, through foreign keys checking
     /// every row, the child holding it as that key itself where the table is
-    /// the tree. A key into a table only one of the two columns references
+    /// the tree. A key into a table only one of the two lists references
     /// constrains the edge without changing the rows it joins.
     fn edge(
         &self,
         table: &'db DB::Table,
-        returned: &'db DB::Column,
-        compared: &'db DB::Column,
+        returned: Vec<&'db DB::Column>,
+        compared: Vec<&'db DB::Column>,
     ) -> Result<Option<WalkArm<'db, DB>>, LookupError> {
-        if core::ptr::eq(returned, compared) {
+        if same_columns(&returned, &compared) {
             return Ok(None);
         }
         let database = self.database;
-        let primary = table.primary_key_column(database)?;
-        let is_primary = |column| primary.is_some_and(|primary| core::ptr::eq(primary, column));
-        let direction = match (is_primary(returned), is_primary(compared)) {
+        let primary: Vec<_> = table.primary_key_columns(database)?.collect();
+        let is_primary = |columns: &[&'db DB::Column]| {
+            !primary.is_empty()
+                && primary.len() == columns.len()
+                && primary
+                    .iter()
+                    .all(|key| columns.iter().any(|column| core::ptr::eq(*key, *column)))
+        };
+        let direction = match (is_primary(&returned), is_primary(&compared)) {
             (true, _) => WalkDirection::Down,
             (false, true) => WalkDirection::Up,
             (false, false) => {
-                if !holds_key(table, &[returned], database)?
-                    && holds_key(table, &[compared], database)?
+                if !holds_key(table, &returned, database)? && holds_key(table, &compared, database)?
                 {
                     WalkDirection::Up
                 } else {
@@ -1653,24 +1654,24 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 }
             }
         };
-        let (child, column) = match direction {
+        let (child, parent) = match direction {
             WalkDirection::Down => (returned, compared),
             WalkDirection::Up => (compared, returned),
         };
-        let mut drawn: Option<ReferencedKey<'db, DB>> = None;
+        let mut drawn: Option<DrawnKey<'db, DB>> = None;
         for foreign_key in table.foreign_keys(database)? {
-            let Some((tree, key, _)) = primary_reference(foreign_key, column, database)? else {
+            let Some((tree, key)) = primary_reference(foreign_key, &parent, database)? else {
                 continue;
             };
-            if drawn.is_some_and(|(drawn, _, _)| core::ptr::eq(drawn, tree))
-                || !checks_every_row(foreign_key, column, database)?
+            if drawn.as_ref().is_some_and(|(drawn, _, _)| core::ptr::eq(*drawn, tree))
+                || !checks_every_row(foreign_key, &parent, database)?
             {
                 continue;
             }
             let names_tree = if core::ptr::eq(tree, table) {
-                core::ptr::eq(child, key)
+                same_columns(&child, &key)
             } else {
-                self.names_row_of(table, child, tree)?
+                self.names_row_of(table, &child, tree, &key)?
             };
             if !names_tree {
                 continue;
@@ -1688,7 +1689,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             tree,
             key,
             child,
-            column,
+            parent,
             foreign_key,
             direction,
             restrictions: Vec::new(),
@@ -1697,19 +1698,23 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }))
     }
 
-    /// Whether `column` of `table` holds the one-column primary key of `tree`
-    /// through a foreign key checking every row whose column is not `NULL`.
+    /// Whether `columns` of `table` hold `key`, the primary key of `tree`,
+    /// column by column, through a foreign key checking every row whose
+    /// columns are not `NULL`.
     fn names_row_of(
         &self,
         table: &'db DB::Table,
-        column: &'db DB::Column,
+        columns: &[&'db DB::Column],
         tree: &'db DB::Table,
+        key: &[&'db DB::Column],
     ) -> Result<bool, LookupError> {
         let database = self.database;
         for foreign_key in table.foreign_keys(database)? {
-            if primary_reference(foreign_key, column, database)?
-                .is_some_and(|(referenced, _, _)| core::ptr::eq(referenced, tree))
-                && checks_every_row(foreign_key, column, database)?
+            if primary_reference(foreign_key, columns, database)?.is_some_and(
+                |(referenced, referenced_key)| {
+                    core::ptr::eq(referenced, tree) && same_columns(&referenced_key, key)
+                },
+            ) && checks_every_row(foreign_key, columns, database)?
             {
                 return Ok(true);
             }
@@ -1733,8 +1738,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut tree: Option<&'db DB::Table> = None;
         let mut checked = None;
         for foreign_key in table.foreign_keys(database)? {
-            let Some((referenced, referenced_column, _)) =
-                primary_reference(foreign_key, column, database)?
+            let Some((referenced, key)) = primary_reference(foreign_key, &[column], database)?
             else {
                 continue;
             };
@@ -1742,8 +1746,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 return Ok(None);
             }
             tree = Some(referenced);
-            if checked.is_none() && checks_every_row(foreign_key, column, database)? {
-                checked = Some((referenced, referenced_column, foreign_key));
+            if checked.is_none() && checks_every_row(foreign_key, &[column], database)? {
+                checked = Some((referenced, key[0], foreign_key));
             }
         }
         Ok(checked)
@@ -3915,20 +3919,28 @@ fn walk_qualifier<'q>(relation: &'q TableFactor, walk: &Ident) -> Option<&'q Ide
     same_ident(part, walk).then_some(alias.unwrap_or(part))
 }
 
-/// Whether `query` is `SELECT <column> FROM <walk>`, returning every value
+/// Whether `query` is `SELECT <columns> FROM <walk>`, returning every row
 /// the walk reached.
 fn reads_walk(query: &Query, walk: &Walk<'_>) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else { return false };
-    let ([SelectItem::UnnamedExpr(returned)], [from], None) =
-        (select.projection.as_slice(), select.from.as_slice(), &select.selection)
-    else {
+    let ([from], None) = (select.from.as_slice(), &select.selection) else {
         return false;
     };
     plain_query(query)
         && plain_select(select)
         && from.joins.is_empty()
         && walk_qualifier(&from.relation, walk.name)
-            .is_some_and(|qualifier| names_column(returned, qualifier, walk.column, true))
+            .is_some_and(|qualifier| returns_walk(&select.projection, qualifier, &walk.columns))
+}
+
+/// Whether `projection` returns the walk's `columns` in their order, each
+/// named qualified by `qualifier` or bare.
+fn returns_walk(projection: &[SelectItem], qualifier: &Ident, columns: &[&Ident]) -> bool {
+    projection.len() == columns.len()
+        && projection.iter().zip(columns).all(|(item, column)| {
+            matches!(item, SelectItem::UnnamedExpr(returned) | SelectItem::ExprWithAlias { expr: returned, .. }
+                if names_column(returned, qualifier, column, true))
+        })
 }
 
 /// Whether `arm` keeps every row of its table, for every request.
@@ -3956,39 +3968,84 @@ fn names_column(expression: &Expr, qualifier: &Ident, column: &Ident, bare: bool
     }
 }
 
-/// The side of `<left> = <right>` compared with `column` of the walk
-/// `qualifier` names, `None` where `condition` compares nothing with it.
+/// Takes from `conditions` the first conjunct comparing each of the walk's
+/// `columns` `qualifier` names, `<expression> = <walk>.<column>` either way
+/// round or a row comparison pairing several, leaving the others. The side
+/// compared with each column, in the order of `columns`, `None` where a
+/// column is compared with nothing.
+fn walk_comparisons<'q>(
+    conditions: &mut Vec<&'q Expr>,
+    qualifier: &Ident,
+    columns: &[&Ident],
+) -> Option<Vec<&'q Expr>> {
+    let mut compared: Vec<Option<&'q Expr>> = vec![None; columns.len()];
+    conditions.retain(|condition| {
+        let Some(pairs) = compared_with_walk(condition, qualifier, columns) else {
+            return true;
+        };
+        let free = pairs.iter().enumerate().all(|(index, (position, _))| {
+            compared[*position].is_none()
+                && pairs[..index].iter().all(|(earlier, _)| earlier != position)
+        });
+        if !free {
+            return true;
+        }
+        for (position, expression) in pairs {
+            compared[position] = Some(expression);
+        }
+        false
+    });
+    compared.into_iter().collect()
+}
+
+/// The sides of `<left> = <right>` compared with the walk's `columns`
+/// `qualifier` names, each beside the position of its column, a comparison
+/// of two rows pairing their elements in order. `None` where a pair
+/// compares nothing with a column of the walk.
 fn compared_with_walk<'q>(
     condition: &'q Expr,
     qualifier: &Ident,
-    column: &Ident,
-) -> Option<&'q Expr> {
+    columns: &[&Ident],
+) -> Option<Vec<(usize, &'q Expr)>> {
     let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = unnest(condition) else {
         return None;
     };
-    if names_column(right, qualifier, column, false) {
-        Some(left)
-    } else if names_column(left, qualifier, column, false) {
-        Some(right)
-    } else {
-        None
-    }
+    let pairs: Vec<(&Expr, &Expr)> = match (unnest(left), unnest(right)) {
+        (Expr::Tuple(left), Expr::Tuple(right)) if left.len() == right.len() => {
+            left.iter().zip(right).collect()
+        }
+        _ => vec![(left, right)],
+    };
+    pairs
+        .into_iter()
+        .map(|(left, right)| {
+            columns.iter().enumerate().find_map(|(position, column)| {
+                if names_column(right, qualifier, column, false) {
+                    Some((position, left))
+                } else if names_column(left, qualifier, column, false) {
+                    Some((position, right))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
 }
 
 /// Whether `condition` reads the row of the walk `qualifier` names, through a
-/// name it qualifies or through `column` named bare, which names the walk's
-/// column unless `hiding`, the table a `LATERAL` edge reads, holds a column
-/// of that name.
+/// name it qualifies or through one of `columns` named bare, which names the
+/// walk's column unless `hiding`, the table a `LATERAL` edge reads, holds a
+/// column of that name.
 fn reads_walk_row<DB: DatabaseLike>(
     condition: &Expr,
     qualifier: &Ident,
-    column: &Ident,
+    columns: &[&Ident],
     hiding: Option<&ArmTable<'_, '_, DB>>,
 ) -> bool {
     walk_expressions(condition, |expression| {
         let reads = match expression {
             Expr::Identifier(ident) => {
-                same_ident(ident, column)
+                columns.iter().any(|column| same_ident(ident, column))
                     && hiding.is_none_or(|table| table.column(expression).is_none())
             }
             Expr::CompoundIdentifier(parts) => {
@@ -4011,20 +4068,64 @@ fn same_ident(left: &Ident, right: &Ident) -> bool {
     )
 }
 
-/// The name of the column `select` returns, which names the column of a
-/// `WITH` item declaring none.
-fn output_name(select: &Select) -> Option<&Ident> {
-    match select.projection.as_slice() {
-        [SelectItem::ExprWithAlias { alias, .. }] => Some(alias),
-        [SelectItem::UnnamedExpr(expression)] => {
-            match unnest(expression) {
-                Expr::Identifier(ident) => Some(ident),
-                Expr::CompoundIdentifier(parts) => parts.last(),
+/// The names of the columns of a walk or of a `LATERAL` step, the ones
+/// `listed` declares, else the ones `first`, the first `SELECT` of its
+/// query, returns. `None` where an item returns no name or two columns
+/// share one.
+fn walk_columns<'q>(
+    listed: &'q [TableAliasColumnDef],
+    first: Option<&'q Select>,
+) -> Option<Vec<&'q Ident>> {
+    let columns: Vec<&Ident> = if listed.is_empty() {
+        first?
+            .projection
+            .iter()
+            .map(|item| {
+                match item {
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias),
+                    SelectItem::UnnamedExpr(expression) => {
+                        match unnest(expression) {
+                            Expr::Identifier(ident) => Some(ident),
+                            Expr::CompoundIdentifier(parts) => parts.last(),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Option<_>>()?
+    } else {
+        listed
+            .iter()
+            .map(|column| column.data_type.is_none().then_some(&column.name))
+            .collect::<Option<_>>()?
+    };
+    let distinct = columns.iter().enumerate().all(|(position, column)| {
+        !columns[..position].iter().any(|earlier| same_ident(earlier, column))
+    });
+    distinct.then_some(columns)
+}
+
+/// The expression each item of `select` returns, `None` where one is a
+/// wildcard.
+fn projected_expressions(select: &Select) -> Option<Vec<&Expr>> {
+    select
+        .projection
+        .iter()
+        .map(|item| {
+            match item {
+                SelectItem::UnnamedExpr(expression)
+                | SelectItem::ExprWithAlias { expr: expression, .. } => Some(expression),
                 _ => None,
             }
-        }
-        _ => None,
-    }
+        })
+        .collect()
+}
+
+/// Whether two lists hold the same columns in the same order.
+fn same_columns<C>(left: &[&C], right: &[&C]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| core::ptr::eq(*left, *right))
 }
 
 /// Whether `select` filters rows with nothing but `FROM` and `WHERE`.
@@ -4234,38 +4335,48 @@ fn single_column_foreign_keys<'db, DB: DatabaseLike>(
     Ok(foreign_keys)
 }
 
-/// The table `foreign_key` references, its one-column primary key and the key
-/// itself, where the key holds `column` at the position of that primary key.
+/// The table `foreign_key` references and its primary key, column by column
+/// beside `columns`, where the key holds each of `columns` at the position
+/// of a different column of that primary key and `columns` cover it.
 fn primary_reference<'db, DB: DatabaseLike>(
     foreign_key: &'db DB::ForeignKey,
-    column: &'db DB::Column,
+    columns: &[&'db DB::Column],
     database: &'db DB,
-) -> Result<Option<ReferencedKey<'db, DB>>, LookupError> {
-    let Some(referenced_column) =
-        foreign_key.referenced_column_for_host_column(database, column)?
-    else {
-        return Ok(None);
-    };
+) -> Result<Option<PrimaryReference<'db, DB>>, LookupError> {
+    let mut key: Vec<&'db DB::Column> = Vec::with_capacity(columns.len());
+    for column in columns {
+        let Some(referenced_column) =
+            foreign_key.referenced_column_for_host_column(database, column)?
+        else {
+            return Ok(None);
+        };
+        if key.iter().any(|held| core::ptr::eq(*held, referenced_column)) {
+            return Ok(None);
+        }
+        key.push(referenced_column);
+    }
     let referenced = foreign_key.referenced_table(database)?;
-    let primary = referenced.primary_key_column(database)?;
-    Ok(primary.is_some_and(|primary| core::ptr::eq(primary, referenced_column)).then_some((
-        referenced,
-        referenced_column,
-        foreign_key,
-    )))
+    let mut primary_columns = 0;
+    let covered = referenced.primary_key_columns(database)?.all(|primary| {
+        primary_columns += 1;
+        key.iter().any(|held| core::ptr::eq(*held, primary))
+    });
+    Ok((covered && primary_columns == key.len()).then_some((referenced, key)))
 }
 
-/// Whether `foreign_key` checks every row whose `column` is not `NULL`.
+/// Whether `foreign_key` checks every row whose `columns` are not `NULL`.
 fn checks_every_row<'db, DB: DatabaseLike>(
     foreign_key: &'db DB::ForeignKey,
-    column: &'db DB::Column,
+    columns: &[&'db DB::Column],
     database: &'db DB,
 ) -> Result<bool, LookupError> {
     if foreign_key.match_full(database) {
         return Ok(true);
     }
     for host in foreign_key.host_columns(database)? {
-        if !core::ptr::eq(host, column) && host.is_nullable(database)? {
+        if !columns.iter().any(|column| core::ptr::eq(host, *column))
+            && host.is_nullable(database)?
+        {
             return Ok(false);
         }
     }

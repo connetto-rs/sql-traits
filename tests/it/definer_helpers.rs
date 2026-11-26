@@ -468,14 +468,14 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                 HelperArm::Grant(grant) => render_grant(grant),
                 HelperArm::Walk(walk) => {
                     let (returned, compared) = match walk.direction() {
-                        WalkDirection::Down => (walk.child(), walk.column()),
-                        WalkDirection::Up => (walk.column(), walk.child()),
+                        WalkDirection::Down => (walk.child(), walk.parent()),
+                        WalkDirection::Up => (walk.parent(), walk.child()),
                     };
                     let mut rendered = format!(
                         "{}.{} WHERE {} IN itself",
                         walk.table().table_name(),
-                        returned.column_name(),
-                        compared.column_name(),
+                        render_columns(returned),
+                        render_columns(compared),
                     );
                     let conditions = walk
                         .restrictions()
@@ -679,20 +679,38 @@ fn cap_rows(
 }
 
 /// Evaluates an answer of one column over `fixture` for `request`, the way a
-/// translator lowering it to SQL over the backing tables would. A walk up
-/// the tree leaves out the `NULL` a root adds.
+/// translator lowering it to SQL over the backing tables would.
 fn evaluate(
     set: &HelperSet<'_, ParserDB>,
     request: Request,
     fixture: Rows,
 ) -> BTreeSet<&'static str> {
-    let mut returned: BTreeSet<&'static str> = arm_rows(set, request, fixture)
+    let mut returned: BTreeSet<&'static str> = walked_rows(set, request, fixture)
         .into_iter()
         .map(|row| {
             let [value] = row[..] else { panic!("the helper returns one column") };
             value
         })
         .collect();
+    if let Some(selection) = set.selection() {
+        let mut kept = BTreeSet::new();
+        for grant in selection {
+            grant_rows(grant, request, fixture, &mut kept);
+        }
+        returned.retain(|value| kept.contains(&vec![*value]));
+    }
+    returned
+}
+
+/// The rows the arms of `set` return over `fixture` for `request` and the
+/// rows its walks add to them, before its selection. A walk up the tree
+/// leaves out the `NULL` a root adds.
+fn walked_rows(
+    set: &HelperSet<'_, ParserDB>,
+    request: Request,
+    fixture: Rows,
+) -> BTreeSet<Vec<&'static str>> {
+    let mut returned = arm_rows(set, request, fixture);
     // A walk adds the rows next to what the set holds until it holds them
     // all, as PostgreSQL's `UNION` iterates its working table.
     loop {
@@ -700,8 +718,8 @@ fn evaluate(
         for arm in set.arms() {
             let HelperArm::Walk(walk) = arm else { continue };
             let (reached, added) = match walk.direction() {
-                WalkDirection::Down => (walk.column(), walk.child()),
-                WalkDirection::Up => (walk.child(), walk.column()),
+                WalkDirection::Down => (walk.parent(), walk.child()),
+                WalkDirection::Up => (walk.child(), walk.parent()),
             };
             let excluded: Vec<_> = walk
                 .exclusions()
@@ -714,10 +732,10 @@ fn evaluate(
                     nullable(row, exclusion.column().column_name())
                         .map_or(excluded.is_empty(), |value| !excluded.contains(value))
                 });
-                if nullable(row, reached.column_name()).is_some_and(|held| returned.contains(held))
+                if values(row, reached).is_some_and(|held| returned.contains(&held))
                     && walk.restrictions().iter().all(|restriction| restricts(restriction, row))
                     && outside
-                    && let Some(added) = nullable(row, added.column_name())
+                    && let Some(added) = values(row, added)
                 {
                     grew |= returned.insert(added);
                 }
@@ -727,14 +745,24 @@ fn evaluate(
             break;
         }
     }
-    if let Some(selection) = set.selection() {
-        let mut kept = BTreeSet::new();
-        for grant in selection {
-            grant_rows(grant, request, fixture, &mut kept);
-        }
-        returned.retain(|value| kept.contains(&vec![*value]));
-    }
     returned
+}
+
+/// The values `row` holds in `columns`, `None` where one is `NULL`.
+fn values(
+    row: &[(&str, &'static str)],
+    columns: &[&<ParserDB as DatabaseLike>::Column],
+) -> Option<Vec<&'static str>> {
+    columns.iter().map(|column| nullable(row, column.column_name())).collect()
+}
+
+/// Columns by name, one bare and several in parentheses.
+fn render_columns(columns: &[&<ParserDB as DatabaseLike>::Column]) -> String {
+    let names: Vec<&str> = columns.iter().map(ColumnLike::column_name).collect();
+    match names.as_slice() {
+        [name] => (*name).to_string(),
+        _ => format!("({})", names.join(", ")),
+    }
 }
 
 /// Adds the rows `grant` returns over `fixture` for `request` to `returned`,
@@ -837,18 +865,16 @@ fn crossed(columns: &[Vec<&'static str>]) -> Vec<Vec<&'static str>> {
     })
 }
 
-/// The rows `set` returns over `fixture` for `request`, the walks of a set
-/// of one column included.
+/// The rows `set` returns over `fixture` for `request`, its walks included.
 fn helper_rows(
     set: &HelperSet<'_, ParserDB>,
     request: Request,
     fixture: Rows,
 ) -> BTreeSet<Vec<&'static str>> {
-    let walks = set.arms().iter().any(|arm| matches!(arm, HelperArm::Walk(_)));
-    if walks || set.selection().is_some() {
+    if set.selection().is_some() {
         return evaluate(set, request, fixture).into_iter().map(|value| vec![value]).collect();
     }
-    arm_rows(set, request, fixture)
+    walked_rows(set, request, fixture)
 }
 
 /// The rows the grant and parent arms of `set` return over `fixture` for
@@ -2977,7 +3003,7 @@ fn a_walk_of_any_other_shape_refuses_the_answer() {
     }
     let two_columns = groups(&walking(CHILD_JOIN), "")
         .replace("RETURNS SETOF TEXT", "RETURNS TABLE (id TEXT, role TEXT)");
-    assert!(shape(&two_columns), "a walk under a helper returning two columns");
+    assert!(shape(&two_columns), "a walk of one column under a helper returning two");
 
     let shadowed = format!(
         "WITH RECURSIVE reached (id) AS (SELECT id FROM reached \
@@ -3029,6 +3055,332 @@ fn a_walk_needs_the_owner_to_read_the_key_and_the_parent_column() {
         groups_with(&database, &deployment, "read"),
         Err(HelperSetError::NotExempt { table, .. }) if table == "groups"
     ));
+}
+
+const NAMESPACED: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TABLE grantees (
+  namespace_id TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL,
+  PRIMARY KEY (namespace_id, id)
+);
+CREATE TABLE teams (
+  namespace_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (namespace_id, id),
+  FOREIGN KEY (namespace_id, id) REFERENCES grantees (namespace_id, id)
+);
+CREATE TABLE team_members (
+  team_namespace_id TEXT NOT NULL, team_id TEXT NOT NULL,
+  user_namespace_id TEXT NOT NULL, user_id TEXT NOT NULL,
+  PRIMARY KEY (team_namespace_id, team_id, user_namespace_id, user_id),
+  FOREIGN KEY (team_namespace_id, team_id) REFERENCES teams (namespace_id, id),
+  FOREIGN KEY (user_namespace_id, user_id) REFERENCES grantees (namespace_id, id)
+);
+CREATE TABLE team_parents (
+  child_namespace_id TEXT NOT NULL, child_id TEXT NOT NULL,
+  parent_namespace_id TEXT NOT NULL, parent_id TEXT NOT NULL,
+  PRIMARY KEY (child_namespace_id, child_id),
+  FOREIGN KEY (child_namespace_id, child_id) REFERENCES teams (namespace_id, id),
+  FOREIGN KEY (parent_namespace_id, parent_id) REFERENCES teams (namespace_id, id)
+);
+CREATE TABLE shared_parents (
+  namespace_id TEXT NOT NULL, child_id TEXT NOT NULL, parent_id TEXT NOT NULL,
+  PRIMARY KEY (namespace_id, child_id),
+  FOREIGN KEY (namespace_id, child_id) REFERENCES teams (namespace_id, id),
+  FOREIGN KEY (namespace_id, parent_id) REFERENCES teams (namespace_id, id)
+);
+GRANT SELECT ON grantees, teams, team_members, team_parents, shared_parents TO authz_owner;
+";
+
+const NAMESPACED_ARMS: &str = "SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee \
+     WHERE grantee.id = current_setting('app.user_id', true) AND grantee.kind = 'user' \
+     UNION SELECT member.team_namespace_id, member.team_id FROM public.team_members member \
+     WHERE member.user_id = current_setting('app.user_id', true)";
+const PAIR_UP: &str = "SELECT parent.parent_namespace_id, parent.parent_id \
+     FROM public.team_parents parent JOIN reached \
+     ON (parent.child_namespace_id, parent.child_id) = (reached.namespace_id, reached.id)";
+const PAIR_DOWN: &str = "SELECT parent.child_namespace_id, parent.child_id \
+     FROM public.team_parents parent JOIN reached \
+     ON (parent.parent_namespace_id, parent.parent_id) = (reached.namespace_id, reached.id)";
+const PAIR_LAST: &str = "SELECT reached.namespace_id, reached.id FROM reached";
+
+/// A body walking from [`NAMESPACED_ARMS`] along the team tree through
+/// `term`.
+fn pair_walking(term: &str) -> String {
+    format!(
+        "WITH RECURSIVE reached (namespace_id, id) AS ({NAMESPACED_ARMS} UNION {term}) {PAIR_LAST}"
+    )
+}
+
+/// [`NAMESPACED`] with `authz.caller_grantees()` written as `body`.
+fn namespaced(body: &str) -> String {
+    format!(
+        "{NAMESPACED}
+         CREATE FUNCTION authz.caller_grantees() RETURNS TABLE (namespace_id TEXT, id TEXT)
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$ {body} $$;
+         ALTER FUNCTION authz.caller_grantees() OWNER TO authz_owner;"
+    )
+}
+
+const NAMESPACED_TEAMS: Rows = &[
+    ("grantees", &[("namespace_id", "a0"), ("id", "u1"), ("kind", "user")]),
+    ("grantees", &[("namespace_id", "b0"), ("id", "u2"), ("kind", "user")]),
+    ("grantees", &[("namespace_id", "a1"), ("id", "t11"), ("kind", "team")]),
+    ("grantees", &[("namespace_id", "a1"), ("id", "t12"), ("kind", "team")]),
+    ("grantees", &[("namespace_id", "a1"), ("id", "t14"), ("kind", "team")]),
+    ("grantees", &[("namespace_id", "b1"), ("id", "t11"), ("kind", "team")]),
+    ("grantees", &[("namespace_id", "b1"), ("id", "t13"), ("kind", "team")]),
+    ("teams", &[("namespace_id", "a1"), ("id", "t11")]),
+    ("teams", &[("namespace_id", "a1"), ("id", "t12")]),
+    ("teams", &[("namespace_id", "a1"), ("id", "t14")]),
+    ("teams", &[("namespace_id", "b1"), ("id", "t11")]),
+    ("teams", &[("namespace_id", "b1"), ("id", "t13")]),
+    (
+        "team_members",
+        &[
+            ("team_namespace_id", "a1"),
+            ("team_id", "t11"),
+            ("user_namespace_id", "a0"),
+            ("user_id", "u1"),
+        ],
+    ),
+    (
+        "team_members",
+        &[
+            ("team_namespace_id", "b1"),
+            ("team_id", "t13"),
+            ("user_namespace_id", "b0"),
+            ("user_id", "u2"),
+        ],
+    ),
+    (
+        "team_parents",
+        &[
+            ("child_namespace_id", "a1"),
+            ("child_id", "t11"),
+            ("parent_namespace_id", "a1"),
+            ("parent_id", "t12"),
+        ],
+    ),
+    (
+        "team_parents",
+        &[
+            ("child_namespace_id", "a1"),
+            ("child_id", "t12"),
+            ("parent_namespace_id", "a1"),
+            ("parent_id", "t14"),
+        ],
+    ),
+    (
+        "team_parents",
+        &[
+            ("child_namespace_id", "b1"),
+            ("child_id", "t11"),
+            ("parent_namespace_id", "b1"),
+            ("parent_id", "t13"),
+        ],
+    ),
+    ("shared_parents", &[("namespace_id", "a1"), ("child_id", "t11"), ("parent_id", "t12")]),
+    ("shared_parents", &[("namespace_id", "a1"), ("child_id", "t12"), ("parent_id", "t14")]),
+    ("shared_parents", &[("namespace_id", "b1"), ("child_id", "t11"), ("parent_id", "t13")]),
+];
+
+/// What PostgreSQL 18.7 returns for a caller from `authz.caller_grantees()`
+/// over [`NAMESPACED_TEAMS`] written as `pair_walking(PAIR_UP)`, then as
+/// `pair_walking(PAIR_DOWN)`. The walk up over `shared_parents` returns what
+/// the walk up over `team_parents` does.
+type PairsMeasured = (&'static str, &'static [[&'static str; 2]], &'static [[&'static str; 2]]);
+
+const NAMESPACED_MEASURED: &[PairsMeasured] = &[
+    (
+        "u1",
+        &[["a0", "u1"], ["a1", "t11"], ["a1", "t12"], ["a1", "t14"]],
+        &[["a0", "u1"], ["a1", "t11"]],
+    ),
+    ("u2", &[["b0", "u2"], ["b1", "t13"]], &[["b0", "u2"], ["b1", "t11"], ["b1", "t13"]]),
+    ("zed", &[], &[]),
+];
+
+fn caller_grantees<'db>(
+    database: &'db ParserDB,
+    deployment: &'db Deployment,
+) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    answer(database, deployment, "authz", "caller_grantees", &[])
+}
+
+/// Checks `set`, written with `body` walking in `direction`, against what
+/// PostgreSQL returns for each caller of [`NAMESPACED_MEASURED`].
+fn assert_pairs_measured(set: &HelperSet<'_, ParserDB>, direction: WalkDirection, body: &str) {
+    for &(caller, up, down) in NAMESPACED_MEASURED {
+        let expected = match direction {
+            WalkDirection::Up => up,
+            WalkDirection::Down => down,
+        };
+        let expected: Vec<Vec<&str>> = expected.iter().map(|pair| pair.to_vec()).collect();
+        let returned: Vec<_> =
+            helper_rows(set, Request::of(caller), NAMESPACED_TEAMS).into_iter().collect();
+        assert_eq!(returned, expected, "{caller} walking {body}");
+    }
+}
+
+#[test]
+fn a_walk_over_a_composite_key_follows_each_edge_by_the_whole_key() {
+    let deployment = deployment();
+    let up = "team_parents.(parent_namespace_id, parent_id) \
+         WHERE (child_namespace_id, child_id) IN itself";
+    let down = "team_parents.(child_namespace_id, child_id) \
+         WHERE (parent_namespace_id, parent_id) IN itself";
+    let shared =
+        "shared_parents.(namespace_id, parent_id) WHERE (namespace_id, child_id) IN itself";
+    let team_parents = ("(child_namespace_id, child_id)", "(parent_namespace_id, parent_id)");
+    for (body, rendered, direction, (child, parent)) in [
+        (pair_walking(PAIR_UP), up, WalkDirection::Up, team_parents),
+        (
+            pair_walking(&PAIR_UP.replace(
+                "(parent.child_namespace_id, parent.child_id) = (reached.namespace_id, reached.id)",
+                "parent.child_namespace_id = reached.namespace_id AND parent.child_id = reached.id",
+            )),
+            up,
+            WalkDirection::Up,
+            team_parents,
+        ),
+        (
+            pair_walking(
+                "SELECT parent.parent_namespace_id, parent.parent_id FROM reached r \
+                 JOIN public.team_parents AS parent \
+                 ON (r.namespace_id, r.id) = (parent.child_namespace_id, parent.child_id)",
+            ),
+            up,
+            WalkDirection::Up,
+            team_parents,
+        ),
+        (
+            pair_walking(PAIR_UP)
+                .replace("reached (namespace_id, id) AS", "reached AS")
+                .replace(PAIR_LAST, "SELECT namespace_id, id FROM reached"),
+            up,
+            WalkDirection::Up,
+            team_parents,
+        ),
+        (
+            pair_walking(
+                "SELECT step.parent_namespace_id, step.parent_id FROM reached CROSS JOIN LATERAL \
+                 (SELECT parent.parent_namespace_id, parent.parent_id FROM public.team_parents parent \
+                 WHERE (parent.child_namespace_id, parent.child_id) = (reached.namespace_id, reached.id)) step",
+            ),
+            up,
+            WalkDirection::Up,
+            team_parents,
+        ),
+        (
+            pair_walking(
+                "SELECT s.ns, s.node FROM reached, LATERAL \
+                 (SELECT parent_namespace_id, parent_id FROM public.team_parents \
+                 WHERE child_id = reached.id AND child_namespace_id = reached.namespace_id) AS s (ns, node)",
+            ),
+            up,
+            WalkDirection::Up,
+            team_parents,
+        ),
+        (pair_walking(PAIR_DOWN), down, WalkDirection::Down, team_parents),
+        (
+            pair_walking(
+                "SELECT parent.namespace_id, parent.parent_id FROM public.shared_parents parent \
+                 JOIN reached ON (parent.namespace_id, parent.child_id) = (reached.namespace_id, reached.id)",
+            ),
+            shared,
+            WalkDirection::Up,
+            ("(namespace_id, child_id)", "(namespace_id, parent_id)"),
+        ),
+    ] {
+        let database = postgres(&namespaced(&body));
+        let set = caller_grantees(&database, &deployment).expect("answered");
+        assert_eq!(
+            render(&set),
+            format!(
+                "grantees.(namespace_id, id) WHERE id = app.user_id AND kind IN ('user') \
+                 UNION team_members.(team_namespace_id, team_id) WHERE user_id = app.user_id \
+                 UNION {rendered}"
+            ),
+            "{body}"
+        );
+        assert_eq!(covered(&set), None, "{body}");
+        let HelperArm::Walk(walk) = &set.arms()[2] else { panic!("the third arm is the walk") };
+        assert_eq!(walk.direction(), direction, "{body}");
+        assert_eq!(walk.tree().table_name(), "teams", "{body}");
+        assert_eq!(render_columns(walk.key()), "(namespace_id, id)", "{body}");
+        assert_eq!(render_columns(walk.child()), child, "{body}");
+        assert_eq!(render_columns(walk.parent()), parent, "{body}");
+        let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
+        assert_eq!(referenced.table_name(), "teams", "{body}");
+        assert_pairs_measured(&set, direction, &body);
+    }
+}
+
+#[test]
+fn a_walk_pairing_its_columns_with_other_key_columns_refuses_the_answer() {
+    let deployment = deployment();
+    let returning = |returned: &str| {
+        pair_walking(&PAIR_UP.replace("parent.parent_namespace_id, parent.parent_id", returned))
+    };
+    for body in [
+        returning("parent.parent_id, parent.parent_namespace_id"),
+        returning("parent.child_namespace_id, parent.parent_id"),
+        returning("parent.child_namespace_id, parent.child_id"),
+        pair_walking(
+            &PAIR_UP.replace(
+                "(reached.namespace_id, reached.id)",
+                "(reached.id, reached.namespace_id)",
+            ),
+        ),
+        pair_walking(&PAIR_UP.replace(
+            "(parent.child_namespace_id, parent.child_id) = (reached.namespace_id, reached.id)",
+            "parent.child_id = reached.id",
+        )),
+        pair_walking(&PAIR_UP.replace(") = (reached", ") <> (reached")),
+        pair_walking(PAIR_UP)
+            .replace(PAIR_LAST, "SELECT reached.id, reached.namespace_id FROM reached"),
+        pair_walking(PAIR_UP)
+            .replace(PAIR_LAST, "SELECT reached.namespace_id, reached.namespace_id FROM reached"),
+    ] {
+        let database = postgres(&namespaced(&body));
+        assert!(
+            matches!(
+                caller_grantees(&database, &deployment),
+                Err(HelperSetError::ArmShape { function, .. }) if function == "authz.caller_grantees"
+            ),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_walk_over_a_composite_key_needs_the_owner_to_read_every_edge_column() {
+    let deployment = deployment();
+    let columns = |granted: &str| {
+        namespaced(&pair_walking(PAIR_UP)).replace(
+            "GRANT SELECT ON grantees, teams, team_members, team_parents, shared_parents",
+            &format!(
+                "GRANT SELECT ({granted}) ON team_parents TO authz_owner;
+                 GRANT SELECT ON grantees, teams, team_members, shared_parents"
+            ),
+        )
+    };
+    let database =
+        postgres(&columns("child_namespace_id, child_id, parent_namespace_id, parent_id"));
+    caller_grantees(&database, &deployment).expect("answered");
+    for granted in
+        ["child_id, parent_namespace_id, parent_id", "child_namespace_id, child_id, parent_id"]
+    {
+        let database = postgres(&columns(granted));
+        assert!(
+            matches!(
+                caller_grantees(&database, &deployment),
+                Err(HelperSetError::MissingSelect { table, .. }) if table == "team_parents"
+            ),
+            "{granted}"
+        );
+    }
 }
 
 /// Share links a request presents and app installations capped per table and
@@ -3282,7 +3634,7 @@ fn a_recursive_walk_answers_its_arms_and_the_walk_up_the_parent_column() {
         assert_eq!(covered(&set), Some("groups"), "{body}");
         let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
         assert_eq!(walk.direction(), WalkDirection::Up);
-        assert_eq!(walk.column().column_name(), "parent_id");
+        assert_eq!(render_columns(walk.parent()), "parent_id");
     }
 
     assert_walk_measured(PARENT_JOIN, TREE_UP_MEASURED);
@@ -6156,8 +6508,8 @@ fn a_walk_reads_an_edge_table_down_and_up_its_unique_column() {
         let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
         assert_eq!(walk.direction(), direction, "{term}");
         assert_eq!(walk.tree().table_name(), "folders", "{term}");
-        assert_eq!(walk.key().column_name(), "id", "{term}");
-        assert_eq!(walk.child().column_name(), "folder_id", "{term}");
+        assert_eq!(render_columns(walk.key()), "id", "{term}");
+        assert_eq!(render_columns(walk.child()), "folder_id", "{term}");
         let referenced = walk.foreign_key().referenced_table(&database).expect("resolves");
         assert_eq!(referenced.table_name(), "folders", "{term}");
     }
@@ -6204,7 +6556,7 @@ fn a_self_referencing_walk_reads_its_key_as_the_child() {
     let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
     assert_eq!(walk.tree().table_name(), "groups");
     assert_eq!(walk.table().table_name(), "groups");
-    assert!(core::ptr::eq(walk.child(), walk.key()));
+    assert_eq!(walk.child(), walk.key());
 }
 
 #[test]
@@ -7073,8 +7425,8 @@ fn a_lateral_step_walks_every_edge_its_union_reads() {
             let HelperArm::Walk(walk) = arm else { panic!("every arm after the first walks") };
             assert_eq!(walk.direction(), direction, "{term}");
             assert_eq!(walk.tree().table_name(), "resources", "{term}");
-            assert_eq!(walk.key().column_name(), "id", "{term}");
-            assert_eq!(walk.child().column_name(), "id", "{term}");
+            assert_eq!(render_columns(walk.key()), "id", "{term}");
+            assert_eq!(render_columns(walk.child()), "id", "{term}");
         }
         assert_walked(&set, direction, term, HIERARCHY_MEASURED.iter().copied());
     }

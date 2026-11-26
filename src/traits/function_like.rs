@@ -2346,30 +2346,35 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   condition (see [`CalledArm`](crate::structs::CalledArm)).
     ///
     /// A body walking a tree, or any graph of edges, is `WITH RECURSIVE
-    /// <walk> [(<column>)] AS (<arms> UNION <term>) SELECT <column> FROM
-    /// <walk>`. The term walks down as `SELECT <child> FROM <table> JOIN
-    /// <walk> ON <parent column> = <walk>.<column>` and up as `SELECT
-    /// <parent column> FROM <table> JOIN <walk> ON <child> = <walk>.<column>`,
-    /// the join either way round. A term walking several edges at once is
-    /// `SELECT <step>.<column> FROM <walk> CROSS JOIN LATERAL (<edges>)
-    /// <step>`, or `FROM <walk>, LATERAL`, the edges a `UNION` or `UNION ALL`
-    /// of `SELECT <child> FROM <table> WHERE <parent column> =
-    /// <walk>.<column>` walking down and `SELECT <parent column> FROM <table>
-    /// WHERE <child> = <walk>.<column>` walking up. `<parent column>` names a
-    /// row of the tree through a foreign key holding it at the position of the
-    /// tree's one-column primary key, alone or among other columns, and
-    /// checking every row naming one, its match `FULL` or its other columns
-    /// `NOT NULL`. The table is the tree itself, with `<child>` its primary
-    /// key, or an edge table, with `<child>` naming a row of the tree the same
-    /// way. The tree is the one table the two columns name a row of, so a key
-    /// into a table only one of them names constrains the edge without
-    /// changing the tree, and two tables both name refuse the walk. `<child>`
-    /// is the table's primary key or a column a unique key covers alone where
-    /// one of the two columns is, and otherwise the column the term adds, the
-    /// walk then going down. The term may follow only the edges meeting
-    /// conditions beside its comparison with the walk, in `ON` and in `WHERE`
-    /// of a join and in `WHERE` of a `LATERAL` edge. They name columns of the
-    /// edge table alone, never the walk's row, and reduce to restrictions and
+    /// <walk> [(<columns>)] AS (<arms> UNION <term>) SELECT <columns> FROM
+    /// <walk>`, the walk's columns being every column the helper returns, in
+    /// its order. The term walks down as `SELECT <children> FROM <table> JOIN
+    /// <walk> ON <parents> = <walk>.<columns>` and up as `SELECT <parents>
+    /// FROM <table> JOIN <walk> ON <children> = <walk>.<columns>`, the join
+    /// either way round, each column of the walk compared with the column of
+    /// the table at its position, one equality each or the columns together
+    /// as rows. A term walking several edges at once is `SELECT
+    /// <step>.<columns> FROM <walk> CROSS JOIN LATERAL (<edges>) <step>`, or
+    /// `FROM <walk>, LATERAL`, the edges a `UNION` or `UNION ALL` of `SELECT
+    /// <children> FROM <table> WHERE <parents> = <walk>.<columns>` walking
+    /// down and `SELECT <parents> FROM <table> WHERE <children> =
+    /// <walk>.<columns>` walking up. `<parents>` name a row of the tree
+    /// through a foreign key holding each of them at the position of a
+    /// different column of the tree's primary key, which they cover, alone
+    /// or among other columns, and checking every row naming one, its match
+    /// `FULL` or its other columns `NOT NULL`. The table is the tree itself,
+    /// with `<children>` its primary key, or an edge table, with `<children>`
+    /// naming a row of the tree the same way, each column holding the same
+    /// column of the key as the parent column at its position. The tree is
+    /// the one table the two lists name a row of, so a key into a table only
+    /// one of them names constrains the edge without changing the tree, and
+    /// two tables both name refuse the walk. `<children>` are the table's
+    /// primary key or columns a unique key covers alone where one of the two
+    /// lists is, and otherwise the columns the term adds, the walk then going
+    /// down. The term may follow only the edges meeting conditions beside its
+    /// comparison with the walk, in `ON` and in `WHERE` of a join and in
+    /// `WHERE` of a `LATERAL` edge. They name columns of the edge table
+    /// alone, never the walk's row, and reduce to restrictions and
     /// bounds against the statement time the way a grant arm's do, or exclude
     /// a column from another helper's set the way a grant arm's exclusion
     /// does, a set reaching the walking helper again being a call cycle. They
@@ -2380,11 +2385,11 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// for an edge whose conditions keep no row. `UNION ALL` between the arms
     /// and the term is refused, since it never ends on edges closing a cycle.
     ///
-    /// The final query may instead reselect what the walk reached, `SELECT
-    /// <key> FROM <table> WHERE <key> IN (SELECT <column> FROM <walk>) [AND
-    /// <conditions>]`, where `<table>` is the one the set covers (see
-    /// [`HelperSet::covered_table`]), so the walk reaches keys of it alone.
-    /// The conditions are read as a grant arm's and answered as the
+    /// The final query may instead reselect what a walk of one column
+    /// reached, `SELECT <key> FROM <table> WHERE <key> IN (SELECT <column>
+    /// FROM <walk>) [AND <conditions>]`, where `<table>` is the one the set
+    /// covers (see [`HelperSet::covered_table`]), so the walk reaches keys of
+    /// it alone. The conditions are read as a grant arm's and answered as the
     /// [`selection`](HelperSet::selection), left out where they keep every
     /// row.
     ///
