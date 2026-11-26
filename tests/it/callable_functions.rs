@@ -135,19 +135,23 @@ fn a_bare_name_shared_by_callable_functions_is_refused() {
 
 #[test]
 fn a_function_not_called_by_its_bare_name_is_refused() {
-    let database = parse(API);
+    // `pg_catalog` comes first, so a bare `now()` reaches the catalog's own.
+    let database = parse(&format!(
+        "{API}
+         CREATE FUNCTION public.now() RETURNS text LANGUAGE sql AS $$ SELECT 'n' $$;"
+    ));
     let unreached = callable(&database, None);
     assert_eq!(
         unreached,
         Err(CallableFunctionsError::UnreachedByBareName {
-            function: "api.search(text)".into(),
+            function: "public.now()".into(),
             search_path: "public".into(),
-            reaches: Vec::new(),
+            reaches: vec!["pg_catalog.now()".into()],
         })
     );
     assert_eq!(
         unreached.expect_err("refused").to_string(),
-        "a call of `api.search(text)` by its bare name on search_path `public` reaches no function"
+        "a call of `public.now()` by its bare name on search_path `public` reaches pg_catalog.now()"
     );
 
     // `pg_catalog` comes first, so `lower` reaches the catalog's own.
@@ -172,6 +176,25 @@ fn a_function_not_called_by_its_bare_name_is_refused() {
     assert_eq!(
         callable(&unusable, Some("internal, api")),
         Ok(vec!["rebuild".to_string(), "search".to_string()])
+    );
+}
+
+#[test]
+fn a_function_off_the_path_is_left_out() {
+    // Policy helpers the role must execute, in a schema off its path.
+    let database = parse(&format!(
+        "{API}
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO app;
+         CREATE FUNCTION authz.can_read() RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;
+         CREATE FUNCTION authz.search(term text) RETURNS SETOF text
+             LANGUAGE sql STABLE AS $$ SELECT term $$;"
+    ));
+    assert_eq!(callable(&database, Some("api")), Ok(vec!["search".to_string()]));
+    assert_eq!(callable(&database, None), Ok(Vec::new()));
+    assert_eq!(
+        callable(&database, Some("authz")),
+        Ok(vec!["can_read".to_string(), "search".to_string()])
     );
 }
 

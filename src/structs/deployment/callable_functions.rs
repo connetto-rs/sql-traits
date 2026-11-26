@@ -33,15 +33,18 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     /// and every extension, it is a plain function returning neither
     /// `trigger` nor `event_trigger`, the role may
     /// [execute](FunctionLike::can_execute) it, `PUBLIC`'s default grant and
-    /// inherited memberships included, and the role holds
-    /// [`USAGE`](SchemaLike::has_usage) on its schema. A function in a schema
-    /// the database does not declare is not listed.
+    /// inherited memberships included, the role holds
+    /// [`USAGE`](SchemaLike::has_usage) on its schema, and that schema is on
+    /// [`Self::search_path`]. A function in a schema the database does not
+    /// declare is not listed, nor one in a schema off the path, such as a
+    /// policy's helper the role must execute yet never calls itself.
     ///
     /// Every listed function must be what a call of its bare name reaches,
     /// so a client can call each by that name alone. The bare names are
-    /// looked up on [`Self::search_path`] as PostgreSQL looks them up,
-    /// `pg_catalog` first unless the path places it, `"$user"` read as the
-    /// acting role, and each schema the role holds no `USAGE` on skipped.
+    /// looked up on the path as PostgreSQL looks them up, `pg_catalog` first
+    /// unless the path places it, `"$user"` read as the acting role, the
+    /// temporary schema and each schema the role holds no `USAGE` on
+    /// skipped.
     ///
     /// # Errors
     ///
@@ -49,11 +52,11 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     /// deployment does not act as or a `search_path` it cannot settle,
     /// [`CallableFunctionsError::Lookup`] when a function's privileges cannot
     /// be read, [`CallableFunctionsError::SharedBareName`] when the role may
-    /// call two functions whose names compare equal without case, as
-    /// overloads and one name in two schemas do, and
+    /// call two listed functions whose names compare equal without case, as
+    /// overloads and one name in two schemas on the path do, and
     /// [`CallableFunctionsError::UnreachedByBareName`] when a bare call taking
     /// as many arguments as a listed function accepts reaches another
-    /// function as well, or not that one.
+    /// function, such as a `pg_catalog` function of the same name.
     ///
     /// # Example
     ///
@@ -85,12 +88,9 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
     ///     resolved.callable_functions("app")?.into_iter().map(FunctionLike::name).collect();
     /// assert_eq!(callable, ["search"]);
     ///
-    /// // On the default path a bare `search` reaches nothing.
+    /// // On the default path `public`, no function is listed.
     /// let default_path = Deployment::new("authenticator", ["app"], [])?;
-    /// assert!(matches!(
-    ///     default_path.resolve(&database)?.callable_functions("app"),
-    ///     Err(CallableFunctionsError::UnreachedByBareName { .. })
-    /// ));
+    /// assert!(default_path.resolve(&database)?.callable_functions("app")?.is_empty());
     /// # Ok(())
     /// # }
     /// ```
@@ -102,14 +102,18 @@ impl<'db, DB: DatabaseLike> ResolvedDeployment<'db, DB> {
         let path = self.search_path(acting_role)?;
         let database = self.database;
         let case = database.identifier_case();
+        let lookup = lookup_path(database, role, &path, case);
+        let searched = RoutinePath::Set(&lookup).schemas(database);
         let mut callable = Vec::new();
         for function in database.functions() {
-            if is_listed(function, database)? && may_call(function, role, database, case)? {
+            if is_listed(function, database)?
+                && is_on_path(function, &searched, case)
+                && function.can_execute(role, database)?
+            {
                 callable.push(function);
             }
         }
         refuse_shared_bare_names(&callable, database)?;
-        let lookup = lookup_path(database, role, &path, case);
         for &function in &callable {
             refuse_unreached(function, database, &lookup, &path, case)?;
         }
@@ -145,25 +149,19 @@ fn is_listed<DB: DatabaseLike>(
     ))
 }
 
-/// Whether `role` may execute `function` and holds `USAGE` on its schema.
-///
-/// # Errors
-///
-/// Returns the [`LookupError`] reading the function's privileges raises.
-fn may_call<DB: DatabaseLike>(
-    function: &DB::Function,
-    role: &DB::Role,
-    database: &DB,
+/// Whether `function`'s schema is one of `searched`, the schemas a bare
+/// function name is looked up in, each declared and usable by the role.
+fn is_on_path<F: FunctionLike>(
+    function: &F,
+    searched: &[(&str, bool)],
     case: IdentifierCase,
-) -> Result<bool, LookupError> {
-    if !function.can_execute(role, database)? {
-        return Ok(false);
-    }
+) -> bool {
     let target = function.target_name();
     let (schema, quoted) =
         target.schema().map_or(("public", false), |schema| (schema, target.schema_is_quoted()));
-    Ok(declared_schema(database, schema, quoted, case)
-        .is_some_and(|declared| declared.has_usage(role, database)))
+    searched
+        .iter()
+        .any(|&(entry, entry_quoted)| case.identifiers_match(schema, quoted, entry, entry_quoted))
 }
 
 /// The schema `database` declares under `name`.
