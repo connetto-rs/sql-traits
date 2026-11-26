@@ -15,18 +15,51 @@ use crate::{
     errors::LookupError,
     structs::{CallResolution, ColumnScope, ExpressionContext, FunctionKind, QueryOutput},
     traits::{DatabaseLike, DialectLike, FunctionLike, Relation, TableLike, ViewLike},
-    utils::{object_name::resolve_bound_relation_object_name, walk::walk},
+    utils::{
+        object_name::resolve_bound_relation_object_name,
+        walk::{walk, walk_expressions},
+    },
 };
 
 /// The relation PostgreSQL rewrites an `INSERT`, `UPDATE`, `DELETE` or
 /// `MERGE` targeting an automatically updatable view onto, with what each
-/// output column of the view writes there.
-///
-/// Each column list holds one entry per output column of the view, in output
-/// order, and `None` for a column PostgreSQL refuses to write because it is
-/// no simple reference to a column of the relation.
+/// output column of the view writes there and the condition the view puts on
+/// the write.
 #[derive(Debug)]
-pub enum UpdatableViewBase<'db, DB: DatabaseLike> {
+pub struct UpdatableViewBase<'db, DB: DatabaseLike> {
+    /// The relation written, with what the view's columns and condition
+    /// reach in it.
+    pub relation: WrittenRelation<'db, DB>,
+    /// The `WHERE` of the definition's one `SELECT`, as written, or `None`
+    /// when it has none.
+    ///
+    /// PostgreSQL adds it to an `UPDATE`, `DELETE` or `MERGE` through the
+    /// view, so the write reaches only the rows of the relation it admits.
+    /// A view with a check option also tests each row a write through it
+    /// inserts or updates against it.
+    pub condition: Option<&'db Expr>,
+}
+
+/// The relation a write through an automatically updatable view lands on.
+///
+/// Each `columns` list holds one entry per output column of the view, in
+/// output order, and `None` for a column PostgreSQL refuses to write because
+/// it is no simple reference to a column of the relation.
+///
+/// Each `condition_columns` list holds one entry per column reference inside
+/// [`UpdatableViewBase::condition`] that binds to a column of the relation,
+/// in walk order. An entry pairs the reference's index in the pre-order walk
+/// sqlparser's `visit_expressions` makes over the condition, counting every
+/// expression it meets from zero, with the column the reference binds to.
+/// The reference is an [`Expr::Identifier`] or an
+/// [`Expr::CompoundIdentifier`], bound by the names the definition's `FROM`
+/// item gives the relation and its columns, alias and column aliases
+/// included. An identifier of either kind left out binds to no column of the
+/// relation. It reads a relation a subquery in the condition reads, names the
+/// whole row of the relation, such as `r` in `row_to_json(r)`, or names no
+/// column at all, such as the field `amount` in `(r.payload).amount`.
+#[derive(Debug)]
+pub enum WrittenRelation<'db, DB: DatabaseLike> {
     /// A table, whose own triggers, rules and row-level security policies
     /// then apply to the write.
     Table {
@@ -34,6 +67,8 @@ pub enum UpdatableViewBase<'db, DB: DatabaseLike> {
         table: &'db DB::Table,
         /// The column of the table each output column writes.
         columns: Vec<Option<&'db DB::Column>>,
+        /// The column of the table each reference in the condition reads.
+        condition_columns: Vec<(usize, &'db DB::Column)>,
     },
     /// A foreign table, whose foreign data wrapper takes the write.
     ForeignTable {
@@ -41,6 +76,8 @@ pub enum UpdatableViewBase<'db, DB: DatabaseLike> {
         table: &'db DB::Table,
         /// The column of the table each output column writes.
         columns: Vec<Option<&'db DB::Column>>,
+        /// The column of the table each reference in the condition reads.
+        condition_columns: Vec<(usize, &'db DB::Column)>,
     },
     /// Another view, which takes the write as it takes one written to it
     /// directly, through an `INSTEAD OF` trigger or an `INSTEAD` rule on it,
@@ -51,17 +88,20 @@ pub enum UpdatableViewBase<'db, DB: DatabaseLike> {
         /// The position among that view's output columns, from zero, each
         /// output column writes.
         columns: Vec<Option<usize>>,
+        /// The position among that view's output columns, from zero, each
+        /// reference in the condition reads.
+        condition_columns: Vec<(usize, usize)>,
     },
 }
 
 /// The one relation a view definition reads, as its `FROM` list names it.
 struct Source<'query, 'db, DB: DatabaseLike> {
     factor: &'query TableFactor,
-    relation: Written<'db, DB>,
+    relation: SourceRelation<'db, DB>,
 }
 
 /// A relation of a kind a write through a view lands on.
-enum Written<'db, DB: DatabaseLike> {
+enum SourceRelation<'db, DB: DatabaseLike> {
     Table(&'db DB::Table),
     ForeignTable(&'db DB::Table),
     View(&'db DB::View),
@@ -77,7 +117,7 @@ impl<'db, DB: DatabaseLike> UpdatableViewBase<'db, DB> {
     /// Returns the lookup errors resolving the definition's relation and
     /// column names runs into.
     pub(crate) fn of_definition(
-        definition: &Query,
+        definition: &'db Query,
         database: &'db DB,
     ) -> Result<Option<Self>, LookupError> {
         if database.dialect().sqlparser_dialect().is::<SQLiteDialect>() {
@@ -106,15 +146,27 @@ impl<'db, DB: DatabaseLike> UpdatableViewBase<'db, DB> {
         let Some(positions) = output_positions(select, &source, &context, database)? else {
             return Ok(None);
         };
-        Ok(Some(match source.relation {
-            Written::Table(table) => {
-                Self::Table { table, columns: table_columns(table, &positions, database)? }
+        let condition = select.selection.as_ref();
+        let read = match condition {
+            Some(condition) => condition_positions(condition, source.factor, &context)?,
+            None => Vec::new(),
+        };
+        let relation = match source.relation {
+            SourceRelation::Table(table) => {
+                let (columns, condition_columns) =
+                    table_columns(table, &positions, &read, database)?;
+                WrittenRelation::Table { table, columns, condition_columns }
             }
-            Written::ForeignTable(table) => {
-                Self::ForeignTable { table, columns: table_columns(table, &positions, database)? }
+            SourceRelation::ForeignTable(table) => {
+                let (columns, condition_columns) =
+                    table_columns(table, &positions, &read, database)?;
+                WrittenRelation::ForeignTable { table, columns, condition_columns }
             }
-            Written::View(view) => Self::View { view, columns: positions },
-        }))
+            SourceRelation::View(view) => {
+                WrittenRelation::View { view, columns: positions, condition_columns: read }
+            }
+        };
+        Ok(Some(Self { relation, condition }))
     }
 }
 
@@ -172,9 +224,9 @@ fn single_source<'query, 'db, DB: DatabaseLike>(
         return Ok(None);
     };
     let relation = match resolve_bound_relation_object_name(name, database)? {
-        Some(Relation::Table(table)) => Written::Table(table),
-        Some(Relation::ForeignTable(table)) => Written::ForeignTable(table),
-        Some(Relation::View(view)) => Written::View(view),
+        Some(Relation::Table(table)) => SourceRelation::Table(table),
+        Some(Relation::ForeignTable(table)) => SourceRelation::ForeignTable(table),
+        Some(Relation::View(view)) => SourceRelation::View(view),
         Some(Relation::MaterializedView(_) | Relation::Sequence(_)) | None => return Ok(None),
     };
     Ok(Some(Source { factor, relation }))
@@ -377,17 +429,47 @@ fn referenced_position<DB: DatabaseLike>(
         .map(|entry| entry.ordinal()))
 }
 
+/// Each column reference inside `condition` that binds to a column of
+/// `factor`, as its index in the pre-order walk over `condition` paired with
+/// the position of that column among `factor`'s.
+fn condition_positions<DB: DatabaseLike>(
+    condition: &Expr,
+    factor: &TableFactor,
+    context: &ExpressionContext<'_, '_, DB>,
+) -> Result<Vec<(usize, usize)>, LookupError> {
+    let mut read = Vec::new();
+    let mut index = 0;
+    let walked = walk_expressions(condition, |expression| {
+        let at = index;
+        index += 1;
+        if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+            return ControlFlow::Continue(());
+        }
+        match referenced_position(expression, factor, context) {
+            Ok(position) => {
+                read.extend(position.map(|position| (at, position)));
+                ControlFlow::Continue(())
+            }
+            Err(error) => ControlFlow::Break(error),
+        }
+    });
+    match walked {
+        ControlFlow::Continue(()) => Ok(read),
+        ControlFlow::Break(error) => Err(error),
+    }
+}
+
 /// How many columns a wildcard over `relation` reaches, or `None` when the
 /// output of a view cannot be enumerated.
 fn source_width<DB: DatabaseLike>(
-    relation: &Written<'_, DB>,
+    relation: &SourceRelation<'_, DB>,
     database: &DB,
 ) -> Result<Option<usize>, LookupError> {
     match relation {
-        Written::Table(table) | Written::ForeignTable(table) => {
+        SourceRelation::Table(table) | SourceRelation::ForeignTable(table) => {
             Ok(Some(table.columns(database)?.count()))
         }
-        Written::View(view) => {
+        SourceRelation::View(view) => {
             let definition = view.definition();
             let scope = ColumnScope::for_stored_definition(definition, database)?;
             Ok(scope.scope_for_query(definition).and_then(|query| {
@@ -399,18 +481,32 @@ fn source_width<DB: DatabaseLike>(
     }
 }
 
-/// The column of `table` at each of `positions`.
+/// The column of `table` at each of `positions`, and at the position each
+/// reference of `read` reads, paired with that reference's index.
 fn table_columns<'db, DB: DatabaseLike>(
     table: &'db DB::Table,
     positions: &[Option<usize>],
+    read: &[(usize, usize)],
     database: &'db DB,
-) -> Result<Vec<Option<&'db DB::Column>>, LookupError> {
+) -> Result<TableColumns<'db, DB>, LookupError> {
     let columns: Vec<&'db DB::Column> = table.columns(database)?.collect();
-    Ok(positions
+    let written = positions
         .iter()
         .map(|position| position.and_then(|position| columns.get(position).copied()))
-        .collect())
+        .collect();
+    let condition_columns = read
+        .iter()
+        .filter_map(|(index, position)| columns.get(*position).map(|column| (*index, *column)))
+        .collect();
+    Ok((written, condition_columns))
 }
+
+/// The columns of a table each output column writes, and those the
+/// references of the condition read.
+type TableColumns<'db, DB> = (
+    Vec<Option<&'db <DB as DatabaseLike>::Column>>,
+    Vec<(usize, &'db <DB as DatabaseLike>::Column)>,
+);
 
 #[cfg(test)]
 mod tests {
@@ -422,7 +518,7 @@ mod tests {
         parser::Parser,
     };
 
-    use super::UpdatableViewBase;
+    use super::{UpdatableViewBase, WrittenRelation};
     use crate::{
         structs::ParserDB,
         traits::{ColumnLike, TableLike},
@@ -443,11 +539,13 @@ mod tests {
             .expect("query parses")
     }
 
-    fn of_definition<'db>(
-        sql: &str,
+    fn relation<'db>(
+        definition: &'db Query,
         db: &'db ParserDB,
-    ) -> Option<UpdatableViewBase<'db, ParserDB>> {
-        UpdatableViewBase::of_definition(&definition(sql), db).expect("resolves")
+    ) -> Option<WrittenRelation<'db, ParserDB>> {
+        UpdatableViewBase::of_definition(definition, db)
+            .expect("resolves")
+            .map(|base| base.relation)
     }
 
     fn names<'db, C: ColumnLike + 'db>(columns: &[Option<&'db C>]) -> Vec<Option<&'db str>> {
@@ -459,30 +557,33 @@ mod tests {
     #[test]
     fn a_wildcard_writes_every_column_it_reaches() {
         let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
-        let starred = of_definition("SELECT *, x AS again FROM t", &db);
+        let starred = definition("SELECT *, x AS again FROM t");
+        let starred = relation(&starred, &db);
         assert!(
             matches!(
                 &starred,
-                Some(UpdatableViewBase::Table { table, columns })
+                Some(WrittenRelation::Table { table, columns, .. })
                     if table.table_name() == "t"
                         && names(columns) == [Some("id"), Some("x"), Some("x")]
             ),
             "{starred:?}"
         );
-        let qualified = of_definition("SELECT v.* FROM inner_view AS v", &db);
+        let qualified = definition("SELECT v.* FROM inner_view AS v");
+        let qualified = relation(&qualified, &db);
         assert!(
             matches!(
                 &qualified,
-                Some(UpdatableViewBase::View { columns, .. })
+                Some(WrittenRelation::View { columns, .. })
                     if columns == &[Some(0), Some(1), Some(2)]
             ),
             "{qualified:?}"
         );
-        let whole = of_definition("SELECT * FROM whole_table", &db);
+        let whole = definition("SELECT * FROM whole_table");
+        let whole = relation(&whole, &db);
         assert!(
             matches!(
                 &whole,
-                Some(UpdatableViewBase::View { columns, .. }) if columns == &[Some(0), Some(1)]
+                Some(WrittenRelation::View { columns, .. }) if columns == &[Some(0), Some(1)]
             ),
             "{whole:?}"
         );
@@ -493,7 +594,7 @@ mod tests {
     #[test]
     fn a_wildcard_over_columns_of_unknown_width_answers_nothing() {
         let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
-        assert!(of_definition("SELECT * FROM opaque", &db).is_none());
+        assert!(relation(&definition("SELECT * FROM opaque"), &db).is_none());
     }
 
     /// A wildcard modifier another dialect accepts, such as `EXCLUDE`, drops
@@ -502,7 +603,7 @@ mod tests {
     #[test]
     fn a_modified_wildcard_answers_nothing() {
         let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
-        assert!(of_definition("SELECT * EXCLUDE (x) FROM t", &db).is_none());
+        assert!(relation(&definition("SELECT * EXCLUDE (x) FROM t"), &db).is_none());
     }
 
     /// `GROUP BY ALL`, which PostgreSQL does not accept and other dialects
@@ -511,7 +612,7 @@ mod tests {
     #[test]
     fn grouping_by_all_outputs_makes_a_view_read_only() {
         let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
-        assert!(of_definition("SELECT id FROM t GROUP BY ALL", &db).is_none());
+        assert!(relation(&definition("SELECT id FROM t GROUP BY ALL"), &db).is_none());
     }
 
     /// A reference in an aggregate's arguments that the definition cannot
