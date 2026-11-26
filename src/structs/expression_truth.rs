@@ -1131,18 +1131,19 @@ impl Engine {
     ) -> ScalarType {
         match self {
             Engine::PostgreSql => {
-                PgType::parse(&data_type.name(database)).map_or(ScalarType::Other, |pg_type| {
-                    postgres_scalar_type(&pg_type, rules, database, enums)
-                })
+                PgType::parse(&data_type.name(database))
+                    .map_or(ScalarType::Other(None), |pg_type| {
+                        postgres_scalar_type(&pg_type, rules, database, enums)
+                    })
             }
-            Engine::Sqlite => ScalarType::Other,
+            Engine::Sqlite => ScalarType::Other(None),
             Engine::Other => {
                 match data_type.scalar_family(database) {
                     Some(ScalarFamily::Int | ScalarFamily::Decimal) => ScalarType::Numeric,
                     Some(ScalarFamily::Float) => ScalarType::Float,
                     Some(ScalarFamily::Bool) => ScalarType::Boolean,
                     Some(ScalarFamily::String) => ScalarType::Text(TextRules::UNKNOWN),
-                    _ => ScalarType::Other,
+                    _ => ScalarType::Other(None),
                 }
             }
         }
@@ -1184,11 +1185,11 @@ impl Engine {
                 function
                     .return_type_name(database)
                     .and_then(|name| PgType::parse(name.strip_prefix("SETOF ").unwrap_or(&name)))
-                    .map_or(ScalarType::Other, |pg_type| {
+                    .map_or(ScalarType::Other(None), |pg_type| {
                         postgres_scalar_type(&pg_type, TextRules::DEFAULT, database, enums)
                     })
             }
-            Engine::Sqlite | Engine::Other => ScalarType::Other,
+            Engine::Sqlite | Engine::Other => ScalarType::Other(None),
         };
         let builtin = (self == Engine::PostgreSql).then(|| builtin(function)).flatten();
         Ok(Callee::new(
@@ -1549,11 +1550,11 @@ fn postgres_scalar_type<DB: DatabaseLike>(
                 "text" | "varchar" => ScalarType::Text(rules),
                 "date" => ScalarType::Date,
                 "timestamp" => ScalarType::Timestamp,
-                _ => ScalarType::Other,
+                _ => ScalarType::Other(None),
             }
         }
-        PgType::Named(_) => enums.named(database, pg_type).unwrap_or(ScalarType::Other),
-        PgType::Other(_) => ScalarType::Other,
+        PgType::Named(_) => enums.named(database, pg_type).unwrap_or(ScalarType::Other(None)),
+        PgType::Other(_) => ScalarType::Other(None),
     }
 }
 
