@@ -509,7 +509,7 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                     let arguments: Vec<String> =
                         parent.arguments().iter().map(ToString::to_string).collect();
                     let typed = if parent.foreign_key().is_some() { "->" } else { "as" };
-                    format!(
+                    let mut rendered = format!(
                         "{}.{} WHERE {} {typed} {} IN {}({}) {{{}}}",
                         parent.table().table_name(),
                         parent.key().column_name(),
@@ -518,7 +518,18 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         parent.function().target_name(),
                         arguments.join(", "),
                         render(parent.set()),
-                    )
+                    );
+                    let conditions = parent
+                        .restrictions()
+                        .iter()
+                        .map(render_restriction)
+                        .chain(parent.time_bounds().iter().map(render_bound))
+                        .chain(parent.exclusions().iter().map(render_exclusion));
+                    for condition in conditions {
+                        rendered.push_str(" AND ");
+                        rendered.push_str(&condition);
+                    }
+                    rendered
                 }
                 HelperArm::Called(called) => {
                     let arguments: Vec<String> =
@@ -737,20 +748,11 @@ fn walked_rows(
                 WalkDirection::Down => (walk.parent(), walk.child()),
                 WalkDirection::Up => (walk.child(), walk.parent()),
             };
-            let excluded: Vec<_> = walk
-                .exclusions()
-                .iter()
-                .map(|exclusion| (exclusion, evaluate(exclusion.set(), request, fixture)))
-                .collect();
+            let excluded = excluded_sets(walk.exclusions(), request, fixture);
             for row in rows(fixture, walk.table().table_name()) {
-                // `NOT IN` is `NULL` for a `NULL` compared with any value.
-                let outside = excluded.iter().all(|(exclusion, excluded)| {
-                    nullable(row, exclusion.column().column_name())
-                        .map_or(excluded.is_empty(), |value| !excluded.contains(value))
-                });
                 if values(row, reached).is_some_and(|held| returned.contains(&held))
                     && walk.restrictions().iter().all(|restriction| restricts(restriction, row))
-                    && outside
+                    && outside(&excluded, row)
                     && let Some(added) = values(row, added)
                 {
                     grew |= returned.insert(added);
@@ -762,6 +764,31 @@ fn walked_rows(
         }
     }
     returned
+}
+
+/// Each of `exclusions` beside the set it excludes over `fixture` for
+/// `request`.
+fn excluded_sets<'a, 'db>(
+    exclusions: &'a [ExcludedSet<'db, ParserDB>],
+    request: Request,
+    fixture: Rows,
+) -> Vec<(&'a ExcludedSet<'db, ParserDB>, BTreeSet<&'static str>)> {
+    exclusions
+        .iter()
+        .map(|exclusion| (exclusion, evaluate(exclusion.set(), request, fixture)))
+        .collect()
+}
+
+/// Whether `row` stays outside every set of `excluded`, `NOT IN` being
+/// `NULL` for a `NULL` compared with any value.
+fn outside(
+    excluded: &[(&ExcludedSet<'_, ParserDB>, BTreeSet<&'static str>)],
+    row: &[(&str, &'static str)],
+) -> bool {
+    excluded.iter().all(|(exclusion, excluded)| {
+        nullable(row, exclusion.column().column_name())
+            .map_or(excluded.is_empty(), |value| !excluded.contains(value))
+    })
 }
 
 /// The values `row` holds in `columns`, `None` where one is `NULL`.
@@ -811,11 +838,7 @@ fn grant_rows(
                 .then(|| cap_rows(cap, request, fixture))
         })
         .collect();
-    let excluded: Vec<_> = grant
-        .exclusions()
-        .iter()
-        .map(|exclusion| evaluate(exclusion.set(), request, fixture))
-        .collect();
+    let excluded = excluded_sets(grant.exclusions(), request, fixture);
     for row in rows(fixture, grant.table().table_name()) {
         let restricted = grant.restrictions().iter().all(|restriction| restricts(restriction, row))
             && grant.joined_rows().iter().all(|joined| joins(row, joined, fixture));
@@ -835,12 +858,12 @@ fn grant_rows(
             GrantedTo::Anyone => true,
         };
         let unblocked = grant.anti_joins().iter().all(|anti_join| !blocks(anti_join, row, fixture));
-        // `NOT IN` is `NULL` for a `NULL` compared with any value.
-        let outside = grant.exclusions().iter().zip(&excluded).all(|(exclusion, excluded)| {
-            nullable(row, exclusion.column().column_name())
-                .map_or(excluded.is_empty(), |value| !excluded.contains(value))
-        });
-        if granted && restricted && unblocked && outside && capped(grant, &caps, row, fixture) {
+        if granted
+            && restricted
+            && unblocked
+            && outside(&excluded, row)
+            && capped(grant, &caps, row, fixture)
+        {
             let columns: Vec<Vec<&'static str>> = grant
                 .returned()
                 .iter()
@@ -910,8 +933,16 @@ fn arm_rows(
             HelperArm::Grant(grant) => grant_rows(grant, request, fixture, &mut returned),
             HelperArm::Parent(parent) => {
                 let parents = evaluate(parent.set(), request, fixture);
+                let excluded = excluded_sets(parent.exclusions(), request, fixture);
                 for row in rows(fixture, parent.table().table_name()) {
-                    if parents.contains(cell(row, parent.column().column_name())) {
+                    if nullable(row, parent.column().column_name())
+                        .is_some_and(|value| parents.contains(value))
+                        && parent
+                            .restrictions()
+                            .iter()
+                            .all(|restriction| restricts(restriction, row))
+                        && outside(&excluded, row)
+                    {
                         returned.insert(vec![cell(row, parent.key().column_name())]);
                     }
                 }
@@ -1722,7 +1753,6 @@ fn an_arm_of_any_other_shape_refuses_the_answer() {
     for body in [
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) GROUP BY doc_id",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) INTERSECT SELECT id FROM docs",
-        "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role)) AND id = 'x'",
     ] {
         assert!(
             matches!(refusal(&helper(DEFINER, body, "")), HelperSetError::ArmShape { .. }),
@@ -7981,6 +8011,125 @@ fn a_walk_needs_a_validated_check_setting_the_other_key_column_with_the_edge_col
         !walks("", &format!("ALTER TABLE resources ADD CONSTRAINT kinded {implied} NOT VALID;")),
         "a check no existing row was validated against"
     );
+}
+
+/// [`single_table`] walking [`SINGLE_TABLE_DOWN`], with `authz.children()`
+/// returning `arm`.
+fn single_table_children(arm: &str) -> String {
+    format!(
+        "{}
+         CREATE FUNCTION authz.children() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$ {arm} $$;
+         ALTER FUNCTION authz.children() OWNER TO authz_owner;",
+        single_table(SINGLE_TABLE_DOWN)
+    )
+}
+
+const CHILD_PROJECTS: &str = "SELECT o.id FROM public.resources o \
+     WHERE o.kind = 'project' AND o.parent_id IN (SELECT authz.reached())";
+const UNREACHED_CHILDREN: &str = "SELECT o.id FROM public.resources o \
+     WHERE o.parent_id IN (SELECT authz.reached()) AND o.id NOT IN (SELECT authz.reached())";
+
+/// What one helper returns for each caller, as PostgreSQL measured it.
+type CallersMeasured = [(&'static str, &'static [&'static str]); 4];
+
+#[test]
+fn a_parent_arm_returns_only_the_children_its_conditions_keep() {
+    let deployment = deployment();
+    let reached = format!(
+        "authz.reached() {{{RESOURCE_GRANT_ARM} UNION resources.id WHERE parent_id IN itself \
+         AND kind IN ('folder', 'project')}}"
+    );
+    let parent = format!("resources.id WHERE parent_id as resources IN {reached}");
+    // What PostgreSQL 18.7 returns for each caller over `SINGLE_TABLE`.
+    let measured: [(&str, String, CallersMeasured); 2] = [
+        (
+            CHILD_PROJECTS,
+            format!("{parent} AND kind IN ('project')"),
+            [("alice", &["p1", "p2"]), ("bob", &["p1"]), ("carol", &[]), ("zed", &[])],
+        ),
+        (
+            UNREACHED_CHILDREN,
+            format!("{parent} AND id NOT IN {reached}"),
+            [("alice", &["t1"]), ("bob", &["t1"]), ("carol", &[]), ("zed", &[])],
+        ),
+    ];
+    for (arm, rendered, measured) in measured {
+        let database = postgres(&single_table_children(arm));
+        let set = function(&database, "authz", "children")
+            .helper_set(
+                &[],
+                &deployment,
+                &database,
+                &[
+                    ArmCondition::EdgeCondition,
+                    ArmCondition::ParentCondition,
+                    ArmCondition::Exclusion,
+                ],
+            )
+            .expect("answered");
+        assert_eq!(render(&set), rendered, "{arm}");
+        for (caller, expected) in measured {
+            let returned: Vec<_> =
+                evaluate(&set, Request::of(caller), SINGLE_TABLE).into_iter().collect();
+            assert_eq!(returned, expected, "{caller} reading {arm}");
+        }
+    }
+}
+
+#[test]
+fn a_parent_arm_condition_is_read_only_where_the_consumer_names_it() {
+    let deployment = deployment();
+    let excluding = "o.id NOT IN (SELECT authz.reached())";
+    for (arm, read, refused, first) in [
+        (
+            CHILD_PROJECTS,
+            &[ArmCondition::EdgeCondition][..],
+            ArmCondition::ParentCondition,
+            "o.kind = 'project'",
+        ),
+        (
+            UNREACHED_CHILDREN,
+            &[ArmCondition::EdgeCondition][..],
+            ArmCondition::ParentCondition,
+            excluding,
+        ),
+        (
+            UNREACHED_CHILDREN,
+            &[ArmCondition::EdgeCondition, ArmCondition::ParentCondition][..],
+            ArmCondition::Exclusion,
+            excluding,
+        ),
+    ] {
+        let database = postgres(&single_table_children(arm));
+        let unread =
+            function(&database, "authz", "children").helper_set(&[], &deployment, &database, read);
+        assert!(
+            matches!(
+                &unread,
+                Err(HelperSetError::UnreadCondition { function, condition, kind })
+                    if function == "authz.children" && condition == first && *kind == refused
+            ),
+            "{arm} reading {read:?}: {unread:?}"
+        );
+    }
+}
+
+#[test]
+fn a_parent_arm_whose_conditions_keep_no_row_is_left_out() {
+    let deployment = deployment();
+    let arm = "SELECT o.id FROM public.resources o \
+               WHERE o.kind = 'project' AND o.kind = 'task' AND o.parent_id IN (SELECT authz.reached())";
+    let database = postgres(&single_table_children(arm));
+    let set = function(&database, "authz", "children")
+        .helper_set(
+            &[],
+            &deployment,
+            &database,
+            &[ArmCondition::EdgeCondition, ArmCondition::ParentCondition],
+        )
+        .expect("answered");
+    assert!(set.arms().is_empty(), "{}", render(&set));
 }
 
 #[test]
