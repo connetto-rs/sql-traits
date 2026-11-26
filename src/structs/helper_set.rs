@@ -297,9 +297,13 @@ impl<'db, DB: DatabaseLike> JoinedRow<'db, DB> {
 /// Whose rows a [`GrantArm`] keeps.
 #[derive(Debug)]
 pub enum GrantedTo<'db, DB: DatabaseLike> {
-    /// The rows whose column holds the caller, another principal, an
-    /// element of a declared set, or a scalar value, the request carries.
-    Request(SettingComparison<'db, DB>),
+    /// The rows whose columns hold values the request carries, the caller,
+    /// another principal, an element of a declared set, or a scalar value,
+    /// one comparison or more, in the order the condition writes them. The
+    /// arm keeps a row only where every comparison holds on it, as for
+    /// `<namespace column> = <setting> AND <identity column> = <other
+    /// setting>` naming one principal by two values.
+    Request(Vec<SettingComparison<'db, DB>>),
     /// `<column> IN (SELECT <function>(<arguments>))`, the rows naming one of
     /// the grantees another helper returns, such as every grantee the caller
     /// is.
@@ -598,7 +602,9 @@ impl<'db> CallerGate<'db> {
 /// `<column> = <read>`, `<read>` reading the principal the caller or another
 /// the deployment declares, or a scalar value, or `<column>` compared with
 /// each element of a declared set, `<column> = ANY (<array>)` or `<column>
-/// IN (SELECT <elements>)`.
+/// IN (SELECT <elements>)`. A grant arm may write several, on the same
+/// column or on different ones, and keeps a row only where all of them hold
+/// on it (see [`GrantedTo::Request`]).
 ///
 /// `<read>` is `current_setting(<setting>)[::<declared type>]`. A read of a
 /// scalar may be normalized by `lower(...)`, once, which a consumer applies
@@ -630,6 +636,19 @@ pub struct SettingComparison<'db, DB: DatabaseLike> {
     pub(crate) raises_when_unset: bool,
     pub(crate) excludes_unset: bool,
     pub(crate) normalization: Option<RequestNormalization>,
+}
+
+impl<DB: DatabaseLike> Clone for SettingComparison<'_, DB> {
+    fn clone(&self) -> Self {
+        Self {
+            column: self.column,
+            setting: self.setting,
+            value: self.value,
+            raises_when_unset: self.raises_when_unset,
+            excludes_unset: self.excludes_unset,
+            normalization: self.normalization,
+        }
+    }
 }
 
 impl<'db, DB: DatabaseLike> SettingComparison<'db, DB> {

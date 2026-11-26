@@ -2256,26 +2256,28 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///
     /// - A grant arm, `SELECT <columns> FROM <table> [WHERE <conditions>]`, one
     ///   column per column the helper returns, the conditions joined by `AND`.
-    ///   At most one of them names the grantee, either a comparison of a column
-    ///   with a value of the request or `<column> IN (SELECT
-    ///   <helper>(<arguments>))`, the helper answered in turn as a parent arm's
-    ///   is. The comparison is `<column> = current_setting('<setting>'[,
-    ///   <missing_ok>])` with a setting the deployment declares as the caller,
-    ///   as another principal or as a scalar, a scalar read optionally through
-    ///   `lower(...)`, or `<column>` compared with each element of a setting it
-    ///   declares as a set, unpacked as declared (see
+    ///   The ones naming the grantee are comparisons of columns with values of
+    ///   the request, any number of them all holding on the arm's row, or, in
+    ///   an arm writing none, one `<column> IN (SELECT <helper>(<arguments>))`,
+    ///   the helper answered in turn as a parent arm's is. A comparison is
+    ///   `<column> = current_setting('<setting>'[, <missing_ok>])` with a
+    ///   setting the deployment declares as the caller, as another principal or
+    ///   as a scalar, a scalar read optionally through `lower(...)`, or
+    ///   `<column>` compared with each element of a setting it declares as a
+    ///   set, unpacked as declared (see
     ///   [`SettingComparison`](crate::structs::SettingComparison)). `<column>
     ///   IN (<values>)` listing principals or scalars beside literals and
     ///   parameters answers one grant arm per read and one granted to anyone
-    ///   for the literals together, each keeping the other conditions. An arm
-    ///   naming no grantee returns the same rows for every request its gate
-    ///   lets through. A cap, `(<operands>) IN (SELECT * FROM
-    ///   <helper>(<arguments>))`, optionally behind `<setting> IS NULL OR`,
-    ///   keeps the rows whose operands are a row the helper returns, the helper
-    ///   answered in turn (see [`RowCap`](crate::structs::RowCap)). In an arm
-    ///   naming its grantee by a value of the request, `<column> IN (SELECT
-    ///   <helper>(<arguments>))` on a column of its table is a cap of one
-    ///   operand. Conditions `current_setting('<setting>') <> <text>` and
+    ///   for the literals together, each keeping the other conditions, the
+    ///   comparisons among them included. An arm naming no grantee returns the
+    ///   same rows for every request its gate lets through. A cap,
+    ///   `(<operands>) IN (SELECT * FROM <helper>(<arguments>))`, optionally
+    ///   behind `<setting> IS NULL OR`, keeps the rows whose operands are a row
+    ///   the helper returns, the helper answered in turn (see
+    ///   [`RowCap`](crate::structs::RowCap)). In an arm naming its grantee by a
+    ///   value of the request, `<column> IN (SELECT <helper>(<arguments>))` on
+    ///   a column of its table is a cap of one operand. Conditions
+    ///   `current_setting('<setting>') <> <text>` and
     ///   `current_setting('<setting>') IS NOT NULL` on a caller setting gate
     ///   the arm on what the setting reads (see
     ///   [`CallerGate`](crate::structs::CallerGate)). A condition
@@ -2453,7 +2455,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
     /// let [Returned::Read(doc)] = grant.returned() else { panic!("the helper returns one column") };
     /// assert_eq!(doc.column_name(), "doc_id");
-    /// let GrantedTo::Request(request) = grant.granted_to() else { unreachable!() };
+    /// let GrantedTo::Request(compared) = grant.granted_to() else { unreachable!() };
+    /// let [request] = compared.as_slice() else { panic!("the arm compares one column") };
     /// assert_eq!(request.column().column_name(), "principal_id");
     /// let [Restriction::In(roles)] = grant.restrictions() else {
     ///     panic!("the condition restricts one column to literals")
@@ -2511,7 +2514,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// assert_eq!(blocked.column().column_name(), "id");
     /// assert_eq!(blocked.function().name(), "blocked_projects");
     /// let HelperArm::Grant(block) = &blocked.set().arms()[0] else { unreachable!() };
-    /// let GrantedTo::Request(request) = block.granted_to() else { unreachable!() };
+    /// let GrantedTo::Request(compared) = block.granted_to() else { unreachable!() };
+    /// let [request] = compared.as_slice() else { panic!("the arm compares one column") };
     /// assert_eq!(request.column().column_name(), "principal_id");
     /// # Ok(())
     /// # }
