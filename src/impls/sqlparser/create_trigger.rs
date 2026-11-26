@@ -186,6 +186,11 @@ impl TriggerLike for CreateTrigger {
         let body = self.exec_body.as_ref()?;
         object_name_last_part(&body.func_desc.name)
     }
+
+    #[inline]
+    fn statements(&self) -> &[sqlparser::ast::Statement] {
+        self.statements.as_ref().map_or(&[], |body| body.statements())
+    }
 }
 
 #[cfg(test)]
