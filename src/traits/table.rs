@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 use alloc::string::ToString;
-use alloc::{borrow::Cow, vec, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeSet, vec, vec::Vec};
 use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use crate::{
@@ -3923,16 +3923,23 @@ pub trait TableLike:
         database: &Self::DB,
         other: &<Self::DB as DatabaseLike>::Table,
     ) -> Result<bool, LookupError> {
-        if self.borrow() == other {
+        let start: &<Self::DB as DatabaseLike>::Table = self.borrow();
+        if start == other {
             return Ok(true);
         }
-        for foreign_key in self.foreign_keys(database)? {
+        let mut visited = BTreeSet::from([start]);
+        let mut walks = vec![start.foreign_keys(database)?];
+        while let Some(foreign_keys) = walks.last_mut() {
+            let Some(foreign_key) = foreign_keys.next() else {
+                walks.pop();
+                continue;
+            };
             let referenced_table = foreign_key.referenced_table(database)?;
-            if referenced_table == other
-                || referenced_table != self.borrow()
-                    && referenced_table.depends_on(database, other)?
-            {
+            if referenced_table == other {
                 return Ok(true);
+            }
+            if visited.insert(referenced_table) {
+                walks.push(referenced_table.foreign_keys(database)?);
             }
         }
 

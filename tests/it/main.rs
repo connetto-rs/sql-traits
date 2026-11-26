@@ -84,6 +84,7 @@ mod fixed_length_text_checks;
 mod folded_catalog_reads;
 mod folded_catalog_rewrites;
 mod foreign_key_column_case;
+mod foreign_key_cycles;
 mod foreign_key_deferral;
 mod foreign_key_type_equality;
 mod foreign_row_types;
