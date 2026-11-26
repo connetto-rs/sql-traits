@@ -105,6 +105,33 @@ fn builtin_calls_reach_the_pg_proc_rows() {
     assert_eq!(called_by(&database, "permissive_sum").unwrap(), Vec::<String>::new());
 }
 
+/// `ceil`, `floor`, `substr` and the comma form of `substring` are calls
+/// PostgreSQL resolves on the path like any other, while the `FROM` form of
+/// `SUBSTRING` is grammar calling `pg_catalog`.
+#[test]
+fn keyword_spelled_calls_reach_the_overloads_on_the_path() {
+    let database = postgres(
+        "CREATE FUNCTION ceil(x INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION floor(x INT, places INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION substr(x INT, y INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION substring(x INT, y INT, z INT) RETURNS INT LANGUAGE sql AS 'SELECT x';
+         CREATE FUNCTION spelled() RETURNS INT LANGUAGE sql
+             AS 'SELECT CEIL(1) + FLOOR(1, 2) + substr(1, 2) + SUBSTRING(1, 2, 3)';
+         CREATE FUNCTION grammar() RETURNS TEXT LANGUAGE plpgsql
+             AS $$ BEGIN RETURN SUBSTRING('abc' FROM 2 FOR 1); END $$;",
+    );
+    assert_eq!(
+        declared_called_by(&database, "spelled"),
+        [
+            "public.ceil(INT)",
+            "public.floor(INT, INT)",
+            "public.substr(INT, INT)",
+            "public.substring(INT, INT, INT)",
+        ]
+    );
+    assert_eq!(declared_called_by(&database, "grammar"), Vec::<String>::new());
+}
+
 const TWO_FS: &str = "
     CREATE SCHEMA app;
     CREATE FUNCTION app.f() RETURNS INT LANGUAGE sql AS 'SELECT 1';
