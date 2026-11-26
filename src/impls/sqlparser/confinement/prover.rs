@@ -786,10 +786,13 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                 let arguments = call
                     .node
                     .and_then(|written| {
-                        match (written.function(), written.factor()) {
-                            (Some(expression), _) => positional_arguments(expression, callee),
-                            (None, Some(factor)) => relation_arguments(factor, callee),
-                            (None, None) => None,
+                        match written.factor() {
+                            Some(factor) => relation_arguments(factor, callee),
+                            None => {
+                                written
+                                    .function()
+                                    .and_then(|expression| positional_arguments(expression, callee))
+                            }
                         }
                     })
                     .unwrap_or_default();
