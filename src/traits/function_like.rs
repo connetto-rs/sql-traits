@@ -9,15 +9,15 @@ use sqlparser::ast::{
 };
 
 use crate::{
-    errors::{HelperSetError, LookupError},
+    errors::{HelperSetError, LookupError, ReturnedValuesError},
     impls::{
         atomic_statements, body_calls, body_expression, body_reads, body_site_source,
         body_unqualified_names, helper_set, unconfined_function_read,
     },
     structs::{
         ActingRole, AggregateKind, ArmCondition, Deployment, DynamicExecutionSites, FunctionBody,
-        FunctionKind, HelperSet, PlPgSqlSites, PrivilegeHolder, TargetName, UnconfinedRead,
-        UnqualifiedName,
+        FunctionKind, HelperSet, PlPgSqlSites, PrivilegeHolder, ReturnedValue, TargetName,
+        UnconfinedRead, UnqualifiedName,
     },
     traits::{DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
@@ -2534,6 +2534,119 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         conditions: &[ArmCondition],
     ) -> Result<HelperSet<'db, Self::DB>, HelperSetError> {
         helper_set(self, arguments, deployment, database, conditions)
+    }
+
+    /// Returns what each output parameter of the `plpgsql` function is
+    /// assigned when it returns, in declaration order, on every request
+    /// `deployment` admits.
+    ///
+    /// A parameter holds the one value every definition reaching a return
+    /// gives it. That is an expression reading no variable of the body, the
+    /// `NULL` it starts with, or neither, as [`ReturnedOutput`] tells.
+    ///
+    /// The answer holds only where the function returns. Each request is
+    /// read with what the deployment declares its settings hold, so
+    /// `current_setting(name, true)`, `NULLIF` of it and `''`, and either
+    /// cast to the setting's declared type are read as the setting set and
+    /// unset, and settings set together as
+    /// [`Deployment::with_settings_set_together`] declares are set or unset
+    /// as a whole. A setting the function's `SET` clause names, or the body
+    /// may change through `SET`, `RESET` or `set_config`, is read as any
+    /// text, and so is every expression once the body may change a built-in
+    /// parameter such as `role`. A body running code it does not hold, a
+    /// function outside `pg_catalog`, dynamic SQL, a relation a query reads,
+    /// a statement other than a query, `SET` and `RESET`, an operator or a
+    /// domain check calling such a function, a domain check calling
+    /// `set_config`, or a cursor the caller opened, refuses the function,
+    /// since that code may raise or set a setting unseen. A raise a path
+    /// reaches and no handler of the body catches, `RAISE EXCEPTION`, a
+    /// failing `ASSERT` and a cast that may fail among them, refuses the
+    /// function, and so does a body no request returns from.
+    ///
+    /// [`ReturnedOutput`]: crate::structs::ReturnedOutput
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReturnedValuesError::Language`] for a function in another
+    /// language, [`ReturnedValuesError::ReturnsSet`] for a set-returning
+    /// one, [`ReturnedValuesError::NoOutputParameters`] for one without
+    /// output parameters, [`ReturnedValuesError::RunsCode`] naming the first
+    /// code it runs that it does not hold, [`ReturnedValuesError::Raises`]
+    /// naming the first raise a path reaches on some request,
+    /// [`ReturnedValuesError::NeverReturns`] when no path returns, and the
+    /// errors [`plpgsql_sites`](FunctionLike::plpgsql_sites) returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::{errors::ReturnedValuesError, prelude::*};
+    /// use sqlparser::{ast::DataType, dialect::PostgreSqlDialect};
+    ///
+    /// # fn main() -> Result<(), ReturnedValuesError> {
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION acting_installation(OUT namespace_id UUID, OUT id UUID)
+    ///      LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp AS $$
+    ///      BEGIN
+    ///        namespace_id := NULLIF(current_setting('app.installation_namespace_id', true), '')::UUID;
+    ///        id := NULLIF(current_setting('app.installation_id', true), '')::UUID;
+    ///        IF (namespace_id IS NULL) <> (id IS NULL) THEN
+    ///          RAISE EXCEPTION 'incomplete installation identity' USING ERRCODE = '22023';
+    ///        END IF;
+    ///      END $$;",
+    /// )
+    /// .expect("the schema parses");
+    /// let setting = |name| {
+    ///     SessionSetting::value(name, SettingValue::Scalar(DataType::Uuid))
+    ///         .expect("a custom setting name")
+    ///         .may_be_unset()
+    /// };
+    /// let settings = [setting("app.installation_namespace_id"), setting("app.installation_id")];
+    /// let deployment = Deployment::new("app", ["app"], settings).expect("a valid deployment");
+    /// let validator = db
+    ///     .function_by_target(
+    ///         TargetName::new("acting_installation", false),
+    ///         IdentifierCase::AsWritten,
+    ///     )?
+    ///     .expect("the validator exists");
+    ///
+    /// // Either setting alone may be set, so the raise is reachable.
+    /// assert!(matches!(
+    ///     validator.returned_values(&db, &deployment),
+    ///     Err(ReturnedValuesError::Raises { surely: true, .. })
+    /// ));
+    ///
+    /// let deployment = deployment
+    ///     .with_settings_set_together(["app.installation_namespace_id", "app.installation_id"])
+    ///     .expect("both settings are declared");
+    /// let returned = validator.returned_values(&db, &deployment)?;
+    /// let [namespace_id, id] = returned.as_slice() else { panic!("two output parameters") };
+    /// assert_eq!(namespace_id.name(), "namespace_id");
+    /// assert_eq!(
+    ///     id.expression().expect("one expression").to_string(),
+    ///     "NULLIF(current_setting('app.installation_id', true), '')::UUID"
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn returned_values(
+        &self,
+        database: &Self::DB,
+        deployment: &Deployment,
+    ) -> Result<Vec<ReturnedValue>, ReturnedValuesError> {
+        let language = self.stored_language();
+        if language.as_deref() != Some("plpgsql") {
+            return Err(ReturnedValuesError::Language {
+                function: self.stored_name().into_owned(),
+                language: language.map(Cow::into_owned),
+            });
+        }
+        if self.returns_set() {
+            return Err(ReturnedValuesError::ReturnsSet {
+                function: self.stored_name().into_owned(),
+            });
+        }
+        body_site_source(self, database)?.returned_values(deployment, database.identifier_case())
     }
 
     /// Returns the normalized return type name of the function as a string.

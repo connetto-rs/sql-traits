@@ -29,6 +29,7 @@ mod grant;
 mod helper_set;
 mod index_clauses;
 mod maintenance_body;
+mod outside_code;
 mod plpgsql_body;
 mod role_membership;
 mod schema;
@@ -46,7 +47,9 @@ pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub(crate) use create_table::parameter_value;
 pub(crate) use data_statement::BodyPath;
 pub use dialect::SqlparserDialect;
-pub(crate) use dynamic_sites::{BodyNames, SiteSource, plpgsql_sql_sites};
+pub(crate) use dynamic_sites::{
+    BodyNames, SiteSource, TypeReach, plpgsql_sql_sites, schema_domain,
+};
 pub(crate) use foreign_key_constraint::{foreign_key_enforced, foreign_keys_stored_alike};
 pub(crate) use function_body::{
     atomic_statements, body_calls, body_expression, body_reads, body_site_source,

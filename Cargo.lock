@@ -1048,7 +1048,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#b98dec250acd84397e52d893e5510bfb30e0ec51"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#c5b7a10d1d9a0d118f6b209c3e40341c531a0621"
 dependencies = [
  "quine-mc_cluskey",
  "rpds",
@@ -1069,7 +1069,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-plpgsql-dataflow"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#33371f448377f181403f77917f3bc09f68648125"
+source = "git+https://github.com/connetto-rs/sqlparser-plpgsql-dataflow?branch=main#d9353560282a17191b70bf650cbffbddf984c0c3"
 dependencies = [
  "sqlparser",
  "sqlparser-expr-eval",

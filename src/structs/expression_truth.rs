@@ -24,8 +24,9 @@ use sqlparser::{
 };
 use sqlparser_expr_eval::{
     ArrayElement, Builtin, Callee, CalleeKind, Collation, Context, EnumType, EvalDialect,
-    Evaluation, Guarantees, Interval, NullInput, NullResult, Outcomes, PostgreSqlOptions, Resolved,
-    ScalarType, Subject, TextRules, Unlisted, Values, Volatility, evaluate, implied,
+    Evaluation, Guarantees, Interval, NullInput, NullResult, OtherType, Outcomes,
+    PostgreSqlOptions, Resolved, ScalarType, Subject, TextRules, Unlisted, Values, Volatility,
+    evaluate, implied,
     sql_values::postgres::{IntegerType, PgNumeric},
 };
 
@@ -34,6 +35,7 @@ use crate::{
     impls::{
         SqlparserDialect,
         dql::{ColumnOrigin, JoinSite, RelationSlot, definition_graph::reference_sites::SiteRule},
+        schema_domain,
     },
     structs::{
         CallResolution, ColumnDefinition, ColumnScope, ExpressionContext, FunctionKind,
@@ -265,6 +267,123 @@ pub(crate) fn domain_truth<'a, DB: DatabaseLike>(
     context.truth(expression, assumptions)
 }
 
+/// How the checks of a domain meet the values they are read over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Every check admits every value.
+    Never,
+    /// A check may refuse a value, by taking false or by raising.
+    Sometimes,
+    /// A check refuses every value.
+    Always,
+}
+
+/// How the checks of `domain`, and of the domains it is defined over, meet
+/// `value`, a value of its base type. A check casting to a domain among
+/// `checking`, whose checks are being read, recurses until PostgreSQL
+/// raises, so it may refuse.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving a call a check makes.
+pub(crate) fn domain_refusal<'a, DB: DatabaseLike>(
+    database: &'a DB,
+    case: IdentifierCase,
+    domain: &'a DB::Domain,
+    value: &Evaluation,
+    checking: &[usize],
+) -> Result<Refusal, LookupError> {
+    if value.is_impossible() {
+        return Ok(Refusal::Never);
+    }
+    let chain: Vec<usize> =
+        domain_chain(database, domain).map(|current| ptr::from_ref(current).addr()).collect();
+    if chain.iter().any(|address| checking.contains(address)) {
+        return Ok(Refusal::Sometimes);
+    }
+    let mut context = TruthContext::new(database, case, None);
+    context.checking = [checking, &chain].concat();
+    let named = context.named(Key::Value, value.clone(), None, None);
+    context.value = Some(named);
+    let guarantees = Guarantees::new();
+    let mut refusal = Refusal::Never;
+    for current in domain_chain(database, domain) {
+        context.source = Source::Domain(current);
+        for check in current.check_expressions() {
+            let evaluation = evaluate(
+                check,
+                &PostgreSqlDialect {},
+                &PostgreSqlOptions::default(),
+                &mut context,
+                &guarantees,
+            )?;
+            let outcomes = evaluation.outcomes();
+            // A check admits a value it takes true or `NULL` on.
+            if !outcomes.truth && !outcomes.null {
+                return Ok(Refusal::Always);
+            }
+            if evaluation.may_raise() || outcomes.falsity {
+                refusal = Refusal::Sometimes;
+            }
+        }
+    }
+    Ok(refusal)
+}
+
+/// `domain` and the domains it is defined over, nearest first.
+fn domain_chain<'a, DB: DatabaseLike>(
+    database: &'a DB,
+    domain: &'a DB::Domain,
+) -> impl Iterator<Item = &'a DB::Domain> {
+    core::iter::successors(Some(domain), move |&current| {
+        current.data_type(database).domain(database)
+    })
+}
+
+/// Whether a cast to `domain`, or to an array of it, checks the value it
+/// converts.
+pub(crate) fn domain_checks<DB: DatabaseLike>(database: &DB, domain: &DB::Domain) -> bool {
+    domain_chain(database, domain).any(|current| current.check_expressions().next().is_some())
+}
+
+/// What the checks of `domain` make of `converted`, the value a cast to
+/// `domain` converts to, or a cast to an array of it when `array`. The
+/// evaluation lists no element of an array, so a check refusing some value
+/// of the base type may refuse one of them, and an empty array passes.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving a call a check makes.
+pub(crate) fn domain_checked<'a, DB: DatabaseLike>(
+    database: &'a DB,
+    case: IdentifierCase,
+    domain: &'a DB::Domain,
+    array: bool,
+    converted: Evaluation,
+    checking: &[usize],
+) -> Result<Evaluation, LookupError> {
+    let refusal = if array {
+        let element = Engine::of(database).values(
+            domain.data_type(database),
+            database,
+            TextRules::UNKNOWN,
+            true,
+            &Enums::default(),
+        );
+        match domain_refusal(database, case, domain, &element, checking)? {
+            Refusal::Never => Refusal::Never,
+            Refusal::Sometimes | Refusal::Always => Refusal::Sometimes,
+        }
+    } else {
+        domain_refusal(database, case, domain, &converted, checking)?
+    };
+    Ok(match refusal {
+        Refusal::Never => converted,
+        Refusal::Sometimes => converted.with_error(true),
+        Refusal::Always => Evaluation::raising(converted.ty().clone()),
+    })
+}
+
 impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// A read of nothing yet over `database`, comparing names under `case`,
     /// of the expression of `own` when it is set.
@@ -285,6 +404,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             collations: Vec::new(),
             enums: Enums::default(),
             reached: Vec::new(),
+            checking: Vec::new(),
         }
     }
 
@@ -1005,6 +1125,9 @@ struct TruthContext<'a, DB: DatabaseLike> {
     /// The calls resolved so far, as overload resolution is costly and the
     /// evaluator asks for the same call many times.
     reached: Vec<Reached<'a, DB::Function>>,
+    /// The addresses of the domains whose checks the reads up the stack
+    /// read, which a cast in a check may reach again.
+    checking: Vec<usize>,
 }
 
 /// The enum types met so far, by the address of the type declaring each, so
@@ -1247,6 +1370,25 @@ impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
         ScalarType::of(data_type)
     }
 
+    fn cast_checks(&mut self, data_type: &DataType) -> Result<bool, LookupError> {
+        Ok(self
+            .cast_domain(data_type)
+            .is_some_and(|(domain, _)| domain_checks(self.database, domain)))
+    }
+
+    fn checked_cast(
+        &mut self,
+        data_type: &DataType,
+        converted: Evaluation,
+    ) -> Result<Evaluation, LookupError> {
+        match self.cast_domain(data_type) {
+            Some((domain, array)) => {
+                domain_checked(self.database, self.case, domain, array, converted, &self.checking)
+            }
+            None => Ok(converted),
+        }
+    }
+
     /// A custom plan binds a function parameter, a positional placeholder
     /// and a PL/pgSQL variable or field of one as a constant, and inlining
     /// a SQL function binds its parameters to the arguments. A name nothing
@@ -1261,6 +1403,21 @@ impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
 }
 
 impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
+    /// The domain a cast to `data_type` names, found along the database's
+    /// type search path, and whether the cast is to an array of it.
+    fn cast_domain(&self, data_type: &DataType) -> Option<(&'a DB::Domain, bool)> {
+        if self.engine != Engine::PostgreSql {
+            return None;
+        }
+        let written = PgType::of(data_type);
+        let canonical = canonical(self.database, &written);
+        let (element, array) =
+            canonical.element().map_or((&*canonical, false), |element| (element, true));
+        let PgType::Named(target) = element else { return None };
+        let schema = (target.schema()?, target.schema_is_quoted());
+        schema_domain(self.database, target, schema).map(|domain| (domain, array))
+    }
+
     /// The functions `call` may run, resolved under the search path of
     /// where it was written, or none when it names no known function or
     /// PostgreSQL reads it as a cast.
@@ -1532,7 +1689,9 @@ fn reached_in<'a, 'e, F>(
 }
 
 /// The scalar type a PostgreSQL type reads as, text under `rules` and an
-/// enum among the `enums` of `database`.
+/// enum among the `enums` of `database`. Any other type reads as itself,
+/// a domain by its own name, never its base type's, so that assigning to it
+/// still checks its constraints.
 fn postgres_scalar_type<DB: DatabaseLike>(
     pg_type: &PgType,
     rules: TextRules,
@@ -1556,10 +1715,25 @@ fn postgres_scalar_type<DB: DatabaseLike>(
                 "text" | "varchar" => ScalarType::Text(rules),
                 "date" => ScalarType::Date,
                 "timestamp" => ScalarType::Timestamp,
-                _ => ScalarType::Other(None),
+                _ => ScalarType::Other(Some(OtherType::catalog(name))),
             }
         }
-        PgType::Named(_) => enums.named(database, pg_type).unwrap_or(ScalarType::Other(None)),
+        PgType::Named(_) => {
+            enums.named(database, pg_type).unwrap_or_else(|| {
+                let canonical = canonical(database, pg_type);
+                let PgType::Named(target) = &*canonical else {
+                    return postgres_scalar_type(&canonical, rules, database, enums);
+                };
+                // A name the path never resolved names no type to compare.
+                // Both parts are quoted, so a dot inside one cannot make two
+                // types share an identity.
+                let quoted = |part: &str| format!("\"{}\"", part.replace('"', "\"\""));
+                let identity = target.schema().map(|schema| {
+                    OtherType::new(format!("{}.{}", quoted(schema), quoted(target.name())))
+                });
+                ScalarType::Other(identity)
+            })
+        }
         PgType::Other(_) => ScalarType::Other(None),
     }
 }

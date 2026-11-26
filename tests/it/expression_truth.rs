@@ -633,6 +633,7 @@ fn other_dialects_keep_only_shared_semantics() -> Result<(), Error> {
     assert_eq!(truth("paid OR NOT paid")?, never_raising(Outcomes::TRUE));
     assert_eq!(truth("id IS NULL")?, never_raising(Outcomes::FALSE));
     assert_eq!(truth("rate IS NULL OR issued IS NULL")?, never_raising(Outcomes::FALSE));
+    assert_eq!(truth("CAST(NULL AS INTEGER) IS NULL")?, never_raising(Outcomes::TRUE));
     let text = truth("'a' = 'A'")?;
     assert!(text.outcomes.truth && text.outcomes.falsity, "{text:?}");
     Ok(())
@@ -963,5 +964,42 @@ fn assumed_expressions_whose_calls_the_read_check_resolves_otherwise_seed_nothin
         sometimes_raising(Outcomes::TRUE)
     );
     assert_eq!(check.truth_under(&db, &assumptions)?, sometimes_raising(Outcomes::ANY));
+    Ok(())
+}
+
+#[test]
+fn a_cast_to_a_checking_domain_raises_where_its_checks_refuse() -> Result<(), Error> {
+    let domains = "CREATE DOMAIN present AS int CHECK (VALUE IS NOT NULL);
+         CREATE DOMAIN positive AS int CHECK (VALUE > 0);
+         CREATE DOMAIN small_present AS present CHECK (VALUE < 10);
+         CREATE DOMAIN plain AS int;
+         CREATE DOMAIN admitted AS int CHECK (true);";
+    let (never, sometimes, always) = (Raising::Never, Raising::Sometimes, Raising::Always);
+    for schema in [
+        format!("{domains} CREATE TABLE t (c INT);"),
+        format!(
+            "CREATE SCHEMA app; SET search_path = app, public; {} CREATE TABLE public.t (c INT);",
+            domains.replace("DOMAIN ", "DOMAIN app.")
+        ),
+    ] {
+        for (sql, expected) in [
+            ("(NULL::present) IS NULL", always),
+            ("(NULL::small_present) IS NULL", always),
+            ("(NULL::positive) IS NULL", never),
+            ("(NULL::plain) IS NULL", never),
+            ("(c::positive) > 0", sometimes),
+            ("('{1}'::positive[]) IS NULL", sometimes),
+            ("('{1}'::present[]) IS NULL", sometimes),
+            ("(NULL::_int4) IS NULL", never),
+            ("((1 / 0)::positive) IS NULL", always),
+            ("('{1}'::admitted[]) IS NULL", sometimes),
+        ] {
+            assert_eq!(truth_in(&schema, "t", sql)?.raising, expected, "{sql} in {schema}");
+        }
+    }
+    assert_eq!(
+        truth_in("CREATE TABLE holder (value _int4);", "holder", "value IS NULL")?,
+        never_raising(UNDECIDED)
+    );
     Ok(())
 }
