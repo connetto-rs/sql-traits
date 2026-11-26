@@ -627,4 +627,15 @@ mod tests {
         let resolved = UpdatableViewBase::of_definition(&ambiguous, &db);
         assert!(resolved.is_err(), "{resolved:?}");
     }
+
+    /// A reference in the condition that the definition cannot resolve is a
+    /// lookup error, never a reference left out of the condition's columns.
+    #[test]
+    fn an_unresolvable_condition_reference_is_an_error() {
+        let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA).expect("schema parses");
+        let ambiguous =
+            definition("SELECT x FROM t WHERE EXISTS (SELECT 1 FROM u, u AS u2 WHERE id = 1)");
+        let resolved = UpdatableViewBase::of_definition(&ambiguous, &db);
+        assert!(resolved.is_err(), "{resolved:?}");
+    }
 }
