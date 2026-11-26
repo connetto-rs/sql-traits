@@ -43,9 +43,10 @@ use crate::{
         identifier_resolution::{SearchPath, identifiers_match},
         object_name::{
             PG_CATALOG, Qualifier, object_name_identifiers, object_name_last_part, qualifier_of,
-            resolve_relation_object_name_on_path, target_name_of_table, type_search_path,
+            resolve_relation_object_name_on_path, type_search_path,
         },
         postgres_types::{PgType, parse_data_type},
+        quote_identifier::{function_identity, quote_identifier, table_identity},
         scalar_family::ScalarFamily,
         type_modifier,
         walk::walk_expressions,
@@ -233,6 +234,7 @@ struct Parameter<'f> {
 /// what its body's names resolve to.
 struct Scope<'db, DB: DatabaseLike> {
     function: &'db DB::Function,
+    /// The function's identity, as a refusal names it.
     name: String,
     path: SearchPath<'db>,
     /// The entries of [`path`](Self::path) whose schema the owner holds
@@ -247,6 +249,11 @@ struct Scope<'db, DB: DatabaseLike> {
 }
 
 impl<DB: DatabaseLike> Scope<'_, DB> {
+    /// The owner's identity, as a refusal names it.
+    fn owner_identity(&self) -> String {
+        quote_identifier(&self.owner.stored_name())
+    }
+
     fn arm_shape(&self, arm: &impl ToString) -> HelperSetError {
         HelperSetError::ArmShape { function: self.name.clone(), arm: arm.to_string() }
     }
@@ -842,7 +849,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         arguments: &[Value],
     ) -> Result<HelperSet<'db, DB>, HelperSetError> {
         let database = self.database;
-        let name = function.target_name().to_string();
+        let name = function_identity(function);
         if self.answering.iter().any(|seen| core::ptr::eq(*seen, function)) {
             return Err(HelperSetError::CallCycle { function: name });
         }
@@ -1365,7 +1372,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if !covered_table.is_some_and(|covered| core::ptr::eq(covered, table.table)) {
             return Err(HelperSetError::UncoveredReselection {
                 function: scope.name.clone(),
-                table: target_name_of_table(table.table).to_string(),
+                table: table_identity(table.table),
             });
         }
         // The walk's column the subquery returns is no column of the table.
@@ -1874,11 +1881,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         };
         self.require_usage(scope, table_schema(table))?;
         let refuse = |reason: fn(String, String, String) -> HelperSetError| {
-            reason(
-                scope.name.clone(),
-                scope.owner.name().to_string(),
-                target_name_of_table(table).to_string(),
-            )
+            reason(scope.name.clone(), scope.owner_identity(), table_identity(table))
         };
         // `Lookup` is not met for a table the database resolved itself, and
         // every other answer leaves the owner bound by some policy.
@@ -1930,8 +1933,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 set.covered_table().ok_or_else(|| {
                     HelperSetError::UncoveredParent {
                         function: scope.name.clone(),
-                        column: column.column_name().to_string(),
-                        called: callee.target_name().to_string(),
+                        column: quote_identifier(&column.stored_column_name()),
+                        called: function_identity(callee),
                     }
                 })?
             }
@@ -2075,8 +2078,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if !scope.owner.is_superuser() && !callee.can_execute(scope.owner, database)? {
             return Err(HelperSetError::MissingExecute {
                 function: scope.name.clone(),
-                owner: scope.owner.name().to_string(),
-                called: callee.target_name().to_string(),
+                owner: scope.owner_identity(),
+                called: function_identity(callee),
             });
         }
         Ok(Some(callee))
@@ -2093,7 +2096,10 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Err(HelperSetError::UnsettledOwner { function: name.to_string() });
         };
         database.role(owner).ok_or_else(|| {
-            HelperSetError::UndeclaredOwner { function: name.to_string(), owner: owner.to_string() }
+            HelperSetError::UndeclaredOwner {
+                function: name.to_string(),
+                owner: quote_identifier(owner),
+            }
         })
     }
 
@@ -2127,8 +2133,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             Some(schema) if !schema.has_usage(scope.owner, self.database) => {
                 Err(HelperSetError::MissingUsage {
                     function: scope.name.clone(),
-                    owner: scope.owner.name().to_string(),
-                    schema: schema.name().to_string(),
+                    owner: scope.owner_identity(),
+                    schema: quote_identifier(&schema.stored_name()),
                 })
             }
             _ => Ok(()),
@@ -2149,8 +2155,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         Err(HelperSetError::MissingSelect {
             function: scope.name.clone(),
-            owner: scope.owner.name().to_string(),
-            table: target_name_of_table(table).to_string(),
+            owner: scope.owner_identity(),
+            table: table_identity(table),
         })
     }
 
@@ -3298,7 +3304,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Ok(None);
         }
         let Some(accessor) = self.called(scope, &call.name, 0)? else { return Ok(None) };
-        let name = accessor.target_name().to_string();
+        let name = function_identity(accessor);
         if scope.accessing.iter().any(|seen| core::ptr::eq(*seen, accessor)) {
             return Err(HelperSetError::CallCycle { function: name });
         }
