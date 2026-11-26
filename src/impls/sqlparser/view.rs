@@ -6,7 +6,7 @@ use sqlparser::ast::{Action, Query};
 
 use crate::{
     errors::{LookupError, ObjectKind},
-    structs::{MaterializedView, ParserDB, View, metadata::ViewMetadata},
+    structs::{MaterializedView, ParserDB, View, ViewCheckOption, metadata::ViewMetadata},
     traits::{Metadata, ViewLike},
 };
 
@@ -55,6 +55,10 @@ impl ViewLike for View {
 
     fn is_security_barrier(&self) -> bool {
         self.security_barrier()
+    }
+
+    fn check_option(&self) -> Option<ViewCheckOption> {
+        self.recorded_check_option()
     }
 
     fn owner<'db>(&self, database: &'db ParserDB) -> Result<Option<&'db str>, LookupError> {

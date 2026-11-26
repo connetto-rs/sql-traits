@@ -20,6 +20,7 @@ use sqlparser::ast::{CreateTableOptions, CreateView, Ident, ObjectName, Query, S
 use crate::{
     errors::{Error, ObjectKind},
     impls::SqlparserDialect,
+    structs::ViewCheckOption,
     utils::{
         identifier_resolution::is_temporary_schema,
         object_name::{Qualifier, TEMPORARY_SCHEMA, object_name_last_part, qualifier_of},
@@ -210,6 +211,8 @@ impl ViewDeclaration {
 pub struct View {
     /// What the declaration said.
     declaration: ViewDeclaration,
+    /// Which new rows a write through the view is checked against, if any.
+    check_option: Option<ViewCheckOption>,
     /// Whether the planner may not push a caller's functions below the view's
     /// own conditions.
     security_barrier: bool,
@@ -232,7 +235,12 @@ impl View {
         let options = options::plain_view_options(&node.name, with_options(&node), dialect);
         let declaration = ViewDeclaration::from_node(node)
             .ok_or(Error::UnnamedObject { object_kind: ObjectKind::View })?;
-        let mut view = Self { declaration, security_barrier: false, security_invoker: false };
+        let mut view = Self {
+            declaration,
+            check_option: None,
+            security_barrier: false,
+            security_invoker: false,
+        };
         view.apply(options?);
         Ok(view)
     }
@@ -248,6 +256,11 @@ impl View {
     /// Crate-private, for the same reason [`ViewDeclaration::set_name`] is.
     pub(crate) fn declaration_mut(&mut self) -> &mut ViewDeclaration {
         &mut self.declaration
+    }
+
+    /// Returns the view's `check_option` setting, if it has one.
+    pub(crate) fn recorded_check_option(&self) -> Option<ViewCheckOption> {
+        self.check_option
     }
 
     /// Returns whether the view's `security_barrier` option is on.
@@ -276,14 +289,22 @@ impl View {
         Ok(())
     }
 
-    /// Turns off the options a `RESET (...)` names, leaving the others as they
-    /// are. Only the names written without a namespace reach here.
+    /// Turns off or removes the options a `RESET (...)` names, leaving the
+    /// others as they are. Only the names written without a namespace reach
+    /// here.
     pub(crate) fn reset_options<'name>(&mut self, names: impl IntoIterator<Item = &'name Ident>) {
         self.apply(options::plain_view_reset(names));
     }
 
     /// Applies every setting `written` carries.
     fn apply(&mut self, written: options::PlainViewOptions) {
+        match written.check_option {
+            Some(options::CheckOptionWrite::Set(check_option)) => {
+                self.check_option = Some(check_option);
+            }
+            Some(options::CheckOptionWrite::Remove) => self.check_option = None,
+            None => {}
+        }
         if let Some(on) = written.security_barrier {
             self.security_barrier = on;
         }

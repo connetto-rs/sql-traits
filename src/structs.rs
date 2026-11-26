@@ -64,6 +64,7 @@ mod unqualified_name;
 mod updatable_view_base;
 mod user_defined_type;
 mod view;
+mod view_check_option;
 mod virtual_table_source;
 mod written_call;
 
@@ -159,5 +160,6 @@ pub use updatable_view_base::UpdatableViewBase;
 pub(crate) use user_defined_type::AttributeCollation;
 pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};
+pub use view_check_option::ViewCheckOption;
 pub use virtual_table_source::VirtualTableSource;
 pub use written_call::WrittenCall;

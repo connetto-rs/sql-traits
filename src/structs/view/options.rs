@@ -17,6 +17,7 @@ use sqlparser::ast::{
 use crate::{
     errors::{Error, ObjectKind},
     impls::SqlparserDialect,
+    structs::ViewCheckOption,
     utils::identifier_resolution::identifiers_match,
 };
 
@@ -53,9 +54,20 @@ impl ViewOptionName {
     }
 }
 
+/// What an option list writes to a view's check option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckOptionWrite {
+    /// `check_option = ...`, which sets the check.
+    Set(ViewCheckOption),
+    /// `RESET (check_option)`, which removes it.
+    Remove,
+}
+
 /// What one option list sets on a plain view.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PlainViewOptions {
+    /// What the list writes to the `check_option` setting, if anything.
+    pub(crate) check_option: Option<CheckOptionWrite>,
     /// The `security_barrier` setting the list writes, if it writes one.
     pub(crate) security_barrier: Option<bool>,
     /// The `security_invoker` setting the list writes, if it writes one.
@@ -105,8 +117,6 @@ impl<'key> KeyScope<'key> {
 
 /// Reads the options written on plain view `view_name`.
 ///
-/// `check_option` is checked and not recorded.
-///
 /// # Errors
 ///
 /// Returns [`Error::UnrecognizedViewOption`] for a name a plain view does not
@@ -119,7 +129,6 @@ pub(crate) fn plain_view_options(
     dialect: SqlparserDialect,
 ) -> Result<PlainViewOptions, Error> {
     let mut read = PlainViewOptions::default();
-    let mut check_option_written = false;
     for option in options {
         let Some((key, value)) = named_value(option) else {
             return Err(unrecognized(ObjectKind::View, view_name, option.to_string(), dialect));
@@ -147,7 +156,7 @@ pub(crate) fn plain_view_options(
             ));
         };
         let repeated = match name {
-            ViewOptionName::CheckOption => core::mem::replace(&mut check_option_written, true),
+            ViewOptionName::CheckOption => read.check_option.is_some(),
             ViewOptionName::SecurityBarrier => read.security_barrier.is_some(),
             ViewOptionName::SecurityInvoker => read.security_invoker.is_some(),
         };
@@ -176,10 +185,11 @@ pub(crate) fn plain_view_options(
             }
         };
         match name {
-            ViewOptionName::CheckOption if !value.is_some_and(is_check_option) => {
-                return Err(invalid());
+            ViewOptionName::CheckOption => {
+                read.check_option = Some(CheckOptionWrite::Set(
+                    value.and_then(check_option_kind).ok_or_else(invalid)?,
+                ));
             }
-            ViewOptionName::CheckOption => {}
             ViewOptionName::SecurityBarrier => {
                 read.security_barrier =
                     Some(value.map_or(Some(true), postgres_bool).ok_or_else(invalid)?);
@@ -193,7 +203,7 @@ pub(crate) fn plain_view_options(
     Ok(read)
 }
 
-/// Reads what a `RESET (...)` naming plain view options turns off.
+/// Reads what a `RESET (...)` naming plain view options turns off or removes.
 ///
 /// PostgreSQL refuses nothing here. A name no view takes, a name written twice
 /// and a namespaced name such as `toast.security_invoker` are all accepted,
@@ -205,9 +215,12 @@ pub(crate) fn plain_view_reset<'name>(
     let mut reset = PlainViewOptions::default();
     for key in names {
         match ViewOptionName::named_by(key) {
+            Some(ViewOptionName::CheckOption) => {
+                reset.check_option = Some(CheckOptionWrite::Remove);
+            }
             Some(ViewOptionName::SecurityBarrier) => reset.security_barrier = Some(false),
             Some(ViewOptionName::SecurityInvoker) => reset.security_invoker = Some(false),
-            Some(ViewOptionName::CheckOption) | None => {}
+            None => {}
         }
     }
     reset
@@ -257,11 +270,17 @@ fn unrecognized(
     }
 }
 
-/// Whether `value` is one of the two `check_option` settings, in any case.
-fn is_check_option(value: &Expr) -> bool {
-    option_text(value).is_some_and(|text| {
-        text.eq_ignore_ascii_case("local") || text.eq_ignore_ascii_case("cascaded")
-    })
+/// The check a `check_option` value sets, which PostgreSQL reads as an enum
+/// matched in any case, or `None` for a value it refuses.
+fn check_option_kind(value: &Expr) -> Option<ViewCheckOption> {
+    let text = option_text(value)?;
+    if text.eq_ignore_ascii_case("local") {
+        Some(ViewCheckOption::Local)
+    } else if text.eq_ignore_ascii_case("cascaded") {
+        Some(ViewCheckOption::Cascaded)
+    } else {
+        None
+    }
 }
 
 /// Reads a boolean option value as PostgreSQL does, or `None` for a value it

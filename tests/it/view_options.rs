@@ -7,7 +7,7 @@
 //! and refuses those three. An option named alone is set to `true`. `CREATE OR
 //! REPLACE VIEW` replaces the whole option set, while `ALTER TABLE ... SET`
 //! changes only the options it names and `ALTER TABLE ... RESET` turns them
-//! off, refusing no name at all.
+//! off or removes them, refusing no name at all.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use sql_traits::{
@@ -33,6 +33,14 @@ fn flags(db: &ParserDB) -> (bool, bool) {
 fn declared(options: &str) -> Result<(bool, bool), Error> {
     parse(&format!("CREATE TABLE t (id INT); CREATE VIEW v WITH ({options}) AS SELECT id FROM t;"))
         .map(|db| flags(&db))
+}
+
+/// The check option of plain view `v`.
+fn check_option(db: &ParserDB) -> Option<ViewCheckOption> {
+    db.view_by_target(TargetName::new("v", false), IdentifierCase::AsWritten)
+        .expect("unambiguous lookup")
+        .expect("the view is recorded")
+        .check_option()
 }
 
 #[test]
@@ -322,6 +330,76 @@ fn alter_table_reset_turns_off_only_the_options_it_names() {
 }
 
 #[test]
+fn a_view_records_its_check_option() {
+    let declared = |options: &str| {
+        let with = if options.is_empty() { String::new() } else { format!("WITH ({options})") };
+        check_option(
+            &parse(&format!(
+                "CREATE TABLE t (id INT); CREATE VIEW v {with} AS SELECT id FROM t WHERE id > 0;"
+            ))
+            .expect(options),
+        )
+    };
+    assert_eq!(declared(""), None);
+    assert_eq!(declared("security_barrier"), None);
+    assert_eq!(declared("check_option = local"), Some(ViewCheckOption::Local));
+    assert_eq!(declared("check_option = LOCAL"), Some(ViewCheckOption::Local));
+    assert_eq!(declared("check_option = cascaded"), Some(ViewCheckOption::Cascaded));
+    assert_eq!(declared("Check_Option = 'Cascaded'"), Some(ViewCheckOption::Cascaded));
+    assert_eq!(
+        declared("check_option = cascaded, security_barrier = true"),
+        Some(ViewCheckOption::Cascaded)
+    );
+    assert_eq!(declared("toast.check_option = local"), None);
+
+    let error = parse(
+        "CREATE TABLE t (id INT);
+         CREATE VIEW v WITH (check_option = local, check_option = cascaded) AS SELECT id FROM t;",
+    )
+    .expect_err("written twice");
+    assert!(
+        matches!(&error, Error::RepeatedViewOption { option_name, .. }
+            if option_name == "check_option"),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn later_statements_replace_or_remove_the_check_option() {
+    let schema = "CREATE TABLE t (id INT);
+                  CREATE VIEW v WITH (check_option = local) AS SELECT id FROM t WHERE id > 0;";
+    let after =
+        |statement: &str| check_option(&parse(&format!("{schema} {statement}")).expect(statement));
+    assert_eq!(after(""), Some(ViewCheckOption::Local));
+    assert_eq!(
+        after("ALTER TABLE v SET (check_option = cascaded);"),
+        Some(ViewCheckOption::Cascaded)
+    );
+    assert_eq!(
+        after("ALTER VIEW v SET (check_option = CASCADED);"),
+        Some(ViewCheckOption::Cascaded)
+    );
+    assert_eq!(after("ALTER TABLE v SET (security_barrier);"), Some(ViewCheckOption::Local));
+    assert_eq!(after("ALTER TABLE v RESET (check_option);"), None);
+    assert_eq!(after("ALTER VIEW v RESET (Check_Option);"), None);
+    assert_eq!(after("ALTER TABLE v RESET (security_barrier);"), Some(ViewCheckOption::Local));
+    // Measured: a quoted name or a `toast.` name in `RESET` removes nothing.
+    assert_eq!(after("ALTER TABLE v RESET (\"Check_Option\");"), Some(ViewCheckOption::Local));
+    assert_eq!(after("ALTER TABLE v RESET (toast.check_option);"), Some(ViewCheckOption::Local));
+    assert_eq!(
+        after("ALTER TABLE v RESET (check_option), SET (check_option = cascaded);"),
+        Some(ViewCheckOption::Cascaded)
+    );
+    assert_eq!(after("CREATE OR REPLACE VIEW v AS SELECT id FROM t WHERE id > 0;"), None);
+    assert_eq!(
+        after(
+            "CREATE OR REPLACE VIEW v WITH (check_option = cascaded) AS SELECT id FROM t WHERE id > 0;"
+        ),
+        Some(ViewCheckOption::Cascaded)
+    );
+}
+
+#[test]
 fn a_materialized_view_takes_storage_parameters_and_no_view_option() {
     let db = parse(
         "CREATE TABLE t (id INT);
@@ -335,6 +413,7 @@ fn a_materialized_view_takes_storage_parameters_and_no_view_option() {
         .expect("the view is recorded");
     assert!(!view.is_security_invoker());
     assert!(!view.is_security_barrier());
+    assert_eq!(view.check_option(), None);
 
     for statement in [
         "CREATE MATERIALIZED VIEW m WITH (security_invoker = true) AS SELECT id FROM t;",

@@ -8,7 +8,9 @@ use sqlparser::ast::{Action, Query};
 use crate::{
     errors::LookupError,
     impls::dql::query_output_names,
-    structs::{ActingRole, HeldPrivileges, TablePrivileges, TargetName, UpdatableViewBase},
+    structs::{
+        ActingRole, HeldPrivileges, TablePrivileges, TargetName, UpdatableViewBase, ViewCheckOption,
+    },
     traits::{
         ColumnGrantLike, DatabaseLike, Metadata, Relation, RoleLike, TableGrantLike, TriggerLike,
         role::privilege_holders,
@@ -323,6 +325,42 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     #[inline]
     fn is_security_barrier(&self) -> bool {
         false
+    }
+
+    /// Returns the check a write through this view makes on every new row,
+    /// or [`None`] for a view that checks none.
+    ///
+    /// PostgreSQL sets this with the `check_option` option of `CREATE VIEW ...
+    /// WITH (...)` and of `ALTER VIEW` or `ALTER TABLE ... SET (...)`, which
+    /// takes `local` or `cascaded` in any case. A `RESET (...)` naming it
+    /// removes it, and so does a `CREATE OR REPLACE VIEW` that does not write
+    /// it. A materialized view takes no such option, and the default answers
+    /// [`None`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE docs (id INT);
+    ///      CREATE VIEW positive AS SELECT id FROM docs WHERE id > 0;
+    ///      CREATE VIEW small WITH (check_option = local) AS SELECT id FROM positive WHERE id < 9;
+    ///      ALTER VIEW positive SET (check_option = CASCADED);
+    ///      ALTER VIEW small RESET (check_option);",
+    /// )?;
+    /// let view = |name| db.view_by_target(TargetName::new(name, false), IdentifierCase::AsWritten);
+    /// let positive = view("positive")?.expect("recorded");
+    /// assert_eq!(positive.check_option(), Some(ViewCheckOption::Cascaded));
+    /// assert_eq!(view("small")?.expect("recorded").check_option(), None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn check_option(&self) -> Option<ViewCheckOption> {
+        None
     }
 
     /// Returns the role the input hands this view to, which PostgreSQL checks
