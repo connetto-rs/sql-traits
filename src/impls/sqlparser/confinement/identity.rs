@@ -49,33 +49,48 @@ pub(super) fn identity<DB: DatabaseLike>(
     column: &DB::Column,
     database: &DB,
 ) -> Result<Option<Identity>, LookupError> {
-    let declared = column.data_type(database);
+    let Some(identity) = type_identity(column.data_type(database), database) else {
+        return Ok(None);
+    };
+    if identity == Identity::Family(ScalarFamily::String)
+        && !matches!(column.collation(database)?, ColumnCollation::DatabaseDefault)
+    {
+        return Ok(None);
+    }
+    Ok(Some(identity))
+}
+
+/// What `=` compares values of the type `declared` by under the database's
+/// default collation, or `None` when two equal values of it may differ.
+pub(super) fn type_identity<DB: DatabaseLike>(
+    declared: &DB::DataType,
+    database: &DB,
+) -> Option<Identity> {
     let data_type = declared.base_type(database).unwrap_or(declared);
-    Ok(if data_type.array_element(database).is_some() {
-        None
-    } else if let Some(enumeration) = data_type.enumeration(database) {
-        (enumeration.kind() == EnumerationKind::Enum)
-            .then(|| Identity::Enumeration(data_type.name(database).into_owned()))
-    } else {
-        match data_type.scalar_family(database) {
-            Some(
-                family @ (ScalarFamily::Bool
-                | ScalarFamily::Int
-                | ScalarFamily::Uuid
-                | ScalarFamily::Date
-                | ScalarFamily::Timestamp
-                | ScalarFamily::TimestampTz),
-            ) => Some(Identity::Family(family)),
-            Some(ScalarFamily::String)
-                if declared.domain(database).is_none()
-                    && !data_type.normalized_name(database).starts_with("CHAR")
-                    && matches!(column.collation(database)?, ColumnCollation::DatabaseDefault) =>
-            {
-                Some(Identity::Family(ScalarFamily::String))
-            }
-            _ => None,
+    if data_type.array_element(database).is_some() {
+        return None;
+    }
+    if let Some(enumeration) = data_type.enumeration(database) {
+        return (enumeration.kind() == EnumerationKind::Enum)
+            .then(|| Identity::Enumeration(data_type.name(database).into_owned()));
+    }
+    match data_type.scalar_family(database) {
+        Some(
+            family @ (ScalarFamily::Bool
+            | ScalarFamily::Int
+            | ScalarFamily::Uuid
+            | ScalarFamily::Date
+            | ScalarFamily::Timestamp
+            | ScalarFamily::TimestampTz),
+        ) => Some(Identity::Family(family)),
+        Some(ScalarFamily::String)
+            if declared.domain(database).is_none()
+                && !data_type.normalized_name(database).starts_with("CHAR") =>
+        {
+            Some(Identity::Family(ScalarFamily::String))
         }
-    })
+        _ => None,
+    }
 }
 
 /// Whether `=` holds between `left` and `right` only for identical values,

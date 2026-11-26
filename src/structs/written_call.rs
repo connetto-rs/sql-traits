@@ -99,6 +99,15 @@ impl<'node> WrittenCall<'node> {
             CallNode::Relation { .. } => None,
         }
     }
+
+    /// Returns the `FROM` item the call is written as, or [`None`] for a
+    /// function expression.
+    pub(crate) fn factor(self) -> Option<&'node TableFactor> {
+        match self.0 {
+            CallNode::Function(_) => None,
+            CallNode::Relation { factor, .. } => Some(factor),
+        }
+    }
 }
 
 impl<'node> From<&'node Function> for WrittenCall<'node> {

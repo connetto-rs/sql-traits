@@ -793,7 +793,12 @@ pub trait TriggerLike: Clone + Debug + Metadata + Send + Sync {
     /// the write policies of the firing events, and the foreign keys of the
     /// trigger's table, which hold a row the read reaches by a unique key of
     /// the referenced table equal to the row the key references, its other
-    /// columns included. A write policy or key holds under
+    /// columns included. When that function is `SECURITY DEFINER`, a
+    /// PL/pgSQL function it calls knows the same of a parameter the call
+    /// passes a field of `NEW` or `OLD` it reads unchanged, by position and
+    /// of a type `=` compares as the field's column, where the callee reads
+    /// the parameter unchanged, and so does a function that callee passes
+    /// the parameter on to. A write policy or key holds under
     /// [`DefinerReading::Disclosure`] only once PostgreSQL has checked it
     /// when the function runs, and under [`DefinerReading::Outcome`] once it
     /// holds of every write that commits, as [`DefinerReading`] describes. A

@@ -232,7 +232,6 @@ fn opaque_relation_shapes_report_unfollowed_reads() {
     for query in [
         "SELECT renamed.key FROM public.secret renamed(key)",
         "SELECT secret.id FROM (public.secret JOIN public.visible ON secret.id = visible.id)",
-        "SELECT id FROM public.secret FOR UPDATE",
         "TABLE public.secret",
     ] {
         let database = schema(&format!(

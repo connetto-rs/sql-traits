@@ -48,9 +48,9 @@ pub enum Unconfinement<'db, DB: DatabaseLike> {
     /// The role may not select this column of the table read.
     HiddenColumn(&'db DB::Column),
     /// The read is one the proof cannot follow: a view, a table read under
-    /// an alias renaming its columns, a locking or writing statement, SQL
-    /// built at run time, a body that cannot be parsed, a setting the body
-    /// changes besides `search_path`, or a call cycle.
+    /// an alias renaming its columns, a writing statement, SQL built at run
+    /// time, a body that cannot be parsed, a setting the body changes
+    /// besides `search_path`, or a call cycle.
     Unfollowed,
 }
 

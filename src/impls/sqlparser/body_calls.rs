@@ -54,36 +54,20 @@ impl<'db, 'path, DB: DatabaseLike> CallCollector<'db, 'path, DB> {
 
     /// Records every function `call` may reach under the walk's path.
     fn reach(&mut self, call: Call<'_>) -> Result<(), LookupError> {
-        let (name, arguments, case) = (call.name, call.arguments, self.database.identifier_case());
-        let database = self.database;
-        let path = &self.path;
+        let (name, database) = (call.name, self.database);
         let unqualified = qualifier_of(name) == Qualifier::Absent;
-        if let BodyPath::Unknown(error) = path
+        if let BodyPath::Unknown(error) = &self.path
             && unqualified
         {
             return Err(error.clone());
         }
-        let reaches = |function: &DB::Function| {
-            match path {
-                BodyPath::Database => {
-                    call_reaches(function, name, arguments, || database.search_path(), case)
-                }
-                BodyPath::Set(entries) => {
-                    let entries =
-                        || entries.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
-                    call_reaches(function, name, arguments, entries, case)
-                }
-                // Only a qualified name gets here, which reaches its schema
-                // whatever the path holds.
-                BodyPath::Unknown(_) => {
-                    call_reaches(function, name, arguments, core::iter::empty, case)
-                }
-            }
-        };
         let Some((called, _)) = object_name_last_part(name) else { return Ok(()) };
         let names = self.unqualified.as_mut().filter(|_| unqualified);
         let mut functions = Vec::new();
-        for function in database.functions_named(called).filter(|function| reaches(function)) {
+        for function in database
+            .functions_named(called)
+            .filter(|function| reaches_on_path(database, function, call, &self.path))
+        {
             if !self.functions.iter().any(|seen| core::ptr::eq(*seen, function)) {
                 self.functions.push(function);
             }
@@ -135,6 +119,27 @@ impl<'s, DB: DatabaseLike> BodyWalk<'s> for CallCollector<'_, 's, DB> {
 
     fn calls_path_changer(&self, sql: EmbeddedSql<'_>) -> bool {
         calls_path_changer(&sql, self.database)
+    }
+}
+
+/// Whether `call` may run `function` under `path`, a name written without a
+/// schema reaching nothing under a path that is not known.
+pub(crate) fn reaches_on_path<DB: DatabaseLike>(
+    database: &DB,
+    function: &DB::Function,
+    call: Call<'_>,
+    path: &BodyPath<'_>,
+) -> bool {
+    let (name, arguments, case) = (call.name, call.arguments, database.identifier_case());
+    match path {
+        BodyPath::Database => {
+            call_reaches(function, name, arguments, || database.search_path(), case)
+        }
+        BodyPath::Set(entries) => {
+            let entries = || entries.iter().map(|(schema, quoted)| (schema.as_ref(), *quoted));
+            call_reaches(function, name, arguments, entries, case)
+        }
+        BodyPath::Unknown(_) => call_reaches(function, name, arguments, core::iter::empty, case),
     }
 }
 
