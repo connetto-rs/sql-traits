@@ -155,7 +155,7 @@ struct MemoryCheckConstraint {
 struct MemoryFunction {
     name: String,
     schema: Option<String>,
-    argument_types: Vec<String>,
+    argument_types: Vec<MemoryDataType>,
     language: Option<String>,
     /// The body text, where the catalog stores one.
     body: Option<String>,
@@ -1224,11 +1224,11 @@ impl FunctionLike for MemoryFunction {
         }
     }
 
-    fn argument_type_names<'db>(
+    fn argument_types<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> impl Iterator<Item = Cow<'db, str>> {
-        self.argument_types.iter().map(|declared| Cow::Borrowed(declared.as_str()))
+    ) -> impl Iterator<Item = &'db MemoryDataType> {
+        self.argument_types.iter()
     }
 
     fn argument_names<'db>(
@@ -1239,6 +1239,10 @@ impl FunctionLike for MemoryFunction {
     }
 
     fn return_type_name<'db>(&'db self, _database: &'db Self::DB) -> Option<Cow<'db, str>> {
+        None
+    }
+
+    fn return_type<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db MemoryDataType> {
         None
     }
 
@@ -1257,7 +1261,7 @@ impl FunctionLike for MemoryFunction {
     fn returned_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+    ) -> impl Iterator<Item = (TargetName<'db>, &'db MemoryDataType)> {
         core::iter::empty()
     }
 
@@ -1922,7 +1926,10 @@ fn function(schema: Option<&str>, name: &str, argument_types: &[&str]) -> Memory
     MemoryFunction {
         name: String::from(name),
         schema: schema.map(String::from),
-        argument_types: argument_types.iter().map(|declared| String::from(*declared)).collect(),
+        argument_types: argument_types
+            .iter()
+            .map(|declared| MemoryDataType(String::from(*declared)))
+            .collect(),
         language: None,
         body: None,
         bound_definition: None,

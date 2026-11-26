@@ -19,7 +19,7 @@ use crate::{
         FunctionKind, HelperSet, PlPgSqlSites, PrivilegeHolder, ReturnedValue, TargetName,
         UnconfinedRead, UnqualifiedName,
     },
-    traits::{DatabaseLike, Metadata, Relation, TriggerLike},
+    traits::{DataTypeLike, DatabaseLike, Metadata, Relation, TriggerLike},
     utils::{
         call_typing::{
             accepts_positional, actuals, bind, check_argument_count, declared_at_call, input_modes,
@@ -94,31 +94,66 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
         stored_identifier(self.name(), self.name_is_quoted())
     }
 
-    /// Returns the argument type names (if any) of the function as strings.
+    /// Returns the type each argument is declared with, in declaration order,
+    /// type modifiers included.
+    ///
+    /// PostgreSQL discards a modifier on an argument type, so `VARCHAR(3)`
+    /// accepts and returns a longer string. A catalog-backed implementation
+    /// answers the types `pg_proc` stores, which carry no modifier.
     ///
     /// # Example
     ///
     /// ```rust
-    /// #  fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION f(OUT id VARCHAR(3), note TEXT) LANGUAGE sql AS 'SELECT 1';",
+    /// )?;
+    /// let f = db
+    ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let modifiers: Vec<_> = f.argument_types(&db).map(|declared| declared.typmod(&db)).collect();
+    /// assert_eq!(modifiers, [Some(TypeModifier::Modified(7)), Some(TypeModifier::Unmodified)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn argument_types<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> impl Iterator<Item = &'db <Self::DB as DatabaseLike>::DataType>;
+
+    /// Returns the name of each argument's type, in declaration order, as
+    /// [`DataTypeLike::name`] answers it for
+    /// [`argument_types`](FunctionLike::argument_types).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
     /// use sql_traits::prelude::*;
     ///
     /// let db = ParserDB::parse::<GenericDialect>(
     ///     "
     /// CREATE FUNCTION add(x INT, y INT) RETURNS INT AS 'SELECT x + y;';
-    /// CREATE FUNCTION greet(name TEXT) RETURNS TEXT AS 'SELECT \"Hello, \" || name;';
+    /// CREATE FUNCTION greet(name VARCHAR(20)) RETURNS TEXT AS 'SELECT \"Hello, \" || name;';
     /// ",
     /// )?;
     /// let add_fn = db.functions().find(|f| f.name() == "add").expect("Function should exist");
     /// let greet_fn = db.functions().find(|f| f.name() == "greet").expect("Function should exist");
     /// assert_eq!(add_fn.argument_type_names(&db).collect::<Vec<_>>(), vec!["INT", "INT"]);
-    /// assert_eq!(greet_fn.argument_type_names(&db).collect::<Vec<_>>(), vec!["TEXT"]);
+    /// assert_eq!(greet_fn.argument_type_names(&db).collect::<Vec<_>>(), vec!["VARCHAR"]);
     /// # Ok(())
     /// # }
     /// ```
+    #[inline]
     fn argument_type_names<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> impl Iterator<Item = Cow<'db, str>>;
+    ) -> impl Iterator<Item = Cow<'db, str>> {
+        self.argument_types(database).map(|declared| declared.name(database))
+    }
 
     /// Returns the normalized argument type names (if any) of the function as
     /// strings.
@@ -262,6 +297,40 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn return_type_name<'db>(&'db self, database: &'db Self::DB) -> Option<Cow<'db, str>>;
 
+    /// Returns the type the function is declared to return, type modifiers
+    /// included, or [`None`] for a function declared without `RETURNS`.
+    ///
+    /// A set-returning `RETURNS SETOF type` answers its element type, and
+    /// [`returns_set`](FunctionLike::returns_set) answers the cardinality.
+    /// `RETURNS TABLE (...)` answers the table type it declares, whose
+    /// columns [`returned_columns`](FunctionLike::returned_columns) answers.
+    /// PostgreSQL discards a modifier on a return type, and a catalog-backed
+    /// implementation answers the type `pg_proc.prorettype` stores.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE FUNCTION codes() RETURNS SETOF VARCHAR(2) LANGUAGE sql AS 'SELECT ''ab''';",
+    /// )?;
+    /// let codes = db
+    ///     .function_by_target(TargetName::new("codes", false), IdentifierCase::AsWritten)?
+    ///     .expect("Function should exist");
+    /// let declared = codes.return_type(&db).expect("A return type is declared");
+    /// assert_eq!(declared.name(&db), "VARCHAR");
+    /// assert_eq!(declared.typmod(&db), Some(TypeModifier::Modified(6)));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn return_type<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Option<&'db <Self::DB as DatabaseLike>::DataType>;
+
     /// Returns whether the function returns a set of values rather than a
     /// single value, mirroring `pg_proc.proretset`.
     ///
@@ -375,13 +444,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// ```
     fn argument_modes(&self) -> impl Iterator<Item = ArgMode>;
 
-    /// Returns the name and normalized type name of each column a
-    /// `RETURNS TABLE` clause declares, in declaration order, and nothing
-    /// for any other result.
+    /// Returns the name and the declared type of each column a `RETURNS
+    /// TABLE` clause declares, in declaration order, and nothing for any
+    /// other result.
     ///
     /// PostgreSQL stores these columns after the arguments in
     /// `pg_proc.proargnames` with mode `t`, so a PL/pgSQL body reaches each
-    /// as an output parameter.
+    /// as an output parameter. It discards a modifier on a column type, as it
+    /// does on an argument type.
     ///
     /// # Example
     ///
@@ -391,20 +461,23 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// use sqlparser::dialect::PostgreSqlDialect;
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
-    ///     "CREATE FUNCTION f(a INT) RETURNS TABLE (\"Total\" BIGINT) LANGUAGE sql AS 'SELECT 1';",
+    ///     "CREATE FUNCTION f() RETURNS TABLE (\"Total\" NUMERIC(5,2)) LANGUAGE sql AS 'SELECT 1';",
     /// )?;
     /// let f = db
     ///     .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)?
     ///     .expect("Function should exist");
-    /// let columns: Vec<_> = f.returned_columns(&db).collect();
-    /// assert_eq!(columns, [(TargetName::new("Total", true), "BIGINT".into())]);
+    /// let columns: Vec<_> = f
+    ///     .returned_columns(&db)
+    ///     .map(|(name, declared)| (name, declared.name(&db), declared.numeric_scale(&db)))
+    ///     .collect();
+    /// assert_eq!(columns, [(TargetName::new("Total", true), "NUMERIC".into(), Some(2))]);
     /// # Ok(())
     /// # }
     /// ```
     fn returned_columns<'db>(
         &'db self,
         database: &'db Self::DB,
-    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)>;
+    ) -> impl Iterator<Item = (TargetName<'db>, &'db <Self::DB as DatabaseLike>::DataType)>;
 
     /// Returns how many of the trailing input arguments carry a default,
     /// mirroring `pg_proc.pronargdefaults`. A call may leave those out.

@@ -48,7 +48,9 @@ use crate::{
         column_type, declared_type, declared_type_named,
         plpgsql_flow::{FlowPoint, FlowSource},
     },
-    traits::{ColumnLike, DatabaseLike, DomainLike, FunctionLike, Relation, TableLike},
+    traits::{
+        ColumnLike, DataTypeLike, DatabaseLike, DomainLike, FunctionLike, Relation, TableLike,
+    },
     utils::{
         identifier_resolution::{identifiers_match, stored_identifier},
         object_name::{PG_CATALOG, object_name_last_part, type_search_path},
@@ -150,7 +152,7 @@ impl<'db, DB: DatabaseLike> BodyNames<'db, DB> {
         // `RETURNS TABLE` columns follow the arguments as output parameters.
         let returned_columns = function
             .returned_columns(database)
-            .map(|(name, type_name)| ((ArgMode::Out, Some(name)), type_name));
+            .map(|(name, data_type)| ((ArgMode::Out, Some(name)), data_type.name(database)));
         let parameters: Vec<_> = function
             .argument_modes()
             .zip(function.argument_names(database))
