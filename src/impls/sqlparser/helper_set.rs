@@ -36,7 +36,7 @@ use crate::{
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, EnumerationKind, EnumerationMember, ForeignKeyLike,
         FunctionLike, IndexLike, Relation, RoleLike, SchemaLike, TableIndexLike, TableLike,
-        UserDefinedTypeLike,
+        UserDefinedTypeLike, foreign_key::checks_rows_holding,
     },
     utils::{
         call_sites::{ExpressionForm, call_reaches, expression_form},
@@ -1677,7 +1677,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 continue;
             };
             if drawn.as_ref().is_some_and(|(drawn, _, _)| core::ptr::eq(*drawn, tree))
-                || !checks_every_row(foreign_key, &parent, database)?
+                || !checks_rows_holding(foreign_key, &parent, database)?
             {
                 continue;
             }
@@ -1727,7 +1727,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 |(referenced, referenced_key)| {
                     core::ptr::eq(referenced, tree) && same_columns(&referenced_key, key)
                 },
-            ) && checks_every_row(foreign_key, columns, database)?
+            ) && checks_rows_holding(foreign_key, columns, database)?
             {
                 return Ok(true);
             }
@@ -1739,9 +1739,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// key and the first foreign key the table declares naming it, where
     /// every foreign key holding the column at the position of a table's
     /// one-column primary key references the same table. The key answered
-    /// checks every row whose column is not `NULL`, holding that column alone,
-    /// matching `FULL` or holding its other columns `NOT NULL`, so the column
-    /// names a row of the table whenever it holds a value.
+    /// checks every row whose column is not `NULL`, as
+    /// [`checks_rows_holding`] reads it, so the column names a row of the
+    /// table whenever it holds a value.
     fn tree_reference(
         &self,
         table: &'db DB::Table,
@@ -1759,7 +1759,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 return Ok(None);
             }
             tree = Some(referenced);
-            if checked.is_none() && checks_every_row(foreign_key, &[column], database)? {
+            if checked.is_none() && checks_rows_holding(foreign_key, &[column], database)? {
                 checked = Some((referenced, key[0], foreign_key));
             }
         }
@@ -4404,25 +4404,6 @@ fn primary_reference<'db, DB: DatabaseLike>(
         key.iter().any(|held| core::ptr::eq(*held, primary))
     });
     Ok((covered && primary_columns == key.len()).then_some((referenced, key)))
-}
-
-/// Whether `foreign_key` checks every row whose `columns` are not `NULL`.
-fn checks_every_row<'db, DB: DatabaseLike>(
-    foreign_key: &'db DB::ForeignKey,
-    columns: &[&'db DB::Column],
-    database: &'db DB,
-) -> Result<bool, LookupError> {
-    if foreign_key.match_full(database) {
-        return Ok(true);
-    }
-    for host in foreign_key.host_columns(database)? {
-        if !columns.iter().any(|column| core::ptr::eq(host, *column))
-            && host.is_nullable(database)?
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// The subquery of `NOT EXISTS (<query>)`, also written `NOT (EXISTS

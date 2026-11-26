@@ -5,7 +5,10 @@ use alloc::vec::Vec;
 use crate::{
     errors::LookupError,
     structs::ConstraintDeferral,
-    traits::{ColumnLike, DatabaseLike, ForeignKeyLike, IndexLike, TableIndexLike, TableLike},
+    traits::{
+        DatabaseLike, ForeignKeyLike, IndexLike, TableIndexLike, TableLike,
+        foreign_key::checks_rows_holding,
+    },
 };
 
 /// The columns of one unique key.
@@ -74,26 +77,13 @@ pub(super) fn key_pairs<'db, DB: DatabaseLike>(
 }
 
 /// Whether `foreign_key` checks every row in which `column` is not `NULL`,
-/// which an enforced key does under `MATCH FULL` or when every other host
-/// column is `NOT NULL`, since `MATCH SIMPLE` skips a row with a `NULL` in
-/// its key. A `NOT ENFORCED` key checks no row.
+/// as [`checks_rows_holding`] reads it. A `NOT ENFORCED` key checks no row.
 fn checked_whenever_set<DB: DatabaseLike>(
     database: &DB,
     foreign_key: &DB::ForeignKey,
     column: &DB::Column,
 ) -> Result<bool, LookupError> {
-    if !foreign_key.is_enforced(database) {
-        return Ok(false);
-    }
-    if foreign_key.match_full(database) {
-        return Ok(true);
-    }
-    for host in foreign_key.host_columns(database)? {
-        if host != column && host.is_nullable(database)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(foreign_key.is_enforced(database) && checks_rows_holding(foreign_key, &[column], database)?)
 }
 
 /// Whether every row of the table holding `foreign_key` with a value in

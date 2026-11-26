@@ -2437,13 +2437,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// through a foreign key holding each of them at the position of a
     /// different column of the tree's primary key, which they cover, alone
     /// or among other columns, and checking every row naming one, its match
-    /// `FULL` or its other columns `NOT NULL`. The table is the tree itself,
-    /// with `<children>` its primary key, or an edge table, with `<children>`
-    /// naming a row of the tree the same way, each column holding the same
-    /// column of the key as the parent column at its position. The tree is
-    /// the one table the two lists name a row of, so a key into a table only
-    /// one of them names constrains the edge without changing the tree, and
-    /// two tables both name refuse the walk. `<children>` are the table's
+    /// `FULL` or its other columns holding a value on each such row, as
+    /// `NOT NULL` or the table's validated checks require. The table is the
+    /// tree itself, with `<children>` its primary key, or an edge table, with
+    /// `<children>` naming a row of the tree the same way, each column holding
+    /// the same column of the key as the parent column at its position. The
+    /// tree is the one table the two lists name a row of, so a key into a table
+    /// only one of them names constrains the edge without changing the tree,
+    /// and two tables both name refuse the walk. `<children>` are the table's
     /// primary key or columns a unique key covers alone where one of the two
     /// lists is, and otherwise the columns the term adds, the walk then going
     /// down. The term may follow only the edges meeting conditions beside its

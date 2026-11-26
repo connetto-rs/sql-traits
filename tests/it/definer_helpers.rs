@@ -7810,6 +7810,138 @@ fn an_edge_not_naming_the_tree_key_through_a_checked_foreign_key_refuses_the_wal
     assert_eq!(set.arms().len(), 3, "MATCH FULL refuses a key holding NULL in part");
 }
 
+/// `authz.reached()` walking `term` from the resources granted to the
+/// caller, over one `resources` table whose `parent_id` and `parent_kind`
+/// reference the parent row through a `MATCH SIMPLE` key and are `NULL`
+/// exactly on organizations.
+fn single_table(term: &str) -> String {
+    format!(
+        "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+         CREATE SCHEMA authz;
+         GRANT USAGE ON SCHEMA authz TO authz_owner;
+         CREATE TABLE resources (
+           id TEXT PRIMARY KEY,
+           kind TEXT NOT NULL,
+           parent_id TEXT,
+           parent_kind TEXT,
+           UNIQUE (id, kind),
+           CHECK ((kind = 'organization') = (parent_id IS NULL)),
+           CHECK ((kind = 'organization') = (parent_kind IS NULL)),
+           FOREIGN KEY (parent_id, parent_kind) REFERENCES resources (id, kind)
+         );
+         CREATE TABLE resource_grants (
+           resource_id TEXT NOT NULL REFERENCES resources (id),
+           user_id TEXT NOT NULL,
+           PRIMARY KEY (resource_id, user_id)
+         );
+         GRANT SELECT ON resources, resource_grants TO authz_owner;
+         CREATE FUNCTION authz.reached() RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           WITH RECURSIVE reached (id) AS (
+             SELECT g.resource_id FROM public.resource_grants g
+             WHERE g.user_id = current_setting('app.user_id', true)
+             UNION {term}
+           ) SELECT id FROM reached
+         $$;
+         ALTER FUNCTION authz.reached() OWNER TO authz_owner;"
+    )
+}
+
+const SINGLE_TABLE_DOWN: &str = "SELECT child.id FROM reached \
+     JOIN public.resources child ON child.parent_id = reached.id \
+     WHERE child.kind IN ('folder', 'project')";
+const SINGLE_TABLE_UP: &str = "SELECT child.parent_id FROM reached \
+     JOIN public.resources child ON child.id = reached.id \
+     WHERE child.kind IN ('folder', 'project')";
+
+const SINGLE_TABLE: Rows = &[
+    ("resources", &[("id", "org"), ("kind", "organization")]),
+    (
+        "resources",
+        &[("id", "f1"), ("kind", "folder"), ("parent_id", "org"), ("parent_kind", "organization")],
+    ),
+    (
+        "resources",
+        &[("id", "p1"), ("kind", "project"), ("parent_id", "f1"), ("parent_kind", "folder")],
+    ),
+    (
+        "resources",
+        &[("id", "p2"), ("kind", "project"), ("parent_id", "org"), ("parent_kind", "organization")],
+    ),
+    (
+        "resources",
+        &[("id", "t1"), ("kind", "task"), ("parent_id", "p1"), ("parent_kind", "project")],
+    ),
+    ("resource_grants", &[("resource_id", "org"), ("user_id", "alice")]),
+    ("resource_grants", &[("resource_id", "f1"), ("user_id", "bob")]),
+    ("resource_grants", &[("resource_id", "t1"), ("user_id", "carol")]),
+];
+
+/// What PostgreSQL 18.7 returns for `(rows, caller)` from `authz.reached()`
+/// written with [`SINGLE_TABLE_DOWN`], then with [`SINGLE_TABLE_UP`].
+const SINGLE_TABLE_MEASURED: &[HierarchyMeasured] = &[
+    (SINGLE_TABLE, "alice", &["f1", "org", "p1", "p2"], &["org"]),
+    (SINGLE_TABLE, "bob", &["f1", "p1"], &["f1", "org"]),
+    (SINGLE_TABLE, "carol", &["t1"], &["t1"]),
+    (SINGLE_TABLE, "zed", &[], &[]),
+];
+
+/// `authz.reached()` over `sql`, read with the conditions its walk sets on
+/// its edges.
+fn reached_with_conditions(sql: &str) -> Result<String, HelperSetError> {
+    let database = postgres(sql);
+    let deployment = deployment();
+    function(&database, "authz", "reached")
+        .helper_set(&[], &deployment, &database, &[ArmCondition::EdgeCondition])
+        .map(|set| render(&set))
+}
+
+#[test]
+fn a_foreign_key_whose_other_column_a_check_sets_with_the_edge_column_walks() {
+    let deployment = deployment();
+    for (term, rendered, direction) in [
+        (SINGLE_TABLE_DOWN, "resources.id WHERE parent_id IN itself", WalkDirection::Down),
+        (SINGLE_TABLE_UP, "resources.parent_id WHERE id IN itself", WalkDirection::Up),
+    ] {
+        let database = postgres(&single_table(term));
+        let set = function(&database, "authz", "reached")
+            .helper_set(&[], &deployment, &database, &[ArmCondition::EdgeCondition])
+            .expect("answered");
+        assert_eq!(
+            render(&set),
+            format!("{RESOURCE_GRANT_ARM} UNION {rendered} AND kind IN ('folder', 'project')"),
+            "{term}"
+        );
+        let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+        assert_eq!(walk.tree().table_name(), "resources", "{term}");
+        assert_eq!(walk.direction(), direction, "{term}");
+        let measured = SINGLE_TABLE_MEASURED.iter().copied();
+        assert_walked(&set, direction, term, measured);
+    }
+}
+
+#[test]
+fn a_walk_needs_a_validated_check_setting_the_other_key_column_with_the_edge_column() {
+    let both = "CHECK ((kind = 'organization') = (parent_kind IS NULL)),";
+    let walks = |check: &str, after: &str| {
+        let sql = format!("{}\n{after}", single_table(SINGLE_TABLE_DOWN).replace(both, check));
+        match reached_with_conditions(&sql) {
+            Ok(_) => true,
+            Err(HelperSetError::ArmShape { function, .. }) if function == "authz.reached" => false,
+            Err(other) => panic!("{check}: {other}"),
+        }
+    };
+    let implied = "CHECK (parent_id IS NULL OR parent_kind IS NOT NULL)";
+    assert!(walks(&format!("{implied},"), ""));
+    assert!(!walks("", ""), "no check");
+    assert!(!walks("CHECK (parent_kind IS NULL OR parent_id IS NOT NULL),", ""), "the converse");
+    assert!(!walks("CHECK (kind <> 'organization' OR parent_kind IS NULL),", ""), "roots only");
+    assert!(
+        !walks("", &format!("ALTER TABLE resources ADD CONSTRAINT kinded {implied} NOT VALID;")),
+        "a check no existing row was validated against"
+    );
+}
+
 #[test]
 fn a_lateral_step_needs_the_owner_to_read_every_edge_it_walks() {
     let deployment = deployment();

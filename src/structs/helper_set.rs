@@ -59,7 +59,8 @@ impl<'db, DB: DatabaseLike> HelperSet<'db, DB> {
     /// A foreign key counts where the column stands at the position of the
     /// table's one-column primary key among the columns it references, and
     /// where it checks every value the column holds, being `MATCH FULL` or
-    /// its other columns `NOT NULL`.
+    /// its other columns holding a value on each row the column does, as
+    /// `NOT NULL` or the table's validated checks require.
     ///
     /// `None` where two arms return keys of different tables, or an arm
     /// returns a column that is neither or several columns. Arms left out
