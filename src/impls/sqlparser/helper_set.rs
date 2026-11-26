@@ -696,6 +696,12 @@ type ReadArm<'db, DB> = (Option<&'db <DB as DatabaseLike>::Table>, Vec<HelperArm
 /// adds to the arm's other conditions.
 type Grantee<'db, DB> = (GrantedTo<'db, DB>, Kept<'db, DB>);
 
+/// The comparisons with values of the request by which one arm a grant arm
+/// answers keeps its rows, every one holding on the arm's row and none for
+/// an arm granted to anyone, with what keeping them adds to the arm's other
+/// conditions.
+type Requested<'db, DB> = (Vec<SettingComparison<'db, DB>>, Kept<'db, DB>);
+
 /// An element of an `IN` list naming the request.
 enum Listed<'q> {
     /// A read of a setting, with the cast the body writes on it.
@@ -734,7 +740,7 @@ type JoinedConditions<'q, 'db, DB> = (Vec<&'q Expr>, Option<Vec<JoinedRow<'db, D
 /// writes, the comparisons with a helper's set left until the grantee is
 /// known.
 struct ArmConjuncts<'q, 'db, DB: DatabaseLike> {
-    grantees: Option<Vec<Grantee<'db, DB>>>,
+    requested: Option<Vec<Requested<'db, DB>>>,
     gates: Gates<'db>,
     unset_settings: Vec<UnsetSetting<'db>>,
     /// `None` in the place of each of [`memberships`](Self::memberships).
@@ -2168,7 +2174,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let table = rows.first().ok_or_else(shape)?;
         let (own, joined_rows) = self.joined_rows(scope, select, rows, reached)?;
         let ArmConjuncts {
-            mut grantees,
+            requested,
             gates,
             unset_settings,
             mut caps,
@@ -2176,6 +2182,19 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             exclusions,
             conditions,
         } = self.arm_conjuncts(scope, select, rows, returned, own)?;
+        let mut grantees: Option<Vec<Grantee<'db, DB>>> = requested.map(|requested| {
+            requested
+                .into_iter()
+                .map(|(compared, kept)| {
+                    let granted_to = if compared.is_empty() {
+                        GrantedTo::Anyone
+                    } else {
+                        GrantedTo::Request(compared)
+                    };
+                    (granted_to, kept)
+                })
+                .collect()
+        });
         if grantees.is_some() {
             for (index, compared, called) in memberships {
                 let column = table.column(compared).ok_or_else(shape)?;
@@ -2255,7 +2274,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let shape = || scope.arm_shape(select);
         let table = rows.first().ok_or_else(shape)?;
         let mut read = ArmConjuncts {
-            grantees: None,
+            requested: None,
             gates: Gates::default(),
             unset_settings: Vec::new(),
             caps: Vec::new(),
@@ -2276,13 +2295,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 continue;
             }
             let named = match self.setting_comparison(scope, table, conjunct)? {
-                Some(request) => Some(vec![(GrantedTo::Request(request), Kept::All)]),
+                Some(request) => Some(vec![(vec![request], Kept::All)]),
                 None => self.request_list(scope, table, conjunct)?,
             };
             if let Some(named) = named {
-                if read.grantees.replace(named).is_some() {
-                    return Err(shape());
-                }
+                read.requested = Some(match read.requested.take() {
+                    None => named,
+                    Some(requested) => crossed_requests(&requested, &named),
+                });
             } else if let Expr::In {
                 expr,
                 target: InTarget::Subquery(called),
@@ -2567,16 +2587,16 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     }
 
     /// `<column> IN (<values>)` listing at least one read of a setting
-    /// beside literals and parameters: one grantee per read, each compared
-    /// as `<column> = <read>` is, and the literals together as one grantee
-    /// of anyone restricted to them, in the place of the first. `None`
-    /// where the list names no read or anything else.
+    /// beside literals and parameters: one arm per read, each compared as
+    /// `<column> = <read>` is, and the literals together as one arm granted
+    /// to anyone restricted to them, in the place of the first. `None` where
+    /// the list names no read or anything else.
     fn request_list(
         &self,
         scope: &Scope<'db, DB>,
         table: &ArmTable<'_, 'db, DB>,
         conjunct: &Expr,
-    ) -> Result<Option<Vec<Grantee<'db, DB>>>, HelperSetError> {
+    ) -> Result<Option<Vec<Requested<'db, DB>>>, HelperSetError> {
         let Expr::In { expr, target: InTarget::List(list), negated: false, .. } = unnest(conjunct)
         else {
             return Ok(None);
@@ -2593,7 +2613,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         if !elements.iter().any(|element| matches!(element, Listed::Read(..))) {
             return Ok(None);
         }
-        let mut grantees = Vec::with_capacity(elements.len());
+        let mut requested = Vec::with_capacity(elements.len());
         let mut literals = None;
         let mut values = Vec::new();
         for element in elements {
@@ -2601,21 +2621,21 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 Listed::Read(read, cast) => {
                     let cast = cast.map(|cast| ReadCast { written: cast, compared: cast });
                     let request = self.compared(scope, column, &read, None, cast)?;
-                    grantees.push((GrantedTo::Request(request), Kept::All));
+                    requested.push((vec![request], Kept::All));
                 }
                 Listed::Literal(passed) => {
                     if literals.is_none() {
-                        literals = Some(grantees.len());
-                        grantees.push((GrantedTo::Anyone, Kept::Nothing));
+                        literals = Some(requested.len());
+                        requested.push((Vec::new(), Kept::Nothing));
                     }
                     values.push(passed);
                 }
             }
         }
         if let Some(index) = literals {
-            grantees[index].1 = Kept::listed(column, values);
+            requested[index].1 = Kept::listed(column, values);
         }
-        Ok(Some(grantees))
+        Ok(Some(requested))
     }
 
     /// The cap `conjunct` writes, if it writes one: `<operands> IN (SELECT *
@@ -3665,6 +3685,22 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             .collect();
         Ok(Some(Kept::values(column, values)))
     }
+}
+
+/// The arms two conjuncts naming the request write together, one per arm of
+/// `left` beside each arm of `right`, keeping the rows both keep, every
+/// comparison of either holding on the one row.
+fn crossed_requests<'db, DB: DatabaseLike>(
+    left: &[Requested<'db, DB>],
+    right: &[Requested<'db, DB>],
+) -> Vec<Requested<'db, DB>> {
+    left.iter()
+        .flat_map(|(compared, kept)| {
+            right.iter().map(move |(others, other)| {
+                (compared.iter().chain(others).cloned().collect(), kept.clone().and(other.clone()))
+            })
+        })
+        .collect()
 }
 
 /// Binds each input parameter of `function` to its argument.

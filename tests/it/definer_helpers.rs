@@ -292,22 +292,38 @@ fn answer<'db>(
     function(database, schema, name).helper_set(arguments, deployment, database, &[])
 }
 
+/// The one comparison with a value of the request `grant` names its grantee
+/// by.
+fn compared<'a, 'db>(grant: &'a GrantArm<'db, ParserDB>) -> &'a SettingComparison<'db, ParserDB> {
+    let GrantedTo::Request(compared) = grant.granted_to() else {
+        panic!("the arm names its grantee by the request")
+    };
+    let [compared] = compared.as_slice() else { panic!("one comparison") };
+    compared
+}
+
 /// The condition naming the grantee of a grant arm, `None` for anyone.
 fn render_granted_to(granted_to: &GrantedTo<'_, ParserDB>) -> Option<String> {
     match granted_to {
-        GrantedTo::Request(request) => {
-            let compared = match request.value() {
-                SettingValue::Set { .. } => "IN",
-                SettingValue::Caller(_)
-                | SettingValue::Principal { .. }
-                | SettingValue::Scalar(_) => "=",
-            };
-            let setting = request.setting().name();
-            let read = match request.normalization() {
-                None => setting.to_string(),
-                Some(RequestNormalization::Lower) => format!("lower({setting})"),
-            };
-            Some(format!("{} {compared} {read}", request.column().column_name()))
+        GrantedTo::Request(compared) => {
+            let rendered: Vec<String> = compared
+                .iter()
+                .map(|request| {
+                    let compared = match request.value() {
+                        SettingValue::Set { .. } => "IN",
+                        SettingValue::Caller(_)
+                        | SettingValue::Principal { .. }
+                        | SettingValue::Scalar(_) => "=",
+                    };
+                    let setting = request.setting().name();
+                    let read = match request.normalization() {
+                        None => setting.to_string(),
+                        Some(RequestNormalization::Lower) => format!("lower({setting})"),
+                    };
+                    format!("{} {compared} {read}", request.column().column_name())
+                })
+                .collect();
+            Some(rendered.join(" AND "))
         }
         GrantedTo::Set(grantees) => {
             let arguments: Vec<String> =
@@ -777,8 +793,11 @@ fn grant_rows(
             && grant.joined_rows().iter().all(|joined| joins(row, joined, fixture));
         let granted = match grant.granted_to() {
             GrantedTo::Request(compared) => {
-                let held = cell(row, compared.column().column_name());
-                !(compared.excludes_unset() && held.is_empty()) && request.carries(compared, held)
+                compared.iter().all(|compared| {
+                    let held = cell(row, compared.column().column_name());
+                    !(compared.excludes_unset() && held.is_empty())
+                        && request.carries(compared, held)
+                })
             }
             GrantedTo::Set(compared) => {
                 grantees.as_ref().is_some_and(|grantees| {
@@ -1275,7 +1294,7 @@ fn a_role_less_membership_table_answers_every_grant_row_of_the_caller() {
     assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id");
     let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
     assert!(
-        matches!(grant.granted_to(), GrantedTo::Request(request) if request.raises_when_unset()),
+        compared(grant).raises_when_unset(),
         "current_setting without missing_ok raises on an unset setting"
     );
 
@@ -1283,9 +1302,7 @@ fn a_role_less_membership_table_answers_every_grant_row_of_the_caller() {
         .expect("answered");
     assert_eq!(render(&set), "members.doc_id WHERE user_id = app.user_id AND kind IN ('note')");
     let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
-    assert!(
-        matches!(grant.granted_to(), GrantedTo::Request(request) if !request.raises_when_unset())
-    );
+    assert!(!compared(grant).raises_when_unset());
 }
 
 #[test]
@@ -1578,7 +1595,6 @@ fn an_arm_of_any_other_shape_refuses_the_answer() {
         Err(HelperSetError::ArmShape { function, .. }) if function == "authz.owners_with"
     ));
     for body in [
-        "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) AND role = 'a' AND user_id = current_setting('app.user_id')",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) GROUP BY doc_id",
         "SELECT doc_id FROM members WHERE user_id = current_setting('app.user_id', true) INTERSECT SELECT id FROM docs",
         "SELECT id FROM docs WHERE parent_id IN (SELECT docs_with(min_role)) AND id = 'x'",
@@ -1981,13 +1997,6 @@ fn only_postgres_own_current_setting_with_a_literal_name_reads_the_caller() {
         irreducible("current_setting('app.user_id', true)", shadow),
         "a declared current_setting the call may reach is not PostgreSQL's"
     );
-    assert!(matches!(
-        caller(
-            "current_setting('app.user_id', true) AND doc_id = current_setting('app.user_id', true)",
-            ""
-        ),
-        Err(HelperSetError::ArmShape { .. })
-    ));
     assert!(irreducible("doc_id AND role = 'admin'", ""));
 }
 
@@ -2067,13 +2076,6 @@ fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
             "{condition}"
         );
     }
-    assert!(
-        matches!(
-            compared(&format!("doc_id = ANY ({split}) AND user_id = ANY ({split})"), ""),
-            Err(HelperSetError::ArmShape { .. })
-        ),
-        "an arm compares one column with the request"
-    );
 }
 
 /// A helper over `UUID` keys reading the caller as `read`, under `path`.
@@ -2132,8 +2134,7 @@ fn a_caller_read_cast_to_its_declared_type_reads_the_caller() {
     let raises = |read: &str| {
         blocked_by(&blocking("''", read, ""), DataType::Uuid, |set| {
             let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
-            request.raises_when_unset()
+            compared(grant).raises_when_unset()
         })
     };
     assert_eq!(raises("current_setting('app.user_id')::uuid"), Ok(true));
@@ -2260,8 +2261,7 @@ fn a_comparison_answers_the_value_its_setting_declares() {
     ] {
         let answered = presented_as(sql, value.clone(), |set| {
             let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the request") };
-            request.value() == &value
+            compared(grant).value() == &value
         });
         assert_eq!(answered, Ok(true), "{value:?}");
     }
@@ -3206,14 +3206,184 @@ fn a_set_arm_returns_what_postgres_returns_for_every_presented_set() {
         );
         assert_eq!(covered(&set), Some("share_links"), "{helper}");
         let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
-        assert!(
-            matches!(grant.granted_to(), GrantedTo::Request(request) if !request.raises_when_unset())
-        );
+        assert!(!compared(grant).raises_when_unset());
     }
     for &(helper, request, expected) in SET_MEASURED {
         let set = answer(&database, &deployment, "authz", helper, &[]).expect("answered");
         let returned: Vec<_> = evaluate(&set, request, REQUEST_VALUE_ROWS).into_iter().collect();
         assert_eq!(returned, expected, "{helper} for {:?}", request.values);
+    }
+}
+
+const INSTALLATION_PAIR: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+CREATE TABLE installation_permissions (
+  organization_id TEXT NOT NULL,
+  installation_namespace_id TEXT NOT NULL,
+  installation_id TEXT NOT NULL,
+  PRIMARY KEY (organization_id, installation_namespace_id, installation_id)
+);
+GRANT SELECT ON installation_permissions TO authz_owner;
+CREATE FUNCTION authz.permitted_organizations() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT p.organization_id FROM public.installation_permissions p
+  WHERE p.installation_namespace_id = current_setting('app.installation_namespace_id', true)
+    AND p.installation_id = NULLIF(current_setting('app.installation_id', true), '')
+$$;
+CREATE FUNCTION authz.listed_organizations() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT p.organization_id FROM public.installation_permissions p
+  WHERE p.installation_id IN (NULLIF(current_setting('app.installation_id', true), ''), 'everyone')
+    AND p.installation_namespace_id = current_setting('app.installation_namespace_id', true)
+$$;
+ALTER FUNCTION authz.permitted_organizations() OWNER TO authz_owner;
+ALTER FUNCTION authz.listed_organizations() OWNER TO authz_owner;
+";
+
+const INSTALLATION_PAIR_ROWS: Rows = &[
+    (
+        "installation_permissions",
+        &[
+            ("organization_id", "o1"),
+            ("installation_namespace_id", "n1"),
+            ("installation_id", "i1"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("organization_id", "o2"),
+            ("installation_namespace_id", "n2"),
+            ("installation_id", "i1"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("organization_id", "o3"),
+            ("installation_namespace_id", "n1"),
+            ("installation_id", "i2"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("organization_id", "o3"),
+            ("installation_namespace_id", "n2"),
+            ("installation_id", "i1"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("organization_id", "o4"),
+            ("installation_namespace_id", "n1"),
+            ("installation_id", "everyone"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("organization_id", "o5"),
+            ("installation_namespace_id", "n2"),
+            ("installation_id", "everyone"),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[("organization_id", "o6"), ("installation_namespace_id", "n1"), ("installation_id", "")],
+    ),
+];
+
+const INSTALLATION_NAMESPACE: &str = "app.installation_namespace_id";
+
+/// What PostgreSQL 18.6 returns for `(request, permitted_organizations(),
+/// listed_organizations())`, as `app` over [`INSTALLATION_PAIR_ROWS`], a
+/// setting the request leaves out never set.
+const INSTALLATION_PAIR_MEASURED: &[(Request, &[&str], &[&str])] = &[
+    (
+        Request {
+            caller: None,
+            values: &[(INSTALLATION_NAMESPACE, &["n1"]), (INSTALLATION, &["i1"])],
+        },
+        &["o1"],
+        &["o1", "o4"],
+    ),
+    (
+        Request {
+            caller: None,
+            values: &[(INSTALLATION_NAMESPACE, &["n2"]), (INSTALLATION, &["i1"])],
+        },
+        &["o2", "o3"],
+        &["o2", "o3", "o5"],
+    ),
+    (
+        Request {
+            caller: None,
+            values: &[(INSTALLATION_NAMESPACE, &["n1"]), (INSTALLATION, &["i2"])],
+        },
+        &["o3"],
+        &["o3", "o4"],
+    ),
+    (
+        Request {
+            caller: None,
+            values: &[(INSTALLATION_NAMESPACE, &["n2"]), (INSTALLATION, &["i2"])],
+        },
+        &[],
+        &["o5"],
+    ),
+    (Request { caller: None, values: &[(INSTALLATION_NAMESPACE, &["n1"])] }, &[], &["o4"]),
+    (
+        Request {
+            caller: None,
+            values: &[(INSTALLATION_NAMESPACE, &["n1"]), (INSTALLATION, &[""])],
+        },
+        &[],
+        &["o4"],
+    ),
+    (Request { caller: None, values: &[(INSTALLATION, &["i1"])] }, &[], &[]),
+    (Request { caller: None, values: &[] }, &[], &[]),
+];
+
+#[test]
+fn every_request_comparison_of_an_arm_holds_on_its_one_row() {
+    let database = postgres(INSTALLATION_PAIR);
+    let setting = |name: &str| {
+        SessionSetting::value(name, SettingValue::Scalar(DataType::Text))
+            .expect("a custom setting name")
+            .may_be_unset()
+    };
+    let deployment =
+        Deployment::new("app", ["app"], [setting(INSTALLATION_NAMESPACE), setting(INSTALLATION)])
+            .expect("a valid deployment");
+    let permitted =
+        answer(&database, &deployment, "authz", "permitted_organizations", &[]).expect("answered");
+    assert_eq!(
+        render(&permitted),
+        "installation_permissions.organization_id \
+         WHERE installation_namespace_id = app.installation_namespace_id \
+         AND installation_id = app.installation_id"
+    );
+    let listed =
+        answer(&database, &deployment, "authz", "listed_organizations", &[]).expect("answered");
+    assert_eq!(
+        render(&listed),
+        "installation_permissions.organization_id \
+         WHERE installation_id = app.installation_id \
+         AND installation_namespace_id = app.installation_namespace_id \
+         UNION installation_permissions.organization_id \
+         WHERE installation_namespace_id = app.installation_namespace_id \
+         AND installation_id IN ('everyone')"
+    );
+    for &(request, permitted_returns, listed_returns) in INSTALLATION_PAIR_MEASURED {
+        for (set, expected) in [(&permitted, permitted_returns), (&listed, listed_returns)] {
+            let returned: Vec<_> =
+                evaluate(set, request, INSTALLATION_PAIR_ROWS).into_iter().collect();
+            assert_eq!(returned, expected, "{} for {:?}", render(set), request.values);
+        }
     }
 }
 
@@ -3494,18 +3664,6 @@ fn a_grant_arm_compares_its_grantee_with_every_grantee_the_caller_is() {
             "project_grants.project_id WHERE grantee_id = app.user_id AND (grantee_id) IN authz.caller_grantees() {"
         )),
         "{capped:?}"
-    );
-    let twice = beside_caller.replace(
-        "pg.grantee_id IN (SELECT authz.caller_grantees())",
-        "pg.project_id = current_setting('app.user_id', true)",
-    );
-    assert_ne!(twice, beside_caller, "the condition is replaced");
-    assert!(
-        matches!(
-            answer(&postgres(&twice), &deployment, "authz", "projects_granted", &[text("read")]),
-            Err(HelperSetError::ArmShape { .. })
-        ),
-        "an arm names one grantee"
     );
 }
 
@@ -4005,8 +4163,7 @@ fn a_set_read_excludes_the_unset_request_unless_it_raises_on_the_empty_string() 
         let deployment = Deployment::new("app", ["app"], [setting]).expect("a valid deployment");
         answer(&database, &deployment, "authz", "presented_links", &[]).map(|set| {
             let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-            let GrantedTo::Request(request) = grant.granted_to() else { panic!("the set") };
-            request.excludes_unset()
+            compared(grant).excludes_unset()
         })
     };
     let absent_split = "string_to_array(NULLIF(current_setting('app.link_ids', true), ''), ',')";
@@ -4120,7 +4277,7 @@ fn raw_caller() -> String {
 fn blocked_through(after: &str, read: &str) -> Result<(String, bool, bool), HelperSetError> {
     blocked_by(&blocking("''", read, after), DataType::Uuid, |set| {
         let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-        let GrantedTo::Request(request) = grant.granted_to() else { panic!("the caller") };
+        let request = compared(grant);
         (render(set), request.raises_when_unset(), request.excludes_unset())
     })
 }
@@ -4211,7 +4368,7 @@ fn presented_through(
     let sql = presenting("''", condition, after);
     presented_as(&sql, SettingValue::Set { element: DataType::Uuid, packing }, |set| {
         let [HelperArm::Grant(grant)] = set.arms() else { panic!("one grant arm") };
-        let GrantedTo::Request(request) = grant.granted_to() else { panic!("the set") };
+        let request = compared(grant);
         (render(set), request.raises_when_unset(), request.excludes_unset())
     })
 }
@@ -4610,8 +4767,12 @@ fn an_in_list_of_principals_answers_one_grant_arm_per_principal_and_one_for_its_
     assert_eq!(covered(&set), None, "a block's organization is no key of its table");
     for arm in set.arms() {
         let HelperArm::Grant(grant) = arm else { panic!("grant arms") };
-        if let GrantedTo::Request(request) = grant.granted_to() {
-            assert!(!request.raises_when_unset() && request.excludes_unset());
+        if let GrantedTo::Request(compared) = grant.granted_to() {
+            assert!(
+                compared
+                    .iter()
+                    .all(|request| { !request.raises_when_unset() && request.excludes_unset() })
+            );
         }
     }
     for &(request, expected) in LISTED_BLOCKS_MEASURED {
@@ -4818,13 +4979,6 @@ fn a_list_naming_anything_but_request_values_literals_and_parameters_refuses_the
             "{condition}"
         );
     }
-    assert!(
-        matches!(
-            refused(format!("b.principal_id IN ({user}) AND b.organization_id = {user}"), ""),
-            Err(HelperSetError::ArmShape { .. })
-        ),
-        "an arm names one grantee"
-    );
     assert_eq!(
         refused(
             format!(
@@ -7935,9 +8089,7 @@ fn a_column_compared_with_a_scalar_returns_what_postgres_returns_for_every_reque
     for (set, excludes_unset) in [(&normalized, true), (&raw, true), (&bare, false)] {
         assert_eq!(covered(set), Some("invitations"));
         let HelperArm::Grant(grant) = &set.arms()[0] else { panic!("a grant arm") };
-        let GrantedTo::Request(request) = grant.granted_to() else {
-            panic!("the email names the grantee")
-        };
+        let request = compared(grant);
         assert!(!request.raises_when_unset());
         assert_eq!(request.excludes_unset(), excludes_unset, "{}", render(set));
     }
@@ -8072,17 +8224,6 @@ fn a_read_normalized_otherwise_or_of_anything_but_a_scalar_refuses_the_answer() 
             "{condition}: {refused:?}"
         );
     }
-    assert!(
-        matches!(
-            inviting(
-                "invitation.email = authz.verified_email() \
-                 AND invitation.email = current_setting('app.user_id', true)",
-                ""
-            ),
-            Err(HelperSetError::ArmShape { .. })
-        ),
-        "an arm names one grantee"
-    );
 }
 
 /// Grants a caller may share, as connetto's core schema writes them, an
