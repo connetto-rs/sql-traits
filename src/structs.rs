@@ -147,6 +147,7 @@ pub(crate) use sequence::StoredSequenceOwner;
 pub use sequence_parameters::{SequenceParameters, SequenceType};
 pub use sqlite_index_column::{SqliteIndexColumn, SqliteIndexed};
 pub use sqlparser_expr_eval::Outcomes;
+pub(crate) use table_privileges::HeldPrivileges;
 pub use table_privileges::{ColumnPrivilege, TablePrivileges};
 pub use target_name::TargetName;
 pub use transition_table::TransitionTable;

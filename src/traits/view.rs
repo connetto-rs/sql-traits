@@ -3,12 +3,16 @@
 use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::{fmt::Debug, hash::Hash};
 
-use sqlparser::ast::Query;
+use sqlparser::ast::{Action, Query};
 
 use crate::{
     errors::LookupError,
-    structs::{TargetName, UpdatableViewBase},
-    traits::{DatabaseLike, Metadata, Relation, TriggerLike},
+    impls::dql::query_output_names,
+    structs::{ActingRole, HeldPrivileges, TablePrivileges, TargetName, UpdatableViewBase},
+    traits::{
+        ColumnGrantLike, DatabaseLike, Metadata, Relation, RoleLike, TableGrantLike, TriggerLike,
+        role::privilege_holders,
+    },
     utils::{
         identifier_resolution::{is_temporary_schema, stored_identifier},
         output_from_wildcard,
@@ -372,6 +376,166 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// ```
     fn owner<'db>(&self, database: &'db Self::DB) -> Result<Option<&'db str>, LookupError>;
 
+    /// Iterates over the relation-level privileges the owner's own entry on
+    /// this view holds.
+    ///
+    /// PostgreSQL gives the owner every table privilege when it creates the
+    /// view, through an entry the owner can revoke and grant back like any
+    /// other, as it does for a table. A `REVOKE` naming the
+    /// [`owner`](Self::owner) takes from it, and an owner change hands it to
+    /// the new owner as it stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this view.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app_owner;
+    ///      CREATE TABLE docs (id INT);
+    ///      CREATE VIEW v AS SELECT id FROM docs;
+    ///      ALTER VIEW v OWNER TO app_owner;
+    ///      REVOKE TRUNCATE, TRIGGER, MAINTAIN ON v FROM app_owner;",
+    /// )?;
+    /// let view = db.view_by_target(TargetName::new("v", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let held: Vec<_> = view.owner_privileges(&db)?.map(ToString::to_string).collect();
+    /// assert_eq!(held, ["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn owner_privileges<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db Action>, LookupError>;
+
+    /// Returns the privileges `role` holds on this view, per command and per
+    /// output column, as PostgreSQL's `has_table_privilege`,
+    /// `has_column_privilege` and `has_any_column_privilege` answer them.
+    ///
+    /// The privileges reach `role` as
+    /// [`TableLike::privileges`](crate::traits::TableLike::privileges)
+    /// resolves them on a table, through a grant naming the role itself,
+    /// `PUBLIC` or a role it inherits from, and through the owner's own entry,
+    /// as [`owner_privileges`](Self::owner_privileges) reports it, when the
+    /// role or one it inherits from is the view's [`owner`](Self::owner). A
+    /// superuser holds every privilege.
+    ///
+    /// A column is named by its position among the view's output columns,
+    /// counted from zero, the order
+    /// [`updatable_base`](Self::updatable_base) lists them in. A column grant
+    /// holds on the output columns whose names match the names it lists, the
+    /// names the declaration's column list gives or else the definition's own.
+    /// One whose name cannot be worked out, as behind a call returning an
+    /// unknown row type, holds no column grant.
+    ///
+    /// These are the privileges checked against whoever names the view in a
+    /// statement. A write the view passes on to its base relation is checked
+    /// there against the view's owner, or against the caller for a view that
+    /// [runs with its reader's rights](Self::is_security_invoker).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this view, and the lookup errors resolving the definition's
+    /// relation and column names runs into.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app;
+    ///      CREATE ROLE mover;
+    ///      CREATE TABLE resources (id INT PRIMARY KEY, parent_id INT);
+    ///      CREATE VIEW resource_moves AS SELECT id, parent_id FROM resources WHERE parent_id > 0;
+    ///      ALTER VIEW resource_moves OWNER TO mover;
+    ///      GRANT SELECT, UPDATE (parent_id) ON resource_moves TO app;",
+    /// )?;
+    /// let view = db
+    ///     .view_by_target(TargetName::new("resource_moves", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// let app = view.privileges(db.role("app").unwrap(), &db)?;
+    /// assert!(app.select.on_table());
+    /// assert!(!app.update.on_column(0));
+    /// assert!(app.update.on_column(1));
+    /// assert!(!app.insert.on_any_column());
+    /// assert!(!app.delete);
+    ///
+    /// let mover = view.privileges(db.role("mover").unwrap(), &db)?;
+    /// assert!(mover.insert.on_table() && mover.update.on_table() && mover.delete);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn privileges<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<TablePrivileges<usize>, LookupError>
+    where
+        Self: 'db,
+    {
+        let owner = self.owner(database)?;
+        let holders: Vec<&<Self::DB as DatabaseLike>::Role> = match role.into() {
+            ActingRole::Declared(role) if role.is_superuser() => {
+                return Ok(TablePrivileges::all());
+            }
+            ActingRole::Declared(role) => privilege_holders(role, database).collect(),
+            ActingRole::Public => Vec::new(),
+        };
+        let output = output_names(self, database)?;
+        let names: Vec<(&str, bool)> =
+            output.iter().map(|(name, quoted)| (name.as_str(), *quoted)).collect();
+        let mut held = HeldPrivileges::new(&names);
+
+        if let Some(owner) = owner
+            && holders.iter().any(|holder| holder.stored_name() == owner)
+        {
+            for privilege in self.owner_privileges(database)? {
+                held.take(privilege, None);
+            }
+        }
+        let target = self.target_name();
+        let is_this = |relation: Relation<'_, Self::DB>| {
+            match relation {
+                Relation::View(view) => !self.is_materialized() && view.target_name() == target,
+                Relation::MaterializedView(view) => {
+                    self.is_materialized() && view.target_name() == target
+                }
+                Relation::Table(_) | Relation::ForeignTable(_) | Relation::Sequence(_) => false,
+            }
+        };
+        for grant in database.table_grants().filter(|grant| grant.relations(database).any(is_this))
+        {
+            held.take_grant(grant, &holders, None, database);
+        }
+        let case = database.identifier_case();
+        for grant in
+            database.column_grants().filter(|grant| grant.relation(database).is_some_and(is_this))
+        {
+            let covered: Vec<bool> = names
+                .iter()
+                .map(|(name, quoted)| {
+                    grant.column_names().any(|(granted, granted_quoted)| {
+                        case.identifiers_match(name, *quoted, granted, granted_quoted)
+                    })
+                })
+                .collect();
+            held.take_grant(grant, &holders, Some(&covered), database);
+        }
+        let positions: Vec<usize> = (0..names.len()).collect();
+        Ok(held.answer(&positions))
+    }
+
     /// Returns the triggers defined on the view, such as the `INSTEAD OF`
     /// triggers that make it writable.
     ///
@@ -531,4 +695,23 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
         let declared = self.declared_column_names();
         (!declared.is_empty()).then(|| declared.to_vec())
     }
+}
+
+/// The name of each output column of `view`, with its quote state, in output
+/// order: the declaration's column list over the names the definition
+/// produces, as PostgreSQL applies it. When the definition leaves a name
+/// unknown, the declared names alone are known.
+fn output_names<V: ViewLike>(
+    view: &V,
+    database: &V::DB,
+) -> Result<Vec<(String, bool)>, LookupError> {
+    let mut names = query_output_names(view.definition(), database, database.identifier_case())?
+        .unwrap_or_default();
+    for (position, declared) in view.declared_column_names().iter().enumerate() {
+        match names.get_mut(position) {
+            Some(name) => name.clone_from(declared),
+            None => names.push(declared.clone()),
+        }
+    }
+    Ok(names)
 }

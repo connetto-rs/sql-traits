@@ -278,6 +278,7 @@ mod updatable_view_base;
 mod user_defined_types;
 mod view_identifier_case;
 mod view_options;
+mod view_privileges;
 mod view_triggers;
 mod views;
 mod views_follow_renames;

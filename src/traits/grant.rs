@@ -582,6 +582,34 @@ pub trait ColumnGrantLike:
         database: &'a Self::DB,
     ) -> Result<impl Iterator<Item = &'a <Self::DB as DatabaseLike>::Column>, LookupError>;
 
+    /// Returns the name of each column this grant covers, with its quote
+    /// state, as the grant spelled it.
+    ///
+    /// This is how a grant on a view names its columns, since a view's output
+    /// columns are no column objects for [`Self::columns`] to answer with.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "
+    /// CREATE TABLE t (id INT, \"Name\" TEXT);
+    /// CREATE VIEW v AS SELECT id, \"Name\" FROM t;
+    /// CREATE ROLE app_user;
+    /// GRANT UPDATE (id, \"Name\") ON v TO app_user;
+    /// ",
+    /// )?;
+    /// let grant = db.column_grants().next().unwrap();
+    /// assert_eq!(grant.column_names().collect::<Vec<_>>(), [("id", false), ("Name", true)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn column_names(&self) -> impl Iterator<Item = (&str, bool)>;
+
     /// Returns the table this column grant applies to.
     ///
     /// Answers [`None`] when the grant's target is a view, which PostgreSQL
@@ -651,6 +679,10 @@ where
         database: &'a Self::DB,
     ) -> Result<impl Iterator<Item = &'a <Self::DB as DatabaseLike>::Column>, LookupError> {
         (*self).columns(table, database)
+    }
+
+    fn column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        (*self).column_names()
     }
 
     fn table<'a>(

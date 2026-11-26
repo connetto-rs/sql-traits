@@ -801,37 +801,31 @@ impl TableGrantLike for Grant {
     }
 }
 
+/// The columns each privilege of `grant` lists, in the order written, a
+/// column listed by several privileges once for each.
+fn listed_columns(grant: &Grant) -> impl Iterator<Item = &Ident> {
+    let actions: &[Action] = match &grant.privileges {
+        Privileges::All { .. } => &[],
+        Privileges::Actions(actions) => actions,
+    };
+    actions.iter().flat_map(|action| {
+        match action {
+            Action::Select { columns }
+            | Action::Insert { columns }
+            | Action::Update { columns }
+            | Action::References { columns } => columns.as_deref().unwrap_or_default(),
+            _ => &[],
+        }
+    })
+}
+
 impl ColumnGrantLike for Grant {
     fn columns<'a>(
         &'a self,
         table: &'a <Self::DB as DatabaseLike>::Table,
         database: &'a Self::DB,
     ) -> Result<impl Iterator<Item = &'a <Self::DB as DatabaseLike>::Column>, LookupError> {
-        let column_idents: Vec<&Ident> = match &self.privileges {
-            Privileges::All { .. } => Vec::new(),
-            Privileges::Actions(actions) => {
-                actions
-                    .iter()
-                    .flat_map(|action| {
-                        match action {
-                            Action::Select { columns } => {
-                                columns.as_ref().map(|c| c.iter()).into_iter().flatten().collect()
-                            }
-                            Action::Insert { columns } => {
-                                columns.as_ref().map(|c| c.iter()).into_iter().flatten().collect()
-                            }
-                            Action::Update { columns } => {
-                                columns.as_ref().map(|c| c.iter()).into_iter().flatten().collect()
-                            }
-                            Action::References { columns } => {
-                                columns.as_ref().map(|c| c.iter()).into_iter().flatten().collect()
-                            }
-                            _ => Vec::new(),
-                        }
-                    })
-                    .collect()
-            }
-        };
+        let column_idents: Vec<&Ident> = listed_columns(self).collect();
 
         let case = database.identifier_case();
         Ok(table.columns(database)?.filter(move |column| {
@@ -844,6 +838,10 @@ impl ColumnGrantLike for Grant {
                 )
             })
         }))
+    }
+
+    fn column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        listed_columns(self).map(|ident| (ident.value.as_str(), ident.quote_style.is_some()))
     }
 
     fn table<'a>(

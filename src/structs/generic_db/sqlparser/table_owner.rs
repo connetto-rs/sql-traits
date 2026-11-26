@@ -1,5 +1,6 @@
-//! The table owner's own privilege entry, and the grants an owner change hands
-//! over, as PostgreSQL's `aclnewowner` renames the old owner on the table.
+//! The owner's own privilege entry on a table or view, and the grants a table
+//! owner change hands over, as PostgreSQL's `aclnewowner` renames the old
+//! owner on the table.
 
 use alloc::{sync::Arc, vec, vec::Vec};
 
@@ -9,21 +10,26 @@ use sqlparser::ast::{
 };
 
 use super::{
-    ParserDBBuilder, StoredTable, grantee_role_ident, grantors::grantor_ident, rename_grantee,
-    stored_role_name,
+    ParserDBBuilder, StoredTable, grantee_role_ident,
+    grantors::grantor_ident,
+    rename_grantee, stored_role_name,
+    views::{materialized_view_position, plain_view_position},
 };
 use crate::{
     impls::{grantees_match, schema_matches_table},
     structs::RevokedPrivilege,
 };
 
-/// Takes the privileges `revoke` names from the owner's entry on each table it
-/// reaches that one of its grantees owns.
+/// Takes the privileges `revoke` names from the owner's entry on each table,
+/// view and materialized view it reaches that one of its grantees owns.
 pub(super) fn revoke(builder: &mut ParserDBBuilder, revoke: &Revoke) {
     // Ownership confers the grant option, so the owner keeps it.
     if revoke.grant_option_for {
         return;
     }
+    let names_owner = |owner: Option<&str>| {
+        owner.is_some_and(|owner| revoke.grantees.iter().any(|grantee| names_role(grantee, owner)))
+    };
     let reached: Vec<StoredTable> = match &revoke.objects {
         Some(GrantObjects::Tables(names)) => {
             names
@@ -43,20 +49,29 @@ pub(super) fn revoke(builder: &mut ParserDBBuilder, revoke: &Revoke) {
         }
         _ => Vec::new(),
     };
-    if reached.is_empty() {
-        return;
-    }
-
     let case = builder.identifier_case();
     for (table, metadata, _) in builder.tables_mut() {
-        if !reached.iter().any(|stored| stored.matches(table, case)) {
-            continue;
+        if reached.iter().any(|stored| stored.matches(table, case)) && names_owner(metadata.owner())
+        {
+            metadata.revoke_owner_privileges(&revoke.privileges);
         }
-        let Some(owner) = metadata.owner() else {
+    }
+
+    for objects in builder.per_object_targets(revoke.objects.clone()) {
+        let Some(GrantObjects::Tables(names)) = objects else {
             continue;
         };
-        if revoke.grantees.iter().any(|grantee| names_role(grantee, owner)) {
-            metadata.revoke_owner_privileges(&revoke.privileges);
+        for name in &names {
+            let metadata = if let Some(position) = plain_view_position(builder, name) {
+                &mut builder.views_mut()[position].1
+            } else if let Some(position) = materialized_view_position(builder, name) {
+                &mut builder.materialized_views_mut()[position].1
+            } else {
+                continue;
+            };
+            if names_owner(metadata.owner()) {
+                metadata.revoke_owner_privileges(&revoke.privileges);
+            }
         }
     }
 }

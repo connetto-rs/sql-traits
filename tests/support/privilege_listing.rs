@@ -8,33 +8,50 @@ type Column = <ParserDB as DatabaseLike>::Column;
 pub(crate) const EVERYTHING: [&str; 8] =
     ["SELECT", "INSERT", "UPDATE", "REFERENCES", "DELETE", "TRUNCATE", "TRIGGER", "MAINTAIN"];
 
-/// Each privilege the answer gives, the column ones spelled with their
+/// Each privilege a table answer gives, the column ones spelled with their
 /// columns when it gives them on columns alone.
-pub(crate) fn privilege_names(privileges: &TablePrivileges<'_, Column>) -> Vec<String> {
+pub(crate) fn privilege_names(privileges: &TablePrivileges<&Column>) -> Vec<String> {
+    spelled(privileges, ColumnLike::column_name)
+}
+
+/// Each privilege a view answer gives, the column ones spelled with the
+/// output column names `outputs` lists by position when it gives them on
+/// columns alone.
+pub(crate) fn view_privilege_names(
+    privileges: &TablePrivileges<usize>,
+    outputs: &[&str],
+) -> Vec<String> {
+    spelled(privileges, |position| outputs[position])
+}
+
+fn spelled<'a, C: Copy>(
+    privileges: &TablePrivileges<C>,
+    name: impl Fn(C) -> &'a str,
+) -> Vec<String> {
     let mut names = Vec::new();
-    for (name, privilege) in [
+    for (privilege_name, privilege) in [
         ("SELECT", &privileges.select),
         ("INSERT", &privileges.insert),
         ("UPDATE", &privileges.update),
         ("REFERENCES", &privileges.references),
     ] {
         match privilege {
-            ColumnPrivilege::Table => names.push(name.to_string()),
+            ColumnPrivilege::Table => names.push(privilege_name.to_string()),
             ColumnPrivilege::Columns(columns) if columns.is_empty() => {}
             ColumnPrivilege::Columns(columns) => {
-                let columns: Vec<&str> = columns.iter().map(ColumnLike::column_name).collect();
-                names.push(format!("{name} ({})", columns.join(", ")));
+                let columns: Vec<&str> = columns.iter().map(|column| name(*column)).collect();
+                names.push(format!("{privilege_name} ({})", columns.join(", ")));
             }
         }
     }
-    for (name, holds) in [
+    for (privilege_name, holds) in [
         ("DELETE", privileges.delete),
         ("TRUNCATE", privileges.truncate),
         ("TRIGGER", privileges.trigger),
         ("MAINTAIN", privileges.maintain),
     ] {
         if holds {
-            names.push(name.to_string());
+            names.push(privilege_name.to_string());
         }
     }
     names

@@ -10,7 +10,8 @@ use core::{
 };
 
 use sqlparser::ast::{
-    CreatePolicyCommand, CreatePolicyType, CreateRuleAction, CreateRuleEvent, Expr, Owner, Query,
+    Action, CreatePolicyCommand, CreatePolicyType, CreateRuleAction, CreateRuleEvent, Expr, Owner,
+    Query,
 };
 
 use crate::{
@@ -186,6 +187,13 @@ impl<DB: DatabaseLike> ViewLike for Absent<DB> {
 
     fn owner<'db>(&self, _: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         self.unreachable()
+    }
+
+    fn owner_privileges<'db>(
+        &'db self,
+        _: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db Action>, LookupError> {
+        self.unreachable::<Result<core::iter::Empty<&'db Action>, LookupError>>()
     }
 
     fn declared_column_names(&self) -> &[(String, bool)] {

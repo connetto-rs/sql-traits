@@ -45,7 +45,8 @@ use super::{
     first_repeated_column, function_bodies, materialized_view_indexes, object_name_last_identifier,
     object_name_matches_resolved_identity, place_relation,
     postgres_catalog::{CatalogDependent, PostgresCatalog},
-    relation_name_holder, require_named_in_catalog, rules, stored_ident, stored_view_qualifier,
+    relation_name_holder, rename_grant_columns, require_named_in_catalog, rules, stored_ident,
+    stored_view_qualifier,
     table_owner::Handover,
     triggers,
     type_arrays::TypeArrays,
@@ -205,8 +206,8 @@ pub(super) fn create_view(
     if let Some((previous, current)) = Arc::make_mut(arrays).displace(&builder, &node.name) {
         Arc::make_mut(catalog).rename_type_identity(&previous, current);
     }
-    let mut metadata = ViewMetadata::default();
-    metadata.set_owner(creator.owner());
+    let mut metadata =
+        creator.view_metadata(qualifier_of(&node.name).named(), builder.identifier_case());
     metadata.set_calls(builder.calls_in(&node.query));
     let name = node.name.clone();
     let builder = if node.materialized {
@@ -1308,12 +1309,20 @@ fn rename_view_column(
     let Some(position) = position else {
         return Ok(builder);
     };
-    let (declaration, key) = if kind == ObjectKind::MaterializedView {
+    let (declaration, key, granted) = if kind == ObjectKind::MaterializedView {
         let view = builder.materialized_views()[position].0.as_ref();
-        (view.declaration(), stored_view_key(builder.namespaces(), view, builder.identifier_case()))
+        (
+            view.declaration(),
+            stored_view_key(builder.namespaces(), view, builder.identifier_case()),
+            GrantedView::of(view),
+        )
     } else {
         let view = builder.views()[position].0.as_ref();
-        (view.declaration(), stored_view_key(builder.namespaces(), view, builder.identifier_case()))
+        (
+            view.declaration(),
+            stored_view_key(builder.namespaces(), view, builder.identifier_case()),
+            GrantedView::of(view),
+        )
     };
     // Only a plain view carries rules and triggers.
     let host =
@@ -1362,6 +1371,16 @@ fn rename_view_column(
         Arc::make_mut(&mut builder.views_mut()[position].0).declaration_mut()
     };
     rename_output(declaration, ordinal, new_name, names);
+    let renamed = NamedColumn::of(old_name, builder.identifier_case());
+    let rename = |grants: &mut [(Arc<Grant>, ())]| {
+        for (grant, ()) in grants {
+            if granted.named_by(grant) {
+                rename_grant_columns(Arc::make_mut(grant), &renamed, new_name);
+            }
+        }
+    };
+    rename(builder.table_grants_mut());
+    rename(builder.column_grants_mut());
 
     if let Some(readers) = readers {
         view_rewrites::follow_renames(

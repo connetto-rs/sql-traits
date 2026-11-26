@@ -284,17 +284,7 @@ impl<T: TableLike> TableMetadata<T> {
     /// names. A privilege limited to columns leaves it alone, since column
     /// privileges live in entries of their own.
     pub(crate) fn revoke_owner_privileges(&mut self, revoked: &Privileges) {
-        match revoked {
-            Privileges::All { .. } => self.owner_privileges.clear(),
-            Privileges::Actions(actions) => {
-                self.owner_privileges.retain(|held| {
-                    !actions.iter().any(|action| {
-                        is_table_wide(action)
-                            && core::mem::discriminant(action) == core::mem::discriminant(held)
-                    })
-                });
-            }
-        }
+        revoke_from_owner_entry(&mut self.owner_privileges, revoked);
     }
 
     /// Iterates over the table-level privileges a `REVOKE` took from a
@@ -937,6 +927,23 @@ impl TableMetadata<CreateTable> {
     ) -> impl Iterator<Item = &'a RevokedPrivilege> {
         let name = &column.attribute().name;
         self.revoked_privileges.iter().filter(move |revoked| revoked.column() == Some(name))
+    }
+}
+
+/// Takes from a relation owner's own entry `held` the relation-level
+/// privileges `revoked` names. A privilege limited to columns leaves it
+/// alone, since column privileges live in entries of their own.
+pub(crate) fn revoke_from_owner_entry(held: &mut Vec<Action>, revoked: &Privileges) {
+    match revoked {
+        Privileges::All { .. } => held.clear(),
+        Privileges::Actions(actions) => {
+            held.retain(|held| {
+                !actions.iter().any(|action| {
+                    is_table_wide(action)
+                        && core::mem::discriminant(action) == core::mem::discriminant(held)
+                })
+            });
+        }
     }
 }
 

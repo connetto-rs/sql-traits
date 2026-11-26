@@ -5,7 +5,7 @@ pub use column_metadata::ColumnMetadata;
 pub(crate) use column_metadata::{ColumnCreation, CreatingQuery, ResolvedCollation};
 mod table_metadata;
 pub use table_metadata::TableMetadata;
-pub(crate) use table_metadata::{KeyCreation, RecordedConstraintName};
+pub(crate) use table_metadata::{KeyCreation, RecordedConstraintName, revoke_from_owner_entry};
 mod table_attribute;
 pub use table_attribute::TableAttribute;
 mod index_metadata;
