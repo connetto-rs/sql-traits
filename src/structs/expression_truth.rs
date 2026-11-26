@@ -1192,6 +1192,10 @@ impl Engine {
             Engine::Sqlite | Engine::Other => ScalarType::Other(None),
         };
         let builtin = (self == Engine::PostgreSql).then(|| builtin(function)).flatten();
+        // PostgreSQL may inline a `LANGUAGE sql` function, the language a
+        // function written without one but with a SQL-standard body has.
+        let inlinable = self == Engine::PostgreSql
+            && function.stored_language().is_none_or(|language| language == "sql");
         Ok(Callee::new(
             builtin,
             null_input,
@@ -1201,6 +1205,7 @@ impl Engine {
             returns,
             function.returns_set(),
             !never_raises(function, inputs),
+            inlinable,
             ptr::from_ref(function).addr(),
         ))
     }
