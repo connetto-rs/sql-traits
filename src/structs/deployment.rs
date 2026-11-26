@@ -81,6 +81,9 @@ pub struct Deployment {
     acting_role_settings: bool,
     /// The declared narrower and wider sets, as written.
     sets_within: Vec<(Expr, Expr)>,
+    /// Each group of settings every request sets together, by their
+    /// positions in `settings`.
+    set_together: Vec<Vec<usize>>,
 }
 
 impl Deployment {
@@ -127,6 +130,7 @@ impl Deployment {
             search_path: None,
             acting_role_settings: false,
             sets_within: Vec::new(),
+            set_together: Vec::new(),
         })
     }
 
@@ -264,6 +268,81 @@ impl Deployment {
         Ok(false)
     }
 
+    /// Declares that every request sets each of `names` together. On every
+    /// request either each of them reads text other than `''` or each reads
+    /// `NULL` or `''` through `current_setting(name, true)`.
+    ///
+    /// Names compare without case, as PostgreSQL compares setting names, and
+    /// groups sharing a setting compose.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeploymentError::UndeclaredSetting`] for the first name the
+    /// deployment does not declare, [`DeploymentError::AlwaysSetInGroup`]
+    /// for the first setting declared [`SettingPresence::Always`], and
+    /// [`DeploymentError::TooFewSettingsSetTogether`] when `names` name
+    /// fewer than two distinct settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::ast::DataType;
+    ///
+    /// # fn main() -> Result<(), sql_traits::errors::DeploymentError> {
+    /// let optional = |name: &str| {
+    ///     SessionSetting::value(name, SettingValue::Scalar(DataType::Uuid))
+    ///         .map(SessionSetting::may_be_unset)
+    /// };
+    /// let deployment = Deployment::new(
+    ///     "app",
+    ///     ["app"],
+    ///     [optional("app.installation_namespace_id")?, optional("app.installation_id")?],
+    /// )?
+    /// .with_settings_set_together(["app.installation_namespace_id", "app.installation_id"])?;
+    /// assert!(deployment.sets_together("APP.INSTALLATION_ID", "app.installation_namespace_id"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_settings_set_together<N: AsRef<str>>(
+        mut self,
+        names: impl IntoIterator<Item = N>,
+    ) -> Result<Self, DeploymentError> {
+        let mut written = Vec::new();
+        let mut group = Vec::new();
+        for name in names {
+            let name = name.as_ref();
+            let Some(position) = self.position(name) else {
+                return Err(DeploymentError::UndeclaredSetting { name: name.into() });
+            };
+            let setting = &self.settings[position];
+            if setting.presence == SettingPresence::Always {
+                return Err(DeploymentError::AlwaysSetInGroup { name: setting.name.clone() });
+            }
+            if !group.contains(&position) {
+                group.push(position);
+            }
+            written.push(name.to_string());
+        }
+        if group.len() < 2 {
+            return Err(DeploymentError::TooFewSettingsSetTogether { names: written });
+        }
+        self.set_together.push(group);
+        Ok(self)
+    }
+
+    /// Returns whether every request sets `first` and `second` together, as
+    /// the groups [`Self::with_settings_set_together`] declares compose. A
+    /// declared setting is set together with itself, and a name the
+    /// deployment does not declare with none.
+    #[must_use]
+    pub fn sets_together(&self, first: &str, second: &str) -> bool {
+        let (Some(first), Some(second)) = (self.position(first), self.position(second)) else {
+            return false;
+        };
+        self.set_together_with(first).contains(&second)
+    }
+
     /// The database the deployment connects to, when declared.
     #[must_use]
     pub fn database(&self) -> Option<&str> {
@@ -311,6 +390,94 @@ impl Deployment {
         self.settings.iter().find(|setting| setting.is_named(name))
     }
 
+    /// The position in `settings` of the setting named `name`, compared
+    /// without case.
+    fn position(&self, name: &str) -> Option<usize> {
+        self.settings.iter().position(|setting| setting.is_named(name))
+    }
+
+    /// The positions of the settings every request sets together with the
+    /// setting at `position`, that setting first, as the declared groups
+    /// compose.
+    fn set_together_with(&self, position: usize) -> Vec<usize> {
+        let mut reached = vec![position];
+        let mut next = 0;
+        while let Some(&setting) = reached.get(next) {
+            for group in self.set_together.iter().filter(|group| group.contains(&setting)) {
+                for &member in group {
+                    if !reached.contains(&member) {
+                        reached.push(member);
+                    }
+                }
+            }
+            next += 1;
+        }
+        reached
+    }
+
+    /// The kinds of request the deployment admits, told apart by which
+    /// settings each sets. There is one for each way of setting or leaving
+    /// unset the groups set together that hold a setting `read` accepts. A
+    /// setting declared [`SettingPresence::Always`] is set on each, and any
+    /// other setting outside those groups may be set or not. A setting
+    /// `changed` accepts, one the body read may set itself, holds what no
+    /// request tells on each.
+    pub(crate) fn request_presences(
+        &self,
+        read: impl Fn(&SessionSetting) -> bool,
+        changed: impl Fn(&SessionSetting) -> bool,
+    ) -> Vec<RequestPresence<'_>> {
+        let mut grouped = vec![false; self.settings.len()];
+        let mut split = Vec::new();
+        for (position, setting) in self.settings.iter().enumerate() {
+            if grouped[position] || setting.presence == SettingPresence::Always {
+                continue;
+            }
+            let group = self.set_together_with(position);
+            for &member in &group {
+                grouped[member] = true;
+            }
+            let told = |member: &usize| {
+                let setting = &self.settings[*member];
+                read(setting) && !changed(setting)
+            };
+            if group.len() > 1 && group.iter().any(told) {
+                split.push(group);
+            }
+        }
+        let unsplit = self
+            .settings
+            .iter()
+            .map(|setting| {
+                (!changed(setting)).then_some(match setting.presence {
+                    SettingPresence::Always => Held::Always,
+                    SettingPresence::MayBeUnset => Held::Either,
+                })
+            })
+            .collect();
+        let mut presences: Vec<Vec<Option<Held>>> = vec![unsplit];
+        for group in split {
+            presences = presences
+                .into_iter()
+                .flat_map(|held| {
+                    [Held::Set, Held::Unset].map(|chosen| {
+                        let mut held = held.clone();
+                        for &member in &group {
+                            if held[member].is_some() {
+                                held[member] = Some(chosen);
+                            }
+                        }
+                        held
+                    })
+                })
+                .collect();
+        }
+        presences
+            .into_iter()
+            .map(|held| RequestPresence { settings: &self.settings, held })
+            .collect()
+    }
+
     /// The description's roles as the roles `database` declares.
     ///
     /// # Errors
@@ -329,6 +496,41 @@ impl Deployment {
             self.acting_roles.iter().map(|role| declared(role)).collect::<Result<Vec<_>, _>>()?;
         Ok(ResolvedDeployment { deployment: self, database, login_role, acting_roles })
     }
+}
+
+/// Which settings one kind of request a [`Deployment`] admits sets, from
+/// [`Deployment::request_presences`].
+#[derive(Debug, Clone)]
+pub(crate) struct RequestPresence<'d> {
+    settings: &'d [SessionSetting],
+    /// Whether the request sets each of `settings`, by position, or `None`
+    /// for one the body read may set itself.
+    held: Vec<Option<Held>>,
+}
+
+impl<'d> RequestPresence<'d> {
+    /// The declared setting named `name`, compared without case, with
+    /// whether the request sets it, or `None` for a setting the deployment
+    /// does not declare or the body read may set itself.
+    pub(crate) fn setting(&self, name: &str) -> Option<(&'d SessionSetting, Held)> {
+        let position = self.settings.iter().position(|setting| setting.is_named(name))?;
+        Some((&self.settings[position], self.held[position]?))
+    }
+}
+
+/// Whether a kind of request sets a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// It is declared [`SettingPresence::Always`] and reads any text, `''`
+    /// included.
+    Always,
+    /// It reads text other than `''`, as every setting of a group set
+    /// together does on a request setting the group.
+    Set,
+    /// It reads `NULL` or `''` through `current_setting(name, true)`.
+    Unset,
+    /// Either.
+    Either,
 }
 
 /// Parses one PostgreSQL expression.
@@ -781,7 +983,9 @@ impl SessionSetting {
         self.presence
     }
 
-    fn is_named(&self, name: &str) -> bool {
+    /// Whether the setting is named `name`, compared without case as
+    /// PostgreSQL compares setting names.
+    pub(crate) fn is_named(&self, name: &str) -> bool {
         self.name.eq_ignore_ascii_case(name)
     }
 }

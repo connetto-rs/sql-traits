@@ -10,7 +10,10 @@
 //! function its calls reach, makes such a change, runs code outside the
 //! body, or builds SQL at run time.
 
-use alloc::vec::Vec;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{ContextModifier, Set, Statement, Visit};
@@ -70,43 +73,16 @@ impl<'db, DB: DatabaseLike> CalleeWalk<'db, DB> {
 
     /// Whether `call` may reach a function that leaves the path changed.
     fn call_changes(&mut self, call: Call<'_>) -> bool {
-        let in_catalog =
-            |schema: &str, quoted: bool| identifiers_match(schema, quoted, PG_CATALOG, false);
-        let Some((called, called_quoted)) = object_name_last_part(call.name) else {
-            return true;
-        };
-        let schema = match qualifier_of(call.name) {
-            // A name built at run time may name any function.
-            Qualifier::RunTime => return true,
-            Qualifier::Named(schema, quoted) if in_catalog(schema, quoted) => return false,
-            Qualifier::Named(schema, quoted) => Some((schema, quoted)),
-            Qualifier::Absent => None,
-        };
-        let database = self.database;
-        let mut known = false;
-        let changes = database
-            .functions_named(called)
-            .filter(|function| {
-                let declared = function.target_name();
-                // A function stored without a schema is in `public`.
-                let (declared_schema, declared_quoted) = declared
-                    .schema()
-                    .map_or(("public", false), |name| (name, declared.schema_is_quoted()));
-                identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
-                    && function.accepts_argument_count(call.arguments)
-                    && schema.is_none_or(|(schema, quoted)| {
-                        identifiers_match(declared_schema, declared_quoted, schema, quoted)
+        match reach(call, self.database) {
+            Reach::Any => true,
+            Reach::Catalog => false,
+            Reach::Functions(functions) => {
+                functions.is_empty()
+                    || functions.into_iter().any(|function| {
+                        !declared_in_catalog(function) && !self.keeps_path(function)
                     })
-            })
-            .any(|function| {
-                known = true;
-                let declared = function.target_name();
-                let in_catalog = declared
-                    .schema()
-                    .is_some_and(|schema| in_catalog(schema, declared.schema_is_quoted()));
-                !in_catalog && !self.keeps_path(function)
-            });
-        changes || !known
+            }
+        }
     }
 
     /// Whether `function` leaves its caller's `search_path` as it found it.
@@ -188,5 +164,83 @@ impl<'db, DB: DatabaseLike> CalleeWalk<'db, DB> {
     /// path on exit when `restores`, leave the caller's path alone.
     fn sql_keeps<N: Visit + ?Sized>(&mut self, node: &N, restores: bool) -> bool {
         !sets_search_path_past_exit(node, restores) && !self.calls_changer(node)
+    }
+}
+
+/// The functions a call may run.
+enum Reach<'db, F> {
+    /// Any function, its name or schema built at run time.
+    Any,
+    /// Only `pg_catalog`'s, the schema the call names.
+    Catalog,
+    /// One of these, every overload of the name accepting the call's
+    /// argument count in any schema the call may name, none when the
+    /// database holds no such function.
+    Functions(Vec<&'db F>),
+}
+
+/// The functions `call` may run among those `database` holds. PostgreSQL
+/// picks among overloads by argument type, which is not inferred here, so
+/// every overload accepting that many arguments counts.
+fn reach<'db, DB: DatabaseLike>(call: Call<'_>, database: &'db DB) -> Reach<'db, DB::Function> {
+    let Some((called, called_quoted)) = object_name_last_part(call.name) else {
+        return Reach::Any;
+    };
+    let schema = match qualifier_of(call.name) {
+        // A name built at run time may name any function.
+        Qualifier::RunTime => return Reach::Any,
+        Qualifier::Named(schema, quoted)
+            if identifiers_match(schema, quoted, PG_CATALOG, false) =>
+        {
+            return Reach::Catalog;
+        }
+        Qualifier::Named(schema, quoted) => Some((schema, quoted)),
+        Qualifier::Absent => None,
+    };
+    let functions = database
+        .functions_named(called)
+        .filter(|function| {
+            let declared = function.target_name();
+            // A function stored without a schema is in `public`.
+            let (declared_schema, declared_quoted) = declared
+                .schema()
+                .map_or(("public", false), |name| (name, declared.schema_is_quoted()));
+            identifiers_match(function.name(), function.name_is_quoted(), called, called_quoted)
+                && function.accepts_argument_count(call.arguments)
+                && schema.is_none_or(|(schema, quoted)| {
+                    identifiers_match(declared_schema, declared_quoted, schema, quoted)
+                })
+        })
+        .collect();
+    Reach::Functions(functions)
+}
+
+/// Whether `function` is declared in `pg_catalog`.
+fn declared_in_catalog<F: FunctionLike>(function: &F) -> bool {
+    let declared = function.target_name();
+    declared.schema().is_some_and(|schema| {
+        identifiers_match(schema, declared.schema_is_quoted(), PG_CATALOG, false)
+    })
+}
+
+/// The name of the first call in `node` that may run a function outside
+/// `pg_catalog`, or that no function `database` holds answers.
+pub(crate) fn call_outside_catalog<N: Visit + ?Sized, DB: DatabaseLike>(
+    node: &N,
+    database: &DB,
+) -> Option<String> {
+    let outside = for_each_call(node, |call| {
+        let outside = match reach(call, database) {
+            Reach::Any => true,
+            Reach::Catalog => false,
+            Reach::Functions(functions) => {
+                functions.is_empty() || !functions.into_iter().all(declared_in_catalog)
+            }
+        };
+        if outside { ControlFlow::Break(call.name.to_string()) } else { ControlFlow::Continue(()) }
+    });
+    match outside {
+        ControlFlow::Break(name) => Some(name),
+        ControlFlow::Continue(()) => None,
     }
 }

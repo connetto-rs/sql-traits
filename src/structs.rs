@@ -43,6 +43,7 @@ pub(crate) mod policy_analysis;
 mod policy_expression;
 mod privilege_holder;
 mod replica_identity;
+mod returned_value;
 mod revoked_privilege;
 mod role_membership;
 mod role_setting;
@@ -81,6 +82,7 @@ pub use deployment::{
     Deployment, JsonField, RequestTimeZone, ResolvedDeployment, SessionSetting, SetPacking,
     SettingContent, SettingPresence, SettingValue, TimeZoneSource,
 };
+pub(crate) use deployment::{Held, RequestPresence};
 pub use dynamic_execution::{DynamicExecution, DynamicExecutionSites};
 pub(crate) use dynamic_execution::{SiteFlow, SiteScope};
 pub use embedded_sql::EmbeddedSql;
@@ -89,8 +91,8 @@ pub use expression_context::{
     ArraySource, CallApplication, ExpressionContext, Operand, OperatorApplication,
 };
 pub(crate) use expression_context::{
-    CallRefusal, ReparsePins, Site, applies_operators, array_of, column_type, declared_type,
-    declared_type_named, places_call, plain_arguments, row_of,
+    CallRefusal, ReparsePins, Site, applies_operators, array_of, binary_operator_name, column_type,
+    declared_type, declared_type_named, places_call, plain_arguments, prefix_operator_name, row_of,
 };
 pub use expression_scope::ExpressionScope;
 pub use expression_truth::{Assumption, ExpressionTruth, Raising};
@@ -129,6 +131,7 @@ pub use policy_expression::PolicyExpression;
 pub use privilege_holder::PrivilegeHolder;
 pub(crate) use replica_identity::StoredReplicaIdentity;
 pub use replica_identity::{ReplicaIdentity, ReplicaIdentityIndex};
+pub use returned_value::{ReturnedOutput, ReturnedValue};
 pub use revoked_privilege::RevokedPrivilege;
 pub use role_membership::RoleMembership;
 pub use role_setting::RoleSetting;

@@ -542,3 +542,31 @@ fn a_comparison_over_a_body_name_may_fold_before_raising() {
         Some(Raising::Always)
     );
 }
+
+/// Assigning trigger rows preserves the following constant condition.
+#[test]
+fn trigger_assignments_keep_reachable_conditions() {
+    for (relation, assignment) in [
+        ("CREATE TABLE items (value integer);", "NEW.value := NULL;"),
+        ("CREATE TABLE items (value integer);", "NEW := NULL;"),
+        ("CREATE VIEW items AS SELECT 1 AS value;", "NEW.value := NULL;"),
+        (
+            "CREATE TYPE nested AS (value integer); CREATE TABLE items (value nested);",
+            "NEW.value.value := NULL;",
+        ),
+    ] {
+        let timing = if relation.contains("VIEW") { "INSTEAD OF" } else { "BEFORE" };
+        let schema = format!(
+            "{relation}
+CREATE FUNCTION audit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN {assignment} IF true THEN RETURN NEW; END IF; RETURN NULL; END $$;
+CREATE TRIGGER audit_trigger {timing} UPDATE ON items FOR EACH ROW EXECUTE FUNCTION audit();"
+        );
+        let database = database(&schema);
+        assert_eq!(
+            conditions(&database, "audit")[0].2,
+            Some(never_raising(Outcomes::TRUE)),
+            "{assignment}"
+        );
+    }
+}

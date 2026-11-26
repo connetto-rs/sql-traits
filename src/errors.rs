@@ -1650,6 +1650,27 @@ pub enum DeploymentError {
         /// The refused path.
         path: String,
     },
+    /// A group of settings set together names a setting the deployment does
+    /// not declare.
+    #[error("setting `{name}` is not declared by the deployment")]
+    UndeclaredSetting {
+        /// The name, as written.
+        name: String,
+    },
+    /// A group of settings set together names fewer than two distinct
+    /// settings.
+    #[error("settings set together name fewer than two distinct settings: {names:?}")]
+    TooFewSettingsSetTogether {
+        /// The names, as written.
+        names: Vec<String>,
+    },
+    /// A group of settings set together names a setting every request sets,
+    /// which would force every other setting of the group to be set too.
+    #[error("setting `{name}` is always set, so no setting a request may leave unset joins it")]
+    AlwaysSetInGroup {
+        /// The setting's name, as declared.
+        name: String,
+    },
 }
 
 /// Why [`ResolvedDeployment::callable_functions`] refuses to list the
@@ -1843,6 +1864,99 @@ impl core::fmt::Display for AccessorRefusal {
             Self::ReturnType => "returns another type than its body reads",
             Self::SetsSetting => "sets the setting it reads",
         })
+    }
+}
+
+/// Why [`FunctionLike::returned_values`](crate::traits::FunctionLike::returned_values)
+/// refuses to answer what a function's output parameters hold when it
+/// returns.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum ReturnedValuesError {
+    /// A table, function or column of the body cannot be looked up.
+    #[error(transparent)]
+    Lookup(#[from] LookupError),
+    /// The function is not written in `plpgsql`.
+    #[error("`{function}` is written in {}, not plpgsql", language.as_deref().unwrap_or("no language"))]
+    Language {
+        /// The function.
+        function: String,
+        /// The language it names, if any.
+        language: Option<String>,
+    },
+    /// The function has no output parameter.
+    #[error("`{function}` has no output parameter")]
+    NoOutputParameters {
+        /// The function.
+        function: String,
+    },
+    /// The function returns a set, whose rows `RETURN NEXT` and
+    /// `RETURN QUERY` give rather than the output parameters as it returns.
+    #[error("`{function}` returns a set")]
+    ReturnsSet {
+        /// The function.
+        function: String,
+    },
+    /// The body runs code it does not hold, a call that may run a function
+    /// outside `pg_catalog` or one no function the database holds answers, a
+    /// `pg_catalog` function scanning a relation or a portal, dynamic SQL, a
+    /// relation whose view, policies or triggers may call functions, a
+    /// statement other than a query, `SET` and `RESET`, an operator whose
+    /// function lies outside `pg_catalog`, a type whose domain checks call
+    /// such a function or `set_config`, or a `FETCH` or `MOVE` on a cursor
+    /// the body does not declare. That code may raise or set a setting where
+    /// the body cannot tell.
+    #[error("`{function}` runs `{code}`, which may raise or set a setting")]
+    RunsCode {
+        /// The function.
+        function: String,
+        /// The call's name or the statement, as written.
+        code: String,
+    },
+    /// An error may leave the body uncaught on some request the deployment
+    /// admits.
+    #[error("an error {} leave `{function}` {raise}", if *surely { "does" } else { "may" })]
+    Raises {
+        /// The function.
+        function: String,
+        /// Where the error is raised.
+        raise: RaiseSite,
+        /// Whether the step surely raises, as `RAISE EXCEPTION`, a failing
+        /// `ASSERT` and a `CASE` matching no `WHEN` do, rather than only may.
+        surely: bool,
+    },
+    /// No path through the body returns on any request the deployment
+    /// admits.
+    #[error("no path through `{function}` returns")]
+    NeverReturns {
+        /// The function.
+        function: String,
+    },
+}
+
+/// Where in a PL/pgSQL body an error is raised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaiseSite {
+    /// The step, a loop's iteration included, starting at this line and
+    /// column of the body, counted from 1.
+    Step {
+        /// The line.
+        line: u64,
+        /// The column.
+        column: u64,
+    },
+    /// The default of the declared variable `variable`.
+    Declaration {
+        /// The variable's name, as PostgreSQL stores it.
+        variable: String,
+    },
+}
+
+impl core::fmt::Display for RaiseSite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Step { line, column } => write!(f, "at line {line}, column {column}"),
+            Self::Declaration { variable } => write!(f, "at the default of `{variable}`"),
+        }
     }
 }
 

@@ -2784,7 +2784,7 @@ fn returns_bool<DB: DatabaseLike>(selected: &SelectedOperator<'_, DB>) -> bool {
 /// The name PostgreSQL looks up for the prefix operator `op`, or `None` for
 /// `NOT`, a boolean connective, for a postfix operator, which PostgreSQL 18
 /// no longer has, and for a token PostgreSQL's dialect does not write.
-const fn prefix_operator_name(op: UnaryOperator) -> Option<&'static str> {
+pub(crate) const fn prefix_operator_name(op: UnaryOperator) -> Option<&'static str> {
     Some(match op {
         UnaryOperator::Minus => "-",
         UnaryOperator::Plus => "+",
@@ -2805,7 +2805,7 @@ const fn prefix_operator_name(op: UnaryOperator) -> Option<&'static str> {
 /// The name PostgreSQL looks up for the binary operator `op`, or `None` for
 /// the boolean connectives, the keyword forms that call no operator of that
 /// name, and the tokens PostgreSQL's dialect does not write.
-fn binary_operator_name(op: &BinaryOperator) -> Option<TargetName<'_>> {
+pub(crate) fn binary_operator_name(op: &BinaryOperator) -> Option<TargetName<'_>> {
     let symbol = match op {
         BinaryOperator::PGCustomBinaryOperator(parts) => {
             return match parts.as_slice() {

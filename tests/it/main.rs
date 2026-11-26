@@ -206,6 +206,7 @@ mod repeated_key_columns;
 mod replica_identity;
 mod request_time_zone;
 mod required_column_values;
+mod returned_values;
 mod role_lifecycle;
 mod role_memberships;
 mod role_privileges;

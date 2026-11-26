@@ -167,3 +167,69 @@ fn a_json_setting_names_distinct_non_empty_fields() {
         })
     );
 }
+
+/// A setting of the installation identity, which a request may leave unset.
+fn identity(name: &str) -> SessionSetting {
+    SessionSetting::value(name, SettingValue::Scalar(DataType::Uuid))
+        .expect("a two-part name")
+        .may_be_unset()
+}
+
+/// The installation identity halves, an optional caller and an optional
+/// actor, none grouped yet.
+fn optional_settings() -> Deployment {
+    Deployment::new(
+        "reader",
+        ["member"],
+        [
+            identity("app.installation_namespace_id"),
+            identity("app.installation_id"),
+            caller().may_be_unset(),
+            identity("app.original_actor_id"),
+        ],
+    )
+    .expect("a valid description")
+}
+
+#[test]
+fn settings_set_together_compare_without_case_and_compose() {
+    let deployment = optional_settings()
+        .with_settings_set_together(["app.installation_namespace_id", "App.Installation_Id"])
+        .expect("two declared optional settings");
+    assert!(deployment.sets_together("APP.INSTALLATION_ID", "app.installation_namespace_id"));
+    assert!(!deployment.sets_together("app.installation_id", "app.user_id"));
+    assert!(!deployment.sets_together("app.installation_id", "app.undeclared"));
+
+    let composed = deployment
+        .with_settings_set_together(["app.installation_id", "app.original_actor_id"])
+        .expect("two declared optional settings");
+    assert!(
+        composed.sets_together("app.installation_namespace_id", "app.original_actor_id"),
+        "groups sharing a setting compose"
+    );
+    assert!(!composed.sets_together("app.user_id", "app.original_actor_id"));
+}
+
+#[test]
+fn settings_set_together_are_declared_distinct_and_optional() {
+    assert_eq!(
+        optional_settings().with_settings_set_together(["app.installation_id", "app.tenant_id"]),
+        Err(DeploymentError::UndeclaredSetting { name: "app.tenant_id".into() })
+    );
+    for names in [&["app.installation_id"][..], &["app.installation_id", "APP.installation_id"]] {
+        assert_eq!(
+            optional_settings().with_settings_set_together(names.iter().copied()),
+            Err(DeploymentError::TooFewSettingsSetTogether {
+                names: names.iter().map(|name| (*name).into()).collect(),
+            }),
+            "{names:?} names fewer than two settings"
+        );
+    }
+
+    let always = Deployment::new("reader", ["member"], [identity("app.installation_id"), caller()])
+        .expect("a valid description");
+    assert_eq!(
+        always.with_settings_set_together(["app.installation_id", "app.user_id"]),
+        Err(DeploymentError::AlwaysSetInGroup { name: "app.user_id".into() })
+    );
+}
