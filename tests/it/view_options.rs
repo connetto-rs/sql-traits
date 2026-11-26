@@ -413,6 +413,7 @@ fn a_materialized_view_takes_storage_parameters_and_no_view_option() {
         .expect("the view is recorded");
     assert!(!view.is_security_invoker());
     assert!(!view.is_security_barrier());
+    assert_eq!(view.check_option(), None);
 
     for statement in [
         "CREATE MATERIALIZED VIEW m WITH (security_invoker = true) AS SELECT id FROM t;",
