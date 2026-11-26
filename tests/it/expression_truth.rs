@@ -20,6 +20,12 @@ const fn never_raising(outcomes: Outcomes) -> ExpressionTruth {
     ExpressionTruth { outcomes, raising: Raising::Never }
 }
 
+/// What a call to a function whose body the read does not hold gives, which
+/// may raise.
+const fn sometimes_raising(outcomes: Outcomes) -> ExpressionTruth {
+    ExpressionTruth { outcomes, raising: Raising::Sometimes }
+}
+
 const UNDECIDED: Outcomes = Outcomes { truth: true, falsity: true, null: false };
 
 fn truth_in(schema: &str, table: &str, sql: &str) -> Result<ExpressionTruth, Error> {
@@ -179,11 +185,15 @@ fn builtins_that_never_return_null_are_never_null() -> Result<(), Error> {
         "clock_timestamp() IS NULL",
         "statement_timestamp() IS NULL",
         "transaction_timestamp() IS NULL",
-        "current_setting('app.user_id') IS NULL",
         "CURRENT_TIMESTAMP IS NULL",
     ] {
         assert_eq!(truth(sql)?, never_raising(Outcomes::FALSE), "{sql}");
     }
+    // An unset setting read without `missing_ok` raises `42704`.
+    assert_eq!(
+        truth("current_setting('app.user_id') IS NULL")?,
+        sometimes_raising(Outcomes::FALSE)
+    );
     for sql in ["current_setting('app.user_id', true) IS NULL", "current_setting(NULL) IS NULL"] {
         let truth = truth(sql)?;
         assert!(truth.outcomes.truth, "{sql}: {truth:?}");
@@ -387,7 +397,8 @@ fn check_calls_resolve_under_the_path_the_check_was_created_with() -> Result<(),
          SET search_path = public;";
     let db = ParserDB::parse::<PostgreSqlDialect>(schema)?;
     let check = db.tables().next().unwrap().check_constraints(&db)?.next().unwrap();
-    assert!(check.is_tautology(&db)?);
+    // The immutable `pinned.ok()` answers alike on both reads.
+    assert!(!check.truth_under(&db, &[])?.outcomes.falsity);
     Ok(())
 }
 
@@ -399,9 +410,11 @@ fn checks_whose_calls_the_database_path_reads_otherwise_seed_nothing() -> Result
          SET search_path = pinned, public;
          CREATE TABLE public.invoices (tenant_id INT, CHECK (tenant_id > 0 AND ok()));
          SET search_path = public;";
-    for sql in ["tenant_id > 0 AND ok()", "tenant_id < 0"] {
-        assert_eq!(truth_in(schema, "invoices", sql)?, never_raising(Outcomes::ANY), "{sql}");
-    }
+    assert_eq!(
+        truth_in(schema, "invoices", "tenant_id > 0 AND ok()")?,
+        sometimes_raising(Outcomes::ANY)
+    );
+    assert_eq!(truth_in(schema, "invoices", "tenant_id < 0")?, never_raising(Outcomes::ANY));
     Ok(())
 }
 
@@ -418,7 +431,7 @@ fn checks_whose_calls_the_read_check_resolves_otherwise_seed_nothing() -> Result
     )?;
     let table = db.tables().next().unwrap();
     for check in table.check_constraints(&db)? {
-        assert_eq!(check.truth_under_other_checks(&db)?, never_raising(Outcomes::ANY));
+        assert_eq!(check.truth_under_other_checks(&db)?, sometimes_raising(Outcomes::ANY));
     }
     Ok(())
 }
@@ -500,11 +513,11 @@ fn stable_calls_answer_alike_within_a_statement() -> Result<(), Error> {
          CREATE TABLE invoices (id INT);";
     assert_eq!(
         truth_in(schema, "invoices", "stable_level() IS NULL OR stable_level() IS NOT NULL")?,
-        never_raising(Outcomes::TRUE)
+        sometimes_raising(Outcomes::TRUE)
     );
     assert_eq!(
         truth_in(schema, "invoices", "volatile_level() IS NULL OR volatile_level() IS NOT NULL")?,
-        never_raising(UNDECIDED)
+        sometimes_raising(UNDECIDED)
     );
     Ok(())
 }
@@ -926,8 +939,8 @@ fn assumed_expressions_whose_calls_the_read_check_resolves_otherwise_seed_nothin
     let assumptions = [Assumption::Expression { expression: &positive, outcomes: Outcomes::TRUE }];
     assert_eq!(
         table.truth_under(&db, &positive, IdentifierCase::AsWritten, &assumptions)?,
-        never_raising(Outcomes::TRUE)
+        sometimes_raising(Outcomes::TRUE)
     );
-    assert_eq!(check.truth_under(&db, &assumptions)?, never_raising(Outcomes::ANY));
+    assert_eq!(check.truth_under(&db, &assumptions)?, sometimes_raising(Outcomes::ANY));
     Ok(())
 }

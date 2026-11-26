@@ -1200,6 +1200,7 @@ impl Engine {
             kind,
             returns,
             function.returns_set(),
+            !never_raises(function, inputs),
             ptr::from_ref(function).addr(),
         ))
     }
@@ -1633,4 +1634,21 @@ fn builtin<F: FunctionLike>(function: &F) -> Option<Builtin> {
         "count" => Builtin::Count,
         _ => return None,
     })
+}
+
+/// Whether `function`, taking `inputs` input parameters, is a `pg_catalog`
+/// function that returns without raising on every call, which the evaluator
+/// cannot tell from its signature. Every other function may raise.
+fn never_raises<F: FunctionLike>(function: &F, inputs: usize) -> bool {
+    function.target_name().schema() == Some("pg_catalog")
+        && inputs == 0
+        && matches!(
+            function.name(),
+            "now"
+                | "clock_timestamp"
+                | "statement_timestamp"
+                | "transaction_timestamp"
+                | "random"
+                | "pi"
+        )
 }

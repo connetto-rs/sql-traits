@@ -1048,7 +1048,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#4eacc847e524bfcc79f9b8e9721995ba89a69f59"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#5de59f4cdac65fa8c26c15c9ba702d547da473e9"
 dependencies = [
  "quine-mc_cluskey",
  "rpds",

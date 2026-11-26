@@ -465,12 +465,13 @@ fn a_column_of_a_derived_relation_is_one_value() -> Result<(), Error> {
 #[test]
 fn an_assumption_read_through_a_copy_narrows_the_site() -> Result<(), Error> {
     let schema = format!("{SCHEMA} {FUNCTIONS}");
-    for sql in [
-        "SELECT 1 FROM t AS a WHERE a.x BETWEEN 6 AND 9 AND a.x > 3",
-        "SELECT 1 FROM t AS a WHERE h(NULL) BETWEEN 6 AND 9 AND h(NULL) > 3",
-    ] {
-        assert_eq!(query_truth(&schema, sql)?, never_raising(Outcomes::TRUE), "{sql}");
-    }
+    let sql = "SELECT 1 FROM t AS a WHERE a.x BETWEEN 6 AND 9 AND a.x > 3";
+    assert_eq!(query_truth(&schema, sql)?, never_raising(Outcomes::TRUE));
+    // `h` runs a body the read does not hold, which may raise.
+    let sql = "SELECT 1 FROM t AS a WHERE h(NULL) BETWEEN 6 AND 9 AND h(NULL) > 3";
+    let truth = query_truth(&schema, sql)?;
+    assert_eq!(truth.outcomes, Outcomes::TRUE);
+    assert_eq!(truth.raising, Raising::Sometimes);
     Ok(())
 }
 
