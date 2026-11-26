@@ -11,6 +11,7 @@ use alloc::{
 };
 use core::{
     cell::{Cell, RefCell},
+    convert::Infallible,
     iter, mem,
     ops::ControlFlow,
     ptr, slice,
@@ -209,7 +210,8 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
         }
         self.proving.push(function);
         let confined = if function.security_mode() == FunctionSecurity::Definer {
-            self.confines_body(function, record.map(|record| Firing { record, passed: &[] }))
+            let firing = record.map(|record| Firing { record, passed: &[] });
+            self.confines_body(function, firing.as_ref())
         } else {
             self.confines_invoker(function)
         };
@@ -248,7 +250,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
     fn confines_body(
         &mut self,
         function: &'a DB::Function,
-        firing: Option<Firing<'_, 'a, DB>>,
+        firing: Option<&Firing<'_, 'a, DB>>,
     ) -> Result<bool, LookupError> {
         if !self.confines_body_writes(function)? {
             return Ok(false);
@@ -650,7 +652,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
     fn confines_sites(
         &self,
         function: &'a DB::Function,
-        firing: Option<Firing<'_, 'a, DB>>,
+        firing: Option<&Firing<'_, 'a, DB>>,
     ) -> Result<bool, LookupError> {
         let case = IdentifierCase::AsWritten;
         let body = match function.plpgsql_sites(self.database) {
@@ -721,7 +723,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
     fn confines_firing(
         &mut self,
         callee: &'a DB::Function,
-        firing: Firing<'_, 'a, DB>,
+        firing: &Firing<'_, 'a, DB>,
     ) -> Result<bool, LookupError> {
         if self.proving.iter().any(|proving| ptr::eq(*proving, callee)) {
             return Ok(self.unfollowed());
@@ -742,20 +744,12 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
         &mut self,
         function: &'a DB::Function,
         callee: &'a DB::Function,
-        firing: Firing<'_, 'a, DB>,
+        firing: &Firing<'_, 'a, DB>,
     ) -> Result<bool, LookupError> {
         let database = self.database;
         let case = IdentifierCase::AsWritten;
-        let body = match function.plpgsql_sites(database) {
-            Ok(body) => body,
-            Err(error) if unreadable_body(&error) => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        let sites = match body.sites() {
-            Ok(sites) => sites,
-            Err(error) if unreadable_body(&error) => return Ok(false),
-            Err(error) => return Err(error),
-        };
+        let body = function.plpgsql_sites(database)?;
+        let sites = body.sites()?;
         let inputs: Vec<Option<Identity>> = callee
             .argument_modes()
             .zip(callee.argument_types(database))
@@ -785,7 +779,7 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                 function,
                 scope: site.plpgsql_scope(),
             };
-            let walked = for_each_call(&sql, |call| {
+            let ControlFlow::Continue(()) = for_each_call::<_, Infallible>(&sql, |call| {
                 if !reaches_on_path(database, callee, call, path) {
                     return ControlFlow::Continue(());
                 }
@@ -799,27 +793,24 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
                         }
                     })
                     .unwrap_or_default();
-                let mut passed = Vec::with_capacity(arguments.len());
-                for (argument, input) in arguments.into_iter().zip(&inputs) {
-                    match self.passed_field(&context, &known, argument, input.as_ref()) {
-                        Ok(field) => passed.push(field),
-                        Err(error) => return ControlFlow::Break(error),
-                    }
-                }
+                let passed: Vec<_> = arguments
+                    .into_iter()
+                    .zip(&inputs)
+                    .map(|(argument, input)| {
+                        self.passed_field(&context, &known, argument, input.as_ref())
+                    })
+                    .collect();
                 if !passings.contains(&passed) {
                     passings.push(passed);
                 }
                 ControlFlow::Continue(())
             });
-            if let ControlFlow::Break(error) = walked {
-                return Err(error);
-            }
         }
         if passings.is_empty() {
             return Ok(false);
         }
         for passed in &passings {
-            if !self.confines_firing(callee, Firing { record: firing.record, passed })? {
+            if !self.confines_firing(callee, &Firing { record: firing.record, passed })? {
                 return Ok(false);
             }
         }
@@ -828,28 +819,21 @@ impl<'a, DB: DatabaseLike> Confinement<'a, DB> {
 
     /// The field of the trigger's rows that `argument`, read in `context`
     /// knowing what `known` holds, passes a parameter of a type `=` compares
-    /// by `input`, when the field's column compares alike.
+    /// by `input`, when the field's column compares alike, and none when a
+    /// lookup fails.
     fn passed_field(
         &self,
         context: &ExpressionContext<'_, 'a, DB>,
         known: &Known<'_, 'a, DB>,
         argument: &Expr,
         input: Option<&Identity>,
-    ) -> Result<Option<(Row, String)>, LookupError> {
-        let (Some(input), Some(record)) = (input, known.record) else {
-            return Ok(None);
-        };
-        let Some((definition, _)) = context.reference(unnested(argument)).ok().flatten() else {
-            return Ok(None);
-        };
-        let Some((row, name)) = known.field(&definition, argument) else {
-            return Ok(None);
-        };
-        let Some(column) = column_named(self.database, record.table, &name)? else {
-            return Ok(None);
-        };
-        Ok((identity(column, self.database)?.as_ref() == Some(input))
-            .then(|| (row, name.into_owned())))
+    ) -> Option<(Row, String)> {
+        let record = known.record?;
+        let (definition, _) = context.reference(unnested(argument)).ok()??;
+        let (row, name) = known.field(&definition, argument)?;
+        let column = column_named(self.database, record.table, &name).ok()??;
+        let held = identity(column, self.database).ok()??;
+        (input == Some(&held)).then(|| (row, name.into_owned()))
     }
 
     /// Whether `callee`, a `SECURITY DEFINER` function that neither writes
@@ -1495,15 +1479,6 @@ struct Firing<'f, 'a, DB: DatabaseLike> {
     /// none for the trigger's own function.
     passed: &'f [Option<(Row, String)>],
 }
-
-#[expect(clippy::expl_impl_clone_on_copy, reason = "derive would require DB: Clone")]
-impl<DB: DatabaseLike> Clone for Firing<'_, '_, DB> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<DB: DatabaseLike> Copy for Firing<'_, '_, DB> {}
 
 /// What a statement of a PL/pgSQL body knows of the variables it reads.
 struct Known<'k, 'a, DB: DatabaseLike> {
