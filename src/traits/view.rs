@@ -589,7 +589,8 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
 
     /// Returns the relation PostgreSQL rewrites an `INSERT`, `UPDATE`,
     /// `DELETE` or `MERGE` targeting this view onto, with what each output
-    /// column writes there, or `None` when PostgreSQL does not make the view
+    /// column writes there and the condition the view puts on the write, or
+    /// `None` when PostgreSQL does not make the view
     /// [automatically updatable](https://www.postgresql.org/docs/18/sql-createview.html#SQL-CREATEVIEW-UPDATABLE-VIEWS).
     ///
     /// The view is automatically updatable when its definition reads exactly
@@ -600,12 +601,14 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// the column of that relation it is a simple reference to, whatever the
     /// declaration names it, and is `None` otherwise. A view none of whose
     /// columns PostgreSQL can write still answers, since a `DELETE` goes
-    /// through it.
+    /// through it. The definition's `WHERE` is the condition, with the column
+    /// of the relation each of its column references reads.
     ///
     /// One call follows one level. A view over a view answers with the inner
-    /// view, whatever its own definition. An `INSTEAD OF` trigger or an
-    /// `INSTEAD` rule on a view takes a write to it before this rewriting
-    /// does, which the caller checks against the triggers and rules in force.
+    /// view and this view's own condition, whatever the inner view's
+    /// definition. An `INSTEAD OF` trigger or an `INSTEAD` rule on a view
+    /// takes a write to it before this rewriting does, which the caller checks
+    /// against the triggers and rules in force.
     ///
     /// A materialized view takes no write, and neither does a view under
     /// SQLite, so both answer `None`.
@@ -631,24 +634,33 @@ pub trait ViewLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync {
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "CREATE TABLE invitations (id INT PRIMARY KEY, email TEXT, accepted_by_id INT);
     ///      CREATE VIEW open_invitations AS
-    ///        SELECT id, lower(email) AS email, accepted_by_id AS acceptor FROM invitations
-    ///        WHERE accepted_by_id IS NULL;",
+    ///        SELECT id, lower(email) AS email, accepted_by_id AS acceptor FROM invitations AS i
+    ///        WHERE i.accepted_by_id IS NULL;",
     /// )?;
     /// let view = db
     ///     .view_by_target(TargetName::new("open_invitations", false), IdentifierCase::Folded)?
     ///     .expect("the view is recorded");
-    /// let Some(UpdatableViewBase::Table { table, columns }) = view.updatable_base(&db)? else {
+    /// let Some(base) = view.updatable_base(&db)? else { unreachable!("the view is updatable") };
+    /// let WrittenRelation::Table { table, columns, condition_columns } = base.relation else {
     ///     unreachable!("the view writes one table")
     /// };
     /// assert_eq!(table.table_name(), "invitations");
     /// let written: Vec<_> =
     ///     columns.iter().map(|column| column.map(ColumnLike::column_name)).collect();
     /// assert_eq!(written, [Some("id"), None, Some("accepted_by_id")]);
+    /// assert_eq!(
+    ///     base.condition.map(ToString::to_string).as_deref(),
+    ///     Some("i.accepted_by_id IS NULL")
+    /// );
+    /// // The `IS NULL` test is the walk's first node, and `i.accepted_by_id` its second.
+    /// let read: Vec<_> =
+    ///     condition_columns.iter().map(|(index, column)| (*index, column.column_name())).collect();
+    /// assert_eq!(read, [(1, "accepted_by_id")]);
     /// # Ok(())
     /// # }
     /// ```
     fn updatable_base<'db>(
-        &self,
+        &'db self,
         database: &'db Self::DB,
     ) -> Result<Option<UpdatableViewBase<'db, Self::DB>>, LookupError> {
         if self.is_materialized() {

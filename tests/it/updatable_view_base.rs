@@ -30,10 +30,14 @@ fn base<'db>(db: &'db ParserDB, name: &str) -> Option<UpdatableViewBase<'db, Par
         .expect("the definition resolves")
 }
 
+fn written<'db>(db: &'db ParserDB, name: &str) -> Option<WrittenRelation<'db, ParserDB>> {
+    base(db, name).map(|base| base.relation)
+}
+
 /// The table a view writes and the name of the column each output writes.
 fn table_columns<'db>(db: &'db ParserDB, name: &str) -> (&'db str, Vec<Option<&'db str>>) {
-    match base(db, name) {
-        Some(UpdatableViewBase::Table { table, columns }) => {
+    match written(db, name) {
+        Some(WrittenRelation::Table { table, columns, .. }) => {
             (
                 table.table_name(),
                 columns.iter().map(|column| column.map(ColumnLike::column_name)).collect(),
@@ -170,15 +174,15 @@ fn a_view_over_a_view_writes_the_inner_view_by_output_position() {
          CREATE VIEW over_distinct AS SELECT id AS b FROM distinct_ids;
          CREATE VIEW over_whole_table AS SELECT * FROM whole_table;",
     );
-    let Some(UpdatableViewBase::View { view, columns }) = base(&db, "over_plain") else {
+    let Some(WrittenRelation::View { view, columns, .. }) = written(&db, "over_plain") else {
         panic!("over_plain writes a view");
     };
     assert_eq!((view.view_name(), columns), ("plain", vec![Some(2), Some(0), Some(1)]));
-    let Some(UpdatableViewBase::View { view, columns }) = base(&db, "over_distinct") else {
+    let Some(WrittenRelation::View { view, columns, .. }) = written(&db, "over_distinct") else {
         panic!("over_distinct writes a view");
     };
     assert_eq!((view.view_name(), columns), ("distinct_ids", vec![Some(0)]));
-    let Some(UpdatableViewBase::View { view, columns }) = base(&db, "over_whole_table") else {
+    let Some(WrittenRelation::View { view, columns, .. }) = written(&db, "over_whole_table") else {
         panic!("over_whole_table writes a view");
     };
     assert_eq!((view.view_name(), columns), ("whole_table", vec![Some(0), Some(1)]));
@@ -191,7 +195,8 @@ fn a_view_over_a_foreign_table_writes_the_foreign_table() {
          CREATE FOREIGN TABLE remote (a INT, b INT) SERVER server;
          CREATE VIEW over_remote AS SELECT b FROM remote;",
     );
-    let Some(UpdatableViewBase::ForeignTable { table, columns }) = base(&db, "over_remote") else {
+    let Some(WrittenRelation::ForeignTable { table, columns, .. }) = written(&db, "over_remote")
+    else {
         panic!("over_remote writes a foreign table");
     };
     assert_eq!(table.table_name(), "remote");
@@ -223,7 +228,7 @@ fn a_view_writes_the_table_bound_at_creation() {
          CREATE VIEW open_orders AS SELECT user_id FROM orders;
          SET search_path TO alt, public;",
     );
-    let Some(UpdatableViewBase::Table { table, columns }) = base(&db, "open_orders") else {
+    let Some(WrittenRelation::Table { table, columns, .. }) = written(&db, "open_orders") else {
         panic!("open_orders writes a table");
     };
     assert_eq!(table.table_schema(), None);
@@ -248,4 +253,103 @@ fn a_sqlite_view_takes_no_write() {
     )
     .expect("the schema parses");
     assert!(base(&db, "v").is_none());
+}
+
+/// The text of each column reference the condition of `name` reads and the
+/// name of the table column it reads, found by the index sqlparser's
+/// `visit_expressions` walk gives the reference.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the indices are the ones sqlparser's own walk gives a consumer"
+)]
+fn condition_reads(db: &ParserDB, name: &str) -> Vec<(String, String)> {
+    let base = base(db, name).expect("the view is automatically updatable");
+    let mut walked = Vec::new();
+    if let Some(condition) = base.condition {
+        let _ = sqlparser::ast::visit_expressions(condition, |expression| {
+            walked.push(expression.to_string());
+            core::ops::ControlFlow::<()>::Continue(())
+        });
+    }
+    let WrittenRelation::Table { condition_columns, .. } = base.relation else {
+        panic!("{name} should write a table");
+    };
+    condition_columns
+        .iter()
+        .map(|(index, column)| (walked[*index].clone(), column.column_name().to_string()))
+        .collect()
+}
+
+/// A condition reads the base columns through the alias and column aliases
+/// its `FROM` item gives them, qualified or not.
+#[test]
+fn a_condition_reads_base_columns_through_the_from_item_names() {
+    let db = postgres(
+        "CREATE VIEW moves AS SELECT a.id, a.moved FROM t AS a (id, moved)
+           WHERE a.moved > 0 AND y IS NOT NULL;
+         CREATE VIEW everything AS SELECT id FROM t;",
+    );
+    let moves = base(&db, "moves").expect("moves is automatically updatable");
+    assert_eq!(
+        moves.condition.map(ToString::to_string).as_deref(),
+        Some("a.moved > 0 AND y IS NOT NULL")
+    );
+    assert_eq!(
+        condition_reads(&db, "moves"),
+        [("a.moved".to_string(), "x".to_string()), ("y".to_string(), "y".to_string())]
+    );
+    let everything = base(&db, "everything").expect("everything is automatically updatable");
+    assert!(everything.condition.is_none());
+    assert_eq!(condition_reads(&db, "everything"), Vec::<(String, String)>::new());
+}
+
+/// A reference in a subquery of the condition binding to the subquery's own
+/// relation is left out, while one reaching out to the base relation is
+/// listed.
+#[test]
+fn a_condition_subquery_lists_only_references_to_the_base_relation() {
+    let db = postgres(
+        "CREATE VIEW linked AS SELECT id FROM t
+           WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.x);",
+    );
+    assert_eq!(condition_reads(&db, "linked"), [("t.x".to_string(), "x".to_string())]);
+}
+
+/// A whole-row reference to the base relation reads no single column, so it
+/// is left out.
+#[test]
+fn a_whole_row_reference_in_the_condition_is_left_out() {
+    let db =
+        postgres("CREATE VIEW described AS SELECT id FROM t WHERE row_to_json(t) IS NOT NULL;");
+    assert_eq!(condition_reads(&db, "described"), Vec::<(String, String)>::new());
+}
+
+/// The field a composite column's access chain names is no column reference,
+/// so only the column holding the composite is listed.
+#[test]
+fn a_field_name_in_the_condition_is_left_out() {
+    let db = postgres(
+        "CREATE TYPE money_t AS (amount INT);
+         CREATE TABLE payments (id INT, payload money_t);
+         CREATE VIEW positive AS SELECT id FROM payments AS p WHERE (p.payload).amount > 0;",
+    );
+    assert_eq!(
+        condition_reads(&db, "positive"),
+        [("p.payload".to_string(), "payload".to_string())]
+    );
+}
+
+/// The condition of a view over a view reads the inner view's output columns
+/// by position.
+#[test]
+fn a_condition_over_a_view_reads_output_positions() {
+    let db = postgres(
+        "CREATE VIEW plain AS SELECT id, x AS renamed FROM t;
+         CREATE VIEW over_plain AS SELECT id FROM plain WHERE renamed > 0;",
+    );
+    let Some(WrittenRelation::View { condition_columns, .. }) = written(&db, "over_plain") else {
+        panic!("over_plain writes a view");
+    };
+    // `renamed > 0` is the walk's first node, `renamed` its second.
+    assert_eq!(condition_columns, [(1, 1)]);
 }

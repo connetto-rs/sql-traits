@@ -155,7 +155,7 @@ pub use trigger_enablement::TriggerEnablement;
 pub use type_facts::{DomainFacts, TypeCategory, TypeFacts, TypeKind};
 pub use undeclared_row_field::{TriggerRow, UndeclaredRowField};
 pub use unqualified_name::UnqualifiedName;
-pub use updatable_view_base::UpdatableViewBase;
+pub use updatable_view_base::{UpdatableViewBase, WrittenRelation};
 pub(crate) use user_defined_type::AttributeCollation;
 pub use user_defined_type::UserDefinedType;
 pub use view::{MaterializedView, View, ViewDeclaration};
