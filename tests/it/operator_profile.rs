@@ -263,7 +263,7 @@ impl<P: EmptyKinds> TableLike for NoneKind<P> {
         &'db self,
         _role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
         _database: &'db Self::DB,
-    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    ) -> Result<TablePrivileges<&'db <Self::DB as DatabaseLike>::Column>, LookupError>
     where
         Self: 'db,
     {
@@ -1017,6 +1017,10 @@ impl<P: EmptyKinds> ColumnGrantLike for NoneKind<P> {
         _database: &'a Self::DB,
     ) -> Result<impl Iterator<Item = &'a <Self::DB as DatabaseLike>::Column>, LookupError> {
         self.unreach::<Result<core::iter::Empty<&'a Self>, LookupError>>()
+    }
+
+    fn column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.unreach::<core::iter::Empty<(&str, bool)>>()
     }
 
     fn table<'a>(

@@ -2,7 +2,7 @@
 
 use alloc::string::{String, ToString};
 
-use sqlparser::ast::Query;
+use sqlparser::ast::{Action, Query};
 
 use crate::{
     errors::{LookupError, ObjectKind},
@@ -58,10 +58,14 @@ impl ViewLike for View {
     }
 
     fn owner<'db>(&self, database: &'db ParserDB) -> Result<Option<&'db str>, LookupError> {
-        database
-            .view_metadata(self)
-            .map(ViewMetadata::owner)
-            .ok_or_else(|| ObjectKind::View.not_in_database(&self.target_name().to_string()))
+        Ok(view_metadata(self, database)?.owner())
+    }
+
+    fn owner_privileges<'db>(
+        &'db self,
+        database: &'db ParserDB,
+    ) -> Result<impl Iterator<Item = &'db Action>, LookupError> {
+        Ok(view_metadata(self, database)?.owner_privileges())
     }
 
     fn declared_column_names(&self) -> &[(String, bool)] {
@@ -105,12 +109,37 @@ impl ViewLike for MaterializedView {
     }
 
     fn owner<'db>(&self, database: &'db ParserDB) -> Result<Option<&'db str>, LookupError> {
-        database.materialized_view_metadata(self).map(ViewMetadata::owner).ok_or_else(|| {
-            ObjectKind::MaterializedView.not_in_database(&self.target_name().to_string())
-        })
+        Ok(materialized_view_metadata(self, database)?.owner())
+    }
+
+    fn owner_privileges<'db>(
+        &'db self,
+        database: &'db ParserDB,
+    ) -> Result<impl Iterator<Item = &'db Action>, LookupError> {
+        Ok(materialized_view_metadata(self, database)?.owner_privileges())
     }
 
     fn declared_column_names(&self) -> &[(String, bool)] {
         self.declaration().columns()
     }
+}
+
+/// The metadata `database` holds for `view`.
+fn view_metadata<'db>(
+    view: &View,
+    database: &'db ParserDB,
+) -> Result<&'db ViewMetadata, LookupError> {
+    database
+        .view_metadata(view)
+        .ok_or_else(|| ObjectKind::View.not_in_database(&view.target_name().to_string()))
+}
+
+/// The metadata `database` holds for the materialized view `view`.
+fn materialized_view_metadata<'db>(
+    view: &MaterializedView,
+    database: &'db ParserDB,
+) -> Result<&'db ViewMetadata, LookupError> {
+    database.materialized_view_metadata(view).ok_or_else(|| {
+        ObjectKind::MaterializedView.not_in_database(&view.target_name().to_string())
+    })
 }

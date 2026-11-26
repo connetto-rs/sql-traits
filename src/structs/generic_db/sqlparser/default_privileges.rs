@@ -34,7 +34,7 @@ use crate::{
     impls::{SqlparserDialect, grantee_is_public, grantee_is_session_principal, grantees_match},
     structs::{
         DefaultGrant, DefaultGrantee, DefaultPrivilege, DefaultPrivilegeKind, FunctionMetadata,
-        IdentifierCase,
+        IdentifierCase, ViewMetadata,
     },
     utils::{
         identifier_resolution::{SessionPrincipal, stored_identifier},
@@ -1013,6 +1013,19 @@ impl<'a> Creator<'a> {
             .iter()
             .find(|item| matches!(item.holder, Holder::Owner))
             .map_or_else(Vec::new, |item| item.privileges.actions())
+    }
+
+    /// The metadata a new view in `schema` starts with, which holds its owner
+    /// and the owner's own entry.
+    pub(super) fn view_metadata(
+        &self,
+        schema: SchemaQualifier<'_>,
+        case: IdentifierCase,
+    ) -> ViewMetadata {
+        let mut metadata = ViewMetadata::default();
+        metadata.set_owner(self.owner());
+        metadata.set_owner_privileges(self.owner_table_privileges(schema, case));
+        metadata
     }
 
     /// Records the grants the defaults give on the new object `objects`

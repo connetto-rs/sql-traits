@@ -489,7 +489,7 @@ impl TableLike for CreateTable {
         &'db self,
         role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
         database: &'db Self::DB,
-    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    ) -> Result<TablePrivileges<&'db <Self::DB as DatabaseLike>::Column>, LookupError>
     where
         Self: 'db,
     {

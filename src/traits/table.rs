@@ -8,14 +8,14 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
     structs::{
-        ActingRole, Assumption, ColumnPrivilege, ExpressionTruth, ForeignTableSource,
+        ActingRole, Assumption, ExpressionTruth, ForeignTableSource, HeldPrivileges,
         IdentifierCase, PartitionBound, ReplicaIdentity, RowSecurity, RowStatement,
         SchemaFingerprint, TablePrivileges, VirtualTableSource,
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
-        ColumnGrantLike, ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, GrantLike,
-        Metadata, PolicyLike, Relation, RoleLike, RuleLike, TableGrantLike, TriggerLike,
+        ColumnGrantLike, ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, Metadata,
+        PolicyLike, Relation, RoleLike, RuleLike, TableGrantLike, TriggerLike,
         check_constraint::non_tautological, role::privilege_holders,
     },
     utils::identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
@@ -4990,7 +4990,7 @@ pub trait TableLike:
         &'db self,
         role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
         database: &'db Self::DB,
-    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    ) -> Result<TablePrivileges<&'db <Self::DB as DatabaseLike>::Column>, LookupError>
     where
         Self: 'db,
     {
@@ -5004,17 +5004,21 @@ pub trait TableLike:
         };
         let columns: Vec<&'db <Self::DB as DatabaseLike>::Column> =
             self.columns(database)?.collect();
-        let mut held = HeldPrivileges::new(columns.len());
+        let names: Vec<(&str, bool)> = columns
+            .iter()
+            .map(|column| (column.column_name(), column.column_name_is_quoted()))
+            .collect();
+        let mut held = HeldPrivileges::new(&names);
 
         if let Some(owner) = self.owner(database)?
             && holders.iter().any(|holder| holder.stored_name() == owner)
         {
             for privilege in self.owner_privileges(database)? {
-                held.take(privilege, &columns, None);
+                held.take(privilege, None);
             }
         }
         for grant in self.grants(database)? {
-            held.take_grant(grant, &holders, &columns, None, database);
+            held.take_grant(grant, &holders, None, database);
         }
         let table: &<Self::DB as DatabaseLike>::Table = self.borrow();
         for grant in database.column_grants().filter(|grant| {
@@ -5030,7 +5034,7 @@ pub trait TableLike:
                 .iter()
                 .map(|column| granted.iter().any(|granted| core::ptr::eq(*granted, *column)))
                 .collect();
-            held.take_grant(grant, &holders, &columns, Some(&covered), database);
+            held.take_grant(grant, &holders, Some(&covered), database);
         }
         Ok(held.answer(&columns))
     }
@@ -5099,157 +5103,9 @@ pub trait TableLike:
         &'db self,
         role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
         database: &'db Self::DB,
-    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    ) -> Result<TablePrivileges<&'db <Self::DB as DatabaseLike>::Column>, LookupError>
     where
         Self: 'db;
-}
-
-/// How many table privileges PostgreSQL has, in the order
-/// [`privilege_slot`] numbers them.
-const TABLE_PRIVILEGES: usize = 8;
-
-/// How many of the table privileges can be granted per column, which
-/// [`privilege_slot`] numbers first.
-const COLUMN_PRIVILEGES: usize = 4;
-
-/// The slot of a table privilege, `SELECT`, `INSERT`, `UPDATE` and
-/// `REFERENCES` first, then `DELETE`, `TRUNCATE`, `TRIGGER` and `MAINTAIN`,
-/// or `None` for an action that is no table privilege.
-fn privilege_slot(action: &sqlparser::ast::Action) -> Option<usize> {
-    use sqlparser::ast::Action;
-    match action {
-        Action::Select { .. } => Some(0),
-        Action::Insert { .. } => Some(1),
-        Action::Update { .. } => Some(2),
-        Action::References { .. } => Some(3),
-        Action::Delete => Some(4),
-        Action::Truncate => Some(5),
-        Action::Trigger => Some(6),
-        Action::Maintain => Some(7),
-        _ => None,
-    }
-}
-
-/// The table privileges one role has been found to hold, at the table level
-/// and on each column of the table by position.
-struct HeldPrivileges {
-    table: [bool; TABLE_PRIVILEGES],
-    columns: [Vec<bool>; COLUMN_PRIVILEGES],
-}
-
-impl HeldPrivileges {
-    fn new(columns: usize) -> Self {
-        Self {
-            table: [false; TABLE_PRIVILEGES],
-            columns: core::array::from_fn(|_| vec![false; columns]),
-        }
-    }
-
-    /// Records what `grant` gives, when it reaches one of `holders`, or
-    /// `PUBLIC`. `covered` marks the columns a column grant covers, as
-    /// [`take`](Self::take) reads it.
-    fn take_grant<G: GrantLike, C: ColumnLike>(
-        &mut self,
-        grant: &G,
-        holders: &[&<G::DB as DatabaseLike>::Role],
-        columns: &[&C],
-        covered: Option<&[bool]>,
-        database: &G::DB,
-    ) {
-        if !(grant.applies_to_public()
-            || holders.iter().any(|holder| grant.applies_to_role(holder)))
-        {
-            return;
-        }
-        if grant.is_all_privileges() {
-            match covered {
-                None => self.table = [true; TABLE_PRIVILEGES],
-                Some(covered) => self.columns.iter_mut().for_each(|held| mark(held, covered)),
-            }
-            return;
-        }
-        for privilege in grant.privileges(database) {
-            self.take(privilege, columns, covered);
-        }
-    }
-
-    /// Records `privilege` on the columns it lists. A privilege listing no
-    /// columns holds on the table for a table-level entry, and on the
-    /// columns `covered` marks for a column grant, which never holds on the
-    /// table and carries no privilege a column cannot.
-    fn take<C: ColumnLike>(
-        &mut self,
-        privilege: &sqlparser::ast::Action,
-        columns: &[&C],
-        covered: Option<&[bool]>,
-    ) {
-        use sqlparser::ast::Action;
-        let Some(slot) = privilege_slot(privilege) else {
-            return;
-        };
-        let listed = match privilege {
-            Action::Select { columns: listed }
-            | Action::Insert { columns: listed }
-            | Action::Update { columns: listed }
-            | Action::References { columns: listed } => listed.as_deref(),
-            _ => None,
-        };
-        match (listed, covered) {
-            (None, None) => self.table[slot] = true,
-            (None, Some(covered)) => {
-                if let Some(held) = self.columns.get_mut(slot) {
-                    mark(held, covered);
-                }
-            }
-            (Some(listed), _) => {
-                for (held, column) in self.columns[slot].iter_mut().zip(columns) {
-                    *held |= listed.iter().any(|ident| {
-                        identifiers_match(
-                            &ident.value,
-                            ident.quote_style.is_some(),
-                            column.column_name(),
-                            column.column_name_is_quoted(),
-                        )
-                    });
-                }
-            }
-        }
-    }
-
-    fn answer<'db, C>(self, columns: &[&'db C]) -> TablePrivileges<'db, C> {
-        let [select, insert, update, references] = self.columns;
-        let column_privilege = |slot: usize, held: Vec<bool>| {
-            if self.table[slot] {
-                ColumnPrivilege::Table
-            } else {
-                ColumnPrivilege::Columns(
-                    columns
-                        .iter()
-                        .zip(held)
-                        .filter(|(_, held)| *held)
-                        .map(|(column, _)| *column)
-                        .collect(),
-                )
-            }
-        };
-        TablePrivileges {
-            select: column_privilege(0, select),
-            insert: column_privilege(1, insert),
-            update: column_privilege(2, update),
-            references: column_privilege(3, references),
-            delete: self.table[4],
-            truncate: self.table[5],
-            trigger: self.table[6],
-            maintain: self.table[7],
-        }
-    }
-}
-
-/// Marks as held each column `covered` marks.
-fn mark(held: &mut [bool], covered: &[bool]) {
-    for (held, covered) in held.iter_mut().zip(covered) {
-        *held |= covered;
-    }
 }
 
 impl<T: TableLike> TableLike for &T
@@ -5487,7 +5343,7 @@ where
         &'db self,
         role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
         database: &'db Self::DB,
-    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    ) -> Result<TablePrivileges<&'db <Self::DB as DatabaseLike>::Column>, LookupError>
     where
         Self: 'db,
     {

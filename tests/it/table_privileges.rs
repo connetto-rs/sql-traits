@@ -31,7 +31,7 @@ fn open_world(sql: &str) -> Result<ParserDB, Error> {
 const ROLES: &str = "CREATE ROLE grp; CREATE ROLE r; CREATE ROLE noinh; CREATE ROLE own;
      GRANT grp TO r; GRANT grp TO noinh WITH INHERIT FALSE;";
 
-fn privileges<'db>(db: &'db ParserDB, relation: &str, role: &str) -> TablePrivileges<'db, Column> {
+fn privileges<'db>(db: &'db ParserDB, relation: &str, role: &str) -> TablePrivileges<&'db Column> {
     let (schema, name) = match relation.split_once('.') {
         Some((schema, name)) => (Some(schema), name),
         None => (None, relation),

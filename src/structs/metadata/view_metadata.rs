@@ -1,22 +1,38 @@
 //! Submodule defining a `ViewMetadata` struct.
 
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
 
-use sqlparser::ast::CreateFunction;
+use sqlparser::ast::{Action, CreateFunction, Privileges};
 
-use super::ExpressionCalls;
+use super::{ExpressionCalls, revoke_from_owner_entry};
+use crate::impls::PrivilegeKind;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Metadata about a database view.
 ///
 /// Holds what the input says about a view that the view's own declaration
-/// cannot carry, which is the role owning it and the functions its definition
-/// was bound to call.
+/// cannot carry, which is the role owning it, the privileges the owner's own
+/// entry holds and the functions its definition was bound to call.
 pub struct ViewMetadata {
     /// The role the input names as the view's owner, if it names one.
     owner: Option<String>,
+    /// The relation-level privileges the owner's own entry holds.
+    ///
+    /// Mirrors the owner's item in `pg_class.relacl`, which starts with every
+    /// table privilege and loses the ones a `REVOKE` naming the owner takes.
+    owner_privileges: Vec<Action>,
     /// The calls of the definition, bound when the view was written.
     calls: ExpressionCalls<CreateFunction>,
+}
+
+impl Default for ViewMetadata {
+    fn default() -> Self {
+        Self {
+            owner: None,
+            owner_privileges: PrivilegeKind::Relation.all_privileges(),
+            calls: ExpressionCalls::default(),
+        }
+    }
 }
 
 impl ViewMetadata {
@@ -56,6 +72,23 @@ impl ViewMetadata {
     #[inline]
     pub fn set_owner(&mut self, owner: Option<String>) {
         self.owner = owner;
+    }
+
+    /// Returns the relation-level privileges the owner's own entry holds.
+    #[inline]
+    pub fn owner_privileges(&self) -> impl Iterator<Item = &Action> {
+        self.owner_privileges.iter()
+    }
+
+    /// Replaces the owner's own entry.
+    pub(crate) fn set_owner_privileges(&mut self, privileges: Vec<Action>) {
+        self.owner_privileges = privileges;
+    }
+
+    /// Takes from the owner's own entry the relation-level privileges a
+    /// `REVOKE` names.
+    pub(crate) fn revoke_owner_privileges(&mut self, revoked: &Privileges) {
+        revoke_from_owner_entry(&mut self.owner_privileges, revoked);
     }
 
     /// Stores the calls of the view's definition.

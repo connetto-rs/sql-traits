@@ -763,7 +763,7 @@ impl TableLike for MemoryTable {
         &'db self,
         role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
         database: &'db Self::DB,
-    ) -> Result<TablePrivileges<'db, <Self::DB as DatabaseLike>::Column>, LookupError>
+    ) -> Result<TablePrivileges<&'db <Self::DB as DatabaseLike>::Column>, LookupError>
     where
         Self: 'db,
     {
@@ -917,6 +917,13 @@ impl ViewLike for MemoryView {
 
     fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(None)
+    }
+
+    fn owner_privileges<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db Action>, LookupError> {
+        Ok(core::iter::empty())
     }
 }
 
@@ -1888,6 +1895,10 @@ impl ColumnGrantLike for MemoryColumnGrant {
         database: &'a Self::DB,
     ) -> Result<impl Iterator<Item = &'a MemoryColumn>, LookupError> {
         Ok(table.columns(database)?.filter(move |column| column.name == self.column_name))
+    }
+
+    fn column_names(&self) -> impl Iterator<Item = (&str, bool)> {
+        core::iter::once((self.column_name.as_str(), false))
     }
 
     fn table<'a>(&'a self, database: &'a Self::DB) -> Option<&'a MemoryTable> {

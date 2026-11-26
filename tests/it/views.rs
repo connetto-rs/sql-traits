@@ -120,6 +120,13 @@ impl ViewLike for DefaultView {
     fn owner<'db>(&self, _database: &'db Self::DB) -> Result<Option<&'db str>, LookupError> {
         Ok(None)
     }
+
+    fn owner_privileges<'db>(
+        &'db self,
+        _database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db sqlparser::ast::Action>, LookupError> {
+        Ok(core::iter::empty())
+    }
 }
 
 #[test]
