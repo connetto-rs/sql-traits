@@ -1,8 +1,14 @@
 //! PostgreSQL identifier spelling.
 
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
+};
+
+use crate::{
+    traits::{FunctionLike, TableLike},
+    utils::identifier_resolution::stored_identifier,
 };
 
 /// PostgreSQL keywords requiring identifier quotes.
@@ -179,4 +185,21 @@ pub(crate) fn quote_identifier(name: &str) -> String {
         && name.bytes().all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_'))
         && QUOTED_KEYWORDS.binary_search(&name).is_err();
     if bare { name.to_string() } else { format!("\"{}\"", name.replace('"', "\"\"")) }
+}
+
+/// `function` as PostgreSQL displays its stored name, qualified by its
+/// schema, `public` for one declared without a qualifier.
+pub(crate) fn function_identity<F: FunctionLike>(function: &F) -> String {
+    let target = function.target_name();
+    let schema = target.schema().map_or(Cow::Borrowed("public"), |schema| {
+        stored_identifier(schema, target.schema_is_quoted())
+    });
+    format!("{}.{}", quote_identifier(&schema), quote_identifier(&function.stored_name()))
+}
+
+/// `table` as PostgreSQL displays its stored name, qualified by its schema,
+/// `public` for one declared without a qualifier.
+pub(crate) fn table_identity<T: TableLike>(table: &T) -> String {
+    let schema = table.stored_table_schema().unwrap_or(Cow::Borrowed("public"));
+    format!("{}.{}", quote_identifier(&schema), quote_identifier(&table.stored_table_name()))
 }

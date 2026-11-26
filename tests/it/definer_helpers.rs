@@ -1254,7 +1254,7 @@ fn a_column_without_a_foreign_key_compared_to_a_set_covering_no_table_refuses_th
     assert!(matches!(
         notes(&mixed, typed),
         Err(HelperSetError::UncoveredParent { function, column, called })
-            if function == "notes_with" && column == "target" && called == "docs_with"
+            if function == "public.notes_with" && column == "target" && called == "public.docs_with"
     ));
     assert_eq!(
         notes(GRANT_ARM, "SELECT id FROM notes WHERE id IN (SELECT docs_with(min_role))")
@@ -1393,7 +1393,7 @@ fn the_shape_of_the_declaration_is_checked_before_the_body() {
     ));
     assert!(matches!(
         header("LANGUAGE sql STABLE SET search_path = public"),
-        HelperSetError::SecurityInvoker { function } if function == "docs_with"
+        HelperSetError::SecurityInvoker { function } if function == "public.docs_with"
     ));
     assert!(matches!(
         header("LANGUAGE sql STABLE SECURITY DEFINER"),
@@ -1461,11 +1461,11 @@ fn a_table_whose_policies_bind_the_owner_refuses_the_answer() {
     let forced = format!("{owner_owns_it} ALTER TABLE members FORCE ROW LEVEL SECURITY;");
     assert!(matches!(
         refusal(&forced),
-        HelperSetError::NotExempt { table, owner, .. } if table == "members" && owner == "owner"
+        HelperSetError::NotExempt { table, owner, .. } if table == "public.members" && owner == "owner"
     ));
     assert!(matches!(
         refusal(&sql),
-        HelperSetError::NotExempt { table, .. } if table == "members"
+        HelperSetError::NotExempt { table, .. } if table == "public.members"
     ));
 }
 
@@ -1475,7 +1475,7 @@ fn an_owner_lacking_a_privilege_the_body_needs_refuses_the_answer() {
         .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON docs TO owner;");
     assert!(matches!(
         refusal(&sql),
-        HelperSetError::MissingSelect { table, owner, .. } if table == "members" && owner == "owner"
+        HelperSetError::MissingSelect { table, owner, .. } if table == "public.members" && owner == "owner"
     ));
 
     let calls = helper(
@@ -1492,10 +1492,109 @@ fn an_owner_lacking_a_privilege_the_body_needs_refuses_the_answer() {
          REVOKE EXECUTE ON FUNCTION other.docs_with(TEXT) FROM PUBLIC;
          GRANT USAGE ON SCHEMA other TO owner;",
     );
+    let refused = refusal(&calls);
     assert!(matches!(
-        refusal(&calls),
+        &refused,
         HelperSetError::MissingExecute { called, owner, .. } if called == "other.docs_with" && owner == "owner"
     ));
+    let shouted = calls
+        .replace("CREATE SCHEMA other;", "CREATE SCHEMA OTHER;")
+        .replace("FUNCTION other.docs_with(", "FUNCTION OTHER.DOCS_WITH(");
+    assert_eq!(refusal(&shouted), refused, "one function however its DDL spells it");
+}
+
+/// The helper `authz.projects_with` owned by `authz_owner` and reading
+/// `public.project_grants` without `SELECT` on it, each name spelled as
+/// given, `after` the statements after it.
+fn projects_with(schema: &str, helper: &str, owner: &str, table: &str, after: &str) -> String {
+    format!(
+        "CREATE ROLE {owner} NOLOGIN BYPASSRLS;
+         CREATE SCHEMA {schema};
+         CREATE TABLE {table} (project_id TEXT, user_id TEXT, role TEXT);
+         CREATE FUNCTION {schema}.{helper}(min_role TEXT) RETURNS SETOF TEXT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT project_id FROM {table}
+           WHERE user_id = current_setting('app.user_id', true) AND role = min_role
+         $$;
+         ALTER FUNCTION {schema}.{helper}(TEXT) OWNER TO {owner};
+         GRANT USAGE ON SCHEMA {schema} TO {owner};
+         {after}"
+    )
+}
+
+/// Why the helper `sql` declares refuses to answer, looked up by the stored
+/// names `schema` and `helper`.
+fn projects_refusal(sql: &str, schema: &str, helper: &str) -> HelperSetError {
+    let database = postgres(sql);
+    database
+        .function_by_target(
+            TargetName::new(helper, true).with_schema(schema, true),
+            IdentifierCase::AsWritten,
+        )
+        .expect("unambiguous lookup")
+        .expect("function exists")
+        .helper_set(&[text("read")], &deployment(), &database, &[])
+        .expect_err("refused")
+}
+
+#[test]
+fn a_refusal_names_each_object_by_its_stored_identity_however_the_ddl_spells_it() {
+    let spellings = [
+        ("authz", "projects_with", "authz_owner", "public.project_grants"),
+        ("AUTHZ", "Projects_With", "Authz_Owner", "Public.Project_Grants"),
+        (r#""authz""#, r#""projects_with""#, r#""authz_owner""#, r#""public"."project_grants""#),
+    ];
+    let refused = |bypasses: bool, after: &str| {
+        spellings.map(|(schema, helper, owner, table)| {
+            let mut sql = projects_with(schema, helper, owner, table, after)
+                .replace("{owner}", owner)
+                .replace("{table}", table);
+            if !bypasses {
+                sql = sql.replace("NOLOGIN BYPASSRLS", "NOLOGIN");
+            }
+            projects_refusal(&sql, "authz", "projects_with")
+        })
+    };
+    let missing = refused(true, "");
+    assert_eq!(
+        missing[0].to_string(),
+        "owner `authz_owner` of helper `authz.projects_with` lacks SELECT on `public.project_grants`"
+    );
+    assert!(missing.iter().all(|refusal| *refusal == missing[0]), "{missing:?}");
+
+    let bound = refused(
+        false,
+        "GRANT SELECT ON {table} TO {owner}; ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;",
+    );
+    assert_eq!(
+        bound[0].to_string(),
+        "owner `authz_owner` of helper `authz.projects_with` reads `public.project_grants` through its policies"
+    );
+    assert!(bound.iter().all(|refusal| *refusal == bound[0]), "{bound:?}");
+}
+
+#[test]
+fn a_refusal_quotes_each_identity_postgres_cannot_display_bare() {
+    let sql = projects_with(
+        r#""Authz""#,
+        r#""Projects With""#,
+        r#""Authz ""Owner""""#,
+        r#"public."Project_Grants""#,
+        "",
+    );
+    assert_eq!(
+        projects_refusal(&sql, "Authz", "Projects With").to_string(),
+        r#"owner `"Authz ""Owner"""` of helper `"Authz"."Projects With"` lacks SELECT on `public."Project_Grants"`"#
+    );
+    let keyword = projects_with("authz", "projects_with", r#""user""#, r#"grants."order""#, "")
+        .replace(
+            "CREATE TABLE",
+            "CREATE SCHEMA grants; GRANT USAGE ON SCHEMA grants TO \"user\"; CREATE TABLE",
+        );
+    assert_eq!(
+        projects_refusal(&keyword, "authz", "projects_with").to_string(),
+        r#"owner `"user"` of helper `authz.projects_with` lacks SELECT on `grants."order"`"#
+    );
 }
 
 /// A deployment declaring `app.user_id` as `value`.
@@ -1643,7 +1742,7 @@ fn a_helper_reaching_itself_refuses_the_answer() {
     );
     assert!(matches!(
         refusal(&sql),
-        HelperSetError::CallCycle { function } if function == "docs_with"
+        HelperSetError::CallCycle { function } if function == "public.docs_with"
     ));
 }
 
@@ -2087,7 +2186,7 @@ fn only_postgres_own_functions_unpack_a_set_in_either_spelling() {
     assert!(
         matches!(
             compared("user_id = 'u' AND doc_id IN (SELECT docs_with(min_role))", ""),
-            Err(HelperSetError::CallCycle { function }) if function == "docs_with"
+            Err(HelperSetError::CallCycle { function }) if function == "public.docs_with"
         ),
         "a subquery unpacking no set calls a helper returning grantees, here the helper itself"
     );
@@ -2480,6 +2579,10 @@ fn an_owner_lacking_usage_on_the_schema_of_a_table_it_reads_refuses_the_answer()
         )
     };
     assert!(missing(&in_grants(DEFINER, "grants.members", "")));
+    let shouted = in_grants(DEFINER, "grants.members", "")
+        .replace("CREATE SCHEMA grants;", "CREATE SCHEMA GRANTS;")
+        .replace("CREATE ROLE owner ", "CREATE ROLE OWNER ");
+    assert!(missing(&shouted), "one schema and role however the DDL spells them");
     let reached_on_path = DEFINER.replace("search_path = public", "search_path = grants");
     assert!(
         missing(&in_grants(&reached_on_path, "members", "")),
@@ -2584,7 +2687,7 @@ fn select_on_every_column_an_arm_reads_is_enough() {
     );
     assert!(matches!(
         refusal(&columns("doc_id, user_id")),
-        HelperSetError::MissingSelect { table, .. } if table == "members"
+        HelperSetError::MissingSelect { table, .. } if table == "public.members"
     ));
     let folded = helper(
         DEFINER,
@@ -2607,7 +2710,7 @@ fn select_on_every_column_an_arm_reads_is_enough() {
     folders_with(&parent("id, team_id"), text("read")).expect("answered");
     assert!(matches!(
         folders_with(&parent("id"), text("read")),
-        Err(HelperSetError::MissingSelect { table, .. }) if table == "folders"
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "public.folders"
     ));
 }
 
@@ -2875,7 +2978,7 @@ fn a_reselection_needs_the_owner_to_read_the_columns_its_conditions_name() {
     let database = postgres(&columns("id, parent_id"));
     assert!(matches!(
         groups_with(&database, &deployment, "write"),
-        Err(HelperSetError::MissingSelect { table, .. }) if table == "groups"
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "public.groups"
     ));
 }
 
@@ -2895,7 +2998,7 @@ fn a_reselection_of_another_table_or_shape_refuses_the_answer() {
     assert!(matches!(
         groups_with(&database, &deployment, "read"),
         Err(HelperSetError::UncoveredReselection { function, table })
-            if function == "authz.groups_with" && table == "orgs"
+            if function == "authz.groups_with" && table == "public.orgs"
     ));
 
     for last in [
@@ -3045,7 +3148,7 @@ fn a_walk_needs_the_owner_to_read_the_key_and_the_parent_column() {
     let database = postgres(&columns("id"));
     assert!(matches!(
         groups_with(&database, &deployment, "read"),
-        Err(HelperSetError::MissingSelect { table, .. }) if table == "groups"
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "public.groups"
     ));
 
     let bound = groups(&walking(CHILD_JOIN), "ALTER TABLE groups ENABLE ROW LEVEL SECURITY;")
@@ -3053,7 +3156,7 @@ fn a_walk_needs_the_owner_to_read_the_key_and_the_parent_column() {
     let database = postgres(&bound);
     assert!(matches!(
         groups_with(&database, &deployment, "read"),
-        Err(HelperSetError::NotExempt { table, .. }) if table == "groups"
+        Err(HelperSetError::NotExempt { table, .. }) if table == "public.groups"
     ));
 }
 
@@ -3376,7 +3479,7 @@ fn a_walk_over_a_composite_key_needs_the_owner_to_read_every_edge_column() {
         assert!(
             matches!(
                 caller_grantees(&database, &deployment),
-                Err(HelperSetError::MissingSelect { table, .. }) if table == "team_parents"
+                Err(HelperSetError::MissingSelect { table, .. }) if table == "public.team_parents"
             ),
             "{granted}"
         );
@@ -6212,7 +6315,7 @@ fn a_reading_leaving_exclusions_unread_refuses_one() {
         matches!(
             &refused,
             Err(HelperSetError::UnreadCondition { function, condition, kind: ArmCondition::Exclusion })
-                if function == "visible_projects"
+                if function == "public.visible_projects"
                     && condition == "project.id NOT IN (SELECT public.blocked_projects())"
         ),
         "{refused:?}"
@@ -6232,7 +6335,7 @@ fn a_reading_leaving_exclusions_unread_refuses_one() {
         matches!(
             &teams,
             Err(HelperSetError::UnreadCondition { function, kind: ArmCondition::Exclusion, .. })
-                if function == "visible_projects"
+                if function == "public.visible_projects"
         ),
         "{teams:?}"
     );
@@ -6268,7 +6371,7 @@ fn an_exclusion_calls_one_helper_returning_one_column() {
         matches!(
             &unresolved,
             Err(HelperSetError::UnresolvedCall { function, call })
-                if function == "visible_projects" && call == "public.unblocked"
+                if function == "public.visible_projects" && call == "public.unblocked"
         ),
         "{unresolved:?}"
     );
@@ -6316,9 +6419,9 @@ fn an_exclusion_needs_its_owner_to_execute_the_helper_excluded() {
         matches!(
             &refused,
             Err(HelperSetError::MissingExecute { function, owner, called })
-                if function == "visible_projects"
+                if function == "public.visible_projects"
                     && owner == "authz_owner"
-                    && called == "blocked_projects"
+                    && called == "public.blocked_projects"
         ),
         "{refused:?}"
     );
@@ -6409,7 +6512,7 @@ fn an_anti_join_of_any_other_shape_refuses_the_answer() {
     assert!(
         matches!(
             answer(&postgres(&unreadable), &deployment(), "public", "resources_with", &[]),
-            Err(HelperSetError::MissingSelect { table, .. }) if table == "memberships"
+            Err(HelperSetError::MissingSelect { table, .. }) if table == "public.memberships"
         ),
         "the owner reads the blocking rows"
     );
@@ -6427,7 +6530,7 @@ fn an_anti_join_of_any_other_shape_refuses_the_answer() {
     assert!(
         matches!(
             excluded_by("SELECT * FROM public.memberships m WHERE m.user_id = permission.grantee_id", some_columns),
-            Err(HelperSetError::MissingSelect { table, .. }) if table == "memberships"
+            Err(HelperSetError::MissingSelect { table, .. }) if table == "public.memberships"
         ),
         "`*` reads every column, as PostgreSQL 16.15 refuses it"
     );
@@ -6766,7 +6869,7 @@ fn an_edge_walk_needs_the_owner_to_read_both_edge_columns() {
     let database = postgres(&columns("folder_id"));
     assert!(matches!(
         answer(&database, &deployment, "authz", "folders_reached", &[]),
-        Err(HelperSetError::MissingSelect { table, .. }) if table == "folder_parents"
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "public.folder_parents"
     ));
 }
 
@@ -7293,7 +7396,7 @@ fn an_edge_condition_needs_the_owner_to_read_the_columns_it_names() {
     let database = postgres(&columns("parent_id, child_id, completed"));
     assert!(matches!(
         templates_reached(&database, &deployment, "into"),
-        Err(HelperSetError::MissingSelect { table, .. }) if table == "template_steps"
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "public.template_steps"
     ));
 }
 
@@ -7718,7 +7821,7 @@ fn a_lateral_step_needs_the_owner_to_read_every_edge_it_walks() {
     let database = postgres(&sql);
     assert!(matches!(
         answer(&database, &deployment, "authz", "reached", &[]),
-        Err(HelperSetError::MissingSelect { table, .. }) if table == "ownables"
+        Err(HelperSetError::MissingSelect { table, .. }) if table == "public.ownables"
     ));
 }
 
@@ -8086,7 +8189,7 @@ fn the_owner_has_to_read_a_joined_table_past_its_policies() {
         .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON members TO owner;");
     assert!(matches!(
         refusal(&ungranted),
-        HelperSetError::MissingSelect { table, .. } if table == "docs"
+        HelperSetError::MissingSelect { table, .. } if table == "public.docs"
     ));
     let columns = helper(DEFINER, body, "GRANT SELECT (id, parent_id) ON docs TO owner;")
         .replace("GRANT SELECT ON docs, members TO owner;", "GRANT SELECT ON members TO owner;");
@@ -8098,7 +8201,7 @@ fn the_owner_has_to_read_a_joined_table_past_its_policies() {
         .replace("CREATE ROLE owner NOLOGIN BYPASSRLS;", "CREATE ROLE owner NOLOGIN;");
     assert!(matches!(
         refusal(&bound),
-        HelperSetError::NotExempt { table, .. } if table == "docs"
+        HelperSetError::NotExempt { table, .. } if table == "public.docs"
     ));
 }
 

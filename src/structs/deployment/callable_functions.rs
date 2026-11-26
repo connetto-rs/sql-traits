@@ -16,11 +16,11 @@ use crate::{
     traits::{DatabaseLike, FunctionLike, RoleLike, SchemaLike},
     utils::{
         call_typing::{input_modes, reached_by_name},
-        identifier_resolution::{identifiers_match, stored_identifier},
+        identifier_resolution::identifiers_match,
         object_name::{PG_CATALOG, RoutinePath},
         postgres_format_type::format_type_in,
         postgres_types::PgType,
-        quote_identifier::quote_identifier,
+        quote_identifier::function_identity,
         search_path_text::display_search_path,
     },
 };
@@ -264,10 +264,6 @@ fn refuse_unreached<DB: DatabaseLike>(
 /// `function` schema-qualified, with the types of its input arguments as
 /// PostgreSQL's `format_type` prints them.
 fn signature<F: FunctionLike>(function: &F, database: &F::DB) -> String {
-    let target = function.target_name();
-    let schema = target.schema().map_or(Cow::Borrowed("public"), |schema| {
-        stored_identifier(schema, target.schema_is_quoted())
-    });
     let inputs: Vec<String> = function
         .argument_modes()
         .zip(function.argument_type_names(database))
@@ -277,10 +273,5 @@ fn signature<F: FunctionLike>(function: &F, database: &F::DB) -> String {
                 .map_or_else(|| type_name.to_string(), |parsed| format_type_in(database, &parsed))
         })
         .collect();
-    format!(
-        "{}.{}({})",
-        quote_identifier(&schema),
-        quote_identifier(&function.stored_name()),
-        inputs.join(", ")
-    )
+    format!("{}({})", function_identity(function), inputs.join(", "))
 }

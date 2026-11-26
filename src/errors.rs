@@ -1851,6 +1851,13 @@ impl core::fmt::Display for AccessorRefusal {
 ///
 /// Each refusal names the helper it is met in, a helper a parent arm calls
 /// where it is met there, and an accessor where it is met in its body.
+///
+/// Every function, table, schema, role and column a refusal names is named
+/// by the name PostgreSQL stores for it, a function or table qualified by
+/// its schema, each part quoted where PostgreSQL cannot display it bare. Two
+/// databases holding the same objects name them alike, whatever spelling
+/// either read them under. A call, condition, query or cast is named as the
+/// body writes it.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum HelperSetError {
     /// A table, function or column of the body cannot be looked up.
