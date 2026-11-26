@@ -787,6 +787,12 @@ struct Walk<'q> {
 /// where the conditions the term sets on the edge keep no edge.
 type Walked<'db, DB> = (&'db <DB as DatabaseLike>::Table, Option<WalkArm<'db, DB>>);
 
+/// What the conditions of a walk's edge or a parent arm's row hold it to,
+/// its restrictions, its bounds against the statement time and the sets it
+/// has to stay outside.
+type RowConditions<'db, DB> =
+    (Vec<Restriction<'db, DB>>, Vec<TimeBound<'db, DB>>, Vec<ExcludedSet<'db, DB>>);
+
 /// One edge a walk's term writes, the columns it adds and the ones it
 /// compares with the walk's columns, position by position, beside the name
 /// the walk is qualified by and its columns. `hides_walk` holds for a
@@ -1613,25 +1619,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             read
         })?;
-        let mut exclusions = Vec::new();
-        let mut filters = Vec::new();
-        for condition in conditions {
-            match self.exclusion(scope, select, table, condition)? {
-                // `NOT IN` an empty set holds for every edge, `NULL` too.
-                Some(exclusion) => {
-                    if !exclusion.set.arms.is_empty() {
-                        exclusions.push(exclusion);
-                    }
-                }
-                None => filters.push(condition),
-            }
-        }
-        let (kept, time_bounds) = self.filter(scope, table, filters)?;
         let tree = walk.tree;
         Ok((
             tree,
-            kept.restrictions()
-                .map(|restrictions| WalkArm { restrictions, time_bounds, exclusions, ..walk }),
+            self.row_conditions(scope, select, table, conditions)?.map(
+                |(restrictions, time_bounds, exclusions)| {
+                    WalkArm { restrictions, time_bounds, exclusions, ..walk }
+                },
+            ),
         ))
     }
 
@@ -1995,21 +1990,11 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 })?
             }
         };
-        let mut exclusions = Vec::new();
-        let mut filters = Vec::new();
-        for condition in conditions {
-            match self.exclusion(scope, select, table, condition)? {
-                // `NOT IN` an empty set holds for every row, `NULL` too.
-                Some(exclusion) => {
-                    if !exclusion.set.arms.is_empty() {
-                        exclusions.push(exclusion);
-                    }
-                }
-                None => filters.push(condition),
-            }
-        }
-        let (kept, time_bounds) = self.filter(scope, table, filters)?;
-        let Some(restrictions) = kept.restrictions() else { return Ok(Vec::new()) };
+        let Some((restrictions, time_bounds, exclusions)) =
+            self.row_conditions(scope, select, table, conditions)?
+        else {
+            return Ok(Vec::new());
+        };
         Ok(vec![HelperArm::Parent(ParentArm {
             table: table.table,
             key,
@@ -2528,6 +2513,33 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }));
         }
         Ok((own, joined_rows.into_iter().collect()))
+    }
+
+    /// What `conditions` hold a row of `table` to, a walk's edge or a parent
+    /// arm's row, `None` where they keep no row. An exclusion of a set holding
+    /// no arm takes no row away and is left out.
+    fn row_conditions(
+        &mut self,
+        scope: &Scope<'db, DB>,
+        select: &Select,
+        table: &ArmTable<'_, 'db, DB>,
+        conditions: Vec<&Expr>,
+    ) -> Result<Option<RowConditions<'db, DB>>, HelperSetError> {
+        let mut exclusions = Vec::new();
+        let mut filters = Vec::new();
+        for condition in conditions {
+            match self.exclusion(scope, select, table, condition)? {
+                // `NOT IN` an empty set holds for every row, `NULL` too.
+                Some(exclusion) => {
+                    if !exclusion.set.arms.is_empty() {
+                        exclusions.push(exclusion);
+                    }
+                }
+                None => filters.push(condition),
+            }
+        }
+        let (kept, time_bounds) = self.filter(scope, table, filters)?;
+        Ok(kept.restrictions().map(|restrictions| (restrictions, time_bounds, exclusions)))
     }
 
     /// What `conditions` keep of `table`, beside the bounds they set against
