@@ -453,12 +453,19 @@ mod tests {
     use core::{convert::Infallible, ops::ControlFlow};
 
     use sqlparser::{
-        ast::{Ident, ObjectName, ObjectNamePart},
+        ast::{Expr, Ident, ObjectName, ObjectNamePart},
         dialect::GenericDialect,
         parser::Parser,
     };
 
-    use super::{for_each_call, respell_calls};
+    use super::{KeywordCall, for_each_call, respell_calls};
+
+    #[test]
+    fn spelling_leaves_an_expression_of_another_form_as_written() {
+        let mut expression = Expr::Identifier(Ident::new("a"));
+        KeywordCall::spell_as_function(&mut expression, ObjectName::from(vec![Ident::new("f")]));
+        assert_eq!(expression, Expr::Identifier(Ident::new("a")));
+    }
 
     #[test]
     fn both_walks_meet_every_call_in_the_same_order() {
