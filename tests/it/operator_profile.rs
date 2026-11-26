@@ -584,11 +584,8 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
         self.unreach()
     }
 
-    fn argument_type_names<'db>(
-        &'db self,
-        _database: &'db Self::DB,
-    ) -> impl Iterator<Item = Cow<'db, str>> {
-        self.unreach::<core::iter::Empty<Cow<'db, str>>>()
+    fn argument_types<'db>(&'db self, _database: &'db Self::DB) -> impl Iterator<Item = &'db Self> {
+        self.unreach::<core::iter::Empty<&'db Self>>()
     }
 
     fn argument_names<'db>(
@@ -599,6 +596,10 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
     }
 
     fn return_type_name<'db>(&'db self, _database: &'db Self::DB) -> Option<Cow<'db, str>> {
+        self.unreach()
+    }
+
+    fn return_type<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db Self> {
         self.unreach()
     }
 
@@ -617,8 +618,8 @@ impl<P: EmptyKinds> FunctionLike for NoneKind<P> {
     fn returned_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
-        self.unreach::<core::iter::Empty<(TargetName<'db>, Cow<'db, str>)>>()
+    ) -> impl Iterator<Item = (TargetName<'db>, &'db Self)> {
+        self.unreach::<core::iter::Empty<(TargetName<'db>, &'db Self)>>()
     }
 
     fn argument_default_count(&self) -> usize {

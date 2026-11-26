@@ -68,13 +68,11 @@ impl FunctionLike for CreateFunction {
     }
 
     #[inline]
-    fn argument_type_names<'db>(
+    fn argument_types<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> impl Iterator<Item = Cow<'db, str>> {
-        self.args
-            .iter()
-            .flat_map(|args| args.iter().map(|arg| normalize_sqlparser_type(&arg.data_type)))
+    ) -> impl Iterator<Item = &'db DataType> {
+        self.args.iter().flatten().map(|arg| &arg.data_type)
     }
 
     #[inline]
@@ -117,6 +115,17 @@ impl FunctionLike for CreateFunction {
     }
 
     #[inline]
+    fn return_type<'db>(&'db self, _database: &'db Self::DB) -> Option<&'db DataType> {
+        self.return_type.as_ref().map(|declared| {
+            match declared {
+                FunctionReturnType::DataType(data_type) | FunctionReturnType::SetOf(data_type) => {
+                    data_type
+                }
+            }
+        })
+    }
+
+    #[inline]
     fn returns_set(&self) -> bool {
         match &self.return_type {
             Some(FunctionReturnType::SetOf(_)) => true,
@@ -145,7 +154,7 @@ impl FunctionLike for CreateFunction {
     fn returned_columns<'db>(
         &'db self,
         _database: &'db Self::DB,
-    ) -> impl Iterator<Item = (TargetName<'db>, Cow<'db, str>)> {
+    ) -> impl Iterator<Item = (TargetName<'db>, &'db DataType)> {
         let columns = match &self.return_type {
             Some(FunctionReturnType::DataType(DataType::Table(Some(columns)))) => {
                 columns.as_slice()
@@ -155,7 +164,7 @@ impl FunctionLike for CreateFunction {
         columns.iter().map(|column| {
             (
                 TargetName::new(&column.name.value, column.name.quote_style.is_some()),
-                normalize_sqlparser_type(&column.data_type),
+                &column.data_type,
             )
         })
     }

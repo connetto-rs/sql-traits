@@ -23,7 +23,7 @@ use crate::{
     errors::LookupError,
     structs::{FunctionKind, IdentifierCase, TargetName, TypeKind, WrittenCall},
     traits::{
-        ColumnLike, DatabaseLike, FunctionLike, Relation, StructuredField, TableLike,
+        ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, Relation, StructuredField, TableLike,
         UserDefinedTypeKind, UserDefinedTypeLike,
     },
     utils::{object_name::type_search_path, postgres_types::PgType},
@@ -217,7 +217,11 @@ where
         .zip(function.argument_type_names(database))
         .filter(|((mode, _), _)| matches!(mode, ArgMode::Out | ArgMode::InOut))
         .map(|((_, name), data_type)| (name, data_type))
-        .chain(function.returned_columns(database).map(|(name, data_type)| (Some(name), data_type)))
+        .chain(
+            function
+                .returned_columns(database)
+                .map(|(name, data_type)| (Some(name), data_type.name(database))),
+        )
         .collect();
     if !outputs.is_empty() {
         if listed.is_some() || outputs.iter().any(|(_, data_type)| is_polymorphic(data_type)) {

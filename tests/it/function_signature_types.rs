@@ -97,7 +97,7 @@ fn only_a_returns_table_clause_declares_returned_columns() {
             .expect("the function exists");
         function
             .returned_columns(&database)
-            .map(|(column, type_name)| format!("{} {type_name}", column.name()))
+            .map(|(column, data_type)| format!("{} {}", column.name(), data_type.name(&database)))
             .collect()
     };
     assert_eq!(columns("columns"), ["c app.d"]);

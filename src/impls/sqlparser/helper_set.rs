@@ -3768,7 +3768,7 @@ fn returned_type<F: FunctionLike>(
     index: usize,
 ) -> Option<DataType> {
     let declared = match function.returned_columns(database).nth(index) {
-        Some((_, declared)) => declared,
+        Some((_, declared)) => declared.name(database),
         None => function.result_type_name(database)?,
     };
     parse_data_type(&declared)
