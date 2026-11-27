@@ -136,6 +136,62 @@ fn every_path_returning_new_assigns() {
         filled("BEGIN NEW.x := 1 / NEW.id; EXCEPTION WHEN division_by_zero THEN NULL; END;"),
         [] as [&str; 0]
     );
+    assert_eq!(filled("IF NEW.id < 0 THEN RETURN OLD; END IF; NEW.x := 1;"), [] as [&str; 0]);
+    assert_eq!(filled("IF NEW.id < 0 THEN RETURN; END IF; NEW.x := 1;"), [] as [&str; 0]);
+}
+
+#[test]
+fn assigning_the_whole_row_assigns_every_column() {
+    assert_eq!(filled("SELECT a.* INTO NEW FROM audit a WHERE a.id = NEW.id;"), ["x", "y"]);
+    assert_eq!(filled("IF NEW.id > 0 THEN NEW := ROW(1, 2, 3); ELSE NEW.x := 2; END IF;"), ["x"]);
+    assert_eq!(filled("IF NEW.id > 0 THEN NEW.x := 2; ELSE NEW := ROW(1, 2, 3); END IF;"), ["x"]);
+}
+
+#[test]
+fn a_loop_may_run_no_round() {
+    assert_eq!(filled("FOR i IN 1 .. NEW.id LOOP NEW.y := i; END LOOP; NEW.x := 1;"), ["x"]);
+}
+
+#[test]
+fn dynamic_sql_and_calls_read_what_they_are_handed() {
+    assert_eq!(
+        filled("EXECUTE 'INSERT INTO audit VALUES ($1, $2)' USING NEW.id, NEW.x; NEW.x := 1;"),
+        [] as [&str; 0]
+    );
+    assert_eq!(filled("EXECUTE 'SELECT ' || NEW.y; NEW.x := 1; NEW.y := 1;"), ["x"]);
+    let schema = "
+        CREATE TABLE t (id INT, x INT);
+        CREATE PROCEDURE remember(INOUT value INT) LANGUAGE plpgsql AS $$ BEGIN END $$;
+        CREATE FUNCTION fill() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN CALL remember(NEW.x); NEW.x := 1; RETURN NEW; END $$;
+        CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fill();";
+    assert_eq!(filled_in(schema, "t"), [] as [&str; 0]);
+}
+
+#[test]
+fn a_field_of_another_row_variable_is_no_column() {
+    let schema = "
+        CREATE TABLE t (id INT, x INT);
+        CREATE FUNCTION fill() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        DECLARE scratch t;
+        BEGIN scratch.x := 1; NEW.x := scratch.x; RETURN NEW; END $$;
+        CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fill();";
+    assert_eq!(filled_in(schema, "t"), ["x"]);
+}
+
+#[test]
+fn a_body_whose_names_do_not_resolve_fills_nothing() {
+    let schema = |declarations: &str, statements: &str| {
+        format!(
+            "CREATE TABLE t (id INT, x INT);
+             CREATE FUNCTION fill() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             {declarations} BEGIN {statements} NEW.x := 1; RETURN NEW; END $$;
+             CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fill();"
+        )
+    };
+    assert_eq!(filled_in(&schema("", ""), "t"), ["x"]);
+    assert_eq!(filled_in(&schema("DECLARE lost ALIAS FOR missing;", ""), "t"), [] as [&str; 0]);
+    assert_eq!(filled_in(&schema("", "missing := 1;"), "t"), [] as [&str; 0]);
 }
 
 #[test]
@@ -275,4 +331,14 @@ fn a_partitioned_table_needs_every_partition_filled() {
     assert_eq!(filled_in(schema, "t_one"), ["x"]);
     assert_eq!(filled_in(schema, "t_two"), [] as [&str; 0]);
     assert_eq!(filled_in(schema, "t"), [] as [&str; 0]);
+}
+
+#[test]
+fn a_partitioned_table_without_partitions_answers_its_own_triggers() {
+    let schema = "
+        CREATE TABLE t (id INT, x INT) PARTITION BY LIST (id);
+        CREATE FUNCTION fill() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+        BEGIN NEW.x := 1; RETURN NEW; END $$;
+        CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION fill();";
+    assert_eq!(filled_in(schema, "t"), ["x"]);
 }
