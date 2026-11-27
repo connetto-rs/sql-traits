@@ -2405,7 +2405,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   keeping the rows whose key the helper returns. Any other arm naming no
     ///   grantee by a value of the request and comparing a helper's set while
     ///   returning a key it would return as a parent arm is one, so it joins no
-    ///   row and compares no other set but in an exclusion.
+    ///   row and compares no other set but in an exclusion or a cap.
     /// - A parent arm, `SELECT <key> FROM <table> WHERE <column> IN (SELECT
     ///   <helper>(<arguments>)) [AND <conditions>]`, each argument a parameter
     ///   or a literal, the helper called answered in turn for the arguments it
@@ -2417,11 +2417,13 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   an edge table holding the parent of each child, and the column, one
     ///   other than `<key>`, has one single-column foreign key. The conditions
     ///   reduce to restrictions and bounds against the statement time the way a
-    ///   grant arm's do, or exclude a column from another helper's set the way
-    ///   a grant arm's exclusion does. They are read where `conditions` names
-    ///   [`ArmCondition::ParentCondition`], and for an exclusion
-    ///   [`ArmCondition::Exclusion`] as well, refusing the answer otherwise. An
-    ///   arm whose conditions keep no row is left out.
+    ///   grant arm's do, exclude a column from another helper's set the way a
+    ///   grant arm's exclusion does, or cap the row the way a grant arm's cap
+    ///   does, with a row of operands or behind `<setting> IS NULL OR`. They
+    ///   are read where `conditions` names [`ArmCondition::ParentCondition`],
+    ///   for an exclusion [`ArmCondition::Exclusion`] as well and for a cap
+    ///   [`ArmCondition::Cap`] as well, refusing the answer otherwise. An arm
+    ///   whose conditions keep no row is left out.
     /// - A called arm, `SELECT <columns> FROM <helper>(<arguments>) [<alias>
     ///   [(<names>)]]`, returning columns of the rows another helper returns,
     ///   answered in turn, crossed with lists of labels and with no other
@@ -2458,12 +2460,14 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// comparison with the walk, in `ON` and in `WHERE` of a join and in
     /// `WHERE` of a `LATERAL` edge. They name columns of the edge table
     /// alone, never the walk's row, and reduce to restrictions and
-    /// bounds against the statement time the way a grant arm's do, or exclude
+    /// bounds against the statement time the way a grant arm's do, exclude
     /// a column from another helper's set the way a grant arm's exclusion
-    /// does, a set reaching the walking helper again being a call cycle. They
-    /// are read where `conditions` names [`ArmCondition::EdgeCondition`], and
-    /// for an exclusion [`ArmCondition::Exclusion`] as well, refusing the
-    /// answer otherwise. The walk answers a
+    /// does, or cap the edge the way a grant arm's cap does, with a row of
+    /// operands or behind `<setting> IS NULL OR`, a set reaching the walking
+    /// helper again being a call cycle. They are read where `conditions`
+    /// names [`ArmCondition::EdgeCondition`], for an exclusion
+    /// [`ArmCondition::Exclusion`] as well and for a cap [`ArmCondition::Cap`]
+    /// as well, refusing the answer otherwise. The walk answers a
     /// [`WalkArm`](crate::structs::WalkArm) per edge after the arms, and none
     /// for an edge whose conditions keep no row. `UNION ALL` between the arms
     /// and the term is refused, since it never ends on edges closing a cycle.

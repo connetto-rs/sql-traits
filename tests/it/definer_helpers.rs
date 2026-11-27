@@ -498,7 +498,8 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         .iter()
                         .map(render_restriction)
                         .chain(walk.time_bounds().iter().map(render_bound))
-                        .chain(walk.exclusions().iter().map(render_exclusion));
+                        .chain(walk.exclusions().iter().map(render_exclusion))
+                        .chain(walk.caps().iter().map(|cap| render_cap(cap, &[])));
                     for condition in conditions {
                         rendered.push_str(" AND ");
                         rendered.push_str(&condition);
@@ -524,7 +525,8 @@ fn render(set: &HelperSet<'_, ParserDB>) -> String {
                         .iter()
                         .map(render_restriction)
                         .chain(parent.time_bounds().iter().map(render_bound))
-                        .chain(parent.exclusions().iter().map(render_exclusion));
+                        .chain(parent.exclusions().iter().map(render_exclusion))
+                        .chain(parent.caps().iter().map(|cap| render_cap(cap, &[])));
                     for condition in conditions {
                         rendered.push_str(" AND ");
                         rendered.push_str(&condition);
@@ -749,10 +751,12 @@ fn walked_rows(
                 WalkDirection::Up => (walk.child(), walk.parent()),
             };
             let excluded = excluded_sets(walk.exclusions(), request, fixture);
+            let caps = cap_sets(walk.caps(), request, fixture);
             for row in rows(fixture, walk.table().table_name()) {
                 if values(row, reached).is_some_and(|held| returned.contains(&held))
                     && walk.restrictions().iter().all(|restriction| restricts(restriction, row))
                     && outside(&excluded, row)
+                    && capped(walk.caps(), &[], &caps, row, fixture)
                     && let Some(added) = values(row, added)
                 {
                     grew |= returned.insert(added);
@@ -829,15 +833,7 @@ fn grant_rows(
         GrantedTo::Set(grantees) => Some(evaluate(grantees.set(), request, fixture)),
         GrantedTo::Request(_) | GrantedTo::Anyone => None,
     };
-    // A lifted cap keeps every row, so its rows are `None`.
-    let caps: Vec<_> = grant
-        .caps()
-        .iter()
-        .map(|cap| {
-            (!cap.lift().is_some_and(|lift| left_unset(lift, request)))
-                .then(|| cap_rows(cap, request, fixture))
-        })
-        .collect();
+    let caps = cap_sets(grant.caps(), request, fixture);
     let excluded = excluded_sets(grant.exclusions(), request, fixture);
     for row in rows(fixture, grant.table().table_name()) {
         let restricted = grant.restrictions().iter().all(|restriction| restricts(restriction, row))
@@ -862,7 +858,7 @@ fn grant_rows(
             && restricted
             && unblocked
             && outside(&excluded, row)
-            && capped(grant, &caps, row, fixture)
+            && capped(grant.caps(), grant.joined_rows(), &caps, row, fixture)
         {
             let columns: Vec<Vec<&'static str>> = grant
                 .returned()
@@ -934,6 +930,7 @@ fn arm_rows(
             HelperArm::Parent(parent) => {
                 let parents = evaluate(parent.set(), request, fixture);
                 let excluded = excluded_sets(parent.exclusions(), request, fixture);
+                let caps = cap_sets(parent.caps(), request, fixture);
                 for row in rows(fixture, parent.table().table_name()) {
                     if nullable(row, parent.column().column_name())
                         .is_some_and(|value| parents.contains(value))
@@ -942,6 +939,7 @@ fn arm_rows(
                             .iter()
                             .all(|restriction| restricts(restriction, row))
                         && outside(&excluded, row)
+                        && capped(parent.caps(), &[], &caps, row, fixture)
                     {
                         returned.insert(vec![cell(row, parent.key().column_name())]);
                     }
@@ -968,15 +966,32 @@ fn arm_rows(
     returned
 }
 
-/// Whether `row` of `grant` meets every cap, each beside the rows it
-/// compares with, `None` where it is lifted.
+/// The rows each of `caps` compares its operands with for `request` over
+/// `fixture`, `None` where it is lifted, which keeps every row.
+fn cap_sets(
+    caps: &[RowCap<'_, ParserDB>],
+    request: Request,
+    fixture: Rows,
+) -> Vec<Option<BTreeSet<Vec<&'static str>>>> {
+    caps.iter()
+        .map(|cap| {
+            (!cap.lift().is_some_and(|lift| left_unset(lift, request)))
+                .then(|| cap_rows(cap, request, fixture))
+        })
+        .collect()
+}
+
+/// Whether `row` meets every one of `caps`, each beside the rows it
+/// compares with, `None` where it is lifted. `joined` holds the rows a
+/// grant arm joins, which joined operands read.
 fn capped(
-    grant: &GrantArm<'_, ParserDB>,
+    caps: &[RowCap<'_, ParserDB>],
+    joined: &[JoinedRow<'_, ParserDB>],
     compared: &[Option<BTreeSet<Vec<&'static str>>>],
     row: &[(&str, &'static str)],
     fixture: Rows,
 ) -> bool {
-    grant.caps().iter().zip(compared).all(|(cap, allowed)| {
+    caps.iter().zip(compared).all(|(cap, allowed)| {
         let Some(allowed) = allowed else { return true };
         // A `NULL` operand matches no row.
         let operands: Option<Vec<&str>> = cap
@@ -985,8 +1000,8 @@ fn capped(
             .map(|operand| {
                 match operand {
                     CapOperand::Column(column) => nullable(row, column.column_name()),
-                    CapOperand::Joined { row: joined, column } => {
-                        let named = named_row(row, &grant.joined_rows()[*joined], fixture)
+                    CapOperand::Joined { row: joined_row, column } => {
+                        let named = named_row(row, &joined[*joined_row], fixture)
                             .expect("the arm keeps only rows naming their joined rows");
                         nullable(named, column.column_name())
                     }
@@ -5915,6 +5930,209 @@ fn every_arm_an_in_list_of_principals_answers_keeps_the_caps() {
     assert!(arms[0].starts_with("resources.id WHERE owner_id = app.user_id AND "), "{answer}");
     assert!(arms[1].starts_with("resources.id WHERE owner_id IN ('nobody') AND "), "{answer}");
     assert!(arms.iter().all(|arm| arm.contains(cap)), "{answer}");
+}
+
+const CAPPED_WALKS: &str = "
+CREATE TABLE nodes (
+  id TEXT PRIMARY KEY, organization_id TEXT NOT NULL, kind authz.resource_kind NOT NULL,
+  parent_id TEXT REFERENCES nodes (id));
+CREATE TABLE node_grants (
+  node_id TEXT NOT NULL REFERENCES nodes (id), user_id TEXT NOT NULL, PRIMARY KEY (node_id, user_id));
+GRANT SELECT ON nodes, node_grants TO authz_owner;
+CREATE FUNCTION authz.acting_installation_id() RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT NULLIF(current_setting('app.installation_id', true), '')
+$$;
+CREATE FUNCTION authz.capped_nodes(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  WITH RECURSIVE reached (id) AS (
+    SELECT ng.node_id FROM public.node_grants ng
+    WHERE ng.user_id = NULLIF(current_setting('app.user_id', true), '')
+    UNION
+    SELECT child.id FROM reached JOIN public.nodes child ON child.parent_id = reached.id
+    WHERE (SELECT authz.acting_installation_id()) IS NULL
+      OR (child.organization_id, child.kind) IN (SELECT * FROM authz.capped_kinds(min_role))
+  ) SELECT id FROM reached
+$$;
+CREATE FUNCTION authz.capped_children(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT child.id FROM public.nodes child
+  WHERE child.parent_id IN (SELECT authz.capped_nodes(min_role))
+    AND ((SELECT authz.acting_installation_id()) IS NULL
+      OR (child.organization_id, child.kind) IN (SELECT * FROM authz.capped_kinds(min_role)))
+$$;
+ALTER FUNCTION authz.acting_installation_id() OWNER TO authz_owner;
+ALTER FUNCTION authz.capped_nodes(TEXT) OWNER TO authz_owner;
+ALTER FUNCTION authz.capped_children(TEXT) OWNER TO authz_owner;
+";
+
+const CAPPED_STEP: &str = "(SELECT authz.acting_installation_id()) IS NULL
+      OR (child.organization_id, child.kind) IN (SELECT * FROM authz.capped_kinds(min_role))
+  ) SELECT";
+
+const NODE_ROWS: Rows = &[
+    ("nodes", &[("id", "n_org"), ("organization_id", "o1"), ("kind", "organization")]),
+    (
+        "nodes",
+        &[("id", "n_f"), ("organization_id", "o1"), ("kind", "folder"), ("parent_id", "n_org")],
+    ),
+    (
+        "nodes",
+        &[("id", "n_p"), ("organization_id", "o1"), ("kind", "project"), ("parent_id", "n_f")],
+    ),
+    ("nodes", &[("id", "m_org"), ("organization_id", "o2"), ("kind", "organization")]),
+    (
+        "nodes",
+        &[("id", "m_f"), ("organization_id", "o2"), ("kind", "folder"), ("parent_id", "m_org")],
+    ),
+    (
+        "nodes",
+        &[("id", "m_p"), ("organization_id", "o2"), ("kind", "project"), ("parent_id", "m_f")],
+    ),
+    ("node_grants", &[("node_id", "n_org"), ("user_id", "alice")]),
+    ("node_grants", &[("node_id", "m_org"), ("user_id", "alice")]),
+    ("node_grants", &[("node_id", "m_f"), ("user_id", "bob")]),
+];
+
+/// What PostgreSQL 18.7 returns for `(helper, min_role, request, returned)`
+/// over [`CAP_ROWS`] and [`NODE_ROWS`], the helpers of [`CAPPED_WALKS`]
+/// declared after [`CAPS`].
+const CAPPED_WALKS_MEASURED: &[(&str, &str, Request, &[&str])] = &[
+    ("capped_nodes", "reader", ALICE, &["m_f", "m_org", "m_p", "n_f", "n_org", "n_p"]),
+    ("capped_nodes", "reader", ALICE_EMPTY, &["m_f", "m_org", "m_p", "n_f", "n_org", "n_p"]),
+    ("capped_nodes", "reader", ALICE_I1, &["m_org", "n_f", "n_org"]),
+    ("capped_nodes", "reader", ALICE_I2, &["m_f", "m_org", "n_org"]),
+    ("capped_nodes", "reader", ALICE_IX, &["m_org", "n_org"]),
+    ("capped_nodes", "reader", BOB_I1, &["m_f", "m_p"]),
+    ("capped_nodes", "reader", BOB_I2, &["m_f"]),
+    ("capped_nodes", "admin", ALICE_I1, &["m_org", "n_org"]),
+    ("capped_nodes", "admin", BOB_I1, &["m_f", "m_p"]),
+    ("capped_children", "reader", ALICE, &["m_f", "m_p", "n_f", "n_p"]),
+    ("capped_children", "reader", ALICE_EMPTY, &["m_f", "m_p", "n_f", "n_p"]),
+    ("capped_children", "reader", ALICE_I1, &["n_f"]),
+    ("capped_children", "reader", ALICE_I2, &["m_f"]),
+    ("capped_children", "reader", ALICE_IX, &[]),
+    ("capped_children", "reader", BOB_I1, &["m_p"]),
+    ("capped_children", "reader", BOB_I2, &[]),
+    ("capped_children", "admin", ALICE_I1, &[]),
+];
+
+/// What PostgreSQL 18.7 returns for `(request, returned)` from
+/// `authz.capped_nodes('reader')` whose step caps the child with no lift.
+const UNLIFTED_STEP_MEASURED: &[(Request, &[&str])] = &[
+    (ALICE, &["m_org", "n_org"]),
+    (ALICE_I1, &["m_org", "n_f", "n_org"]),
+    (ALICE_I2, &["m_f", "m_org", "n_org"]),
+    (BOB_I1, &["m_f", "m_p"]),
+];
+
+/// `authz.<helper>(min_role)` over `sql`, read with every condition a walk
+/// or a parent arm sets, caps included.
+fn capped_walk<'db>(
+    database: &'db ParserDB,
+    deployment: &'db Deployment,
+    helper: &str,
+    min_role: &str,
+) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    function(database, "authz", helper).helper_set(
+        &[text(min_role)],
+        deployment,
+        database,
+        &[ArmCondition::EdgeCondition, ArmCondition::ParentCondition, ArmCondition::Cap],
+    )
+}
+
+#[test]
+fn a_walk_stops_at_a_child_its_step_caps_out() {
+    let database = postgres(&format!("{CAPS}{CAPPED_WALKS}"));
+    let deployment = installation_deployment();
+    let fixture: Rows = [CAP_ROWS, NODE_ROWS].concat().leak();
+    let capped_kinds = "authz.capped_kinds('reader') {installation_permissions.(organization_id, kind) WHERE installation_id = app.installation_id AND max_role IN ('admin', 'reader')}";
+    let walk = format!(
+        "node_grants.node_id WHERE user_id = app.user_id UNION nodes.id WHERE parent_id IN itself AND (app.installation_id IS UNSET OR (organization_id, kind) IN {capped_kinds})"
+    );
+    let set = capped_walk(&database, &deployment, "capped_nodes", "reader").expect("answered");
+    assert_eq!(render(&set), walk);
+    let set = capped_walk(&database, &deployment, "capped_children", "reader").expect("answered");
+    assert_eq!(
+        render(&set),
+        format!(
+            "nodes.id WHERE parent_id -> nodes IN authz.capped_nodes('reader') {{{walk}}} AND (app.installation_id IS UNSET OR (organization_id, kind) IN {capped_kinds})"
+        )
+    );
+    for &(helper, min_role, request, expected) in CAPPED_WALKS_MEASURED {
+        let set = capped_walk(&database, &deployment, helper, min_role).expect("answered");
+        let returned: Vec<_> = evaluate(&set, request, fixture).into_iter().collect();
+        assert_eq!(returned, expected, "{helper}('{min_role}') for {:?}", request.values);
+    }
+
+    let unlifted = CAPPED_WALKS.replace(
+        CAPPED_STEP,
+        "(child.organization_id, child.kind) IN (SELECT * FROM authz.capped_kinds(min_role))
+  ) SELECT",
+    );
+    let database = postgres(&format!("{CAPS}{unlifted}"));
+    let set = capped_walk(&database, &deployment, "capped_nodes", "reader").expect("answered");
+    let HelperArm::Walk(walk) = &set.arms()[1] else { panic!("the second arm is the walk") };
+    let [cap] = walk.caps() else { panic!("one cap on the step") };
+    assert!(cap.lift().is_none());
+    for &(request, expected) in UNLIFTED_STEP_MEASURED {
+        let returned: Vec<_> = evaluate(&set, request, fixture).into_iter().collect();
+        assert_eq!(returned, expected, "{:?}", request.values);
+    }
+}
+
+#[test]
+fn a_cap_on_a_step_or_a_parent_row_is_read_only_where_the_consumer_names_it() {
+    let database = postgres(&format!("{CAPS}{CAPPED_WALKS}"));
+    let deployment = installation_deployment();
+    for (helper, conditions, kind) in [
+        ("capped_nodes", &[ArmCondition::EdgeCondition][..], ArmCondition::Cap),
+        ("capped_nodes", &[ArmCondition::Cap][..], ArmCondition::EdgeCondition),
+        (
+            "capped_children",
+            &[ArmCondition::EdgeCondition, ArmCondition::ParentCondition][..],
+            ArmCondition::Cap,
+        ),
+        (
+            "capped_children",
+            &[ArmCondition::EdgeCondition, ArmCondition::Cap][..],
+            ArmCondition::ParentCondition,
+        ),
+    ] {
+        let unread = function(&database, "authz", helper).helper_set(
+            &[text("reader")],
+            &deployment,
+            &database,
+            conditions,
+        );
+        assert!(
+            matches!(&unread, Err(HelperSetError::UnreadCondition { kind: refused, .. }) if *refused == kind),
+            "{helper} read with {conditions:?}: {unread:?}"
+        );
+    }
+}
+
+#[test]
+fn a_step_membership_neither_capping_the_edge_nor_lifted_refuses_the_answer() {
+    let deployment = installation_deployment();
+    for condition in [
+        "child.organization_id IN (SELECT authz.member_organizations())",
+        "(reached.id, child.kind) IN (SELECT * FROM authz.capped_kinds(min_role))",
+        "child.kind = 'folder' OR (child.organization_id, child.kind) IN (SELECT * FROM authz.capped_kinds(min_role))",
+    ] {
+        let sql = CAPPED_WALKS.replace(CAPPED_STEP, &format!("{condition}\n  ) SELECT"));
+        let database = postgres(&format!("{CAPS}{sql}"));
+        let refused = capped_walk(&database, &deployment, "capped_nodes", "reader");
+        assert!(
+            matches!(
+                &refused,
+                Err(HelperSetError::Irreducible { function, condition: refusing })
+                    if function == "authz.capped_nodes" && refusing == condition
+            ),
+            "{condition}: {refused:?}"
+        );
+    }
 }
 
 const CALLER_CONDITIONS: &str = "
