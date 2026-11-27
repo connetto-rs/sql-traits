@@ -609,13 +609,15 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
     }
 
     /// The scope a query with body `body` reads outer references from, the
-    /// parent of the scope of its first `SELECT`, `None` for a body with no
-    /// `SELECT` and for a query nothing encloses.
+    /// parent of the scope of its first `SELECT` or the scope the cells of
+    /// its first `VALUES` list are read in, `None` for a body with neither
+    /// and for a `SELECT` nothing encloses.
     fn outer_cursor(&self, body: &SetExpr) -> Option<ScopeCursor> {
         match body {
             SetExpr::Select(select) => {
                 self.graph.select_scope(select).and_then(|scope| self.graph.scopes[scope.0].parent)
             }
+            SetExpr::Values(values) => self.graph.values_cursor(values),
             SetExpr::Query(query) => self.outer_cursor(&query.body),
             SetExpr::SetOperation { left, .. } => self.outer_cursor(left),
             _ => None,
@@ -638,7 +640,8 @@ impl<DB: DatabaseLike> Walk<'_, '_, '_, '_, DB> {
                     self.modifying(statement);
                 }
             }
-            other => self.node(other, None),
+            SetExpr::Values(values) => self.node(values, self.graph.values_cursor(values)),
+            SetExpr::Table(table) => self.node(table, None),
         }
     }
 

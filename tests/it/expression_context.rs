@@ -6,12 +6,18 @@
     clippy::unreachable,
     reason = "Fixtures must hold the nodes they navigate to."
 )]
+#![expect(
+    clippy::disallowed_methods,
+    reason = "test code ships in no binary, so walking the tree directly costs nothing"
+)]
+
+use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{
         BinaryOperator, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement,
-        TableFactor, Update,
+        TableFactor, Update, visit_expressions,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -342,6 +348,41 @@ fn row_counts_bind_columns_of_the_enclosing_query() {
         };
         assert_eq!(column.column_name(), "n");
         assert!(binding.entry().is_some());
+    }
+}
+
+/// A cell of a `VALUES` list binds a column of the enclosing query, and of
+/// its own query's `FROM` only under `LATERAL`.
+#[test]
+fn values_cells_bind_the_columns_their_list_reaches() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE samples (v INTERVAL);").unwrap();
+    for (sql, binds) in [
+        ("SELECT (SELECT sum(x) FROM (VALUES (v), (interval '1 mon')) AS s(x)) FROM samples", true),
+        ("SELECT x FROM samples, LATERAL (VALUES (v)) AS s(x)", true),
+        ("SELECT x FROM samples, (VALUES (v)) AS s(x)", false),
+    ] {
+        let statement = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
+        let context = ExpressionContext::for_statement(
+            &statement,
+            &ExpressionScope::Empty,
+            &db,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
+        let mut found = None;
+        let ControlFlow::<Infallible>::Continue(()) = visit_expressions(&statement, |expression| {
+            if matches!(expression, Expr::Identifier(name) if name.value == "v") {
+                found = Some(context.reference(expression).unwrap().map(|(definition, _)| {
+                    let ColumnDefinition::Base { table, column, .. } = definition else {
+                        panic!("{sql}: v binds no base column")
+                    };
+                    (table.table_name().to_owned(), column.column_name().to_owned())
+                }));
+            }
+            ControlFlow::Continue(())
+        });
+        let expected = binds.then(|| ("samples".to_owned(), "v".to_owned()));
+        assert_eq!(found, Some(expected), "{sql}");
     }
 }
 
