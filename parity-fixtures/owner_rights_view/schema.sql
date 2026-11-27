@@ -1,0 +1,11 @@
+CREATE ROLE app_user NOLOGIN;
+CREATE ROLE authz_writer NOLOGIN BYPASSRLS;
+CREATE TABLE resources (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, archived BOOLEAN NOT NULL DEFAULT FALSE);
+ALTER TABLE resources ENABLE ROW LEVEL SECURITY;
+GRANT SELECT, UPDATE (archived) ON resources TO app_user;
+GRANT SELECT, UPDATE (parent_id) ON resources TO authz_writer;
+CREATE POLICY resources_select ON resources FOR SELECT TO app_user USING (parent_id > 0);
+CREATE POLICY resources_update ON resources FOR UPDATE TO app_user USING (parent_id > 1) WITH CHECK (TRUE);
+CREATE VIEW resource_moves WITH (check_option = cascaded) AS SELECT id, parent_id FROM resources WHERE parent_id > 0;
+ALTER VIEW resource_moves OWNER TO authz_writer;
+GRANT SELECT, UPDATE (parent_id) ON resource_moves TO app_user;

@@ -420,6 +420,7 @@ static EMBEDDED: &[Embedded] = &embedded![
     "insert_only_grant" known,
     "jsonb_numeric_owner",
     "membership_under_rls",
+    "owner_rights_view",
     "partitioned" known,
     "policy_for_role_without_privilege",
     "restrictive_to_role",
