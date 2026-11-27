@@ -38,7 +38,7 @@ use crate::{
         schema_domain,
     },
     structs::{
-        CallResolution, ColumnDefinition, ColumnScope, ExpressionContext, FunctionKind,
+        CallResolution, ColumnDefinition, ColumnScope, Deployment, ExpressionContext, FunctionKind,
         IdentifierCase, OperandType, PlPgSqlVariable, TargetName, VariableKind,
         expression_context::plain_arguments, plpgsql_scope::stored_parts,
     },
@@ -58,6 +58,7 @@ use crate::{
 };
 
 mod body;
+mod setting;
 
 pub(crate) use body::BodyTruth;
 
@@ -123,6 +124,12 @@ pub enum Assumption<'a, DB: DatabaseLike> {
         /// The outcomes it is assumed to take.
         outcomes: Outcomes,
     },
+    /// The deployment whose requests run the expression. A read of a setting
+    /// it declares through `current_setting(name[, missing_ok])` with literal
+    /// arguments, `NULLIF` of that read and `''`, and either cast to the
+    /// setting's declared type, reads what any request the deployment admits
+    /// leaves in the setting. A read assumes at most one deployment.
+    Deployment(&'a Deployment),
 }
 
 #[expect(clippy::expl_impl_clone_on_copy, reason = "derive would require DB: Clone")]
@@ -157,6 +164,33 @@ pub(crate) fn validated_checks<'a, DB: DatabaseLike>(
         }
     }
     Ok(checks)
+}
+
+/// Any value of `ty`, or `NULL`, read without raising.
+fn any(ty: ScalarType) -> Evaluation {
+    Evaluation::new(ty, true, false, Values::Unlisted(Unlisted::any()))
+}
+
+/// The deployment `assumptions` read an expression under, if any.
+///
+/// # Errors
+///
+/// Returns [`LookupError::SeveralDeployments`] when they assume more than
+/// one.
+fn assumed_deployment<'a, DB: DatabaseLike>(
+    assumptions: &[Assumption<'a, DB>],
+) -> Result<Option<&'a Deployment>, LookupError> {
+    let mut deployments = assumptions.iter().filter_map(|assumption| {
+        match *assumption {
+            Assumption::Deployment(deployment) => Some(deployment),
+            Assumption::Check(_) | Assumption::Expression { .. } => None,
+        }
+    });
+    let first = deployments.next();
+    match deployments.count() {
+        0 => Ok(first),
+        more => Err(LookupError::SeveralDeployments { count: more + 1 }),
+    }
 }
 
 /// The engine whose semantics an expression is read with.
@@ -405,16 +439,24 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             enums: Enums::default(),
             reached: Vec::new(),
             checking: Vec::new(),
+            deployment: None,
         }
     }
 
     /// What the read expression evaluates to under `assumptions`, read under
     /// the engine's dialect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::SeveralDeployments`] when `assumptions` assume
+    /// more than one deployment, and the lookup errors resolving a
+    /// reference, a call or a check raises.
     fn truth(
-        self,
+        mut self,
         expression: &Expr,
         assumptions: &[Assumption<'a, DB>],
     ) -> Result<ExpressionTruth, LookupError> {
+        self.deployment = assumed_deployment(assumptions)?;
         match self.engine {
             Engine::PostgreSql => {
                 self.truth_under(
@@ -480,7 +522,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             let held = assumptions.iter().filter_map(|assumption| {
                 match *assumption {
                     Assumption::Check(check) => Some(check),
-                    Assumption::Expression { .. } => None,
+                    Assumption::Expression { .. } | Assumption::Deployment(_) => None,
                 }
             });
             for check in self.tables[read].checks.clone().into_iter().chain(held) {
@@ -492,17 +534,22 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                     check.expression(database),
                     Self::runs_immutable_alike,
                 )? {
-                    seeding.push((Some(read), Assumption::Check(check)));
+                    seeding.push((
+                        Some(read),
+                        Some(check),
+                        check.expression(database),
+                        Outcomes::NOT_FALSE,
+                    ));
                 }
             }
         }
         self.reading = self.caller;
         self.source = self.caller_source();
         for assumption in assumptions {
-            if let Assumption::Expression { expression, .. } = *assumption
+            if let Assumption::Expression { expression, outcomes } = *assumption
                 && (self.site.is_some() || self.every_call(expression, Self::resolves_alike)?)
             {
-                seeding.push((self.caller, *assumption));
+                seeding.push((self.caller, None, expression, outcomes));
             }
         }
         // A check or a generated column may narrow a column only once another
@@ -519,18 +566,9 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                     guarantees.restrict(Subject::Reference(named), held);
                 }
             }
-            for &(reading, assumption) in &seeding {
+            for &(reading, check, expression, outcomes) in &seeding {
                 self.reading = reading;
-                let (expression, outcomes) = match assumption {
-                    Assumption::Check(check) => {
-                        self.source = Source::Check(check);
-                        (check.expression(database), Outcomes::NOT_FALSE)
-                    }
-                    Assumption::Expression { expression, outcomes } => {
-                        self.source = self.caller_source();
-                        (expression, outcomes)
-                    }
-                };
+                self.source = check.map_or_else(|| self.caller_source(), Source::Check);
                 guarantees =
                     implied(expression, outcomes, dialect, options, &mut *self, &guarantees)?;
             }
@@ -1128,6 +1166,8 @@ struct TruthContext<'a, DB: DatabaseLike> {
     /// The addresses of the domains whose checks the reads up the stack
     /// read, which a cast in a check may reach again.
     checking: Vec<usize>,
+    /// The deployment whose requests run the read, if one is assumed.
+    deployment: Option<&'a Deployment>,
 }
 
 /// The enum types met so far, by the address of the type declaring each, so
@@ -1399,6 +1439,17 @@ impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
             self.named[*reference].key,
             Key::Parameter { .. } | Key::Variable { .. } | Key::Placeholder(_) | Key::Name { .. }
         )
+    }
+
+    /// What a read of a request setting gives, read over every request the
+    /// assumed deployment admits for a setting it declares.
+    fn expression(&mut self, expression: &Expr) -> Result<Option<Evaluation>, LookupError> {
+        let deployment = self.deployment;
+        let read = self.setting_expression(
+            |name| deployment?.setting(name).map(|setting| (setting, setting.held())),
+            expression,
+        )?;
+        read.map(|read| read.checked(self)).transpose()
     }
 }
 

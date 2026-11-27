@@ -119,6 +119,18 @@ fn an_expression_under_a_null_test_is_never_true() {
 }
 
 #[test]
+fn a_customized_option_read_with_missing_ok_never_raises() {
+    let database = function("BEGIN RETURN current_setting('app.user_id', true) IS NULL; END");
+    let body = named(&database, "run").plpgsql_sites(&database).unwrap();
+    let sites = body.sites().unwrap();
+    let [returned] = sites.as_slice() else { panic!("one site") };
+    assert_eq!(
+        returned.truth_under(selected(returned), IdentifierCase::Folded).unwrap(),
+        Some(never_raising(Outcomes { truth: true, falsity: true, null: false }))
+    );
+}
+
+#[test]
 fn a_parameter_reads_as_its_type_and_an_elsif_knows_what_follows_it() {
     let database = function(
         "BEGIN IF n > 0 THEN RETURN 'positive'; ELSIF n > 5 THEN RETURN 'never'; END IF; \
