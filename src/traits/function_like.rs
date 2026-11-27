@@ -2359,22 +2359,37 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   the arm's rows only for a request leaving it unset (see
     ///   [`UnsetSetting`](crate::structs::UnsetSetting)), read where
     ///   `conditions` names [`ArmCondition::UnsetSetting`] and refusing the
-    ///   answer otherwise. The body may cast a read of one value to its
-    ///   declared type, and a set to an array of its declared element type or
-    ///   each element to that type, and any other cast refuses the answer. It
-    ///   may read any setting through `NULLIF(current_setting(...), '')`, which
-    ///   reads `''` as `NULL` and so maps both states of an unset setting to
-    ///   `NULL`. Wherever it reads a setting it may call an accessor instead, a
-    ///   zero-argument `sql` function written as a string whose body selects
-    ///   one such read, cast or not, and returns its type, and wherever it
-    ///   builds the array of a set it may call an accessor whose body selects
-    ///   that array and returns its array type. The accessor's body resolves on
-    ///   its own path or, where it pins none, on the caller's, as the role it
-    ///   runs as, and an accessor that is `IMMUTABLE` or sets the setting it
-    ///   reads refuses the answer. A time bound is a conjunct `<column>
-    ///   <comparison> now()`, a `timestamptz` column of the table compared with
-    ///   `<`, `<=`, `>` or `>=` either way round, optionally `OR <column> IS
-    ///   NULL`, and the arm answers it as a
+    ///   answer otherwise. A condition `current_setting('<setting>') IS NOT
+    ///   NULL` on a declared setting other than a caller keeps them only for a
+    ///   request carrying it (see [`SetSetting`](crate::structs::SetSetting)),
+    ///   read where `conditions` names [`ArmCondition::SetSetting`] and
+    ///   refusing the answer otherwise. Such conditions on the request alone
+    ///   joined by `OR` split the arm into one per condition, each keeping the
+    ///   other conditions, as a `UNION` of the arms would. The body may cast a
+    ///   read of one value to its declared type, and a set to an array of its
+    ///   declared element type or each element to that type, and any other cast
+    ///   refuses the answer. It may read any setting through
+    ///   `NULLIF(current_setting(...), '')`, which reads `''` as `NULL` and so
+    ///   maps both states of an unset setting to `NULL`, and a setting the
+    ///   deployment sets together with another through `CASE WHEN <other> IS
+    ///   NOT NULL THEN <setting> END`, both read that way. Wherever it reads a
+    ///   setting it may call an accessor instead, a zero-argument `sql`
+    ///   function written as a string whose body selects one such read, cast or
+    ///   not, and returns its type, and wherever it builds the array of a set
+    ///   it may call an accessor whose body selects that array and returns its
+    ///   array type. The accessor may select the read from the one row `FROM
+    ///   <function>() [<alias>]` returns, a zero-argument `plpgsql` function
+    ///   returning no set and resolving names on the accessor's path as the
+    ///   accessor's role, each output parameter it names read as what
+    ///   [`returned_values`](FunctionLike::returned_values) finds it holding,
+    ///   cast to the parameter's type. The accessor's body resolves on its own
+    ///   path or, where it pins none, on the caller's, as the role it runs as,
+    ///   and an accessor or a selected function that is `IMMUTABLE` or sets the
+    ///   setting it reads refuses the answer, as does a selected function whose
+    ///   outputs `returned_values` does not find. A time bound is a conjunct
+    ///   `<column> <comparison> now()`, a `timestamptz` column of the table
+    ///   compared with `<`, `<=`, `>` or `>=` either way round, optionally `OR
+    ///   <column> IS NULL`, and the arm answers it as a
     ///   [`TimeBound`](crate::structs::TimeBound). `CURRENT_TIMESTAMP` and
     ///   `transaction_timestamp()` read the same statement time as `now()`. An
     ///   anti-join is a conjunct `NOT EXISTS (SELECT 1 FROM <table> WHERE
@@ -2382,7 +2397,8 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   columns of the arm's table and otherwise read `<table>` alone, and the
     ///   arm answers it as an [`AntiJoin`](crate::structs::AntiJoin). An
     ///   exclusion, a conjunct `<column> NOT IN (SELECT <helper>(<arguments>))`
-    ///   or another spelling of it, is read where `conditions` names
+    ///   or `(<columns>) NOT IN (SELECT * FROM <helper>(<arguments>))`, or
+    ///   another spelling of either, is read where `conditions` names
     ///   [`ArmCondition::Exclusion`] and refuses the answer otherwise (see
     ///   [`ExcludedSet`](crate::structs::ExcludedSet)). The rest, the arguments
     ///   substituted, reduce to `TRUE`, to `FALSE` or `NULL`, or to what
@@ -2417,11 +2433,12 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     ///   an edge table holding the parent of each child, and the column, one
     ///   other than `<key>`, has one single-column foreign key. The conditions
     ///   reduce to restrictions and bounds against the statement time the way a
-    ///   grant arm's do, exclude a column from another helper's set the way a
-    ///   grant arm's exclusion does, or cap the row the way a grant arm's cap
-    ///   does, with a row of operands or behind `<setting> IS NULL OR`. They
-    ///   are read where `conditions` names [`ArmCondition::ParentCondition`],
-    ///   for an exclusion [`ArmCondition::Exclusion`] as well and for a cap
+    ///   grant arm's do, exclude a column or a row of columns from another
+    ///   helper's set the way a grant arm's exclusion does, or cap the row the
+    ///   way a grant arm's cap does, with a row of operands or behind
+    ///   `<setting> IS NULL OR`. They are read where `conditions` names
+    ///   [`ArmCondition::ParentCondition`], for an exclusion
+    ///   [`ArmCondition::Exclusion`] as well and for a cap
     ///   [`ArmCondition::Cap`] as well, refusing the answer otherwise. An arm
     ///   whose conditions keep no row is left out.
     /// - A called arm, `SELECT <columns> FROM <helper>(<arguments>) [<alias>
@@ -2601,7 +2618,7 @@ pub trait FunctionLike: Metadata + Debug + Clone + Hash + Ord + Eq + Send + Sync
     /// let set = visible.helper_set(&[], &deployment, &db, &[ArmCondition::Exclusion])?;
     /// let HelperArm::Grant(grant) = &set.arms()[0] else { unreachable!() };
     /// let [blocked] = grant.exclusions() else { panic!("the arm excludes one set") };
-    /// assert_eq!(blocked.column().column_name(), "id");
+    /// assert_eq!(blocked.columns()[0].column_name(), "id");
     /// assert_eq!(blocked.function().name(), "blocked_projects");
     /// let HelperArm::Grant(block) = &blocked.set().arms()[0] else { unreachable!() };
     /// let GrantedTo::Request(compared) = block.granted_to() else { unreachable!() };

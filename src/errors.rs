@@ -1862,6 +1862,12 @@ pub enum AccessorRefusal {
     /// The accessor sets the setting it reads for its own run, so it reads
     /// that value rather than the caller's.
     SetsSetting,
+    /// The accessor's body selects what an `IMMUTABLE` function returns,
+    /// which PostgreSQL may run once while it plans a statement.
+    SelectsImmutable,
+    /// The accessor's body selects what a function returns that sets the
+    /// setting it reads for its own run.
+    SelectsSettingSetter,
 }
 
 impl core::fmt::Display for AccessorRefusal {
@@ -1870,7 +1876,46 @@ impl core::fmt::Display for AccessorRefusal {
             Self::Immutable => "is IMMUTABLE",
             Self::ReturnType => "returns another type than its body reads",
             Self::SetsSetting => "sets the setting it reads",
+            Self::SelectsImmutable => "selects what an IMMUTABLE function returns",
+            Self::SelectsSettingSetter => {
+                "selects what a function returns that sets the setting it reads"
+            }
         })
+    }
+}
+
+/// Why an accessor whose body selects what a `plpgsql` function's output
+/// parameters hold reads as no setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputRefusal {
+    /// [`FunctionLike::returned_values`](crate::traits::FunctionLike::returned_values)
+    /// refuses to answer what the outputs hold.
+    Unreturned(Box<ReturnedValuesError>),
+    /// The output selected holds what one of several assignments gives it,
+    /// depending on the path taken.
+    Several {
+        /// The output parameter, as PostgreSQL stores its name.
+        output: String,
+    },
+    /// The output selected holds what a write gives it other than an
+    /// assignment of an expression reading no variable.
+    Unread {
+        /// The output parameter, as PostgreSQL stores its name.
+        output: String,
+    },
+}
+
+impl core::fmt::Display for OutputRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unreturned(source) => write!(f, "whose outputs are not read ({source})"),
+            Self::Several { output } => {
+                write!(f, "whose output `{output}` several assignments give")
+            }
+            Self::Unread { output } => {
+                write!(f, "whose output `{output}` no assignment of an expression gives")
+            }
+        }
     }
 }
 
@@ -2273,6 +2318,22 @@ pub enum HelperSetError {
         setting: String,
         /// Why its call does not read as its body.
         reason: AccessorRefusal,
+    },
+    /// The body calls an accessor whose body selects what a `plpgsql`
+    /// function's output parameters hold, which do not read as one
+    /// expression each.
+    #[error(
+        "helper `{function}` calls `{accessor}`, which selects what `{called}` returns, {reason}"
+    )]
+    AccessorOutputs {
+        /// The helper, or the accessor whose body calls it.
+        function: String,
+        /// The accessor.
+        accessor: String,
+        /// The `plpgsql` function whose outputs it selects.
+        called: String,
+        /// Why the outputs it selects do not read.
+        reason: OutputRefusal,
     },
 }
 

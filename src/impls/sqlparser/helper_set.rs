@@ -3,6 +3,7 @@
 
 use alloc::{
     borrow::Cow,
+    boxed::Box,
     collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
@@ -11,12 +12,12 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    ArgMode, BinaryOperator, CastKind, DataType, Distinct, Expr, Function, FunctionArg,
+    ArgMode, BinaryOperator, CaseWhen, CastKind, DataType, Distinct, Expr, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentList, FunctionArguments, FunctionBehavior, FunctionSecurity,
     GroupByExpr, Ident, InTarget, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart,
     Query, Select, SelectFlavor, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
     TableAlias, TableAliasColumnDef, TableFactor, TableFunctionArgs, UnaryOperator, Value, Visit,
-    WildcardAdditionalOptions,
+    VisitorMut, WildcardAdditionalOptions,
 };
 
 use super::{
@@ -24,14 +25,14 @@ use super::{
     function_body::{SqlBody, written_sql_body},
 };
 use crate::{
-    errors::{AccessorRefusal, HelperSetError, LookupError},
+    errors::{AccessorRefusal, HelperSetError, LookupError, OutputRefusal},
     structs::{
         AntiJoin, ArmCondition, CalledArm, CallerGate, CapOperand, Correlation, Deployment,
         ExcludedSet, FunctionBody, GrantArm, GrantedTo, GranteeSet, HelperArm, HelperSet,
         IdentifierCase, JoinedRow, LiteralSet, ParentArm, RequestNormalization, Restriction,
-        Returned, RowCap, RowSecurity, RowStatement, SessionSetting, SetPacking, SettingComparison,
-        SettingContent, SettingValue, TargetName, TimeBound, TimeComparison, UnsetSetting, WalkArm,
-        WalkDirection,
+        Returned, ReturnedOutput, ReturnedValue, RowCap, RowSecurity, RowStatement, SessionSetting,
+        SetPacking, SetSetting, SettingComparison, SettingContent, SettingValue, TargetName,
+        TimeBound, TimeComparison, UnsetSetting, WalkArm, WalkDirection,
     },
     traits::{
         ColumnLike, DataTypeLike, DatabaseLike, EnumerationKind, EnumerationMember, ForeignKeyLike,
@@ -49,7 +50,7 @@ use crate::{
         quote_identifier::{function_identity, quote_identifier, table_identity},
         scalar_family::ScalarFamily,
         type_modifier,
-        walk::walk_expressions,
+        walk::{walk_expressions, walk_mut},
     },
 };
 
@@ -67,6 +68,7 @@ pub(crate) fn helper_set<'db, DB: DatabaseLike>(
         database,
         reads_exclusions: conditions.contains(&ArmCondition::Exclusion),
         reads_unset_settings: conditions.contains(&ArmCondition::UnsetSetting),
+        reads_set_settings: conditions.contains(&ArmCondition::SetSetting),
         reads_edge_conditions: conditions.contains(&ArmCondition::EdgeCondition),
         reads_parent_conditions: conditions.contains(&ArmCondition::ParentCondition),
         reads_row_caps: conditions.contains(&ArmCondition::Cap),
@@ -150,6 +152,7 @@ struct Passed {
 }
 
 /// One conjunct gating a grant arm on a caller setting itself.
+#[derive(Clone)]
 struct GateRead<'db> {
     setting: &'db SessionSetting,
     raises_when_unset: bool,
@@ -162,7 +165,7 @@ struct GateRead<'db> {
 }
 
 /// The gates a grant arm's conjuncts write, merged into one.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Gates<'db> {
     gate: Option<CallerGate<'db>>,
     /// Whether the gates read the setting through `NULLIF(<read>, '')`.
@@ -209,6 +212,14 @@ impl<'db> Gates<'db> {
         }
         true
     }
+}
+
+/// A condition on the request alone, one disjunct of a grant arm's
+/// conjunct joining such conditions by `OR`.
+enum RequestTest<'db> {
+    Gate(GateRead<'db>),
+    Set(SetSetting<'db>),
+    Unset(UnsetSetting<'db>),
 }
 
 /// The helper an arm's `(SELECT <helper>(<arguments>))` calls, with what it
@@ -758,6 +769,10 @@ struct ArmConjuncts<'q, 'db, DB: DatabaseLike> {
     requested: Option<Vec<Requested<'db, DB>>>,
     gates: Gates<'db>,
     unset_settings: Vec<UnsetSetting<'db>>,
+    set_settings: Vec<SetSetting<'db>>,
+    /// The conjuncts joining conditions on the request alone by `OR`, each
+    /// splitting the arm into one arm per disjunct.
+    disjunctions: Vec<Vec<RequestTest<'db>>>,
     /// `None` in the place of each of [`memberships`](Self::memberships).
     caps: Vec<Option<RowCap<'db, DB>>>,
     /// Each `<column> IN (<subquery>)` capping no key, beside its place in
@@ -820,6 +835,9 @@ struct Reader<'db, DB: DatabaseLike> {
     /// Whether a grant arm's settings required unset are read rather than
     /// refused, in every helper answered.
     reads_unset_settings: bool,
+    /// Whether a grant arm's settings required carried are read rather than
+    /// refused, in every helper answered.
+    reads_set_settings: bool,
     /// Whether the conditions a walk's term sets on its edges are read
     /// rather than refused, in every helper answered.
     reads_edge_conditions: bool,
@@ -2261,6 +2279,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             requested,
             gates,
             unset_settings,
+            set_settings,
+            disjunctions,
             mut caps,
             memberships,
             exclusions,
@@ -2306,26 +2326,29 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         }
         let (kept, time_bounds) = self.filter(scope, table, filters)?;
-        let Some(joined_rows) = joined_rows.filter(|_| !gates.keeps_nothing) else {
+        let Some(joined_rows) = joined_rows else { return Ok(Vec::new()) };
+        let requests =
+            request_tests(gates, unset_settings, set_settings, &disjunctions).ok_or_else(shape)?;
+        let Some((last_request, requests)) = requests.split_last() else {
             return Ok(Vec::new());
         };
         let mut grantees = grantees.unwrap_or_else(|| vec![(GrantedTo::Anyone, Kept::All)]);
         let caps: Arc<[RowCap<'db, DB>]> = caps.into_iter().flatten().collect();
-        let unset_settings: Arc<[UnsetSetting<'db>]> = unset_settings.into();
         let anti_joins: Arc<[AntiJoin<'db, DB>]> = anti_joins.into();
         let exclusions: Arc<[ExcludedSet<'db, DB>]> = exclusions.into();
         let joined_rows: Arc<[JoinedRow<'db, DB>]> = joined_rows.into();
         let grant = |(granted_to, own): Grantee<'db, DB>,
                      kept: Kept<'db, DB>,
-                     gate: Option<CallerGate<'db>>,
+                     request: &RequestTests<'db>,
                      time_bounds: Vec<TimeBound<'db, DB>>| {
             let restrictions = kept.and(own).restrictions()?;
             Some(A::from(GrantArm {
                 table: table.table,
                 returned: returned.to_vec(),
                 granted_to,
-                gate,
-                unset_settings: Arc::clone(&unset_settings),
+                gate: request.gate.clone(),
+                unset_settings: Arc::clone(&request.unset_settings),
+                set_settings: Arc::clone(&request.set_settings),
                 restrictions,
                 time_bounds,
                 caps: Arc::clone(&caps),
@@ -2334,13 +2357,18 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 joined_rows: Arc::clone(&joined_rows),
             }))
         };
-        // Every grantee but the last takes its own copy of the conditions.
-        let last = grantees.pop();
-        let mut arms = Vec::with_capacity(grantees.len() + 1);
-        for grantee in grantees {
-            arms.extend(grant(grantee, kept.clone(), gates.gate.clone(), time_bounds.clone()));
+        // Every arm but the last takes its own copy of the conditions.
+        let mut arms = Vec::with_capacity((requests.len() + 1) * grantees.len());
+        for request in requests {
+            for grantee in &grantees {
+                arms.extend(grant(grantee.clone(), kept.clone(), request, time_bounds.clone()));
+            }
         }
-        arms.extend(last.and_then(|last| grant(last, kept, gates.gate, time_bounds)));
+        let last = grantees.pop();
+        for grantee in grantees {
+            arms.extend(grant(grantee, kept.clone(), last_request, time_bounds.clone()));
+        }
+        arms.extend(last.and_then(|last| grant(last, kept, last_request, time_bounds)));
         Ok(arms)
     }
 
@@ -2361,6 +2389,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             requested: None,
             gates: Gates::default(),
             unset_settings: Vec::new(),
+            set_settings: Vec::new(),
+            disjunctions: Vec::new(),
             caps: Vec::new(),
             memberships: Vec::new(),
             exclusions: Vec::new(),
@@ -2400,13 +2430,19 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                     read.memberships.push((read.caps.len(), expr.as_ref(), called.as_ref()));
                     read.caps.push(None);
                 }
-            } else if let Some(gate) = self.gate(scope, table, conjunct)? {
-                if !read.gates.add(gate) {
-                    return Err(shape());
+            } else if let Some(test) = self.request_test(scope, table, conjunct)? {
+                self.require_test(scope, conjunct, &test)?;
+                match test {
+                    RequestTest::Gate(gate) => {
+                        if !read.gates.add(gate) {
+                            return Err(shape());
+                        }
+                    }
+                    RequestTest::Set(set) => read.set_settings.push(set),
+                    RequestTest::Unset(unset) => read.unset_settings.push(unset),
                 }
-            } else if let Some(unset) = self.unset_setting(scope, table, conjunct)? {
-                self.require_read(scope, conjunct, ArmCondition::UnsetSetting)?;
-                read.unset_settings.push(unset);
+            } else if let Some(tests) = self.request_disjunction(scope, table, conjunct)? {
+                read.disjunctions.push(tests);
             } else {
                 read.conditions.push(conjunct);
             }
@@ -2414,11 +2450,12 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(read)
     }
 
-    /// The exclusion `conjunct` writes on a column of the arm's `table`, if
-    /// it writes one, `<column> NOT IN (SELECT <helper>(<arguments>))` or
-    /// another spelling [`excluded_operands`] reads, refused where the
-    /// reading leaves exclusions unread. Excluding the elements of a setting
-    /// is no exclusion.
+    /// The exclusion `conjunct` writes on columns of the arm's `table`, if it
+    /// writes one, `<column> NOT IN (SELECT <helper>(<arguments>))`,
+    /// `(<columns>) NOT IN (SELECT * FROM <helper>(<arguments>))` or another
+    /// spelling [`excluded_operands`] reads, refused where the reading leaves
+    /// exclusions unread. Excluding the elements of a setting is no
+    /// exclusion.
     fn exclusion(
         &mut self,
         scope: &Scope<'db, DB>,
@@ -2427,7 +2464,17 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         conjunct: &Expr,
     ) -> Result<Option<ExcludedSet<'db, DB>>, HelperSetError> {
         let Some((compared, subquery)) = excluded_operands(conjunct) else { return Ok(None) };
-        let (Some(column), Some(call)) = (table.column(compared), projected_call(subquery)) else {
+        let items = match unnest(compared) {
+            Expr::Tuple(items) => items.as_slice(),
+            item => core::slice::from_ref(item),
+        };
+        let Some(columns) = items.iter().map(|item| table.column(item)).collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some(call) = selected_call(subquery)
+            .or_else(|| projected_call(subquery).filter(|_| items.len() == 1))
+        else {
             return Ok(None);
         };
         if self.set_elements(scope, subquery)?.is_some() {
@@ -2435,8 +2482,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         }
         self.require_read(scope, conjunct, ArmCondition::Exclusion)?;
         let Called { function, arguments, set } =
-            self.called_set(scope, select, core::slice::from_ref(table), &call, 1)?;
-        Ok(Some(ExcludedSet { column, function, arguments, set }))
+            self.called_set(scope, select, core::slice::from_ref(table), &call, columns.len())?;
+        Ok(Some(ExcludedSet { columns, function, arguments, set }))
     }
 
     /// Refuses `conjunct`, a condition read as `kind`, where the consumer
@@ -2450,6 +2497,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let reads = match kind {
             ArmCondition::Exclusion => self.reads_exclusions,
             ArmCondition::UnsetSetting => self.reads_unset_settings,
+            ArmCondition::SetSetting => self.reads_set_settings,
             ArmCondition::EdgeCondition => self.reads_edge_conditions,
             ArmCondition::ParentCondition => self.reads_parent_conditions,
             ArmCondition::Cap => self.reads_row_caps,
@@ -2822,6 +2870,64 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok(Some(RowCap { operands, function, arguments, set, lift }))
     }
 
+    /// The condition on the request alone `conjunct` writes, if it writes
+    /// one: a gate on a caller setting, a setting other than a caller the
+    /// request has to carry, or a setting it has to leave unset.
+    fn request_test(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        conjunct: &Expr,
+    ) -> Result<Option<RequestTest<'db>>, HelperSetError> {
+        if let Some(set) = self.set_setting(scope, table, conjunct)? {
+            return Ok(Some(RequestTest::Set(set)));
+        }
+        if let Some(gate) = self.gate(scope, table, conjunct)? {
+            return Ok(Some(RequestTest::Gate(gate)));
+        }
+        Ok(self.unset_setting(scope, table, conjunct)?.map(RequestTest::Unset))
+    }
+
+    /// Refuses the answer where `test`, written by `conjunct`, requires a
+    /// setting set or unset and the reading leaves that unread.
+    fn require_test(
+        &self,
+        scope: &Scope<'db, DB>,
+        conjunct: &Expr,
+        test: &RequestTest<'db>,
+    ) -> Result<(), HelperSetError> {
+        match test {
+            RequestTest::Gate(_) => Ok(()),
+            RequestTest::Set(_) => self.require_read(scope, conjunct, ArmCondition::SetSetting),
+            RequestTest::Unset(_) => self.require_read(scope, conjunct, ArmCondition::UnsetSetting),
+        }
+    }
+
+    /// The conditions on the request alone `conjunct` joins by `OR`, each
+    /// read as [`request_test`](Self::request_test) reads a conjunct, `None`
+    /// where it joins no two conditions or one on anything else.
+    fn request_disjunction(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        conjunct: &Expr,
+    ) -> Result<Option<Vec<RequestTest<'db>>>, HelperSetError> {
+        let mut disjuncts = Vec::new();
+        disjunction(conjunct, &mut disjuncts);
+        if disjuncts.len() < 2 {
+            return Ok(None);
+        }
+        let mut tests = Vec::with_capacity(disjuncts.len());
+        for disjunct in &disjuncts {
+            let Some(test) = self.request_test(scope, table, disjunct)? else { return Ok(None) };
+            tests.push(test);
+        }
+        for (disjunct, test) in disjuncts.iter().zip(&tests) {
+            self.require_test(scope, disjunct, test)?;
+        }
+        Ok(Some(tests))
+    }
+
     /// The `current_setting(<setting>) IS NULL` `expression` writes, if it
     /// writes one, the read optionally cast to the type the setting is
     /// declared in.
@@ -2832,7 +2938,49 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         expression: &Expr,
     ) -> Result<Option<UnsetSetting<'db>>, HelperSetError> {
         let Expr::IsNull(read) = unnest(expression) else { return Ok(None) };
-        let Operand::Setting { read, cast } = self.operand(scope, table, read)? else {
+        Ok(self.tested_setting(scope, table, read)?.map(|(setting, read)| {
+            UnsetSetting {
+                setting,
+                raises_when_unset: read.raises_when_unset,
+                reads_empty_as_unset: read.empty_as_null,
+            }
+        }))
+    }
+
+    /// The `current_setting(<setting>) IS NOT NULL` `expression` writes on a
+    /// setting other than a caller, if it writes one, the read optionally
+    /// cast to the type the setting is declared in. On a caller setting it
+    /// is a [`gate`](Self::gate).
+    fn set_setting(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        expression: &Expr,
+    ) -> Result<Option<SetSetting<'db>>, HelperSetError> {
+        let Expr::IsNotNull(read) = unnest(expression) else { return Ok(None) };
+        let Some((setting, read)) = self.tested_setting(scope, table, read)? else {
+            return Ok(None);
+        };
+        if matches!(setting.content(), SettingContent::Value(SettingValue::Caller(_))) {
+            return Ok(None);
+        }
+        Ok(Some(SetSetting {
+            setting,
+            raises_when_unset: read.raises_when_unset,
+            reads_empty_as_unset: read.empty_as_null,
+        }))
+    }
+
+    /// The declared setting `expression` reads, where `IS NULL` or `IS NOT
+    /// NULL` tests it, the read optionally cast to the type the setting is
+    /// declared in.
+    fn tested_setting(
+        &self,
+        scope: &Scope<'db, DB>,
+        table: &ArmTable<'_, 'db, DB>,
+        expression: &Expr,
+    ) -> Result<Option<(&'db SessionSetting, SettingRead)>, HelperSetError> {
+        let Operand::Setting { read, cast } = self.operand(scope, table, expression)? else {
             return Ok(None);
         };
         if read.normalization.is_some() {
@@ -2848,11 +2996,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 cast: cast.to_string(),
             });
         }
-        Ok(Some(UnsetSetting {
-            setting,
-            raises_when_unset: read.raises_when_unset,
-            reads_empty_as_unset: read.empty_as_null,
-        }))
+        Ok(Some((setting, read)))
     }
 
     /// The gate `conjunct` writes on a caller setting,
@@ -3310,6 +3454,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         scope: &Scope<'db, DB>,
         expression: &'q Expr,
     ) -> Result<Option<(SettingRead, Option<&'q DataType>)>, HelperSetError> {
+        if let Some(guarded) = self.guarded_setting(scope, expression)? {
+            return Ok(Some(guarded));
+        }
         let Expr::Cast {
             kind: CastKind::Cast | CastKind::DoubleColon,
             expr,
@@ -3320,6 +3467,49 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Ok(self.setting_expression(scope, expression)?.map(|read| (read, None)));
         };
         Ok(self.text_setting(scope, expr)?.map(|read| (read, Some(data_type))))
+    }
+
+    /// The setting `CASE WHEN <tested> IS NOT NULL THEN <read> END` reads,
+    /// where both are reads through `NULLIF(<read>, '')` of settings every
+    /// request sets together, each optionally cast to its declared type.
+    /// Where the request carries them the `CASE` returns `<read>`, and
+    /// where it leaves them unset both read `NULL`, so the `CASE` reads as
+    /// `<read>` but raises where `<tested>` does.
+    fn guarded_setting<'q>(
+        &self,
+        scope: &Scope<'db, DB>,
+        expression: &'q Expr,
+    ) -> Result<Option<(SettingRead, Option<&'q DataType>)>, HelperSetError> {
+        let Expr::Case { operand: None, conditions, else_result: None, .. } = scalar(expression)
+        else {
+            return Ok(None);
+        };
+        let [CaseWhen { condition, result }] = conditions.as_slice() else { return Ok(None) };
+        let Expr::IsNotNull(tested) = unnest(condition) else { return Ok(None) };
+        let (Some((tested, tested_cast)), Some((read, cast))) =
+            (self.typed_setting(scope, tested)?, self.typed_setting(scope, result)?)
+        else {
+            return Ok(None);
+        };
+        if !tested.empty_as_null
+            || !read.empty_as_null
+            || tested.normalization.is_some()
+            || read.normalization.is_some()
+            || !self.deployment.sets_together(&tested.name, &read.name)
+        {
+            return Ok(None);
+        }
+        if let Some(cast) = tested_cast {
+            let (setting, declared) = self.declared_setting(scope, &tested.name)?;
+            if declared.is_none_or(|declared| !self.is_declared_type(scope, cast, declared)) {
+                return Err(HelperSetError::SettingCast {
+                    function: scope.name.clone(),
+                    setting: setting.name().to_string(),
+                    cast: cast.to_string(),
+                });
+            }
+        }
+        Ok(Some((SettingRead { raises_when_unset: tested.raises_when_unset, ..read }, cast)))
     }
 
     /// The setting the accessor `call` reaches returns, a zero-argument
@@ -3431,7 +3621,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Ok(None);
         };
         let [Statement::Query(query)] = statements.as_ref() else { return Ok(None) };
-        let Some(returned) = projected(query) else { return Ok(None) };
+        let shape = if let Some(returned) = projected(query) {
+            AccessorBody::Projected(returned)
+        } else if let Some(selection) = output_selection(query) {
+            AccessorBody::Selected(selection)
+        } else {
+            return Ok(None);
+        };
         let path = match accessor.search_path(database)? {
             Some(path) => path,
             None => scope.path.clone(),
@@ -3453,13 +3649,29 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             owner,
             accessing,
         };
-        let Some((setting_read, accessed, returns_read)) = read(&body, returned)? else {
+        let (returned, called) = match shape {
+            AccessorBody::Projected(returned) => (Cow::Borrowed(returned), None),
+            AccessorBody::Selected(selection) => {
+                let Some((returned, called)) = self.selected_outputs(scope, &body, selection)?
+                else {
+                    return Ok(None);
+                };
+                (Cow::Owned(returned), Some(called))
+            }
+        };
+        let Some((setting_read, accessed, returns_read)) = read(&body, &returned)? else {
             return Ok(None);
         };
-        let reason = if accessor.volatility() == FunctionBehavior::Immutable {
+        let immutable =
+            |function: &DB::Function| function.volatility() == FunctionBehavior::Immutable;
+        let reason = if immutable(accessor) {
             AccessorRefusal::Immutable
+        } else if called.is_some_and(immutable) {
+            AccessorRefusal::SelectsImmutable
         } else if sets_setting(accessor, &setting_read.name) {
             AccessorRefusal::SetsSetting
+        } else if called.is_some_and(|called| sets_setting(called, &setting_read.name)) {
+            AccessorRefusal::SelectsSettingSetter
         } else if !returns_read {
             AccessorRefusal::ReturnType
         } else {
@@ -3471,6 +3683,85 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             setting: setting_read.name,
             reason,
         })
+    }
+
+    /// What the accessor `body` returns where its body selects from the one
+    /// row a zero-argument `plpgsql` function returning no set hands its
+    /// `FROM`, beside that function. Each name of a column of the row is
+    /// replaced by what the output parameter of that name holds when the
+    /// function returns, on every request the deployment admits, cast to the
+    /// parameter's type as PL/pgSQL converts what it assigns. `None` where
+    /// the call reaches another function, the projection names anything else
+    /// or reads a subquery, or the function resolves names on a path other
+    /// than the accessor's, where its assignments run. `scope` is the helper
+    /// or accessor calling `body`.
+    fn selected_outputs(
+        &self,
+        scope: &Scope<'db, DB>,
+        body: &Scope<'db, DB>,
+        (selected, name, alias): OutputSelection<'_>,
+    ) -> Result<Option<(Expr, &'db DB::Function)>, HelperSetError> {
+        let database = self.database;
+        let Some(called) = self.called(body, name, 0)? else { return Ok(None) };
+        if called.stored_language().as_deref() != Some("plpgsql") || called.returns_set() {
+            return Ok(None);
+        }
+        let called_name = function_identity(called);
+        let path = match called.search_path(database)? {
+            Some(path) => path,
+            None => body.path.clone(),
+        };
+        let owner = if called.security_mode() == FunctionSecurity::Definer {
+            self.owner(called, &called_name)?
+        } else {
+            body.owner
+        };
+        if self.usable_path(&path, owner) != body.usable_path {
+            return Ok(None);
+        }
+        let refuse = |reason| {
+            HelperSetError::AccessorOutputs {
+                function: scope.name.clone(),
+                accessor: body.name.clone(),
+                called: called_name.clone(),
+                reason,
+            }
+        };
+        let returned = called
+            .returned_values(database, self.deployment)
+            .map_err(|source| refuse(OutputRefusal::Unreturned(Box::new(source))))?;
+        let declared: Vec<_> = called
+            .argument_modes()
+            .zip(called.stored_argument_names(database))
+            .zip(called.argument_type_names(database))
+            .filter(|((mode, _), _)| matches!(mode, ArgMode::Out | ArgMode::InOut))
+            .filter_map(|((_, output), declared)| Some((output?, declared)))
+            .collect();
+        let typed: Option<Vec<_>> = returned
+            .iter()
+            .map(|value| {
+                let (_, declared) = declared.iter().find(|(output, _)| output == value.name())?;
+                Some((value, parse_data_type(declared)?))
+            })
+            .collect();
+        let Some(outputs) = typed else { return Ok(None) };
+        // A function in `FROM` is named by its own name, without its schema.
+        let qualifier = match alias {
+            Some(alias) => Some(alias.name.clone()),
+            None => {
+                object_name_last_part(name).map(|(function_name, quoted)| {
+                    Ident { quote_style: quoted.then_some('"'), ..Ident::new(function_name) }
+                })
+            }
+        };
+        let Some(qualifier) = qualifier else { return Ok(None) };
+        let mut selected = selected.clone();
+        let mut substitution = OutputSubstitution { qualifier: &qualifier, outputs: &outputs };
+        match walk_mut(&mut selected, &mut substitution) {
+            ControlFlow::Continue(()) => Ok(Some((selected, called))),
+            ControlFlow::Break(None) => Ok(None),
+            ControlFlow::Break(Some(reason)) => Err(refuse(reason)),
+        }
     }
 
     /// The caller setting `name` names, with the type the deployment
@@ -3827,6 +4118,63 @@ fn crossed_requests<'db, DB: DatabaseLike>(
         .collect()
 }
 
+/// The conditions on the request alone one arm a grant arm splits into
+/// keeps its rows under.
+struct RequestTests<'db> {
+    gate: Option<CallerGate<'db>>,
+    unset_settings: Arc<[UnsetSetting<'db>]>,
+    set_settings: Arc<[SetSetting<'db>]>,
+}
+
+/// The conditions on the request alone of each arm a grant arm splits
+/// into, those of its conjuncts, `gates`, `unset_settings` and
+/// `set_settings`, beside one disjunct of each of `disjunctions`, one arm
+/// per way of picking them, leaving out the arms whose gates keep no row.
+/// `None` where a disjunct gates on a caller setting other than the gates
+/// picked beside it, or reads it in another type or spelling.
+fn request_tests<'db>(
+    gates: Gates<'db>,
+    unset_settings: Vec<UnsetSetting<'db>>,
+    set_settings: Vec<SetSetting<'db>>,
+    disjunctions: &[Vec<RequestTest<'db>>],
+) -> Option<Vec<RequestTests<'db>>> {
+    let mut picked = vec![(gates, unset_settings, set_settings)];
+    for disjunction in disjunctions {
+        let mut split = Vec::with_capacity(picked.len() * disjunction.len());
+        for (gates, unset_settings, set_settings) in &picked {
+            for test in disjunction {
+                let mut gates = gates.clone();
+                let mut unset_settings = unset_settings.clone();
+                let mut set_settings = set_settings.clone();
+                match test {
+                    RequestTest::Gate(read) => {
+                        if !gates.add(read.clone()) {
+                            return None;
+                        }
+                    }
+                    RequestTest::Set(set) => set_settings.push(set.clone()),
+                    RequestTest::Unset(unset) => unset_settings.push(unset.clone()),
+                }
+                split.push((gates, unset_settings, set_settings));
+            }
+        }
+        picked = split;
+    }
+    Some(
+        picked
+            .into_iter()
+            .filter(|(gates, ..)| !gates.keeps_nothing)
+            .map(|(gates, unset_settings, set_settings)| {
+                RequestTests {
+                    gate: gates.gate,
+                    unset_settings: unset_settings.into(),
+                    set_settings: set_settings.into(),
+                }
+            })
+            .collect(),
+    )
+}
+
 /// Binds each input parameter of `function` to its argument.
 fn parameters<'db, F: FunctionLike>(
     function: &'db F,
@@ -4104,6 +4452,7 @@ fn keeps_every_row<DB: DatabaseLike>(arm: &GrantArm<'_, DB>) -> bool {
     matches!(arm.granted_to, GrantedTo::Anyone)
         && arm.gate.is_none()
         && arm.unset_settings.is_empty()
+        && arm.set_settings.is_empty()
         && arm.restrictions.is_empty()
         && arm.time_bounds.is_empty()
         && arm.caps.is_empty()
@@ -4372,6 +4721,113 @@ fn projected(query: &Query) -> Option<&Expr> {
     .then_some(expression)
 }
 
+/// The expression and the call of `SELECT <expression> FROM <function>()
+/// [<alias>]`, the alias naming no column.
+type OutputSelection<'q> = (&'q Expr, &'q ObjectName, Option<&'q TableAlias>);
+
+/// What the body of an accessor selects its one expression from.
+enum AccessorBody<'q> {
+    /// The expression alone, reading no relation.
+    Projected(&'q Expr),
+    /// The expression over the one row a function returns.
+    Selected(OutputSelection<'q>),
+}
+
+/// The expression `query` selects from the one row a call passing no
+/// argument hands its `FROM`, beside the call's name and alias.
+fn output_selection(query: &Query) -> Option<OutputSelection<'_>> {
+    let SetExpr::Select(select) = query.body.as_ref() else { return None };
+    let ([SelectItem::UnnamedExpr(expression)], [from]) =
+        (select.projection.as_slice(), select.from.as_slice())
+    else {
+        return None;
+    };
+    let (name, alias, []) = called_relation(&from.relation)? else { return None };
+    (plain_query(query)
+        && plain_select(select)
+        && select.selection.is_none()
+        && from.joins.is_empty()
+        && alias.is_none_or(|alias| alias.columns.is_empty()))
+    .then_some((expression, name, alias))
+}
+
+/// Replaces each name of a column of the row a function returns, bare or
+/// qualified by `qualifier`, with what the output parameter of that name
+/// holds, cast to its type unless the expression casts to that type itself.
+/// Breaks with `None` on a subquery, which resolves names in scopes of its
+/// own, and on a name no output answers, and with the refusal where the
+/// output holds no one expression.
+struct OutputSubstitution<'o> {
+    qualifier: &'o Ident,
+    outputs: &'o [(&'o ReturnedValue, DataType)],
+}
+
+impl VisitorMut for OutputSubstitution<'_> {
+    type Break = Option<OutputRefusal>;
+
+    fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        ControlFlow::Break(None)
+    }
+
+    fn post_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<Self::Break> {
+        let column = match expression {
+            Expr::Identifier(column) => column,
+            Expr::CompoundIdentifier(parts) => {
+                match parts.as_slice() {
+                    [qualifier, column] if same_ident(qualifier, self.qualifier) => column,
+                    _ => return ControlFlow::Break(None),
+                }
+            }
+            _ => return ControlFlow::Continue(()),
+        };
+        let quoted = column.quote_style.is_some();
+        let Some((output, declared)) = self
+            .outputs
+            .iter()
+            .find(|(output, _)| identifiers_match(output.name(), true, &column.value, quoted))
+        else {
+            return ControlFlow::Break(None);
+        };
+        let held = match output.output() {
+            ReturnedOutput::Expression(held) => held.as_ref().clone(),
+            ReturnedOutput::Null => Expr::value(Value::Null),
+            ReturnedOutput::Several => {
+                return ControlFlow::Break(Some(OutputRefusal::Several {
+                    output: output.name().to_string(),
+                }));
+            }
+            ReturnedOutput::Unread => {
+                return ControlFlow::Break(Some(OutputRefusal::Unread {
+                    output: output.name().to_string(),
+                }));
+            }
+        };
+        // A setting read is already `text`, so a `text` output holding one
+        // converts nothing, and an uncast value of another type reads as no
+        // setting with or without the cast.
+        let converted = match &held {
+            Expr::Cast {
+                kind: CastKind::Cast | CastKind::DoubleColon,
+                data_type,
+                format: None,
+                ..
+            } => data_type == declared,
+            _ => PgType::of(declared) == PgType::of(&DataType::Text),
+        };
+        *expression = if converted {
+            held
+        } else {
+            Expr::Cast {
+                kind: CastKind::DoubleColon,
+                expr: Box::new(held),
+                data_type: declared.clone(),
+                format: None,
+            }
+        };
+        ControlFlow::Continue(())
+    }
+}
+
 /// The subquery of `ARRAY(<query>)`, a constructor no function shadows.
 fn array_constructor(call: &Function) -> Option<&Query> {
     let FunctionArguments::Subquery(query) = &call.args else { return None };
@@ -4381,13 +4837,16 @@ fn array_constructor(call: &Function) -> Option<&Query> {
 
 /// The compared value and the subquery of `<value> NOT IN (<query>)`, also
 /// written `NOT (<value> IN (<query>))`, `<value> <> ALL (<set>)` or `NOT
-/// (<value> = ANY (<set>))`, `<set>` being `(<query>)` or `ARRAY(<query>)`,
-/// which PostgreSQL evaluates alike, `NULL` included.
+/// (<value> = ANY (<set>))`, which PostgreSQL evaluates alike, `NULL`
+/// included. `<value>` is one value or a row of them, and `<set>` is
+/// `(<query>)`, or `ARRAY(<query>)` for one value.
 fn excluded_operands(conjunct: &Expr) -> Option<(&Expr, &Query)> {
-    fn set_query(set: &Expr) -> Option<&Query> {
+    fn set_query<'e>(compared: &Expr, set: &'e Expr) -> Option<&'e Query> {
         match unnest(set) {
             Expr::Subquery(query) => Some(query),
-            Expr::Function(call) => array_constructor(call),
+            Expr::Function(call) if !matches!(unnest(compared), Expr::Tuple(_)) => {
+                array_constructor(call)
+            }
             _ => None,
         }
     }
@@ -4398,7 +4857,7 @@ fn excluded_operands(conjunct: &Expr) -> Option<(&Expr, &Query)> {
                     Some((expr, query))
                 }
                 Expr::AnyOp { left, compare_op: BinaryOperator::Eq, right, .. } => {
-                    Some((left, set_query(right)?))
+                    Some((left, set_query(left, right)?))
                 }
                 _ => None,
             }
@@ -4407,7 +4866,7 @@ fn excluded_operands(conjunct: &Expr) -> Option<(&Expr, &Query)> {
             Some((expr, query))
         }
         Expr::AllOp { left, compare_op: BinaryOperator::NotEq, right } => {
-            Some((left, set_query(right)?))
+            Some((left, set_query(left, right)?))
         }
         _ => None,
     }
@@ -4470,6 +4929,17 @@ fn conjunction<'q>(expression: &'q Expr, terms: &mut Vec<&'q Expr>) {
         Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
             conjunction(left, terms);
             conjunction(right, terms);
+        }
+        term => terms.push(term),
+    }
+}
+
+/// The terms `expression` joins with `OR`.
+fn disjunction<'q>(expression: &'q Expr, terms: &mut Vec<&'q Expr>) {
+    match unnest(expression) {
+        Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+            disjunction(left, terms);
+            disjunction(right, terms);
         }
         term => terms.push(term),
     }
