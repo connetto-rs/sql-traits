@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::{collections::BTreeSet, sync::Arc};
 
 use sql_traits::{
-    errors::{AccessorRefusal, HelperSetError},
+    errors::{AccessorRefusal, HelperSetError, OutputRefusal},
     prelude::*,
 };
 use sqlparser::{
@@ -396,6 +396,10 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
         let unset_as = if unset.reads_empty_as_unset() { "UNSET" } else { "NULL" };
         format!("{} IS {unset_as}", unset.setting().name())
     });
+    let set_settings = grant.set_settings().iter().map(|set| {
+        let set_as = if set.reads_empty_as_unset() { "SET" } else { "NOT NULL" };
+        format!("{} IS {set_as}", set.setting().name())
+    });
     let restrictions = grant.restrictions().iter().map(render_restriction);
     let bounds = grant.time_bounds().iter().map(render_bound);
     let joins = grant.joined_rows().iter().map(render_joined_row);
@@ -424,6 +428,7 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
         .into_iter()
         .chain(gate)
         .chain(unset_settings)
+        .chain(set_settings)
         .chain(restrictions)
         .chain(bounds)
         .chain(joins)
@@ -440,12 +445,12 @@ fn render_grant(grant: &GrantArm<'_, ParserDB>) -> String {
     format!("{}.{returned}{filter}", grant.table().table_name())
 }
 
-/// `<column> NOT IN <helper>(<arguments>) {<set>}`.
+/// `<columns> NOT IN <helper>(<arguments>) {<set>}`.
 fn render_exclusion(exclusion: &ExcludedSet<'_, ParserDB>) -> String {
     let arguments: Vec<String> = exclusion.arguments().iter().map(ToString::to_string).collect();
     format!(
         "{} NOT IN {}({}) {{{}}}",
-        exclusion.column().column_name(),
+        render_columns(exclusion.columns()),
         exclusion.function().target_name(),
         arguments.join(", "),
         render(exclusion.set()),
@@ -692,6 +697,15 @@ fn left_unset(unset: &UnsetSetting<'_>, request: Request) -> bool {
     }
 }
 
+/// Whether `request` carries the setting `set` reads, as a scalar.
+fn carried(set: &SetSetting<'_>, request: Request) -> bool {
+    match request.values(set.setting().name()) {
+        None => false,
+        Some(&[value]) => !(value.is_empty() && set.reads_empty_as_unset()),
+        Some(values) => panic!("a scalar holds one value, not {values:?}"),
+    }
+}
+
 /// The rows `cap` compares its operands with for `request` over `fixture`.
 fn cap_rows(
     cap: &RowCap<'_, ParserDB>,
@@ -770,28 +784,32 @@ fn walked_rows(
     returned
 }
 
-/// Each of `exclusions` beside the set it excludes over `fixture` for
+/// Each of `exclusions` beside the rows it excludes over `fixture` for
 /// `request`.
 fn excluded_sets<'a, 'db>(
     exclusions: &'a [ExcludedSet<'db, ParserDB>],
     request: Request,
     fixture: Rows,
-) -> Vec<(&'a ExcludedSet<'db, ParserDB>, BTreeSet<&'static str>)> {
+) -> Vec<(&'a ExcludedSet<'db, ParserDB>, BTreeSet<Vec<&'static str>>)> {
     exclusions
         .iter()
-        .map(|exclusion| (exclusion, evaluate(exclusion.set(), request, fixture)))
+        .map(|exclusion| (exclusion, helper_rows(exclusion.set(), request, fixture)))
         .collect()
 }
 
-/// Whether `row` stays outside every set of `excluded`, `NOT IN` being
-/// `NULL` for a `NULL` compared with any value.
+/// Whether `row` stays outside every set of `excluded`, `NOT IN` holding
+/// only where each excluded row differs from `row` in a column `row` holds
+/// a value in, and being `NULL` otherwise.
 fn outside(
-    excluded: &[(&ExcludedSet<'_, ParserDB>, BTreeSet<&'static str>)],
+    excluded: &[(&ExcludedSet<'_, ParserDB>, BTreeSet<Vec<&'static str>>)],
     row: &[(&str, &'static str)],
 ) -> bool {
     excluded.iter().all(|(exclusion, excluded)| {
-        nullable(row, exclusion.column().column_name())
-            .map_or(excluded.is_empty(), |value| !excluded.contains(value))
+        let held: Vec<Option<&str>> =
+            exclusion.columns().iter().map(|column| nullable(row, column.column_name())).collect();
+        excluded.iter().all(|excluded| {
+            held.iter().zip(excluded).any(|(held, value)| held.is_some_and(|held| held != *value))
+        })
     })
 }
 
@@ -826,7 +844,10 @@ fn grant_rows(
                 && gate.excluded().iter().all(|value| !holds(value, caller))
         })
     });
-    if !gated || !grant.unset_settings().iter().all(|unset| left_unset(unset, request)) {
+    if !gated
+        || !grant.unset_settings().iter().all(|unset| left_unset(unset, request))
+        || !grant.set_settings().iter().all(|set| carried(set, request))
+    {
         return;
     }
     let grantees = match grant.granted_to() {
@@ -5522,9 +5543,7 @@ fn a_list_naming_anything_but_request_values_literals_and_parameters_refuses_the
     }
     assert_eq!(
         refused(
-            format!(
-                "b.principal_id IN ({user}) AND current_setting('{INSTALLATION}', true) IS NOT NULL"
-            ),
+            format!("b.principal_id IN ({user}) AND current_setting('{INSTALLATION}', true) <> ''"),
             ""
         ),
         Err(HelperSetError::SettingNotCaller {
@@ -6673,6 +6692,169 @@ fn an_exclusion_calls_one_helper_returning_one_column() {
     let deployment = deployment();
     let refused = excluding(&database, &deployment, "visible_projects");
     assert!(matches!(refused, Err(HelperSetError::ArmShape { .. })), "{refused:?}");
+}
+
+const PAIR_EXCLUSIONS: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE ROLE app NOLOGIN;
+CREATE TABLE memberships (
+  id TEXT PRIMARY KEY, organization_namespace_id TEXT, organization_id TEXT, user_id TEXT NOT NULL);
+CREATE TABLE organization_blocks (
+  organization_namespace_id TEXT NOT NULL, organization_id TEXT NOT NULL, principal_id TEXT NOT NULL);
+CREATE FUNCTION blocking_organizations() RETURNS TABLE (namespace_id TEXT, id TEXT)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT block.organization_namespace_id, block.organization_id FROM public.organization_blocks block
+  WHERE block.principal_id = current_setting('app.user_id', true)
+$$;
+CREATE FUNCTION unblocked_memberships() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT membership.id FROM public.memberships membership
+  WHERE membership.user_id = current_setting('app.user_id', true)
+    AND NOT ((membership.organization_namespace_id, membership.organization_id)
+      IN (SELECT * FROM public.blocking_organizations()))
+$$;
+ALTER FUNCTION blocking_organizations() OWNER TO authz_owner;
+ALTER FUNCTION unblocked_memberships() OWNER TO authz_owner;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION unblocked_memberships() TO app;
+GRANT SELECT ON memberships, organization_blocks TO authz_owner;
+";
+
+const PAIR_EXCLUSION_ROWS: Rows = &[
+    (
+        "memberships",
+        &[
+            ("id", "m1"),
+            ("organization_namespace_id", "n1"),
+            ("organization_id", "o1"),
+            ("user_id", "alice"),
+        ],
+    ),
+    (
+        "memberships",
+        &[
+            ("id", "m2"),
+            ("organization_namespace_id", "n1"),
+            ("organization_id", "o2"),
+            ("user_id", "alice"),
+        ],
+    ),
+    (
+        "memberships",
+        &[
+            ("id", "m3"),
+            ("organization_namespace_id", "n2"),
+            ("organization_id", "o1"),
+            ("user_id", "alice"),
+        ],
+    ),
+    ("memberships", &[("id", "m4"), ("organization_id", "o1"), ("user_id", "alice")]),
+    ("memberships", &[("id", "m5"), ("organization_id", "o3"), ("user_id", "alice")]),
+    ("memberships", &[("id", "m6"), ("organization_namespace_id", "n1"), ("user_id", "alice")]),
+    (
+        "memberships",
+        &[
+            ("id", "m7"),
+            ("organization_namespace_id", "n1"),
+            ("organization_id", "o1"),
+            ("user_id", "bob"),
+        ],
+    ),
+    ("memberships", &[("id", "m8"), ("organization_id", "o1"), ("user_id", "bob")]),
+    (
+        "organization_blocks",
+        &[
+            ("organization_namespace_id", "n1"),
+            ("organization_id", "o1"),
+            ("principal_id", "alice"),
+        ],
+    ),
+    (
+        "organization_blocks",
+        &[("organization_namespace_id", "n2"), ("organization_id", "o2"), ("principal_id", "bob")],
+    ),
+];
+
+/// What PostgreSQL 18.7 returns for each caller of `unblocked_memberships()`
+/// in [`PAIR_EXCLUSIONS`], called as `app` over [`PAIR_EXCLUSION_ROWS`],
+/// in each spelling
+/// [`a_pair_excluded_from_a_helpers_pairs_reads_in_every_spelling`] writes.
+const PAIR_EXCLUSIONS_MEASURED: &[(&str, &[&str])] =
+    &[("alice", &["m2", "m3", "m5"]), ("bob", &["m7", "m8"]), ("carol", &[])];
+
+#[test]
+fn a_pair_excluded_from_a_helpers_pairs_reads_in_every_spelling() {
+    let written = "NOT ((membership.organization_namespace_id, membership.organization_id)
+      IN (SELECT * FROM public.blocking_organizations()))";
+    let deployment = deployment();
+    for condition in [
+        written,
+        "(membership.organization_namespace_id, membership.organization_id) \
+         NOT IN (SELECT * FROM public.blocking_organizations())",
+        "(membership.organization_namespace_id, membership.organization_id) \
+         <> ALL (SELECT * FROM public.blocking_organizations())",
+        "NOT ((membership.organization_namespace_id, membership.organization_id) \
+         = ANY (SELECT * FROM public.blocking_organizations()))",
+    ] {
+        let sql = PAIR_EXCLUSIONS.replace(written, condition);
+        assert!(sql.contains(condition), "the exclusion is replaced");
+        let database = postgres(&sql);
+        let unblocked = function(&database, "public", "unblocked_memberships");
+        let refused = unblocked.helper_set(&[], &deployment, &database, &[]);
+        assert!(
+            matches!(
+                &refused,
+                Err(HelperSetError::UnreadCondition { kind: ArmCondition::Exclusion, .. })
+            ),
+            "{condition}: {refused:?}"
+        );
+        let set = excluding(&database, &deployment, "unblocked_memberships").expect("answered");
+        assert_eq!(
+            render(&set),
+            "memberships.id WHERE user_id = app.user_id AND \
+             (organization_namespace_id, organization_id) NOT IN blocking_organizations() \
+             {organization_blocks.(organization_namespace_id, organization_id) \
+             WHERE principal_id = app.user_id}",
+            "{condition}"
+        );
+        for &(caller, measured) in PAIR_EXCLUSIONS_MEASURED {
+            let returned: Vec<_> =
+                evaluate(&set, Request::of(caller), PAIR_EXCLUSION_ROWS).into_iter().collect();
+            assert_eq!(returned, measured, "{caller:?} through {condition}");
+        }
+    }
+}
+
+#[test]
+fn a_pair_exclusion_compares_every_column_the_helper_returns() {
+    let written = "NOT ((membership.organization_namespace_id, membership.organization_id)
+      IN (SELECT * FROM public.blocking_organizations()))";
+    let deployment = deployment();
+    for condition in [
+        "membership.organization_id NOT IN (SELECT * FROM public.blocking_organizations())",
+        "(membership.organization_namespace_id, membership.organization_id, membership.id) \
+         NOT IN (SELECT * FROM public.blocking_organizations())",
+    ] {
+        let database = postgres(&PAIR_EXCLUSIONS.replace(written, condition));
+        let refused = excluding(&database, &deployment, "unblocked_memberships");
+        assert!(
+            matches!(refused, Err(HelperSetError::ArmShape { .. })),
+            "{condition}: {refused:?}"
+        );
+    }
+    for condition in [
+        "(membership.organization_namespace_id, membership.organization_id) \
+         <> ALL (ARRAY(SELECT * FROM public.blocking_organizations()))",
+        "(membership.organization_namespace_id, 'o1') \
+         NOT IN (SELECT * FROM public.blocking_organizations())",
+    ] {
+        let database = postgres(&PAIR_EXCLUSIONS.replace(written, condition));
+        let refused = excluding(&database, &deployment, "unblocked_memberships");
+        assert!(
+            matches!(refused, Err(HelperSetError::Irreducible { .. })),
+            "{condition}: {refused:?}"
+        );
+    }
 }
 
 #[test]
@@ -9624,4 +9806,544 @@ fn a_helper_called_twice_with_the_same_arguments_is_answered_once() {
         set = parent.set();
     }
     assert_eq!(render(set), "items.id WHERE owner_id = app.user_id");
+}
+
+/// Namespace step 2 of connetto's schema, where rows are keyed by a pair and
+/// the acting installation is read through a `sql` accessor over a
+/// `plpgsql` validator of both settings naming it.
+const NAMESPACE_PAIRS: &str = "
+CREATE ROLE authz_owner NOLOGIN BYPASSRLS;
+CREATE ROLE app NOLOGIN;
+CREATE SCHEMA authz;
+GRANT USAGE ON SCHEMA authz TO authz_owner, app;
+CREATE TYPE grantee_kind AS ENUM ('user', 'installation', 'signed_in', 'everyone');
+CREATE TABLE grantees (
+  namespace_id UUID NOT NULL, id UUID NOT NULL, kind grantee_kind NOT NULL,
+  PRIMARY KEY (namespace_id, id));
+CREATE TABLE installation_permissions (
+  installation_namespace_id UUID NOT NULL, installation_id UUID NOT NULL, organization_id UUID NOT NULL,
+  PRIMARY KEY (installation_namespace_id, installation_id, organization_id));
+CREATE FUNCTION authz.caller_id() RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT NULLIF(current_setting('app.user_id', true), '')::uuid
+$$;
+CREATE FUNCTION authz.acting_installation(OUT namespace_id UUID, OUT id UUID) RETURNS RECORD
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+  namespace_id := NULLIF(current_setting('app.installation_namespace_id', true), '')::UUID;
+  id := NULLIF(current_setting('app.installation_id', true), '')::UUID;
+  IF (namespace_id IS NULL) <> (id IS NULL) THEN
+    RAISE EXCEPTION 'incomplete installation identity' USING ERRCODE = '22023';
+  END IF;
+END
+$$;
+CREATE FUNCTION authz.acting_installation_id() RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT id FROM authz.acting_installation()
+$$;
+CREATE FUNCTION authz.acting_installation_namespace_id() RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CASE WHEN id IS NOT NULL THEN namespace_id END FROM authz.acting_installation()
+$$;
+CREATE FUNCTION authz.caller_grantees() RETURNS TABLE (namespace_id UUID, id UUID)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.namespace_id = '00000000-0000-0000-0000-000000000000'
+    AND grantee.id = (SELECT authz.caller_id()) AND grantee.kind = 'user'
+    AND (SELECT authz.acting_installation_id()) IS NULL
+  UNION
+  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.namespace_id = (SELECT authz.acting_installation_namespace_id())
+    AND grantee.id = (SELECT authz.acting_installation_id()) AND grantee.kind = 'installation'
+  UNION
+  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.kind = 'signed_in'
+    AND ((SELECT authz.caller_id()) IS NOT NULL OR (SELECT authz.acting_installation_id()) IS NOT NULL)
+$$;
+CREATE FUNCTION authz.permitted_organizations() RETURNS SETOF UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT permission.organization_id FROM public.installation_permissions permission
+  WHERE permission.installation_namespace_id = (SELECT authz.acting_installation_namespace_id())
+    AND permission.installation_id = (SELECT authz.acting_installation_id())
+$$;
+ALTER FUNCTION authz.caller_id() OWNER TO authz_owner;
+ALTER FUNCTION authz.acting_installation() OWNER TO authz_owner;
+ALTER FUNCTION authz.acting_installation_id() OWNER TO authz_owner;
+ALTER FUNCTION authz.acting_installation_namespace_id() OWNER TO authz_owner;
+ALTER FUNCTION authz.caller_grantees() OWNER TO authz_owner;
+ALTER FUNCTION authz.permitted_organizations() OWNER TO authz_owner;
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION authz.caller_grantees(), authz.permitted_organizations() TO app;
+GRANT SELECT ON grantees, installation_permissions TO authz_owner;
+";
+
+/// The `signed_in` arm of `authz.caller_grantees` in [`NAMESPACE_PAIRS`].
+const SIGNED_IN: &str = "  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.kind = 'signed_in'
+    AND ((SELECT authz.caller_id()) IS NOT NULL OR (SELECT authz.acting_installation_id()) IS NOT NULL)";
+
+/// [`SIGNED_IN`] as one arm per presence it tests.
+const SIGNED_IN_UNION: &str =
+    "  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.kind = 'signed_in' AND (SELECT authz.caller_id()) IS NOT NULL
+  UNION
+  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.kind = 'signed_in' AND (SELECT authz.acting_installation_id()) IS NOT NULL";
+
+const NAMESPACE_ZERO: &str = "00000000-0000-0000-0000-000000000000";
+const NAMESPACE_A1: &str = "00000000-0000-0000-0000-0000000000a1";
+const NAMESPACE_A2: &str = "00000000-0000-0000-0000-0000000000a2";
+const USER_C1: &str = "00000000-0000-0000-0000-0000000000c1";
+const INSTALLATION_B1: &str = "00000000-0000-0000-0000-0000000000b1";
+const INSTALLATION_B2: &str = "00000000-0000-0000-0000-0000000000b2";
+const SIGNED_IN_D1: &str = "00000000-0000-0000-0000-0000000000d1";
+const EVERYONE_E1: &str = "00000000-0000-0000-0000-0000000000e1";
+const ORGANIZATION_F1: &str = "00000000-0000-0000-0000-0000000000f1";
+const ORGANIZATION_F2: &str = "00000000-0000-0000-0000-0000000000f2";
+const ORGANIZATION_F3: &str = "00000000-0000-0000-0000-0000000000f3";
+
+const NAMESPACE_PAIR_ROWS: Rows = &[
+    ("grantees", &[("namespace_id", NAMESPACE_ZERO), ("id", USER_C1), ("kind", "user")]),
+    (
+        "grantees",
+        &[("namespace_id", NAMESPACE_A1), ("id", INSTALLATION_B1), ("kind", "installation")],
+    ),
+    (
+        "grantees",
+        &[("namespace_id", NAMESPACE_A1), ("id", INSTALLATION_B2), ("kind", "installation")],
+    ),
+    (
+        "grantees",
+        &[("namespace_id", NAMESPACE_A2), ("id", INSTALLATION_B1), ("kind", "installation")],
+    ),
+    ("grantees", &[("namespace_id", NAMESPACE_ZERO), ("id", SIGNED_IN_D1), ("kind", "signed_in")]),
+    ("grantees", &[("namespace_id", NAMESPACE_ZERO), ("id", EVERYONE_E1), ("kind", "everyone")]),
+    (
+        "installation_permissions",
+        &[
+            ("installation_namespace_id", NAMESPACE_A1),
+            ("installation_id", INSTALLATION_B1),
+            ("organization_id", ORGANIZATION_F1),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_namespace_id", NAMESPACE_A1),
+            ("installation_id", INSTALLATION_B2),
+            ("organization_id", ORGANIZATION_F2),
+        ],
+    ),
+    (
+        "installation_permissions",
+        &[
+            ("installation_namespace_id", NAMESPACE_A2),
+            ("installation_id", INSTALLATION_B1),
+            ("organization_id", ORGANIZATION_F3),
+        ],
+    ),
+];
+
+const A1_B1: &[(&str, &[&str])] =
+    &[(INSTALLATION_NAMESPACE, &[NAMESPACE_A1]), (INSTALLATION, &[INSTALLATION_B1])];
+const A2_B1: &[(&str, &[&str])] =
+    &[(INSTALLATION_NAMESPACE, &[NAMESPACE_A2]), (INSTALLATION, &[INSTALLATION_B1])];
+
+/// A request beside the pairs `authz.caller_grantees()` returns for it and
+/// the organizations `authz.permitted_organizations()` returns.
+type InstallationMeasured = (Request, &'static [[&'static str; 2]], &'static [&'static str]);
+
+/// What PostgreSQL 18.7 returns from `authz.caller_grantees()` and
+/// `authz.permitted_organizations()` in [`NAMESPACE_PAIRS`], called as `app`
+/// over [`NAMESPACE_PAIR_ROWS`], for each request the deployment admits,
+/// the user alone, an installation alone, both, and neither.
+const NAMESPACE_PAIRS_MEASURED: &[InstallationMeasured] = &[
+    (
+        Request { caller: Some(USER_C1), values: &[] },
+        &[[NAMESPACE_ZERO, USER_C1], [NAMESPACE_ZERO, SIGNED_IN_D1]],
+        &[],
+    ),
+    (
+        Request { caller: None, values: A1_B1 },
+        &[[NAMESPACE_ZERO, SIGNED_IN_D1], [NAMESPACE_A1, INSTALLATION_B1]],
+        &[ORGANIZATION_F1],
+    ),
+    (
+        Request { caller: None, values: A2_B1 },
+        &[[NAMESPACE_ZERO, SIGNED_IN_D1], [NAMESPACE_A2, INSTALLATION_B1]],
+        &[ORGANIZATION_F3],
+    ),
+    (
+        Request { caller: Some(USER_C1), values: A1_B1 },
+        &[[NAMESPACE_ZERO, SIGNED_IN_D1], [NAMESPACE_A1, INSTALLATION_B1]],
+        &[ORGANIZATION_F1],
+    ),
+    (Request { caller: None, values: &[] }, &[], &[]),
+];
+
+/// The deployment of [`NAMESPACE_PAIRS`], whose caller is `app.user_id` and
+/// whose acting installation is named by two settings every request sets
+/// together, or leaves unset together, every identity of `identity`.
+fn namespace_deployment(identity: &DataType) -> Deployment {
+    namespace_settings(identity)
+        .with_settings_set_together([INSTALLATION_NAMESPACE, INSTALLATION])
+        .expect("both settings are declared")
+}
+
+/// [`namespace_deployment`] admitting a request that sets one of the two
+/// settings naming the installation without the other.
+fn namespace_settings(identity: &DataType) -> Deployment {
+    let setting = |name: &str, value: SettingValue| {
+        SessionSetting::value(name, value).expect("a custom setting name").may_be_unset()
+    };
+    Deployment::new(
+        "app",
+        ["app"],
+        [
+            setting("app.user_id", SettingValue::Caller(identity.clone())),
+            setting(INSTALLATION_NAMESPACE, SettingValue::Scalar(identity.clone())),
+            setting(
+                INSTALLATION,
+                SettingValue::Principal { kind: "installation".into(), identity: identity.clone() },
+            ),
+        ],
+    )
+    .expect("a valid deployment")
+}
+
+/// What `name` in `database` answers, reading the settings it requires set
+/// or unset.
+fn namespace_helper<'db>(
+    database: &'db ParserDB,
+    deployment: &'db Deployment,
+    name: &str,
+) -> Result<HelperSet<'db, ParserDB>, HelperSetError> {
+    function(database, "authz", name).helper_set(
+        &[],
+        deployment,
+        database,
+        &[ArmCondition::UnsetSetting, ArmCondition::SetSetting],
+    )
+}
+
+/// [`NAMESPACE_PAIRS`] keeping every identity in `text`, the validator
+/// assigning setting reads to `text` outputs without a cast.
+fn namespace_pairs_in_text() -> String {
+    NAMESPACE_PAIRS.replace("::UUID", "").replace("::uuid", "").replace(" UUID", " TEXT")
+}
+
+/// Asserts that `set`, `authz.caller_grantees()` read over `sql`, returns
+/// for each request of `measured` the pairs PostgreSQL returned.
+fn assert_grantees(set: &HelperSet<'_, ParserDB>, sql: &str, measured: &[(Request, &[[&str; 2]])]) {
+    for &(request, pairs) in measured {
+        let returned = arm_rows(set, request, NAMESPACE_PAIR_ROWS);
+        let pairs: BTreeSet<Vec<&str>> = pairs.iter().map(|pair| pair.to_vec()).collect();
+        assert_eq!(
+            returned, pairs,
+            "caller_grantees() for {:?}, {:?} over {sql}",
+            request.caller, request.values
+        );
+    }
+}
+
+#[test]
+fn an_installation_pair_read_through_its_validator_names_the_grantee() {
+    let union = NAMESPACE_PAIRS.replace(SIGNED_IN, SIGNED_IN_UNION);
+    assert_ne!(union, NAMESPACE_PAIRS, "the signed_in arm is split");
+    let in_text = namespace_pairs_in_text();
+    let mut rendered = Vec::new();
+    for (sql, identity) in [
+        (NAMESPACE_PAIRS, DataType::Uuid),
+        (&union, DataType::Uuid),
+        (&in_text, DataType::Text),
+        (&in_text, DataType::Uuid),
+    ] {
+        let deployment = namespace_deployment(&identity);
+        let database = postgres(sql);
+        let grantees =
+            namespace_helper(&database, &deployment, "caller_grantees").expect("answered");
+        let organizations =
+            namespace_helper(&database, &deployment, "permitted_organizations").expect("answered");
+        let measured: Vec<_> =
+            NAMESPACE_PAIRS_MEASURED.iter().map(|&(request, pairs, _)| (request, pairs)).collect();
+        assert_grantees(&grantees, sql, &measured);
+        for &(request, _, organizations_measured) in NAMESPACE_PAIRS_MEASURED {
+            let returned: Vec<_> =
+                evaluate(&organizations, request, NAMESPACE_PAIR_ROWS).into_iter().collect();
+            assert_eq!(
+                returned, organizations_measured,
+                "permitted_organizations() for {:?}",
+                request.values
+            );
+        }
+        rendered.push((render(&grantees), render(&organizations)));
+    }
+    assert_eq!(rendered[0], rendered[1], "both spellings answer the same arms");
+    assert_eq!(rendered[0], rendered[2], "a text identity reads as a uuid one");
+    assert_eq!(rendered[0], rendered[3], "a uuid setting read in text reads as cast");
+    assert_eq!(
+        rendered[0].0,
+        "grantees.(namespace_id, id) WHERE id = app.user_id AND app.installation_id IS UNSET \
+         AND namespace_id IN ('00000000-0000-0000-0000-000000000000') AND kind IN ('user') \
+         UNION grantees.(namespace_id, id) WHERE namespace_id = app.installation_namespace_id \
+         AND id = app.installation_id AND kind IN ('installation') \
+         UNION grantees.(namespace_id, id) WHERE app.user_id IS SET AND kind IN ('signed_in') \
+         UNION grantees.(namespace_id, id) WHERE app.installation_id IS SET AND kind IN ('signed_in')"
+    );
+    assert_eq!(
+        rendered[0].1,
+        "installation_permissions.organization_id WHERE \
+         installation_namespace_id = app.installation_namespace_id \
+         AND installation_id = app.installation_id"
+    );
+}
+
+#[test]
+fn a_presence_gate_and_a_validated_pair_refuse_where_unread_or_unproven() {
+    let database = postgres(NAMESPACE_PAIRS);
+    let deployment = namespace_deployment(&DataType::Uuid);
+    let unread = function(&database, "authz", "caller_grantees").helper_set(
+        &[],
+        &deployment,
+        &database,
+        &[ArmCondition::UnsetSetting],
+    );
+    assert!(
+        matches!(
+            &unread,
+            Err(HelperSetError::UnreadCondition { kind: ArmCondition::SetSetting, .. })
+        ),
+        "{unread:?}"
+    );
+    // Either setting alone may be set, so the validator may raise.
+    let apart = namespace_settings(&DataType::Uuid);
+    let refused = namespace_helper(&database, &apart, "permitted_organizations");
+    assert!(
+        matches!(
+            &refused,
+            Err(HelperSetError::AccessorOutputs {
+                called,
+                reason: OutputRefusal::Unreturned(_),
+                ..
+            }) if called == "authz.acting_installation"
+        ),
+        "{refused:?}"
+    );
+}
+
+/// The assignment [`NAMESPACE_PAIRS`]'s validator gives its `id` output.
+const VALIDATED_ID: &str = "id := NULLIF(current_setting('app.installation_id', true), '')::UUID;";
+
+/// The check [`NAMESPACE_PAIRS`]'s validator makes on both settings.
+const VALIDATION: &str = "  IF (namespace_id IS NULL) <> (id IS NULL) THEN
+    RAISE EXCEPTION 'incomplete installation identity' USING ERRCODE = '22023';
+  END IF;
+";
+
+/// What `permitted_organizations()` answers once each written text in
+/// `sql` is replaced by its replacement, every identity of `identity`.
+fn permitted_with(
+    sql: &str,
+    identity: &DataType,
+    replaced: &[(&str, &str)],
+) -> Result<String, HelperSetError> {
+    let mut sql = sql.to_string();
+    for (written, replacement) in replaced {
+        assert!(sql.contains(written), "{written} is replaced");
+        sql = sql.replace(written, replacement);
+    }
+    let database = postgres(&sql);
+    let deployment = namespace_deployment(identity);
+    namespace_helper(&database, &deployment, "permitted_organizations").map(|set| render(&set))
+}
+
+/// Whether `answer` refuses an accessor for `expected`.
+fn refuses_accessor(answer: &Result<String, HelperSetError>, expected: AccessorRefusal) -> bool {
+    matches!(answer, Err(HelperSetError::Accessor { reason, .. }) if *reason == expected)
+}
+
+#[test]
+fn a_validator_reads_only_where_each_output_is_one_setting_read_run_on_each_call() {
+    let validator =
+        "LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp";
+    let uuid =
+        |replaced: &[(&str, &str)]| permitted_with(NAMESPACE_PAIRS, &DataType::Uuid, replaced);
+    let immutable = uuid(&[(validator, &validator.replace("STABLE", "IMMUTABLE"))]);
+    assert!(refuses_accessor(&immutable, AccessorRefusal::SelectsImmutable), "{immutable:?}");
+    // Unchecked and in `text`, a validator setting what it reads raises
+    // nowhere.
+    let setter = permitted_with(
+        &namespace_pairs_in_text(),
+        &DataType::Text,
+        &[(validator, &format!("{validator} SET app.installation_id = ''")), (VALIDATION, "")],
+    );
+    assert!(refuses_accessor(&setter, AccessorRefusal::SelectsSettingSetter), "{setter:?}");
+    let several = uuid(&[(
+        VALIDATED_ID,
+        &format!("IF namespace_id IS NULL THEN id := NULL; ELSE {VALIDATED_ID} END IF;"),
+    )]);
+    assert!(
+        matches!(
+            &several,
+            Err(HelperSetError::AccessorOutputs { reason: OutputRefusal::Several { output }, .. })
+                if output == "id"
+        ),
+        "{several:?}"
+    );
+    let unread = uuid(&[(VALIDATED_ID, "id := namespace_id;")]);
+    assert!(
+        matches!(
+            &unread,
+            Err(HelperSetError::AccessorOutputs { reason: OutputRefusal::Unread { output }, .. })
+                if output == "id"
+        ),
+        "{unread:?}"
+    );
+}
+
+#[test]
+fn a_guarded_read_is_the_setting_only_where_both_are_set_together_and_read_empty_as_unset() {
+    let accessor =
+        "SELECT CASE WHEN id IS NOT NULL THEN namespace_id END FROM authz.acting_installation()";
+    let id = "NULLIF(current_setting('app.installation_id', true), '')::uuid";
+    let namespace = "NULLIF(current_setting('app.installation_namespace_id', true), '')::uuid";
+    let direct = |tested: &str, guarded: &str| {
+        let sql = NAMESPACE_PAIRS
+            .replace(accessor, &format!("SELECT CASE WHEN {tested} IS NOT NULL THEN {guarded} END"))
+            .replace("SELECT id FROM authz.acting_installation()", &format!("SELECT {id}"));
+        assert!(!sql.contains("FROM authz.acting_installation()"), "both accessors read directly");
+        postgres(&sql)
+    };
+    let read = "installation_permissions.organization_id WHERE \
+                installation_namespace_id = app.installation_namespace_id \
+                AND installation_id = app.installation_id";
+    let database = direct(id, namespace);
+    let together = namespace_deployment(&DataType::Uuid);
+    assert_eq!(
+        namespace_helper(&database, &together, "permitted_organizations")
+            .map(|set| render(&set))
+            .as_deref(),
+        Ok(read)
+    );
+    let apart = namespace_settings(&DataType::Uuid);
+    let unproven = namespace_helper(&database, &apart, "permitted_organizations");
+    assert!(matches!(unproven, Err(HelperSetError::Irreducible { .. })), "{unproven:?}");
+    let raw_namespace = "current_setting('app.installation_namespace_id', true)::uuid";
+    for (tested, guarded) in
+        [("current_setting('app.installation_id', true)::uuid", namespace), (id, raw_namespace)]
+    {
+        let database = direct(tested, guarded);
+        let raw = namespace_helper(&database, &together, "permitted_organizations");
+        assert!(matches!(raw, Err(HelperSetError::Irreducible { .. })), "{tested}: {raw:?}");
+    }
+}
+
+/// The pairs `authz.caller_grantees()` returns for each request of
+/// [`NAMESPACE_PAIRS_MEASURED`], in their order.
+type PairsPerRequest = [&'static [[&'static str; 2]]; 5];
+
+/// The conditions beside `kind = 'signed_in'` in [`SIGNED_IN`], spelled
+/// with `OR` and as the `UNION` of the arms it splits into, beside what
+/// PostgreSQL 18.7 returns from `authz.caller_grantees()` with the arm so
+/// written, called as `app` over [`NAMESPACE_PAIR_ROWS`].
+const SPLIT_ARMS: &[(&str, &str, PairsPerRequest)] = &[
+    (
+        "(SELECT authz.acting_installation_id()) IS NULL AND \
+         ((SELECT authz.caller_id()) IS NOT NULL OR (SELECT authz.acting_installation_id()) IS NOT NULL)",
+        "(SELECT authz.acting_installation_id()) IS NULL AND (SELECT authz.caller_id()) IS NOT NULL
+  UNION
+  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.kind = 'signed_in' AND (SELECT authz.acting_installation_id()) IS NULL \
+         AND (SELECT authz.acting_installation_id()) IS NOT NULL",
+        [
+            &[[NAMESPACE_ZERO, USER_C1], [NAMESPACE_ZERO, SIGNED_IN_D1]],
+            &[[NAMESPACE_A1, INSTALLATION_B1]],
+            &[[NAMESPACE_A2, INSTALLATION_B1]],
+            &[[NAMESPACE_A1, INSTALLATION_B1]],
+            &[],
+        ],
+    ),
+    (
+        "((SELECT authz.caller_id()) IS NOT NULL OR (SELECT authz.acting_installation_id()) IS NULL)",
+        "(SELECT authz.caller_id()) IS NOT NULL
+  UNION
+  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.kind = 'signed_in' AND (SELECT authz.acting_installation_id()) IS NULL",
+        [
+            &[[NAMESPACE_ZERO, USER_C1], [NAMESPACE_ZERO, SIGNED_IN_D1]],
+            &[[NAMESPACE_A1, INSTALLATION_B1]],
+            &[[NAMESPACE_A2, INSTALLATION_B1]],
+            &[[NAMESPACE_ZERO, SIGNED_IN_D1], [NAMESPACE_A1, INSTALLATION_B1]],
+            &[[NAMESPACE_ZERO, SIGNED_IN_D1]],
+        ],
+    ),
+];
+
+#[test]
+fn a_split_arm_keeps_the_conditions_beside_its_disjunct() {
+    let deployment = namespace_deployment(&DataType::Uuid);
+    let written = "((SELECT authz.caller_id()) IS NOT NULL OR (SELECT authz.acting_installation_id()) IS NOT NULL)";
+    for &(conditions, union, measured) in SPLIT_ARMS {
+        let mut rendered = Vec::new();
+        for spelling in [conditions, union] {
+            let sql = NAMESPACE_PAIRS.replace(written, spelling);
+            assert_ne!(sql, NAMESPACE_PAIRS, "the signed_in conditions are replaced");
+            let database = postgres(&sql);
+            let set =
+                namespace_helper(&database, &deployment, "caller_grantees").expect("answered");
+            let requests = NAMESPACE_PAIRS_MEASURED.iter().map(|&(request, ..)| request);
+            let measured: Vec<_> = requests.zip(measured).collect();
+            assert_grantees(&set, spelling, &measured);
+            rendered.push(render(&set));
+        }
+        assert_eq!(rendered[0], rendered[1], "{conditions}");
+    }
+    // A disjunct gating on the caller in another type than a conjunct does.
+    let mixed = NAMESPACE_PAIRS.replace(
+        written,
+        &format!("current_setting('app.user_id', true) IS NOT NULL AND {written}"),
+    );
+    let database = postgres(&mixed);
+    let refused = namespace_helper(&database, &deployment, "caller_grantees");
+    assert!(matches!(refused, Err(HelperSetError::ArmShape { .. })), "{refused:?}");
+}
+
+/// `authz.children()` over [`single_table`], subtracting the pairs of
+/// `authz.projects()`.
+const PAIR_EXCLUDING_CHILDREN: &str = "
+CREATE FUNCTION authz.projects() RETURNS TABLE (id TEXT, kind TEXT)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT r.id, r.kind FROM public.resources r WHERE r.kind = 'project'
+$$;
+ALTER FUNCTION authz.projects() OWNER TO authz_owner;";
+
+#[test]
+fn a_parent_arm_subtracts_a_helpers_pairs() {
+    let deployment = deployment();
+    let arm = "SELECT o.id FROM public.resources o WHERE o.parent_id IN (SELECT authz.reached()) \
+               AND NOT ((o.id, o.kind) IN (SELECT * FROM authz.projects()))";
+    let database = postgres(&format!("{}{PAIR_EXCLUDING_CHILDREN}", single_table_children(arm)));
+    let set = function(&database, "authz", "children")
+        .helper_set(
+            &[],
+            &deployment,
+            &database,
+            &[ArmCondition::EdgeCondition, ArmCondition::ParentCondition, ArmCondition::Exclusion],
+        )
+        .expect("answered");
+    assert_eq!(
+        render(&set),
+        "resources.id WHERE parent_id as resources IN authz.reached() \
+         {resource_grants.resource_id WHERE user_id = app.user_id \
+         UNION resources.id WHERE parent_id IN itself AND kind IN ('folder', 'project')} \
+         AND (id, kind) NOT IN authz.projects() {resources.(id, kind) WHERE kind IN ('project')}"
+    );
+    // What PostgreSQL 18.7 returns for each caller over `SINGLE_TABLE`.
+    for (caller, expected) in
+        [("alice", &["f1", "t1"][..]), ("bob", &["t1"]), ("carol", &[]), ("zed", &[])]
+    {
+        let returned: Vec<_> =
+            evaluate(&set, Request::of(caller), SINGLE_TABLE).into_iter().collect();
+        assert_eq!(returned, expected, "{caller}");
+    }
 }

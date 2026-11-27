@@ -107,7 +107,7 @@ pub use function_kind::{AggregateKind, FunctionKind};
 pub use helper_set::{
     AntiJoin, ArmCondition, CalledArm, CallerGate, CapOperand, Correlation, ExcludedSet, GrantArm,
     GrantedTo, GranteeSet, HelperArm, HelperSet, JoinedRow, LiteralSet, ParentArm,
-    RequestNormalization, Restriction, Returned, RowCap, SettingComparison, TimeBound,
+    RequestNormalization, Restriction, Returned, RowCap, SetSetting, SettingComparison, TimeBound,
     TimeComparison, UnsetSetting, WalkArm, WalkDirection,
 };
 pub use identifier_case::IdentifierCase;
