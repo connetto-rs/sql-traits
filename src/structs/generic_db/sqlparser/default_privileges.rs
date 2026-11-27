@@ -1003,13 +1003,14 @@ impl<'a> Creator<'a> {
         metadata
     }
 
-    /// The privileges the owner of a new table in `schema` holds.
-    pub(super) fn owner_table_privileges(
+    /// The privileges the owner of a new object of `kind` in `schema` holds.
+    pub(super) fn owner_privileges(
         &self,
+        kind: DefaultPrivilegeKind,
         schema: SchemaQualifier<'_>,
         case: IdentifierCase,
     ) -> Vec<Action> {
-        self.items(DefaultPrivilegeKind::Tables, schema, case)
+        self.items(kind, schema, case)
             .iter()
             .find(|item| matches!(item.holder, Holder::Owner))
             .map_or_else(Vec::new, |item| item.privileges.actions())
@@ -1024,7 +1025,11 @@ impl<'a> Creator<'a> {
     ) -> ViewMetadata {
         let mut metadata = ViewMetadata::default();
         metadata.set_owner(self.owner());
-        metadata.set_owner_privileges(self.owner_table_privileges(schema, case));
+        metadata.set_owner_privileges(self.owner_privileges(
+            DefaultPrivilegeKind::Tables,
+            schema,
+            case,
+        ));
         metadata
     }
 

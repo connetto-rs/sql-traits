@@ -957,6 +957,15 @@ impl SequenceLike for MemorySequence {
     fn origin(&self) -> SequenceOrigin {
         SequenceOrigin::Declared
     }
+
+    /// This catalog records no owner, so no entry of the owner's is kept.
+    fn authorization(&self) -> Option<&str> {
+        None
+    }
+
+    fn authorization_privileges(&self) -> impl Iterator<Item = &Action> {
+        core::iter::empty()
+    }
 }
 
 impl IndexLike for MemoryIndex {

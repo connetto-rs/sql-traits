@@ -13908,7 +13908,8 @@ impl ParserDB {
                     let name = create_table.name.clone();
                     let mut metadata = TableMetadata::default();
                     metadata.set_owner(creator.owner());
-                    metadata.set_owner_privileges(creator.owner_table_privileges(
+                    metadata.set_owner_privileges(creator.owner_privileges(
+                        DefaultPrivilegeKind::Tables,
                         qualifier_of(&name).named(),
                         builder.identifier_case(),
                     ));

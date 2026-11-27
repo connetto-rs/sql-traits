@@ -1,6 +1,6 @@
-//! The owner's own privilege entry on a table or view, and the grants a table
-//! owner change hands over, as PostgreSQL's `aclnewowner` renames the old
-//! owner on the table.
+//! The owner's own privilege entry on a table, view or sequence, and the
+//! grants a table owner change hands over, as PostgreSQL's `aclnewowner`
+//! renames the old owner on the table.
 
 use alloc::{sync::Arc, vec, vec::Vec};
 
@@ -12,7 +12,9 @@ use sqlparser::ast::{
 use super::{
     ParserDBBuilder, StoredTable, grantee_role_ident,
     grantors::grantor_ident,
-    rename_grantee, stored_role_name,
+    rename_grantee,
+    sequences::resolve_sequence,
+    stored_role_name,
     views::{materialized_view_position, plain_view_position},
 };
 use crate::{
@@ -21,7 +23,8 @@ use crate::{
 };
 
 /// Takes the privileges `revoke` names from the owner's entry on each table,
-/// view and materialized view it reaches that one of its grantees owns.
+/// view, materialized view and sequence it reaches that one of its grantees
+/// owns.
 pub(super) fn revoke(builder: &mut ParserDBBuilder, revoke: &Revoke) {
     // Ownership confers the grant option, so the owner keeps it.
     if revoke.grant_option_for {
@@ -58,10 +61,22 @@ pub(super) fn revoke(builder: &mut ParserDBBuilder, revoke: &Revoke) {
     }
 
     for objects in builder.per_object_targets(revoke.objects.clone()) {
-        let Some(GrantObjects::Tables(names)) = objects else {
-            continue;
+        let (names, relation_list) = match objects {
+            Some(GrantObjects::Tables(names)) => (names, true),
+            Some(GrantObjects::Sequences(names)) => (names, false),
+            _ => continue,
         };
         for name in &names {
+            if let Some(position) = sequence_position(builder, name) {
+                let sequence = &mut builder.sequences_mut()[position].0;
+                if names_owner(sequence.authorization_owner()) {
+                    Arc::make_mut(sequence).revoke_owner_privileges(&revoke.privileges);
+                }
+                continue;
+            }
+            if !relation_list {
+                continue;
+            }
             let metadata = if let Some(position) = plain_view_position(builder, name) {
                 &mut builder.views_mut()[position].1
             } else if let Some(position) = materialized_view_position(builder, name) {
@@ -74,6 +89,12 @@ pub(super) fn revoke(builder: &mut ParserDBBuilder, revoke: &Revoke) {
             }
         }
     }
+}
+
+/// The position among the stored sequences of the one `name` reaches.
+fn sequence_position(builder: &ParserDBBuilder, name: &ObjectName) -> Option<usize> {
+    let sequence = resolve_sequence(builder, name).ok()??;
+    builder.sequences().iter().position(|(held, ())| core::ptr::eq(held.as_ref(), sequence))
 }
 
 /// Hands every grant on `handed` naming `previous`, as grantee or grantor, to

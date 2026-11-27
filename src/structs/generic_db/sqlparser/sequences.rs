@@ -143,13 +143,18 @@ pub(super) fn create_sequence(
         }
     }
 
+    let owner_privileges = creator.owner_privileges(
+        DefaultPrivilegeKind::Sequences,
+        schema,
+        builder.identifier_case(),
+    );
     let sequence = Sequence::new(
         (name_ident.value.clone(), name_ident.quote_style.is_some()),
         schema.map(|(value, quoted)| (value.to_string(), quoted)),
         kept,
         parameters,
         owner,
-        creator.owner(),
+        (creator.owner(), owner_privileges),
         SequenceOrigin::Declared,
     );
     let builder = builder.add_sequence(Arc::new(sequence), ());
@@ -738,13 +743,18 @@ pub(super) fn create_column_sequences(
                 identity: origin == SequenceOrigin::Identity,
             }
         })?;
+        let owner_privileges = creator.owner_privileges(
+            DefaultPrivilegeKind::Sequences,
+            qualifier,
+            builder.identifier_case(),
+        );
         let sequence = Arc::new(Sequence::new(
             (name, quoted),
             schema.clone(),
             options,
             parameters,
             None,
-            creator.owner(),
+            (creator.owner(), owner_privileges),
             origin,
         ));
         created.push((column, Arc::as_ptr(&sequence)));

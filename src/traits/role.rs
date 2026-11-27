@@ -4,7 +4,7 @@ use alloc::{borrow::Cow, vec::Vec};
 use core::{fmt::Debug, iter::once};
 
 use crate::{
-    traits::{DatabaseLike, Metadata, RoleMembershipLike},
+    traits::{DatabaseLike, GrantLike, Metadata, RoleMembershipLike},
     utils::identifier_resolution::stored_identifier,
 };
 
@@ -528,6 +528,14 @@ pub(crate) fn privilege_holders<'db, DB: DatabaseLike>(
     database: &'db DB,
 ) -> impl Iterator<Item = &'db DB::Role> {
     once(role).chain(role.inherited_roles(database))
+}
+
+/// Returns whether `grant` reaches `PUBLIC` or one of `holders`.
+pub(crate) fn grant_reaches<G: GrantLike>(
+    grant: &G,
+    holders: &[&<G::DB as DatabaseLike>::Role],
+) -> bool {
+    grant.applies_to_public() || holders.iter().any(|holder| grant.applies_to_role(holder))
 }
 
 impl<T: RoleLike> RoleLike for &T {

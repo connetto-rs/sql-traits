@@ -1,12 +1,14 @@
 //! Submodule providing a trait for describing SQL sequences.
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, vec::Vec};
 use core::{fmt::Debug, hash::Hash};
 
+use sqlparser::ast::Action;
+
 use crate::{
-    errors::LookupError,
-    structs::{SequenceParameters, TargetName},
-    traits::{DatabaseLike, Metadata},
+    errors::{LookupError, ObjectKind},
+    structs::{ActingRole, SequenceParameters, SequencePrivileges, TargetName},
+    traits::{DatabaseLike, Metadata, Relation, RoleLike, TableGrantLike, role::privilege_holders},
     utils::identifier_resolution::{is_temporary_schema, stored_identifier},
 };
 
@@ -286,4 +288,158 @@ pub trait SequenceLike: Debug + Clone + Hash + Ord + Eq + Metadata + Send + Sync
     /// # }
     /// ```
     fn origin(&self) -> SequenceOrigin;
+
+    /// Returns the role owning the sequence, whose own entry holds the
+    /// [`authorization_privileges`](Self::authorization_privileges), or
+    /// `None` when the input names none.
+    ///
+    /// It is the role that created the sequence, or the one that created the
+    /// table for a sequence created for a column. Handing that table to
+    /// another role hands its sequences over too. The owning role is apart
+    /// from the column [`owner`](Self::owner) names, which decides only when
+    /// the sequence is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app_owner;
+    ///      CREATE TABLE notes (id SERIAL PRIMARY KEY);
+    ///      ALTER TABLE notes OWNER TO app_owner;",
+    /// )?;
+    /// let sequence = db
+    ///     .sequence_by_target(TargetName::new("notes_id_seq", false), IdentifierCase::AsWritten)?
+    ///     .unwrap();
+    /// assert_eq!(sequence.authorization(), Some("app_owner"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn authorization(&self) -> Option<&str>;
+
+    /// Iterates over the privileges the own entry of the
+    /// [`authorization`](Self::authorization) role holds on this sequence.
+    ///
+    /// PostgreSQL gives the owning role `USAGE`, `SELECT` and `UPDATE` when it
+    /// creates the sequence, less what the default privileges of the creating
+    /// role take, through an entry the owner can revoke and grant back like
+    /// any other. A `REVOKE` naming the owning role takes from it, and an
+    /// owner change hands it to the new owner as it stands.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app_owner;
+    ///      GRANT CREATE ON SCHEMA public TO app_owner;
+    ///      SET ROLE app_owner;
+    ///      CREATE SEQUENCE ticket_seq;
+    ///      REVOKE UPDATE ON SEQUENCE ticket_seq FROM app_owner;",
+    /// )?;
+    /// let sequence = db.sequences().next().unwrap();
+    /// let held: Vec<_> = sequence.authorization_privileges().map(ToString::to_string).collect();
+    /// assert_eq!(held, ["SELECT", "USAGE"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn authorization_privileges(&self) -> impl Iterator<Item = &Action>;
+
+    /// Returns the privileges `role` holds on this sequence, as PostgreSQL's
+    /// `has_sequence_privilege` answers them.
+    ///
+    /// A privilege reaches `role` through a grant naming the role itself,
+    /// `PUBLIC`, or one of the
+    /// [`inherited_roles`](crate::traits::RoleLike::inherited_roles) of the
+    /// role, and through the owner's own entry, as
+    /// [`authorization_privileges`](Self::authorization_privileges) reports
+    /// it, when the role or one it inherits from is the sequence's
+    /// [`authorization`](Self::authorization) role. A grant reaches the
+    /// sequence through `ON SEQUENCE`, through a plain `ON` relation list and
+    /// through `ALL SEQUENCES IN SCHEMA`, and `ALL PRIVILEGES` on it means
+    /// `USAGE`, `SELECT` and `UPDATE`. What a `REVOKE` took is gone already. A
+    /// superuser holds every privilege, and a role that is a member of a
+    /// superuser does not. [`ActingRole::Public`], a caller holding no role,
+    /// holds what `PUBLIC` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this sequence.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE ROLE app;
+    ///      CREATE ROLE app_group;
+    ///      GRANT app_group TO app;
+    ///      CREATE TABLE notes (id SERIAL PRIMARY KEY, body TEXT);
+    ///      CREATE SEQUENCE ticket_seq;
+    ///      GRANT INSERT ON notes TO app;
+    ///      GRANT USAGE ON SEQUENCE ticket_seq TO app_group;",
+    /// )?;
+    /// let sequence = |name| {
+    ///     db.sequence_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+    ///         .map(Option::unwrap)
+    /// };
+    /// let app = db.role("app").unwrap();
+    ///
+    /// let notes_id = sequence("notes_id_seq")?.privileges(app, &db)?;
+    /// assert!(!notes_id.usage && !notes_id.update);
+    ///
+    /// let ticket = sequence("ticket_seq")?.privileges(app, &db)?;
+    /// assert!(ticket.usage && !ticket.select && !ticket.update);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn privileges<'db>(
+        &'db self,
+        role: impl Into<ActingRole<'db, <Self::DB as DatabaseLike>::Role>>,
+        database: &'db Self::DB,
+    ) -> Result<SequencePrivileges, LookupError>
+    where
+        Self: 'db,
+    {
+        let target = self.target_name();
+        if !database.sequences().any(|sequence| sequence.target_name() == target) {
+            return Err(ObjectKind::Sequence.not_in_database(&target.to_string()));
+        }
+        let holders: Vec<&<Self::DB as DatabaseLike>::Role> = match role.into() {
+            ActingRole::Declared(role) if role.is_superuser() => {
+                return Ok(SequencePrivileges::ALL);
+            }
+            ActingRole::Declared(role) => privilege_holders(role, database).collect(),
+            ActingRole::Public => Vec::new(),
+        };
+        let mut held = SequencePrivileges::NONE;
+        if let Some(owner) = self.authorization()
+            && holders.iter().any(|holder| holder.stored_name() == owner)
+        {
+            for privilege in self.authorization_privileges() {
+                held.take(privilege);
+            }
+        }
+        let is_this = |relation: Relation<'_, Self::DB>| {
+            let Relation::Sequence(sequence) = relation else {
+                return false;
+            };
+            sequence.target_name() == target
+        };
+        for grant in database.table_grants().filter(|grant| grant.relations(database).any(is_this))
+        {
+            held.take_grant(grant, &holders, database);
+        }
+        Ok(held)
+    }
 }

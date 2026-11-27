@@ -230,6 +230,7 @@ mod select_into_tables;
 mod semantic_proofs;
 mod sequence_defaults;
 mod sequence_parameters;
+mod sequence_privileges;
 mod sequences;
 mod set_returning_functions;
 mod simple_index_entries;

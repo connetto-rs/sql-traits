@@ -5,11 +5,14 @@ use alloc::{
     vec::Vec,
 };
 
-use sqlparser::ast::{DataType, SequenceOptions};
+use sqlparser::ast::{Action, DataType, Privileges, SequenceOptions};
 
 use crate::{
     errors::SequenceParameterError,
-    structs::{ColumnIdentity, RelationIdentity, SequenceParameters, SequenceType},
+    structs::{
+        ColumnIdentity, RelationIdentity, SequenceParameters, SequenceType,
+        metadata::revoke_from_owner_entry,
+    },
     traits::SequenceOrigin,
 };
 
@@ -48,20 +51,27 @@ pub struct Sequence {
     owner: Option<StoredSequenceOwner>,
     /// The stored role owning the sequence's privileges.
     authorization_owner: Option<String>,
+    /// The privileges the owning role's own entry holds.
+    ///
+    /// Mirrors the owner's item in `pg_class.relacl`, which starts with every
+    /// sequence privilege and loses the ones a `REVOKE` naming the owner
+    /// takes.
+    owner_privileges: Vec<Action>,
     /// Why the sequence exists.
     origin: SequenceOrigin,
 }
 
 impl Sequence {
     /// Records a sequence ingestion has placed, whose `parameters` it read
-    /// from `options` and whose owner it resolved.
+    /// from `options` and whose owner it resolved, owned by the role
+    /// `authorization_owner` names with `owner_privileges` in its own entry.
     pub(crate) fn new(
         (name, name_is_quoted): (String, bool),
         schema: Option<(String, bool)>,
         options: Vec<SequenceOptions>,
         parameters: SequenceParameters,
         owner: Option<StoredSequenceOwner>,
-        authorization_owner: Option<String>,
+        (authorization_owner, owner_privileges): (Option<String>, Vec<Action>),
         origin: SequenceOrigin,
     ) -> Self {
         let schema_is_quoted = schema.as_ref().is_some_and(|(_, quoted)| *quoted);
@@ -74,6 +84,7 @@ impl Sequence {
             parameters,
             owner,
             authorization_owner,
+            owner_privileges,
             origin,
         }
     }
@@ -150,6 +161,17 @@ impl Sequence {
     /// Sets the role owning the sequence's privileges.
     pub(crate) fn set_authorization_owner(&mut self, owner: Option<String>) {
         self.authorization_owner = owner;
+    }
+
+    /// Returns the privileges the owning role's own entry holds.
+    pub(crate) fn owner_privileges(&self) -> &[Action] {
+        &self.owner_privileges
+    }
+
+    /// Takes from the owning role's own entry the privileges a `REVOKE`
+    /// names.
+    pub(crate) fn revoke_owner_privileges(&mut self, revoked: &Privileges) {
+        revoke_from_owner_entry(&mut self.owner_privileges, revoked);
     }
 
     /// Returns why the sequence exists.

@@ -229,6 +229,14 @@ impl<DB: DatabaseLike> SequenceLike for Absent<DB> {
     fn origin(&self) -> SequenceOrigin {
         self.unreachable()
     }
+
+    fn authorization(&self) -> Option<&str> {
+        self.unreachable()
+    }
+
+    fn authorization_privileges(&self) -> impl Iterator<Item = &Action> {
+        self.unreachable::<core::iter::Empty<&Action>>()
+    }
 }
 
 impl<DB: DatabaseLike> ExtensionLike for Absent<DB> {

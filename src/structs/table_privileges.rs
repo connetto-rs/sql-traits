@@ -7,7 +7,7 @@ use alloc::{vec, vec::Vec};
 use sqlparser::ast::Action;
 
 use crate::{
-    traits::{DatabaseLike, GrantLike},
+    traits::{DatabaseLike, GrantLike, role::grant_reaches},
     utils::identifier_resolution::identifiers_match,
 };
 
@@ -158,9 +158,7 @@ impl<'names> HeldPrivileges<'names> {
         covered: Option<&[bool]>,
         database: &G::DB,
     ) {
-        if !(grant.applies_to_public()
-            || holders.iter().any(|holder| grant.applies_to_role(holder)))
-        {
+        if !grant_reaches(grant, holders) {
             return;
         }
         if grant.is_all_privileges() {

@@ -2,6 +2,8 @@
 
 use alloc::format;
 
+use sqlparser::ast::Action;
+
 use crate::{
     errors::{LookupError, ObjectKind},
     structs::{ParserDB, Sequence, SequenceParameters, StoredSequenceOwner},
@@ -71,5 +73,13 @@ impl SequenceLike for Sequence {
 
     fn origin(&self) -> SequenceOrigin {
         Sequence::origin(self)
+    }
+
+    fn authorization(&self) -> Option<&str> {
+        self.authorization_owner()
+    }
+
+    fn authorization_privileges(&self) -> impl Iterator<Item = &Action> {
+        self.owner_privileges().iter()
     }
 }
