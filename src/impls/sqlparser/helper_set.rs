@@ -3,6 +3,7 @@
 
 use alloc::{
     borrow::Cow,
+    boxed::Box,
     collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
