@@ -46,8 +46,8 @@ use super::{
     relations::{same_name, stored_column},
     sites::Kinds,
     terms::{
-        conjuncts, is_role_read, literal, sets_only_search_path, sql_query_body, unnested,
-        unreadable_body, unwrapped, user_type_named,
+        conjuncts, is_role_read, literal, sets_only_search_path, unnested, unreadable_body,
+        unwrapped, user_type_named,
     },
 };
 use crate::{
@@ -57,7 +57,9 @@ use crate::{
         callee_path::calls_path_changer,
         data_statement::{BodyPath, BodyWalk, RunTimeBody, resolve_on_body_path, walk_body},
         dql::{join_constraint, scoped_roots::ScopedRoot},
-        function_body::{SqlBody, hex_strings_may_be_integers, run_time_path, sql_body},
+        function_body::{
+            SqlBody, hex_strings_may_be_integers, run_time_path, sql_body, sql_query_body,
+        },
     },
     structs::{
         ActingRole, ColumnBinding, ColumnDefinition, DefinerReading, DefinitionSource, Deployment,

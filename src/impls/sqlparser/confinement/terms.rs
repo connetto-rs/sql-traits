@@ -1,12 +1,8 @@
 //! Expressions and SQL function bodies used by confinement proofs.
 
-use alloc::{borrow::Cow, string::ToString, vec, vec::Vec};
+use alloc::{string::ToString, vec, vec::Vec};
 
-use sqlparser::{
-    ast::{BinaryOperator, Expr, Function, FunctionArguments, Query, Statement, Value},
-    dialect::PostgreSqlDialect,
-    parser::Parser,
-};
+use sqlparser::ast::{BinaryOperator, Expr, Function, FunctionArguments, Value};
 
 use crate::{
     errors::LookupError,
@@ -24,14 +20,6 @@ pub(super) fn unwrapped(mut expression: &Expr) -> &Expr {
     }
 }
 
-/// The query of a body of statements, when it is one query.
-fn single_query(mut statements: Vec<Statement>) -> Option<Query> {
-    match (statements.pop(), statements.is_empty()) {
-        (Some(Statement::Query(query)), true) => Some(*query),
-        _ => None,
-    }
-}
-
 /// Whether `function` sets no configuration parameter besides
 /// `search_path`.
 pub(super) fn sets_only_search_path<F: FunctionLike>(function: &F) -> bool {
@@ -39,28 +27,6 @@ pub(super) fn sets_only_search_path<F: FunctionLike>(function: &F) -> bool {
         .configuration_parameters()
         .iter()
         .all(|parameter| parameter.name.to_string().eq_ignore_ascii_case("search_path"))
-}
-
-/// The query a `LANGUAGE sql` function runs, when its body is one query
-/// written as a string or as a `BEGIN ATOMIC` block.
-pub(super) fn sql_query_body<'f, F: FunctionLike>(
-    database: &F::DB,
-    function: &'f F,
-) -> Result<Option<Cow<'f, Query>>, LookupError> {
-    if function.stored_language().is_some_and(|language| language != "sql") {
-        return Ok(None);
-    }
-    if let Some(body) = function.body() {
-        return Ok(Parser::parse_sql(&PostgreSqlDialect {}, body)
-            .ok()
-            .and_then(single_query)
-            .map(Cow::Owned));
-    }
-    Ok(match function.atomic_statements(database)? {
-        Some(Cow::Borrowed([Statement::Query(query)])) => Some(Cow::Borrowed(query.as_ref())),
-        Some(Cow::Owned(statements)) => single_query(statements).map(Cow::Owned),
-        _ => None,
-    })
 }
 
 pub(super) use crate::traits::check_constraint::unnested;

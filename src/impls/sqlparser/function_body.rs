@@ -4,7 +4,8 @@
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use sqlparser::{
-    ast::{CreateFunctionBody, Expr, Select, Statement},
+    ast::{CreateFunctionBody, Expr, Query, Select, Statement},
+    dialect::PostgreSqlDialect,
     parser::Parser,
 };
 use sqlparser_plpgsql::{embedded::Block, embedded_sql};
@@ -195,6 +196,40 @@ pub(crate) fn atomic_statements<'f, F: FunctionLike>(
         Some(SqlBody::Atomic(statements)) => Some(statements),
         _ => None,
     })
+}
+
+/// The query a `LANGUAGE sql` function runs, when its body is one query
+/// written as a string or as a `BEGIN ATOMIC` block.
+///
+/// # Errors
+///
+/// Returns the errors [`FunctionLike::atomic_statements`] returns.
+pub(crate) fn sql_query_body<'f, F: FunctionLike>(
+    database: &F::DB,
+    function: &'f F,
+) -> Result<Option<Cow<'f, Query>>, LookupError> {
+    if function.stored_language().is_some_and(|language| language != "sql") {
+        return Ok(None);
+    }
+    if let Some(body) = function.body() {
+        return Ok(Parser::parse_sql(&PostgreSqlDialect {}, body)
+            .ok()
+            .and_then(single_query)
+            .map(Cow::Owned));
+    }
+    Ok(match function.atomic_statements(database)? {
+        Some(Cow::Borrowed([Statement::Query(query)])) => Some(Cow::Borrowed(query.as_ref())),
+        Some(Cow::Owned(statements)) => single_query(statements).map(Cow::Owned),
+        _ => None,
+    })
+}
+
+/// The query of a body of statements, when it is one query.
+fn single_query(mut statements: Vec<Statement>) -> Option<Query> {
+    match (statements.pop(), statements.is_empty()) {
+        (Some(Statement::Query(query)), true) => Some(*query),
+        _ => None,
+    }
 }
 
 /// The path a body read each time `function` runs starts under.

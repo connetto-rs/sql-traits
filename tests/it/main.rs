@@ -150,6 +150,7 @@ mod merged_column_bindings;
 mod multiple_primary_keys;
 mod names_outside_this_catalog;
 mod negated_length_checks;
+mod nested_query_truth;
 mod not_enforced_constraints;
 mod object_kind_reporting;
 mod only_drop_partition_keys;

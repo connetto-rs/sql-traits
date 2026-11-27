@@ -56,7 +56,7 @@ pub(crate) use dynamic_sites::{
 pub(crate) use foreign_key_constraint::{foreign_key_enforced, foreign_keys_stored_alike};
 pub(crate) use function_body::{
     atomic_statements, body_calls, body_expression, body_reads, body_site_source,
-    body_unqualified_names,
+    body_unqualified_names, sql_query_body,
 };
 pub use grant::apply_revoke_to_grant;
 pub(crate) use grant::{
