@@ -225,9 +225,11 @@ fn aggregates() -> Result<(), Error> {
     let sql = "(SELECT 10 / t.maybe FROM caps WHERE t.maybe <> 0 ORDER BY count(*)) IS NULL";
     assert_eq!(truth(sql)?.raising, Raising::Sometimes);
     // A call resolving to no function may be an aggregate, so the query
-    // stays unread.
+    // stays unread, whatever calls follow it.
     let sql = "(SELECT t.o FROM caps WHERE t.o > 5 ORDER BY count(o IS NULL)) > 5";
     assert!(truth(sql)?.outcomes.falsity);
+    let sql = "EXISTS (SELECT 1 FROM caps WHERE false ORDER BY count(o IS NULL), abs(1))";
+    assert!(truth(sql)?.outcomes.truth);
     // An aggregate in a nested query whose arguments read only columns of
     // `c` belongs to the query reading `c`, which then returns one row.
     for sql in [
