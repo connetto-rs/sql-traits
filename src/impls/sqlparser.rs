@@ -42,7 +42,9 @@ mod view;
 
 pub(crate) use check_constraint::check_enforced;
 pub(crate) use column_def::{foreign_options_of, generation_storage, serial_sequence_type};
-pub(crate) use confinement::{unconfined_function_read, unconfined_trigger_read};
+pub(crate) use confinement::{
+    checked_value_lists, unconfined_function_read, unconfined_trigger_read,
+};
 pub(crate) use create_domain::{bound_domain, domain_in_schema, domain_named};
 pub(crate) use create_table::parameter_value;
 pub(crate) use data_statement::BodyPath;

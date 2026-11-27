@@ -1018,9 +1018,8 @@ pub trait ColumnLike:
     /// literal other than `NULL`, under any parentheses, casts and sign, or
     /// `None` for any other column.
     ///
-    /// Every row holds this same value, which makes such a column the
-    /// discriminator of a subtype keyed to its supertype, as
-    /// [`ForeignKeyLike::referenced_constants`] reads it.
+    /// Every row holds this same value, which makes such a column a
+    /// [`Self::pinned_constant`].
     ///
     /// # Example
     ///
@@ -1053,6 +1052,68 @@ pub trait ColumnLike:
     /// ```
     fn generated_constant(&self) -> Option<&Expr> {
         self.generation_expression().filter(|expression| is_literal(expression))
+    }
+
+    /// Returns the one literal other than `NULL` every row of the table holds
+    /// in this column, or `None` when rows may differ in it.
+    ///
+    /// That is the [`Self::generated_constant`], or for a `NOT NULL` column
+    /// the literal a top-level conjunct of a validated check holds it `=` to,
+    /// in either operand order. A nullable column pins nothing to a check,
+    /// since a check holding `NULL` passes.
+    ///
+    /// Such a column is the discriminator of a subtype keyed to its
+    /// supertype, as [`ForeignKeyLike::is_extension_foreign_key`] and
+    /// [`ForeignKeyLike::referenced_constants`] read it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold the table this column belongs to.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (
+    ///          generated TEXT GENERATED ALWAYS AS ('t') STORED,
+    ///          checked TEXT NOT NULL DEFAULT 't' CHECK (checked = 't'),
+    ///          nullable TEXT CHECK (nullable = 't'),
+    ///          listed TEXT NOT NULL CHECK (listed IN ('t', 'u'))
+    ///      );",
+    /// )?;
+    /// let table =
+    ///     db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let constant = |name| -> Result<Option<String>, sql_traits::errors::Error> {
+    ///     let column = table.column(name, &db, IdentifierCase::AsWritten)?.expect("column exists");
+    ///     Ok(column.pinned_constant(&db)?.map(ToString::to_string))
+    /// };
+    /// assert_eq!(constant("generated")?.as_deref(), Some("'t'"));
+    /// assert_eq!(constant("checked")?.as_deref(), Some("'t'"));
+    /// assert_eq!(constant("nullable")?, None);
+    /// assert_eq!(constant("listed")?, None);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn pinned_constant<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<Option<&'db Expr>, LookupError> {
+        if let Some(constant) = self.generated_constant() {
+            return Ok(Some(constant));
+        }
+        Ok(crate::impls::checked_value_lists(database, self.borrow())?.into_iter().find_map(
+            |values| {
+                match values.as_slice() {
+                    [value] if is_literal(value) => Some(*value),
+                    _ => None,
+                }
+            },
+        ))
     }
 
     /// Returns the functions one call in the column's default or generation

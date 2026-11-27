@@ -15,6 +15,7 @@ mod writes;
 
 use alloc::vec::Vec;
 
+pub(crate) use self::identity::checked_value_lists;
 use self::{prover::Confinement, record::Record, sites::Kinds};
 use crate::{
     errors::LookupError,

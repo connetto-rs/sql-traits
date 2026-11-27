@@ -1,6 +1,7 @@
 //! Tests that a subtype keyed to its supertype through the primary key plus
-//! columns generated as constants extends the supertype, and that the key
-//! hands those constants to whoever writes the supertype's row.
+//! columns held to constants, by generation or by a check, extends the
+//! supertype, and that the key hands those constants to whoever writes the
+//! supertype's row.
 #![expect(clippy::expect_used, reason = "a test fails loudly on a broken premise")]
 
 use sql_traits::prelude::*;
@@ -186,4 +187,138 @@ CREATE TABLE wider (id INT, kind TEXT, PRIMARY KEY (id, kind),
     assert!(!is_extension(&database, "crossed", &["a", "b"]));
     assert!(!is_extension(&database, "keyless", &["id", "kind"]));
     assert!(!is_extension(&database, "wider", &["id", "kind"]));
+}
+
+/// A `NOT NULL` column that a validated check of its table holds `=` one
+/// literal is a discriminator, as a column generated as that literal is.
+#[test]
+fn a_check_pinning_a_not_null_column_makes_a_discriminator() {
+    let database = parse(
+        "
+CREATE TYPE grantee_kind AS ENUM ('user', 'organization', 'team', 'bot', 'group', 'guest');
+CREATE TABLE grantees (id UUID PRIMARY KEY, kind grantee_kind NOT NULL, UNIQUE (id, kind));
+CREATE TABLE users (
+  id UUID PRIMARY KEY,
+  kind grantee_kind NOT NULL DEFAULT 'user' CHECK (kind = 'user'),
+  FOREIGN KEY (id, kind) REFERENCES grantees (id, kind)
+);
+CREATE TABLE organizations (
+  id UUID PRIMARY KEY,
+  kind grantee_kind NOT NULL,
+  CHECK ('organization'::grantee_kind = kind AND id IS NOT NULL),
+  FOREIGN KEY (id, kind) REFERENCES grantees (id, kind)
+);
+CREATE TABLE teams (
+  id UUID PRIMARY KEY,
+  kind grantee_kind DEFAULT 'team' CHECK (kind = 'team'),
+  FOREIGN KEY (id, kind) REFERENCES grantees (id, kind)
+);
+CREATE TABLE bots (
+  id UUID PRIMARY KEY,
+  kind grantee_kind NOT NULL,
+  FOREIGN KEY (id, kind) REFERENCES grantees (id, kind)
+);
+ALTER TABLE bots ADD CONSTRAINT bots_kind CHECK (kind = 'bot') NOT VALID;
+CREATE TABLE groups (
+  id UUID PRIMARY KEY,
+  kind grantee_kind NOT NULL CHECK (kind IN ('group', 'team')),
+  FOREIGN KEY (id, kind) REFERENCES grantees (id, kind)
+);
+CREATE TABLE guests (
+  id UUID PRIMARY KEY,
+  kind grantee_kind NOT NULL CHECK (kind = 'guest' OR kind = 'bot'),
+  FOREIGN KEY (id, kind) REFERENCES grantees (id, kind)
+);
+",
+    );
+    assert!(is_extension(&database, "users", &["id", "kind"]));
+    assert_eq!(ancestors(&database, "users"), ["grantees"]);
+    assert_eq!(
+        constants(&database, "users", &["id", "kind"]),
+        [("kind".to_owned(), "'user'".to_owned())]
+    );
+    assert!(is_extension(&database, "organizations", &["id", "kind"]));
+    assert_eq!(
+        constants(&database, "organizations", &["id", "kind"]),
+        [("kind".to_owned(), "'organization'::grantee_kind".to_owned())]
+    );
+    assert!(!is_extension(&database, "teams", &["id", "kind"]), "a NULL kind skips the key");
+    assert!(!is_extension(&database, "bots", &["id", "kind"]), "old rows may hold any kind");
+    assert!(!is_extension(&database, "groups", &["id", "kind"]), "two kinds are allowed");
+    assert!(!is_extension(&database, "guests", &["id", "kind"]), "either kind is allowed");
+}
+
+const ARCHIVED_RESOURCES: &str = "
+CREATE TYPE resource_kind AS ENUM ('project', 'ownable');
+CREATE TABLE resources (
+  id UUID PRIMARY KEY,
+  organization_id UUID NOT NULL,
+  kind resource_kind NOT NULL,
+  archived BOOLEAN NOT NULL DEFAULT FALSE,
+  UNIQUE (organization_id, id, kind, archived)
+);
+CREATE TABLE asset_models (
+  id UUID PRIMARY KEY REFERENCES resources (id) ON DELETE CASCADE,
+  organization_id UUID NOT NULL,
+  archived BOOLEAN NOT NULL DEFAULT FALSE,
+  kind resource_kind NOT NULL DEFAULT 'ownable' CHECK (kind = 'ownable'),
+  FOREIGN KEY (organization_id, id, kind, archived)
+    REFERENCES resources (organization_id, id, kind, archived) ON UPDATE CASCADE ON DELETE CASCADE
+);
+CREATE TABLE loose_models (
+  id UUID PRIMARY KEY REFERENCES resources (id),
+  organization_id UUID,
+  archived BOOLEAN NOT NULL DEFAULT FALSE,
+  kind resource_kind NOT NULL DEFAULT 'ownable' CHECK (kind = 'ownable'),
+  FOREIGN KEY (organization_id, id, kind, archived)
+    REFERENCES resources (organization_id, id, kind, archived)
+);
+CREATE TABLE late_models (
+  id UUID PRIMARY KEY REFERENCES resources (id),
+  organization_id UUID NOT NULL,
+  archived BOOLEAN NOT NULL DEFAULT FALSE,
+  kind resource_kind NOT NULL DEFAULT 'ownable' CHECK (kind = 'ownable')
+);
+ALTER TABLE late_models ADD CONSTRAINT late_models_archive
+  FOREIGN KEY (organization_id, id, kind, archived)
+  REFERENCES resources (organization_id, id, kind, archived) NOT VALID;
+CREATE TABLE linked_models (
+  id UUID PRIMARY KEY REFERENCES resources (id),
+  organization_id UUID NOT NULL,
+  archived BOOLEAN NOT NULL DEFAULT FALSE,
+  linked_id UUID NOT NULL,
+  kind resource_kind NOT NULL DEFAULT 'ownable' CHECK (kind = 'ownable'),
+  FOREIGN KEY (organization_id, linked_id, kind, archived)
+    REFERENCES resources (organization_id, id, kind, archived)
+);
+";
+
+/// Another key that pairs the host primary key with the same referenced
+/// columns reaches the same row of the supertype, so the constants it pins
+/// there are the supertype's discriminators too.
+#[test]
+fn a_sibling_key_hands_over_the_constants_it_pins_into_the_same_row() {
+    let database = parse(ARCHIVED_RESOURCES);
+    assert!(is_extension(&database, "asset_models", &["id"]));
+    assert!(!is_extension(
+        &database,
+        "asset_models",
+        &["organization_id", "id", "kind", "archived"]
+    ));
+    assert_eq!(ancestors(&database, "asset_models"), ["resources"]);
+    assert_eq!(
+        constants(&database, "asset_models", &["id"]),
+        [("kind".to_owned(), "'ownable'".to_owned())]
+    );
+}
+
+/// A sibling key hands over nothing when the database may skip it on a row,
+/// through a `NULL` host column or rows older than the key, or when it
+/// reaches another row.
+#[test]
+fn a_sibling_key_the_database_may_skip_hands_over_nothing() {
+    let database = parse(ARCHIVED_RESOURCES);
+    assert_eq!(constants(&database, "loose_models", &["id"]), []);
+    assert_eq!(constants(&database, "late_models", &["id"]), []);
+    assert_eq!(constants(&database, "linked_models", &["id"]), []);
 }

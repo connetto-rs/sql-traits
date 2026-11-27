@@ -1514,9 +1514,10 @@ pub trait ForeignKeyLike:
     /// row of the referenced table too.
     ///
     /// The host primary key lands on the referenced primary key column for
-    /// column, in any order, and every other host column is generated as a
-    /// constant, a [`ColumnLike::generated_constant`] discriminator, landing
-    /// outside the referenced primary key. A self-reference is no extension.
+    /// column, in any order, and every other host column holds a constant, a
+    /// [`ColumnLike::pinned_constant`] discriminator generated or checked to
+    /// it, landing outside the referenced primary key. A self-reference is no
+    /// extension.
     ///
     /// # Arguments
     ///
@@ -1554,6 +1555,11 @@ pub trait ForeignKeyLike:
     ///     parent_id INT,
     ///     FOREIGN KEY (parent_id) REFERENCES parent_table(id)
     /// );
+    /// CREATE TABLE checked_table (
+    ///     id INT PRIMARY KEY,
+    ///     kind TEXT NOT NULL DEFAULT 'checked' CHECK (kind = 'checked'),
+    ///     FOREIGN KEY (id, kind) REFERENCES parent_table(id, kind)
+    /// );
     /// CREATE TABLE written_kind_table (
     ///     id INT PRIMARY KEY,
     ///     kind TEXT NOT NULL,
@@ -1573,6 +1579,7 @@ pub trait ForeignKeyLike:
     /// };
     /// assert!(is_extension("extension_table")?);
     /// assert!(is_extension("discriminated_table")?, "kind is a generated constant");
+    /// assert!(is_extension("checked_table")?, "kind is checked to a constant");
     /// assert!(!is_extension("reference_table")?, "parent_id is not the primary key");
     /// assert!(!is_extension("written_kind_table")?, "kind is written by each row");
     /// assert!(!is_extension("self_ref_table")?, "a self-reference extends nothing");
@@ -1600,7 +1607,7 @@ pub trait ForeignKeyLike:
                     return Ok(false);
                 }
                 primary_key_pairs += 1;
-            } else if host_column.generated_constant().is_none()
+            } else if host_column.pinned_constant(database)?.is_none()
                 || referenced_primary_key.contains(&referenced_column)
             {
                 return Ok(false);
@@ -1610,9 +1617,16 @@ pub trait ForeignKeyLike:
         Ok(primary_key_pairs == host_primary_key.len())
     }
 
-    /// Iterates over the referenced columns this foreign key fills with a
-    /// constant, each with the [`ColumnLike::generated_constant`] of the host
-    /// column at its position.
+    /// Iterates over the referenced columns the row this foreign key
+    /// references holds at a constant, each with the
+    /// [`ColumnLike::pinned_constant`] of the host column that fills it.
+    ///
+    /// These come from the host columns of this key, then from those of every
+    /// other key of the host table that reaches the same row. Such a key
+    /// references the same table, pairs each host column of this key with the
+    /// same referenced column, is validated, and has no nullable host column,
+    /// since a `NULL` in one would let a row skip it. Each referenced column
+    /// comes once, with the first constant found for it.
     ///
     /// On an [extension key](Self::is_extension_foreign_key) these are the
     /// supertype's discriminators, the values a writer of the subtype puts in
@@ -1638,22 +1652,37 @@ pub trait ForeignKeyLike:
     ///
     /// let db = ParserDB::parse::<PostgreSqlDialect>(
     ///     "
-    /// CREATE TABLE resources (id INT PRIMARY KEY, kind TEXT NOT NULL, UNIQUE (id, kind));
+    /// CREATE TABLE resources (
+    ///     id INT PRIMARY KEY,
+    ///     kind TEXT NOT NULL,
+    ///     archived BOOLEAN NOT NULL,
+    ///     UNIQUE (id, kind),
+    ///     UNIQUE (id, kind, archived)
+    /// );
     /// CREATE TABLE ownables (
     ///     id INT PRIMARY KEY,
     ///     kind TEXT GENERATED ALWAYS AS ('ownable') STORED,
     ///     FOREIGN KEY (id, kind) REFERENCES resources (id, kind)
     /// );
+    /// CREATE TABLE projects (
+    ///     id INT PRIMARY KEY REFERENCES resources (id),
+    ///     kind TEXT NOT NULL DEFAULT 'project' CHECK (kind = 'project'),
+    ///     archived BOOLEAN NOT NULL,
+    ///     FOREIGN KEY (id, kind, archived) REFERENCES resources (id, kind, archived)
+    /// );
     /// ",
     /// )?;
-    /// let ownables =
-    ///     db.table_by_target(TargetName::new("ownables", false), IdentifierCase::AsWritten)?.unwrap();
-    /// let foreign_key = ownables.foreign_keys(&db)?.next().expect("Should have a foreign key");
-    /// let constants: Vec<_> = foreign_key
-    ///     .referenced_constants(&db)?
-    ///     .map(|(column, constant)| (column.column_name(), constant.to_string()))
-    ///     .collect();
-    /// assert_eq!(constants, [("kind", "'ownable'".to_owned())]);
+    /// let constants = |name| -> Result<Vec<(String, String)>, sql_traits::errors::Error> {
+    ///     let table =
+    ///         db.table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)?.unwrap();
+    ///     let foreign_key = table.foreign_keys(&db)?.next().expect("Should have a foreign key");
+    ///     Ok(foreign_key
+    ///         .referenced_constants(&db)?
+    ///         .map(|(column, constant)| (column.column_name().to_owned(), constant.to_string()))
+    ///         .collect())
+    /// };
+    /// assert_eq!(constants("ownables")?, [("kind".to_owned(), "'ownable'".to_owned())]);
+    /// assert_eq!(constants("projects")?, [("kind".to_owned(), "'project'".to_owned())]);
     /// # Ok(())
     /// # }
     /// ```
@@ -1667,11 +1696,46 @@ pub trait ForeignKeyLike:
     where
         Self: 'db,
     {
-        Ok(self.host_columns(database)?.zip(self.referenced_columns(database)?).filter_map(
-            |(host_column, referenced_column)| {
-                Some((referenced_column, host_column.generated_constant()?))
-            },
-        ))
+        let pairs: Vec<_> =
+            self.host_columns(database)?.zip(self.referenced_columns(database)?).collect();
+        let referenced_table = self.referenced_table(database)?;
+        let mut reaching_siblings = Vec::new();
+        for sibling in self.host_table(database).foreign_keys(database)? {
+            let sibling: &'db Self = sibling.borrow();
+            if sibling == self
+                || sibling.referenced_table(database)? != referenced_table
+                || !sibling.is_validated(database)?
+            {
+                continue;
+            }
+            let sibling_pairs: Vec<_> = sibling
+                .host_columns(database)?
+                .zip(sibling.referenced_columns(database)?)
+                .collect();
+            if !pairs.iter().all(|pair| sibling_pairs.contains(pair)) {
+                continue;
+            }
+            let mut skippable = false;
+            for (host_column, _) in &sibling_pairs {
+                skippable |= host_column.is_nullable(database)?;
+            }
+            if !skippable {
+                reaching_siblings.push(sibling_pairs);
+            }
+        }
+
+        let mut constants: Vec<(_, &'db Expr)> = Vec::new();
+        for (host_column, referenced_column) in
+            core::iter::once(pairs).chain(reaching_siblings).flatten()
+        {
+            if constants.iter().any(|(collected, _)| *collected == referenced_column) {
+                continue;
+            }
+            if let Some(constant) = host_column.pinned_constant(database)? {
+                constants.push((referenced_column, constant));
+            }
+        }
+        Ok(constants.into_iter())
     }
 
     /// Returns whether the key is a singleton foreign key, i.e. it is the only
