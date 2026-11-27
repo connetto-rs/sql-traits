@@ -227,6 +227,33 @@ fn privileges_and_policies_of_the_reading_role() -> Result<(), Error> {
 }
 
 #[test]
+fn reads_run_as_each_acting_role_of_the_deployment() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA)?;
+    let table =
+        db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    let read = |sql: &str, acting: &[&str]| -> Result<ExpressionTruth, Error> {
+        let deployment = Deployment::new("authenticator", acting.iter().copied(), []).unwrap();
+        let assumptions = [Assumption::Deployment(&deployment)];
+        Ok(table.truth_under(&db, &expression(sql), IdentifierCase::AsWritten, &assumptions)?)
+    };
+    // `keeper` owns `hidden`, and `bypasser` skips the policy of `guarded`.
+    assert_eq!(read("EXISTS (SELECT 1 FROM hidden)", &["keeper"])?, never_raising(UNDECIDED));
+    assert_eq!(read("EXISTS (SELECT 1 FROM guarded)", &["bypasser"])?, never_raising(UNDECIDED));
+    for (sql, acting) in [
+        // `bypasser` may not read `hidden`.
+        ("EXISTS (SELECT 1 FROM hidden)", ["keeper", "bypasser"].as_slice()),
+        // `keeper` owns `hidden` but not `guarded`, whose policy divides by
+        // `n`.
+        ("EXISTS (SELECT 1 FROM guarded)", ["keeper", "bypasser"].as_slice()),
+        // A role the schema does not declare may be subject to every policy.
+        ("EXISTS (SELECT 1 FROM guarded)", ["ghost"].as_slice()),
+    ] {
+        assert_eq!(read(sql, acting)?.raising, Raising::Sometimes, "{sql} as {acting:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn helper_shapes() -> Result<(), Error> {
     for (sql, outcomes) in [
         ("o = ANY (ARRAY(SELECT capped(2)))", Outcomes::ANY),

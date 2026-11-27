@@ -64,9 +64,8 @@ pub(super) struct Nested<'a, DB: DatabaseLike> {
     running: Vec<usize>,
     /// The functions a call reached, whose addresses their callees carry.
     functions: Vec<&'a DB::Function>,
-    /// The role the expression being read runs as, `None` for one the read
-    /// does not know.
-    role: Option<&'a DB::Role>,
+    /// The role the expression being read runs as.
+    reader: Reader<'a, DB::Role>,
 }
 
 impl<DB: DatabaseLike> Default for Nested<'_, DB> {
@@ -80,7 +79,7 @@ impl<DB: DatabaseLike> Default for Nested<'_, DB> {
             raising: Vec::new(),
             running: Vec::new(),
             functions: Vec::new(),
-            role: None,
+            reader: Reader::Caller,
         }
     }
 }
@@ -98,9 +97,33 @@ impl<'a, DB: DatabaseLike> Nested<'a, DB> {
 
     /// The role the read runs as, as the caches key it.
     fn role_key(&self) -> usize {
-        self.role.map_or(0, |role| ptr::from_ref(role).addr())
+        match self.reader {
+            Reader::Caller => 0,
+            Reader::Unknown => 1,
+            Reader::Role(role) => ptr::from_ref(role).addr(),
+        }
     }
 }
+
+/// The role a read runs as.
+enum Reader<'a, R> {
+    /// The role running the expression the read starts from, each acting
+    /// role of the assumed deployment, or one the read does not know where
+    /// none is assumed.
+    Caller,
+    /// A role the database declares.
+    Role(&'a R),
+    /// A role the read does not know.
+    Unknown,
+}
+
+impl<R> Clone for Reader<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for Reader<'_, R> {}
 
 /// A query the read may meet, its names bound before the read.
 struct QueryPlan<'a, DB: DatabaseLike> {
@@ -783,31 +806,65 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
 
     /// Whether scanning `table` may raise for the role the read runs as,
     /// through a missing `SELECT` privilege or a policy clause that may
-    /// raise on a row it tests.
+    /// raise on a row it tests. The caller's read may raise where the read
+    /// of any acting role of the assumed deployment may.
     fn table_read_raises(&mut self, table: &'a DB::Table) -> Result<bool, LookupError> {
-        let database = self.database;
-        let privileges = match self.nested.role {
-            Some(role) => table.privileges(role, database)?,
-            None => table.privileges(ActingRole::Public, database)?,
+        let Reader::Caller = self.nested.reader else {
+            return self.read_raises_as(table, self.nested.reader);
         };
-        if !privileges.select.on_table() {
-            return Ok(true);
-        }
-        let Some(clauses) = self.select_clauses(table) else { return Ok(true) };
-        for clause in clauses {
-            if self.policy_raises(table, clause)? {
+        let Some(deployment) = self.deployment else {
+            return self.read_raises_as(table, Reader::Unknown);
+        };
+        let database = self.database;
+        for name in deployment.acting_roles() {
+            let reader = database.role(name).map_or(Reader::Unknown, Reader::Role);
+            if self.read_raises_as(table, reader)? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    /// The policy clauses a `SELECT` tests on the rows of `table` it scans,
-    /// those of every role where the read does not know the role it runs as,
-    /// `None` where PostgreSQL refuses the read or the policies do not settle.
-    fn select_clauses(&self, table: &'a DB::Table) -> Option<Vec<&'a Expr>> {
+    /// [`Self::table_read_raises`] for the read running as `reader`, a
+    /// known role or an unknown one, which needs `PUBLIC` to hold `SELECT`
+    /// and every policy clause a `SELECT` may test to be safe.
+    fn read_raises_as(
+        &mut self,
+        table: &'a DB::Table,
+        reader: Reader<'a, DB::Role>,
+    ) -> Result<bool, LookupError> {
         let database = self.database;
-        if let Some(role) = self.nested.role {
+        let privileges = match reader {
+            Reader::Role(role) => table.privileges(role, database)?,
+            Reader::Caller | Reader::Unknown => table.privileges(ActingRole::Public, database)?,
+        };
+        if !privileges.select.on_table() {
+            return Ok(true);
+        }
+        let Some(clauses) = self.select_clauses(table, reader) else { return Ok(true) };
+        let caller = mem::replace(&mut self.nested.reader, reader);
+        let mut raises = Ok(false);
+        for clause in clauses {
+            raises = self.policy_raises(table, clause);
+            if !matches!(raises, Ok(false)) {
+                break;
+            }
+        }
+        self.nested.reader = caller;
+        raises
+    }
+
+    /// The policy clauses a `SELECT` running as `reader` tests on the rows
+    /// of `table` it scans, those of every role for a role the read does not
+    /// know. `None` where PostgreSQL refuses the read or the policies do not
+    /// settle.
+    fn select_clauses(
+        &self,
+        table: &'a DB::Table,
+        reader: Reader<'a, DB::Role>,
+    ) -> Option<Vec<&'a Expr>> {
+        let database = self.database;
+        if let Reader::Role(role) = reader {
             return match table.row_security(RowStatement::Select, role, database).ok()? {
                 RowSecurity::Exempt(_) => Some(Vec::new()),
                 RowSecurity::Gated(gates) => {
@@ -1070,15 +1127,19 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         }
         self.nested.running.push(address);
         let frame = self.save();
-        let caller = self.nested.role;
+        let caller = self.nested.reader;
         // A `SECURITY DEFINER` body runs as the function's owner.
         if function.security_mode() == FunctionSecurity::Definer {
             let database = self.database;
-            self.nested.role =
-                function.owner(database).ok().flatten().and_then(|owner| database.role(owner));
+            self.nested.reader = function
+                .owner(database)
+                .ok()
+                .flatten()
+                .and_then(|owner| database.role(owner))
+                .map_or(Reader::Unknown, Reader::Role);
         }
         let answered = self.read_body(function, arguments);
-        self.nested.role = caller;
+        self.nested.reader = caller;
         self.restore(frame);
         self.nested.running.pop();
         let answered = answered?;
