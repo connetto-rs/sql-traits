@@ -6,9 +6,13 @@
     reason = "Tests require parsed fixtures of a known shape."
 )]
 
-use sql_traits::{errors::Error, prelude::*};
+use sql_traits::{
+    errors::Error,
+    prelude::*,
+    structs::{SessionSetting, SettingValue},
+};
 use sqlparser::{
-    ast::{Expr, SetExpr, Statement},
+    ast::{DataType, Expr, SetExpr, Statement},
     dialect::{
         ClickHouseDialect, Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect,
         PostgreSqlDialect, SQLiteDialect, SnowflakeDialect,
@@ -428,6 +432,50 @@ fn helper_shapes() -> Result<(), Error> {
         ("k IN (SELECT k FROM capped2(2) WHERE o > 0)", UNDECIDED),
     ] {
         assert_eq!(truth(sql)?, never_raising(outcomes), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn expression_forms_in_nested_queries() -> Result<(), Error> {
+    for (sql, outcomes) in [
+        ("(SELECT NULLIF(1, 2)) IS NULL", Outcomes::FALSE),
+        ("(SELECT NULLIF('a', '')) IS NULL", Outcomes::FALSE),
+        ("(SELECT COALESCE(t.maybe, 0)) IS NULL", Outcomes::FALSE),
+        ("(SELECT GREATEST(1, 2)) = 2", Outcomes::TRUE),
+        ("(SELECT current_user) IS NULL", Outcomes::FALSE),
+        ("o IN (SELECT NULLIF(o, 0) FROM caps)", Outcomes::ANY),
+        ("EXISTS (SELECT 1 WHERE (SELECT COALESCE(t.maybe, 1)) > 0)", UNDECIDED),
+    ] {
+        assert_eq!(truth(sql)?, never_raising(outcomes), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_setting_read_through_nullif_in_a_body() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE ROLE app NOLOGIN;
+         CREATE FUNCTION installation() RETURNS UUID LANGUAGE sql STABLE AS
+             $$ SELECT NULLIF(current_setting('app.installation_id', true), '')::uuid $$;
+         CREATE TABLE t (o INT NOT NULL);",
+    )?;
+    let table =
+        db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    let setting =
+        SessionSetting::value("app.installation_id", SettingValue::Scalar(DataType::Uuid))
+            .unwrap()
+            .may_be_unset();
+    let deployment = Deployment::new("app", ["app"], [setting]).unwrap();
+    let assumptions = [Assumption::Deployment(&deployment)];
+    for sql in [
+        "NULLIF(current_setting('app.installation_id', true), '')::uuid IS NULL",
+        "(SELECT NULLIF(current_setting('app.installation_id', true), '')::uuid) IS NULL",
+        "installation() IS NULL",
+    ] {
+        let truth =
+            table.truth_under(&db, &expression(sql), IdentifierCase::AsWritten, &assumptions)?;
+        assert_eq!(truth, never_raising(UNDECIDED), "{sql}");
     }
     Ok(())
 }

@@ -35,6 +35,7 @@ use crate::{
     },
     traits::{DataTypeLike, DatabaseLike, FunctionLike, PolicyLike, TableLike},
     utils::{
+        call_sites::expression_form,
         postgres_types::PgType,
         walk::{walk, walk_expressions},
     },
@@ -670,6 +671,11 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                 queries: Vec::new(),
                 each: |nested: Option<usize>, call: &Function| -> Result<(), LookupError> {
                     if !known {
+                        return Ok(());
+                    }
+                    // An expression written as a call, such as `NULLIF`, runs
+                    // no function and is neither an aggregate nor a set.
+                    if expression_form(&call.name).is_some() {
                         return Ok(());
                     }
                     if let Some(address) = nested {
