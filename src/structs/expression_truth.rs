@@ -11,7 +11,7 @@ use alloc::{
 };
 use core::{
     cell::RefCell,
-    ops::{Bound, ControlFlow},
+    ops::{Bound, ControlFlow, Range},
     ptr,
 };
 
@@ -25,8 +25,8 @@ use sqlparser::{
 use sqlparser_expr_eval::{
     ArrayElement, Builtin, Callee, CalleeKind, Collation, Context, EnumType, EvalDialect,
     Evaluation, Guarantees, Interval, NullInput, NullResult, OtherType, Outcomes,
-    PostgreSqlOptions, Resolved, ScalarType, Subject, TextRules, Unlisted, Values, Volatility,
-    evaluate, implied,
+    PostgreSqlOptions, QueryEvaluation, Resolved, ScalarType, Subject, TextRules, Unlisted, Values,
+    Volatility, evaluate, implied,
     sql_values::postgres::{IntegerType, PgNumeric},
 };
 
@@ -58,9 +58,11 @@ use crate::{
 };
 
 mod body;
+mod nested;
 mod setting;
 
 pub(crate) use body::BodyTruth;
+use nested::Nested;
 
 /// What an expression can evaluate to on the rows of a table.
 ///
@@ -249,6 +251,14 @@ pub(crate) fn table_truth<'a, DB: DatabaseLike>(
     let mut context = TruthContext::new(database, case, own);
     let read = context.read_table(None, table, false)?;
     context.caller = Some(read);
+    context.top_reads = Some(context.tables.len());
+    let assumed = assumptions.iter().filter_map(|assumption| {
+        match assumption {
+            Assumption::Expression { expression, .. } => Some(*expression),
+            Assumption::Check(_) | Assumption::Deployment(_) => None,
+        }
+    });
+    context.plan_table(table, core::iter::once(expression).chain(assumed));
     context.truth(expression, assumptions)
 }
 
@@ -271,6 +281,13 @@ pub(crate) fn site_truth<'a, DB: DatabaseLike>(
     for assumption in assumptions {
         if let Assumption::Expression { expression, .. } = assumption {
             truth.bind_site(context, expression, &mut site)?;
+        }
+    }
+    truth.top_reads = Some(truth.tables.len());
+    truth.plan(context, expression);
+    for assumption in assumptions {
+        if let Assumption::Expression { expression, .. } = assumption {
+            truth.plan(context, *expression);
         }
     }
     truth.site = Some(site);
@@ -428,18 +445,24 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             engine: Engine::of(database),
             named: Vec::new(),
             tables: Vec::new(),
+            top_reads: None,
             site: None,
             caller: None,
+            caller_scope: None,
+            root: 0,
+            roots: 0,
             reading: None,
             read_value: None,
             value: None,
             source: Source::Expression,
             own,
+            current: None,
             collations: Vec::new(),
             enums: Enums::default(),
             reached: Vec::new(),
             checking: Vec::new(),
             deployment: None,
+            nested: Nested::default(),
         }
     }
 
@@ -487,24 +510,40 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         }
         self.reading = self.caller;
         self.source = self.own.map_or_else(|| self.caller_source(), Source::Check);
+        self.current = Some(guarantees.clone());
         let evaluation = evaluate(expression, dialect, options, &mut self, &guarantees)?;
         Ok(ExpressionTruth::from(&evaluation))
     }
 
     /// What the domain checks, the generated columns, the checks of the
-    /// tables read and the `assumptions` guarantee about the values the read
-    /// names, under `dialect` and its `options`.
+    /// tables the caller's names read and the `assumptions` guarantee about
+    /// the values the read names, under `dialect` and its `options`.
     fn guarantees<D: EvalDialect>(
         &mut self,
         dialect: &D,
         options: &D::Options,
         assumptions: &[Assumption<'a, DB>],
     ) -> Result<Guarantees<usize>, LookupError> {
-        let database = self.database;
-        let mut guarantees = self.domain_guarantees(dialect, options)?;
+        let guarantees = self.domain_guarantees(dialect, options)?;
         self.value = self.read_value;
+        let reads = 0..self.top_reads.unwrap_or(self.tables.len());
+        self.seeded(dialect, options, guarantees, reads, assumptions)
+    }
+
+    /// `guarantees` narrowed by what the generated columns and the checks of
+    /// the table reads `reads` and the `assumptions` guarantee, under
+    /// `dialect` and its `options`.
+    fn seeded<D: EvalDialect>(
+        &mut self,
+        dialect: &D,
+        options: &D::Options,
+        mut guarantees: Guarantees<usize>,
+        reads: Range<usize>,
+        assumptions: &[Assumption<'a, DB>],
+    ) -> Result<Guarantees<usize>, LookupError> {
+        let database = self.database;
         let mut generated = Vec::new();
-        for read in 0..self.tables.len() {
+        for read in reads.clone() {
             self.reading = Some(read);
             for column in self.tables[read].table.columns(database)? {
                 if let Some(expression) = column.generation_expression() {
@@ -516,7 +555,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             }
         }
         let mut seeding = Vec::new();
-        for read in 0..self.tables.len() {
+        for read in reads {
             self.reading = Some(read);
             let table = self.tables[read].table;
             let held = assumptions.iter().filter_map(|assumption| {
@@ -589,9 +628,19 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         dialect: &D,
         options: &D::Options,
     ) -> Result<Guarantees<usize>, LookupError> {
+        self.domain_guarantees_over(dialect, options, 0..self.named.len())
+    }
+
+    /// [`Self::domain_guarantees`] over the named values `named` alone.
+    fn domain_guarantees_over<D: EvalDialect>(
+        &mut self,
+        dialect: &D,
+        options: &D::Options,
+        named: Range<usize>,
+    ) -> Result<Guarantees<usize>, LookupError> {
         let database = self.database;
         let mut guarantees = Guarantees::new();
-        for named in 0..self.named.len() {
+        for named in named {
             let mut domain = self.named[named].domain;
             if domain.is_none() {
                 continue;
@@ -642,7 +691,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// `checked`.
     fn read_table(
         &mut self,
-        relation: Option<RelationSlot>,
+        relation: Option<Relation>,
         table: &'a DB::Table,
         checked: bool,
     ) -> Result<usize, LookupError> {
@@ -777,9 +826,9 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         node: &Expr,
         parts: &[Ident],
     ) -> Result<Option<usize>, LookupError> {
-        let database = self.database;
+        let (database, root) = (self.database, self.root);
         let rule = context.rule(node);
-        let unbound = || Key::Name { rule, parts: stored_parts(parts) };
+        let unbound = || Key::Name { root, rule, parts: stored_parts(parts) };
         let Some((definition, binding)) = context.reference(node)? else {
             if let Some(value) = context.domain_value(node) {
                 let evaluation = self.engine.operand(&value, database, &self.enums);
@@ -797,6 +846,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         let built = rule.is_some_and(|rule| {
             context.reads_built_rows(rule, relation.map(|slot| slot.scope), node)
         });
+        let relation = relation.map(|slot| Relation { root, slot });
         let output = || {
             let key = match (relation, binding.origin()) {
                 (
@@ -810,21 +860,30 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         };
         let key = match definition {
             ColumnDefinition::Base { table, column, database: catalog } => {
+                // A query the caller's expression nests reads the caller's
+                // row through the scope the expression's context reaches.
+                if let (Some(caller), Some(relation)) = (self.caller, relation)
+                    && !built
+                    && self.caller_scope == Some((root, relation.slot.scope))
+                    && ptr::eq(table, self.tables[caller].table)
+                {
+                    return Ok(self.column_named(caller, column));
+                }
                 let held =
                     if ptr::eq(catalog, database) { self.held(table, column)? } else { None };
                 if let Some((table, column)) = held
                     && !built
-                    && let Some(relation) = relation.filter(|slot| {
-                        slot.relation.table
-                            && slot.relation.constrained
-                            && !slot.relation.null_extended
+                    && let Some(relation) = relation.filter(|relation| {
+                        relation.slot.relation.table
+                            && relation.slot.relation.constrained
+                            && !relation.slot.relation.null_extended
                     })
                 {
                     let read = self.read_table(Some(relation), table, true)?;
                     return Ok(self.column_named(read, column));
                 }
                 let key = match relation {
-                    Some(relation) if relation.relation.table => {
+                    Some(relation) if relation.slot.relation.table => {
                         let key = Key::Column {
                             relation: Some(relation),
                             column: ptr::from_ref(column).addr(),
@@ -963,6 +1022,17 @@ impl<F: FnMut(&Expr) -> Result<(), LookupError>> Visitor for TopLevel<F> {
     }
 }
 
+/// A relation of one of the contexts the read binds names in, by the number
+/// of the context and the relation's slot in it, since the slots of two
+/// contexts count from the same start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Relation {
+    /// The number of the context, zero for the caller's.
+    root: usize,
+    /// The relation within the context.
+    slot: RelationSlot,
+}
+
 /// What a value the read names stands for, which tells two references of one
 /// value from references of two.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -971,14 +1041,14 @@ enum Key {
     /// `None` for the table a table read reads.
     Column {
         /// The relation reading the table.
-        relation: Option<RelationSlot>,
+        relation: Option<Relation>,
         /// The address of the column.
         column: usize,
     },
     /// Output column `ordinal` of a relation other than a stored table.
     Output {
         /// The relation.
-        relation: RelationSlot,
+        relation: Relation,
         /// The position of the column among the relation's.
         ordinal: usize,
     },
@@ -1007,8 +1077,11 @@ enum Key {
     Placeholder(String),
     /// The value a domain constraint checks.
     Value,
-    /// A name nothing in reach binds, as stored, where `rule` resolves it.
+    /// A name nothing in reach binds, as stored, where `rule` resolves it in
+    /// the context numbered `root`.
     Name {
+        /// The number of the context the name sits in.
+        root: usize,
         /// The rule resolving references where the name sits.
         rule: Option<SiteRule>,
         /// The parts of the name, as stored.
@@ -1035,7 +1108,7 @@ struct NamedValue<'a, DB: DatabaseLike> {
 /// The stored rows of a table one relation reads.
 struct TableRead<'a, DB: DatabaseLike> {
     /// The relation reading the table, `None` for a table read.
-    relation: Option<RelationSlot>,
+    relation: Option<Relation>,
     table: &'a DB::Table,
     /// The table's column scope, built on the first column reference.
     scope: Option<ColumnScope<'a, 'a, DB>>,
@@ -1141,10 +1214,21 @@ struct TruthContext<'a, DB: DatabaseLike> {
     named: Vec<NamedValue<'a, DB>>,
     /// The stored rows the read reads.
     tables: Vec<TableRead<'a, DB>>,
+    /// How many of the `tables` the caller's names and assumptions read,
+    /// the others read by the queries they nest, `None` for all of them.
+    top_reads: Option<usize>,
     /// The references and calls of the query site the read is at, if any.
     site: Option<Site<'a, DB>>,
     /// The table read whose columns the caller's names read, if any.
     caller: Option<usize>,
+    /// The number of the context a nested query of the caller's expression
+    /// is bound in, with the scope through which it reaches the caller's
+    /// row.
+    caller_scope: Option<(usize, usize)>,
+    /// The number of the context names are being bound in.
+    root: usize,
+    /// The highest number a context was given.
+    roots: usize,
     /// The table read whose columns the expression being read reads, or
     /// `None` for the caller's names.
     reading: Option<usize>,
@@ -1156,6 +1240,9 @@ struct TruthContext<'a, DB: DatabaseLike> {
     source: Source<'a, DB>,
     /// The check whose expression is read last, if the expression is one.
     own: Option<&'a DB::CheckConstraint>,
+    /// What holds of the named values where the expression being read
+    /// is evaluated, before the evaluator narrows it.
+    current: Option<Guarantees<usize>>,
     /// The collations met so far, each named by its position.
     collations: Vec<ColumnCollation<'static>>,
     /// The enum types met so far.
@@ -1168,6 +1255,8 @@ struct TruthContext<'a, DB: DatabaseLike> {
     checking: Vec<usize>,
     /// The deployment whose requests run the read, if one is assumed.
     deployment: Option<&'a Deployment>,
+    /// The queries the read may meet and the bodies it read.
+    nested: Nested<'a, DB>,
 }
 
 /// The enum types met so far, by the address of the type declaring each, so
@@ -1386,8 +1475,9 @@ impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
 
     fn callees(&mut self, call: &Function) -> Result<Vec<Callee>, LookupError> {
         let (database, engine) = (self.database, self.engine);
-        let mut callees = self
-            .runnable(call)?
+        let functions = self.runnable(call)?;
+        self.nested.know(&functions);
+        let mut callees = functions
             .into_iter()
             .map(|function| engine.callee(function, database, &self.enums))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1398,7 +1488,31 @@ impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
                 callee.returns = ScalarType::Unknown;
             }
         }
+        // The evaluator hands a body the arguments in written order, which
+        // would bind a named argument to the wrong parameter, so the body of
+        // such a call stays unread.
+        if nested::writes_named_argument(call) {
+            for callee in &mut callees {
+                callee.token = 0;
+            }
+        }
         Ok(callees)
+    }
+
+    fn evaluate_body(
+        &mut self,
+        callee: &Callee,
+        arguments: &[Evaluation],
+    ) -> Result<Option<Evaluation>, LookupError> {
+        self.body_value(callee, arguments)
+    }
+
+    fn query(
+        &mut self,
+        query: &Query,
+        guarantees: &Guarantees<usize>,
+    ) -> Result<QueryEvaluation, LookupError> {
+        self.answer(query, guarantees)
     }
 
     fn data_type(&self, data_type: &DataType) -> ScalarType {
@@ -1441,9 +1555,13 @@ impl<DB: DatabaseLike> Context for TruthContext<'_, DB> {
         )
     }
 
-    /// What a read of a request setting gives, read over every request the
-    /// assumed deployment admits for a setting it declares.
+    /// What `ARRAY(query)` evaluates to, or a read of a request setting,
+    /// read over every request the assumed deployment admits for a setting
+    /// it declares.
     fn expression(&mut self, expression: &Expr) -> Result<Option<Evaluation>, LookupError> {
+        if let Some(array) = self.array_of_query(expression)? {
+            return Ok(Some(array));
+        }
         let deployment = self.deployment;
         let read = self.setting_expression(
             |name| deployment?.setting(name).map(|setting| (setting, setting.held())),
@@ -1457,11 +1575,16 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// The domain a cast to `data_type` names, found along the database's
     /// type search path, and whether the cast is to an array of it.
     fn cast_domain(&self, data_type: &DataType) -> Option<(&'a DB::Domain, bool)> {
+        self.type_domain(&PgType::of(data_type))
+    }
+
+    /// The domain `written` names, found along the database's type search
+    /// path, and whether `written` is an array of it.
+    fn type_domain(&self, written: &PgType) -> Option<(&'a DB::Domain, bool)> {
         if self.engine != Engine::PostgreSql {
             return None;
         }
-        let written = PgType::of(data_type);
-        let canonical = canonical(self.database, &written);
+        let canonical = canonical(self.database, written);
         let (element, array) =
             canonical.element().map_or((&*canonical, false), |element| (element, true));
         let PgType::Named(target) = element else { return None };

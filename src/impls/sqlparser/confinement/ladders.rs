@@ -19,13 +19,11 @@ use sqlparser::ast::{
 
 use super::{
     implication::{parameter, parameter_ordinal},
-    terms::{
-        literal, sets_only_search_path, sql_query_body, text_literal, unnested, unwrapped,
-        user_type_named,
-    },
+    terms::{literal, sets_only_search_path, text_literal, unnested, unwrapped, user_type_named},
 };
 use crate::{
     errors::LookupError,
+    impls::sqlparser::function_body::sql_query_body,
     structs::{
         ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase, OperandType,
         WrittenCall,

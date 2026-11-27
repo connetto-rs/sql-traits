@@ -2107,6 +2107,21 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     pub(crate) fn is_node(&self, expression: &Expr) -> bool {
         self.holds(expression)
     }
+
+    /// The position of the scope holding the names the context's scope
+    /// reaches, as a [`RelationSlot`] names it.
+    pub(crate) fn root_scope(&self) -> usize {
+        self.scope.root_scope()
+    }
+
+    /// The relation the `FROM` item `factor` adds to the scope holding it,
+    /// with the table it reads when it reads a stored table directly.
+    pub(crate) fn factor_relation(
+        &self,
+        factor: &TableFactor,
+    ) -> Option<(RelationSlot, Option<&'db DB::Table>)> {
+        self.scope.factor_relation(factor)
+    }
 }
 
 /// Where `expression` sits in memory, which identifies it among the nodes of

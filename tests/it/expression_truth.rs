@@ -409,7 +409,7 @@ fn checks_whose_calls_the_database_path_reads_otherwise_seed_nothing() -> Result
          SET search_path = public;";
     assert_eq!(
         truth_in(schema, "invoices", "tenant_id > 0 AND ok()")?,
-        sometimes_raising(Outcomes::ANY)
+        never_raising(Outcomes::ANY)
     );
     assert_eq!(truth_in(schema, "invoices", "tenant_id < 0")?, never_raising(Outcomes::ANY));
     Ok(())
@@ -427,9 +427,12 @@ fn checks_whose_calls_the_read_check_resolves_otherwise_seed_nothing() -> Result
          SET search_path = public;",
     )?;
     let table = db.tables().next().unwrap();
-    for check in table.check_constraints(&db)? {
-        assert_eq!(check.truth_under_other_checks(&db)?, sometimes_raising(Outcomes::ANY));
-    }
+    // `public.f()` answers 1 and `pinned.f()` answers 0, each read alone.
+    let truths = table
+        .check_constraints(&db)?
+        .map(|check| check.truth_under_other_checks(&db))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(truths, [never_raising(Outcomes::TRUE), never_raising(Outcomes::FALSE)]);
     Ok(())
 }
 
@@ -505,16 +508,19 @@ fn names_no_reader_resolves_leave_the_expression_undecided() -> Result<(), Error
 
 #[test]
 fn stable_calls_answer_alike_within_a_statement() -> Result<(), Error> {
-    let schema = "CREATE FUNCTION stable_level() RETURNS INT LANGUAGE sql STABLE AS 'SELECT 1';
-         CREATE FUNCTION volatile_level() RETURNS INT LANGUAGE sql VOLATILE AS 'SELECT 1';
-         CREATE TABLE invoices (id INT);";
+    let schema = "CREATE FUNCTION stable_level() RETURNS INT LANGUAGE sql STABLE
+             AS 'SELECT id FROM invoices LIMIT 1';
+         CREATE FUNCTION volatile_level() RETURNS INT LANGUAGE sql VOLATILE
+             AS 'SELECT id FROM invoices LIMIT 1';
+         CREATE TABLE invoices (id INT);
+         GRANT SELECT ON invoices TO PUBLIC;";
     assert_eq!(
         truth_in(schema, "invoices", "stable_level() IS NULL OR stable_level() IS NOT NULL")?,
-        sometimes_raising(Outcomes::TRUE)
+        never_raising(Outcomes::TRUE)
     );
     assert_eq!(
         truth_in(schema, "invoices", "volatile_level() IS NULL OR volatile_level() IS NOT NULL")?,
-        sometimes_raising(UNDECIDED)
+        never_raising(UNDECIDED)
     );
     Ok(())
 }
@@ -958,9 +964,11 @@ fn assumed_expressions_whose_calls_the_read_check_resolves_otherwise_seed_nothin
     let assumptions = [Assumption::Expression { expression: &positive, outcomes: Outcomes::TRUE }];
     assert_eq!(
         table.truth_under(&db, &positive, IdentifierCase::AsWritten, &assumptions)?,
-        sometimes_raising(Outcomes::TRUE)
+        never_raising(Outcomes::TRUE)
     );
-    assert_eq!(check.truth_under(&db, &assumptions)?, sometimes_raising(Outcomes::ANY));
+    // The check calls `pinned.f()`, which answers 0, so the assumption on
+    // `public.f()` leaves it `FALSE`.
+    assert_eq!(check.truth_under(&db, &assumptions)?, never_raising(Outcomes::FALSE));
     Ok(())
 }
 

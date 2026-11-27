@@ -8,8 +8,9 @@ use sqlparser::ast::{
 
 use super::{
     BaseColumnRef, ColumnOrigin, CteShape, DerivationProfile, DerivedShape, Deriving, FromScope,
-    LookupOutcome, OutputNameSource, RelationKey, RelationOrigin, RelationSlot, ResolvedColumn,
-    ResultColumnType, WildcardEntry, derive_query_shape, factor_address, join_tree_address,
+    LocalRelation, LookupOutcome, OutputNameSource, RelationKey, RelationOrigin, RelationSlot,
+    ResolvedColumn, ResultColumnType, WildcardEntry, derive_query_shape, factor_address,
+    join_tree_address,
     modifying::{self, ModifyingScopes},
     resolve_definition_local, resolve_relation_local,
     scoped_roots::is_input,
@@ -120,6 +121,14 @@ pub(super) struct ScopeId(usize);
 pub(crate) struct ScopeCursor {
     pub(super) scope: ScopeId,
     pub(super) visible_entries: usize,
+}
+
+impl ScopeCursor {
+    /// The position of the scope the cursor stands in among the scopes of its
+    /// graph, as a [`RelationSlot`] names it.
+    pub(crate) fn scope_index(self) -> usize {
+        self.scope.0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -483,6 +492,37 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
             LookupOutcome::Found(column) => Ok(column.source),
             LookupOutcome::SearchParent | LookupOutcome::Stop => Ok(None),
         }
+    }
+
+    /// The relation the `FROM` item `factor` adds to the scope holding it,
+    /// with the table it reads when it reads a stored table directly, `None`
+    /// for an item no scope holds as a relation of its own.
+    pub(crate) fn factor_relation(
+        &self,
+        factor: &TableFactor,
+    ) -> Option<(RelationSlot, Option<&'db DB::Table>)> {
+        let address = factor_address(factor);
+        self.scopes.iter().enumerate().find_map(|(scope, node)| {
+            if let Some((index, base)) =
+                node.data.bases.iter().enumerate().find(|(_, base)| base.factor == address)
+            {
+                let slot = RelationSlot { scope, relation: base.local_relation(index) };
+                return Some((slot, Some(base.table)));
+            }
+            node.data.derived.iter().enumerate().find_map(|(index, derived)| {
+                matches!(derived.origin, RelationOrigin::Factor(held) if held == address).then(
+                    || {
+                        let relation = LocalRelation {
+                            table: false,
+                            index,
+                            null_extended: derived.nullable,
+                            constrained: false,
+                        };
+                        (RelationSlot { scope, relation }, None)
+                    },
+                )
+            })
+        })
     }
 
     pub(crate) fn scope_for_select<'scope>(

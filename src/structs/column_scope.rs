@@ -1501,6 +1501,21 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
         self.graph.null_extended_in_join(bound, factor, reference)
     }
 
+    /// The position of the scope holding the names the root reaches among
+    /// the scopes of the graph, as a [`RelationSlot`] names it.
+    pub(crate) fn root_scope(&self) -> usize {
+        self.root.scope_index()
+    }
+
+    /// The relation the `FROM` item `factor` adds to the scope holding it,
+    /// with the table it reads when it reads a stored table directly.
+    pub(crate) fn factor_relation(
+        &self,
+        factor: &TableFactor,
+    ) -> Option<(RelationSlot, Option<&'db DB::Table>)> {
+        self.graph.factor_relation(factor)
+    }
+
     /// Whether `reference`, sitting in the scope `cursor` names, binds in the
     /// query `levels_up` query levels out from that scope, `None` when it
     /// binds nothing.
