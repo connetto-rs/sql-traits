@@ -69,6 +69,7 @@ pub(crate) fn helper_set<'db, DB: DatabaseLike>(
         reads_unset_settings: conditions.contains(&ArmCondition::UnsetSetting),
         reads_edge_conditions: conditions.contains(&ArmCondition::EdgeCondition),
         reads_parent_conditions: conditions.contains(&ArmCondition::ParentCondition),
+        reads_row_caps: conditions.contains(&ArmCondition::Cap),
         answering: Vec::new(),
         answered: BTreeMap::new(),
     }
@@ -788,10 +789,14 @@ struct Walk<'q> {
 type Walked<'db, DB> = (&'db <DB as DatabaseLike>::Table, Option<WalkArm<'db, DB>>);
 
 /// What the conditions of a walk's edge or a parent arm's row hold it to,
-/// its restrictions, its bounds against the statement time and the sets it
-/// has to stay outside.
-type RowConditions<'db, DB> =
-    (Vec<Restriction<'db, DB>>, Vec<TimeBound<'db, DB>>, Vec<ExcludedSet<'db, DB>>);
+/// its restrictions, its bounds against the statement time, the sets it has
+/// to stay outside and the caps it has to meet.
+type RowConditions<'db, DB> = (
+    Vec<Restriction<'db, DB>>,
+    Vec<TimeBound<'db, DB>>,
+    Vec<ExcludedSet<'db, DB>>,
+    Vec<RowCap<'db, DB>>,
+);
 
 /// One edge a walk's term writes, the columns it adds and the ones it
 /// compares with the walk's columns, position by position, beside the name
@@ -821,6 +826,9 @@ struct Reader<'db, DB: DatabaseLike> {
     /// Whether the conditions a parent arm sets beside its comparison with
     /// the set are read rather than refused, in every helper answered.
     reads_parent_conditions: bool,
+    /// Whether the caps a walk's edge or a parent arm's row has to meet are
+    /// read rather than refused, in every helper answered.
+    reads_row_caps: bool,
     /// The helpers being answered, outermost first.
     answering: Vec<&'db DB::Function>,
     /// The sets answered so far, by helper, which every later call of the
@@ -1623,8 +1631,8 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         Ok((
             tree,
             self.row_conditions(scope, select, table, conditions)?.map(
-                |(restrictions, time_bounds, exclusions)| {
-                    WalkArm { restrictions, time_bounds, exclusions, ..walk }
+                |(restrictions, time_bounds, exclusions, caps)| {
+                    WalkArm { restrictions, time_bounds, exclusions, caps, ..walk }
                 },
             ),
         ))
@@ -1713,6 +1721,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             restrictions: Vec::new(),
             time_bounds: Vec::new(),
             exclusions: Vec::new(),
+            caps: Vec::new(),
         }))
     }
 
@@ -1925,11 +1934,16 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let mut membership = None;
         let mut conditions = Vec::new();
         for conjunct in conjuncts {
-            if let Expr::In { expr, target: InTarget::Subquery(called), negated: false, .. } =
-                conjunct
+            if cap_shape(conjunct).is_some() {
+                conditions.push(conjunct);
+            } else if let Expr::In {
+                expr,
+                target: InTarget::Subquery(called),
+                negated: false,
+                ..
+            } = conjunct
             {
                 if membership.is_some()
-                    || matches!(unnest(expr), Expr::Tuple(_))
                     || self.set_elements(scope, called)?.is_some()
                     || !self.parent_comparison(table, key, child, expr)?
                     || self.capping_key(table, returned, expr)?.is_some()
@@ -1990,7 +2004,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
                 })?
             }
         };
-        let Some((restrictions, time_bounds, exclusions)) =
+        let Some((restrictions, time_bounds, exclusions, caps)) =
             self.row_conditions(scope, select, table, conditions)?
         else {
             return Ok(Vec::new());
@@ -2008,6 +2022,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             restrictions,
             time_bounds,
             exclusions,
+            caps,
         })])
     }
 
@@ -2352,7 +2367,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             conditions: Vec::new(),
         };
         for conjunct in own {
-            if let Some(cap) = self.cap(scope, select, rows, conjunct)? {
+            if let Some(cap) = self.cap(scope, select, rows, conjunct, None)? {
                 read.caps.push(Some(cap));
                 continue;
             }
@@ -2437,6 +2452,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             ArmCondition::UnsetSetting => self.reads_unset_settings,
             ArmCondition::EdgeCondition => self.reads_edge_conditions,
             ArmCondition::ParentCondition => self.reads_parent_conditions,
+            ArmCondition::Cap => self.reads_row_caps,
         };
         if reads {
             return Ok(());
@@ -2526,8 +2542,14 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         conditions: Vec<&Expr>,
     ) -> Result<Option<RowConditions<'db, DB>>, HelperSetError> {
         let mut exclusions = Vec::new();
+        let mut caps = Vec::new();
         let mut filters = Vec::new();
+        let rows = core::slice::from_ref(table);
         for condition in conditions {
+            if let Some(cap) = self.cap(scope, select, rows, condition, Some(ArmCondition::Cap))? {
+                caps.push(cap);
+                continue;
+            }
             match self.exclusion(scope, select, table, condition)? {
                 // `NOT IN` an empty set holds for every row, `NULL` too.
                 Some(exclusion) => {
@@ -2539,7 +2561,7 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
         }
         let (kept, time_bounds) = self.filter(scope, table, filters)?;
-        Ok(kept.restrictions().map(|restrictions| (restrictions, time_bounds, exclusions)))
+        Ok(kept.restrictions().map(|restrictions| (restrictions, time_bounds, exclusions, caps)))
     }
 
     /// What `conditions` keep of `table`, beside the bounds they set against
@@ -2740,13 +2762,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
     /// <operands> IN (...)` either way round, with one operand or more, one
     /// operand also compared with `(SELECT <helper>(<arguments>))`. `rows`
     /// holds the arm's table and then each table it joins, whose columns
-    /// the operands may name.
+    /// the operands may name. A cap is refused where the reading leaves
+    /// `read_as` unread.
     fn cap(
         &mut self,
         scope: &Scope<'db, DB>,
         select: &Select,
         rows: &[ArmTable<'_, 'db, DB>],
         conjunct: &Expr,
+        read_as: Option<ArmCondition>,
     ) -> Result<Option<RowCap<'db, DB>>, HelperSetError> {
         let Some((lifted, expr, subquery)) = cap_shape(conjunct) else { return Ok(None) };
         let shape = || scope.arm_shape(select);
@@ -2760,6 +2784,9 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             }
             None => None,
         };
+        if let Some(kind) = read_as {
+            self.require_read(scope, conjunct, kind)?;
+        }
         let items = match unnest(expr) {
             Expr::Tuple(items) => items.as_slice(),
             item => core::slice::from_ref(item),

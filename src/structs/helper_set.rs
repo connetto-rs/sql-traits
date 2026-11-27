@@ -25,13 +25,17 @@ pub enum ArmCondition {
     /// [`GrantArm::unset_settings`]).
     UnsetSetting,
     /// What an edge has to hold for a walk to follow it (see
-    /// [`WalkArm::restrictions`], [`WalkArm::time_bounds`] and
-    /// [`WalkArm::exclusions`]).
+    /// [`WalkArm::restrictions`], [`WalkArm::time_bounds`],
+    /// [`WalkArm::exclusions`] and [`WalkArm::caps`]).
     EdgeCondition,
     /// What a row has to hold for a parent arm to return it (see
-    /// [`ParentArm::restrictions`], [`ParentArm::time_bounds`] and
-    /// [`ParentArm::exclusions`]).
+    /// [`ParentArm::restrictions`], [`ParentArm::time_bounds`],
+    /// [`ParentArm::exclusions`] and [`ParentArm::caps`]).
     ParentCondition,
+    /// The caps an edge has to meet for a walk to follow it, or a row for a
+    /// parent arm to return it (see [`WalkArm::caps`] and
+    /// [`ParentArm::caps`]). A grant arm's caps are read in every answer.
+    Cap,
 }
 
 /// The set a helper returns, the union of its arms kept to the rows its
@@ -419,7 +423,9 @@ impl<'db, DB: DatabaseLike> ExcludedSet<'db, DB> {
 }
 
 /// `<operands> IN (SELECT * FROM <function>(<arguments>))`, a conjunct of a
-/// grant arm's condition keeping a row only where some row the helper
+/// grant arm's condition, of the conditions a walk sets on an edge (see
+/// [`WalkArm::caps`]) or of a parent arm's conditions (see
+/// [`ParentArm::caps`]), keeping a row only where some row the helper
 /// returns holds, column by column, what the operands hold, optionally
 /// behind `<setting> IS NULL OR`, which lifts the cap for a request leaving
 /// the setting unset.
@@ -427,13 +433,14 @@ impl<'db, DB: DatabaseLike> ExcludedSet<'db, DB> {
 /// The operands are written as a row, `(<operand>, ...)`, one per column
 /// the helper returns. A single operand is a cap behind `IS NULL OR`, and
 /// may then compare with `(SELECT <function>(<arguments>))` as well. Without
-/// it, a single operand is a cap only where it is the primary key of the
-/// arm's table, which the arm returns and which references no table through
-/// a single-column foreign key, or where it is a column of the arm's table
-/// in an arm naming its grantee by a value of the request (see
-/// [`GrantedTo::Request`]), since otherwise the conjunct names the arm's
-/// grantee (see [`GrantedTo::Set`]) or its parent (see [`ParentArm`]).
-/// Each operand is a column of the arm's table or of a row it joins (see
+/// it, a single operand is a cap only in a grant arm, where it is the
+/// primary key of the arm's table, which the arm returns and which
+/// references no table through a single-column foreign key, or where it is
+/// a column of the arm's table in an arm naming its grantee by a value of
+/// the request (see [`GrantedTo::Request`]), since otherwise the conjunct
+/// names the arm's grantee (see [`GrantedTo::Set`]) or its parent (see
+/// [`ParentArm`]). Each operand is a column of the arm's table, the edge
+/// table of a walk, or of a row a grant arm joins (see
 /// [`GrantArm::joined_rows`]), or a literal or an argument, plain or cast to
 /// the type the helper declares the column it pairs with in. An operand
 /// holding `NULL` matches no row, as PostgreSQL's row comparison answers
@@ -486,7 +493,8 @@ impl<'db, DB: DatabaseLike> RowCap<'db, DB> {
 /// One operand of a [`RowCap`].
 #[derive(Debug)]
 pub enum CapOperand<'db, DB: DatabaseLike> {
-    /// A column of the arm's table, compared row by row.
+    /// A column of the arm's table, the edge table of a walk, compared row
+    /// by row.
     Column(&'db DB::Column),
     /// A column of the row the arm joins at `row` in
     /// [`GrantArm::joined_rows`], read off the row each row of the arm names.
@@ -934,6 +942,7 @@ pub struct ParentArm<'db, DB: DatabaseLike> {
     pub(crate) restrictions: Vec<Restriction<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
     pub(crate) exclusions: Vec<ExcludedSet<'db, DB>>,
+    pub(crate) caps: Vec<RowCap<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
@@ -1028,6 +1037,16 @@ impl<'db, DB: DatabaseLike> ParentArm<'db, DB> {
     pub fn exclusions(&self) -> &[ExcludedSet<'db, DB>] {
         &self.exclusions
     }
+
+    /// The caps a row has to meet for the arm to return it, as
+    /// [`GrantArm::caps`] reads them, every one of them in the order the arm
+    /// writes them. Empty in every answer whose reading leaves
+    /// [`ArmCondition::ParentCondition`] or [`ArmCondition::Cap`] unread,
+    /// which refuses an arm writing one.
+    #[must_use]
+    pub fn caps(&self) -> &[RowCap<'db, DB>] {
+        &self.caps
+    }
 }
 
 /// `SELECT <returned> FROM <function>(<arguments>) [<alias>] [(<columns>)]
@@ -1084,18 +1103,19 @@ impl<'db, DB: DatabaseLike> CalledArm<'db, DB> {
 /// The walk's columns hold the tree's primary key, one column of the key
 /// each, so a tree keyed by several columns is walked by its whole key.
 /// Each row of the table meeting the [restrictions](Self::restrictions), the
-/// [time bounds](Self::time_bounds) and the [exclusions](Self::exclusions)
-/// is an edge from the tree's row its [child columns](Self::child) name to
-/// the one its [parent columns](Self::parent) name. The table is the tree
-/// itself, its child columns the primary key, where each row names its own
-/// parent, or an edge table holding any number of edges per child and per
-/// parent, so the edges may draw any graph. The child columns of an edge
-/// table are the ones of the two lists its primary key is, else the ones a
-/// unique key covers alone, and the columns the term adds where its keys
-/// tell neither apart, the walk then going [down](WalkDirection::Down). A
-/// term reading a `LATERAL` union of edges answers one walk per edge, each
-/// adding to the one set every other one reads. The walk ends on edges
-/// closing a cycle, as `UNION` keeps no row twice.
+/// [time bounds](Self::time_bounds), the [exclusions](Self::exclusions) and
+/// the [caps](Self::caps) is an edge from the tree's row its [child
+/// columns](Self::child) name to the one its [parent columns](Self::parent)
+/// name. The table is the tree itself, its child columns the primary key,
+/// where each row names its own parent, or an edge table holding any number
+/// of edges per child and per parent, so the edges may draw any graph. The
+/// child columns of an edge table are the ones of the two lists its primary
+/// key is, else the ones a unique key covers alone, and the columns the term
+/// adds where its keys tell neither apart, the walk then going
+/// [down](WalkDirection::Down). A term reading a `LATERAL` union of edges
+/// answers one walk per edge, each adding to the one set every other one
+/// reads. The walk ends on edges closing a cycle, as `UNION` keeps no row
+/// twice.
 #[derive(Debug)]
 pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) table: &'db DB::Table,
@@ -1108,6 +1128,7 @@ pub struct WalkArm<'db, DB: DatabaseLike> {
     pub(crate) restrictions: Vec<Restriction<'db, DB>>,
     pub(crate) time_bounds: Vec<TimeBound<'db, DB>>,
     pub(crate) exclusions: Vec<ExcludedSet<'db, DB>>,
+    pub(crate) caps: Vec<RowCap<'db, DB>>,
 }
 
 impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
@@ -1188,6 +1209,17 @@ impl<'db, DB: DatabaseLike> WalkArm<'db, DB> {
     #[must_use]
     pub fn exclusions(&self) -> &[ExcludedSet<'db, DB>] {
         &self.exclusions
+    }
+
+    /// The caps an edge has to meet for the walk to follow it, as
+    /// [`GrantArm::caps`] reads them, every one of them in the order the term
+    /// writes them. A walk down the tree holding its own edges thus stops at
+    /// a child its caps leave out, never reaching the rows below it. Empty in
+    /// every answer whose reading leaves [`ArmCondition::EdgeCondition`] or
+    /// [`ArmCondition::Cap`] unread, which refuses a term writing one.
+    #[must_use]
+    pub fn caps(&self) -> &[RowCap<'db, DB>] {
+        &self.caps
     }
 }
 
