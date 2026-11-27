@@ -1,0 +1,19 @@
+[[tables]]
+name = "resource_moves"
+key = ["id"]
+columns = ["id", "parent_id"]
+
+[[callers]]
+name = "app"
+role = "app_user"
+settings = { "app.user_id" = "app", "app.subjects" = "" }
+
+[[writes]]
+table = "resource_moves"
+shape = "update"
+set = { parent_id = 2 }
+
+[[writes]]
+table = "resource_moves"
+shape = "update"
+set = { parent_id = 0 }
