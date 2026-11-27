@@ -7,7 +7,7 @@
 
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::{
-    ast::Expr,
+    ast::{DataType, Expr},
     dialect::{GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     parser::Parser,
 };
@@ -194,10 +194,7 @@ fn builtins_that_never_return_null_are_never_null() -> Result<(), Error> {
         truth("current_setting('app.user_id') IS NULL")?,
         sometimes_raising(Outcomes::FALSE)
     );
-    for sql in ["current_setting('app.user_id', true) IS NULL", "current_setting(NULL) IS NULL"] {
-        let truth = truth(sql)?;
-        assert!(truth.outcomes.truth, "{sql}: {truth:?}");
-    }
+    assert!(truth("current_setting(NULL) IS NULL")?.outcomes.truth);
     assert_eq!(truth("concat_ws(',', tenant_id) IS NULL")?, never_raising(Outcomes::FALSE));
     assert!(truth("concat_ws(tenant_id::text, 'a') IS NULL")?.outcomes.truth);
     // `lower` of an empty range is `NULL`.
@@ -1000,6 +997,81 @@ fn a_cast_to_a_checking_domain_raises_where_its_checks_refuse() -> Result<(), Er
     assert_eq!(
         truth_in("CREATE TABLE holder (value _int4);", "holder", "value IS NULL")?,
         never_raising(UNDECIDED)
+    );
+    Ok(())
+}
+
+/// The deployment declaring `app.installation_id` as `value`, a setting a
+/// request may leave unset.
+fn installation_deployment(value: SettingValue) -> Deployment {
+    let setting = SessionSetting::value("app.installation_id", value).unwrap().may_be_unset();
+    Deployment::new("authenticator", ["app"], [setting]).unwrap()
+}
+
+#[test]
+fn a_customized_option_read_with_missing_ok_never_raises() -> Result<(), Error> {
+    assert_eq!(truth("current_setting('app.user_id', true) IS NULL")?, never_raising(UNDECIDED));
+    // A built-in setting may be readable by privileged roles alone.
+    assert_eq!(
+        truth("current_setting('data_directory', true) IS NULL")?,
+        sometimes_raising(UNDECIDED)
+    );
+    // An unset customized option reads `''` after a transaction that set it
+    // ends, which no `uuid` spells.
+    assert_eq!(
+        truth("NULLIF(current_setting('app.user_id', true), '')::UUID IS NULL")?,
+        sometimes_raising(UNDECIDED)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_deployment_types_the_settings_it_declares() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (o INT NOT NULL);")?;
+    let table = db.tables().next().unwrap();
+    let read = |sql: &str, deployment: &Deployment| {
+        table.truth_under(
+            &db,
+            &expression(sql),
+            IdentifierCase::AsWritten,
+            &[Assumption::Deployment(deployment)],
+        )
+    };
+    let uuid = installation_deployment(SettingValue::Principal {
+        kind: "installation".into(),
+        identity: DataType::Uuid,
+    });
+    let text = installation_deployment(SettingValue::Scalar(DataType::Text));
+    let typed = "NULLIF(current_setting('app.installation_id', true), '')::UUID IS NULL";
+    assert_eq!(read(typed, &uuid)?, never_raising(UNDECIDED));
+    assert_eq!(
+        read("current_setting('app.installation_id', true) IS NULL", &uuid)?,
+        never_raising(UNDECIDED)
+    );
+    for (sql, deployment) in [
+        // `''` raises the cast when `NULLIF` does not take it away.
+        ("current_setting('app.installation_id', true)::UUID IS NULL", &uuid),
+        // An unset setting read without `missing_ok` raises `42704`.
+        ("NULLIF(current_setting('app.installation_id'), '')::UUID IS NULL", &uuid),
+        // A setting declared as another type may hold text no `uuid` spells.
+        (typed, &text),
+        // A setting the deployment does not declare may hold any text.
+        ("NULLIF(current_setting('app.user_id', true), '')::UUID IS NULL", &uuid),
+    ] {
+        assert_eq!(read(sql, deployment)?, sometimes_raising(UNDECIDED), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_read_under_several_deployments_is_refused() -> Result<(), Error> {
+    let db = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (o INT);")?;
+    let table = db.tables().next().unwrap();
+    let deployment = installation_deployment(SettingValue::Scalar(DataType::Text));
+    let assumptions = [Assumption::Deployment(&deployment), Assumption::Deployment(&deployment)];
+    assert_eq!(
+        table.truth_under(&db, &expression("o > 0"), IdentifierCase::AsWritten, &assumptions),
+        Err(sql_traits::errors::LookupError::SeveralDeployments { count: 2 })
     );
     Ok(())
 }

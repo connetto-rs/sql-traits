@@ -1370,6 +1370,13 @@ pub enum LookupError {
         /// Stored name of the table the check was assumed of.
         table: String,
     },
+    /// An expression was read under more than one deployment, though the
+    /// requests running it run under one.
+    #[error("An expression is read under one deployment, but {count} were assumed.")]
+    SeveralDeployments {
+        /// How many deployments were assumed.
+        count: usize,
+    },
     /// A column named by a constraint is not declared by the table that
     /// constraint resolves it against.
     #[error("Column `{column_name}` is not declared by table `{table_name}`.")]

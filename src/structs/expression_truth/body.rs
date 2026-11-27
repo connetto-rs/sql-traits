@@ -2,22 +2,19 @@
 //! value guarantees of `sqlparser-plpgsql-dataflow` over the database.
 
 use alloc::{
-    collections::BTreeSet,
     string::{String, ToString},
     vec::Vec,
 };
 
 use sqlparser::{
     ast::{
-        ArgMode, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-        FunctionArguments, FunctionCalledOnNull, Ident, Statement, TriggerEvent, TriggerObject,
-        TriggerObjectKind, TriggerPeriod, Value,
+        ArgMode, DataType, Expr, Function, FunctionCalledOnNull, Ident, Statement, TriggerEvent,
+        TriggerObject, TriggerObjectKind, TriggerPeriod,
     },
     dialect::PostgreSqlDialect,
 };
 use sqlparser_expr_eval::{
-    self as eval, Callee, Evaluation, PostgreSqlOptions, Resolved, ScalarType, Unlisted, Values,
-    sql_values::postgres::PgValue,
+    self as eval, Callee, Evaluation, PostgreSqlOptions, Resolved, ScalarType,
 };
 use sqlparser_plpgsql::{
     embedded::{DeclarationKind, DeclaredType},
@@ -25,24 +22,19 @@ use sqlparser_plpgsql::{
 };
 use sqlparser_plpgsql_dataflow::values;
 
-use super::{Refusal, Site, Source, TruthContext, validated_checks};
+use super::{Refusal, Site, Source, TruthContext, any, validated_checks};
 use crate::{
     errors::LookupError,
     impls::{BodyNames, TypeReach},
     structs::{
-        EmbeddedSql, ExpressionContext, Held, IdentifierCase, OperandType, PlPgSqlSite,
-        PlPgSqlVariable, RequestPresence, SessionSetting, SettingContent, TypeKind, VariableKind,
-        plpgsql_flow::is_record,
+        EmbeddedSql, ExpressionContext, IdentifierCase, OperandType, PlPgSqlSite, PlPgSqlVariable,
+        RequestPresence, TypeKind, VariableKind, plpgsql_flow::is_record,
     },
     traits::{
         CheckConstraintLike, ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, Relation,
         TableLike, TriggerLike,
     },
-    utils::{
-        call_sites::{ExpressionForm, expression_form},
-        postgres_types::PgType,
-        type_modifier,
-    },
+    utils::postgres_types::PgType,
 };
 
 /// The database as the value guarantees domain asks for it over one
@@ -356,98 +348,6 @@ impl<'b, 'db, DB: DatabaseLike> BodyTruth<'b, 'db, DB> {
             _ => TargetDomains::Unknown,
         })
     }
-
-    /// The declared setting `call` reads, when it is `current_setting(name[,
-    /// missing_ok])` with literal arguments reaching PostgreSQL's own function
-    /// alone, under the request's presence.
-    fn setting_read(&mut self, call: &Function) -> Result<Option<SettingRead<'b>>, LookupError> {
-        let Some(presence) = &self.presence else { return Ok(None) };
-        let FunctionArguments::List(list) = &call.args else { return Ok(None) };
-        let (name, missing_ok) = match list.args.as_slice() {
-            [name] => (literal(name), Some(&Value::Boolean(false))),
-            [name, missing_ok] => (literal(name), literal(missing_ok)),
-            _ => return Ok(None),
-        };
-        let (Some(Value::SingleQuotedString(name)), Some(Value::Boolean(missing_ok))) =
-            (name, missing_ok)
-        else {
-            return Ok(None);
-        };
-        let Some((setting, held)) = presence.setting(name) else { return Ok(None) };
-        if !self.reaches_current_setting(call)? {
-            return Ok(None);
-        }
-        let text = eval::Context::data_type(&self.truth, &DataType::Text);
-        Ok(Some(SettingRead { setting, held, missing_ok: *missing_ok, text }))
-    }
-
-    /// Whether `call` runs PostgreSQL's own `current_setting` alone.
-    fn reaches_current_setting(&mut self, call: &Function) -> Result<bool, LookupError> {
-        let functions = self.truth.runnable(call)?;
-        Ok(!functions.is_empty()
-            && functions.iter().all(|function| {
-                function.name() == "current_setting"
-                    && function.target_name().schema() == Some("pg_catalog")
-            }))
-    }
-
-    /// What `current_setting(name, true)` reads where `name` is a literal
-    /// customized option, one with a `.`, that no request sets as declared,
-    /// which is any text or `NULL` read without raising. That holds unless
-    /// a loaded extension defines the option as readable by superusers
-    /// alone, which the schema does not tell.
-    fn custom_read(&mut self, expression: &Expr) -> Result<Option<Evaluation>, LookupError> {
-        let Expr::Function(call) = unnest(expression) else { return Ok(None) };
-        let FunctionArguments::List(list) = &call.args else { return Ok(None) };
-        let [name, missing_ok] = list.args.as_slice() else { return Ok(None) };
-        let (Some(Value::SingleQuotedString(name)), Some(Value::Boolean(true))) =
-            (literal(name), literal(missing_ok))
-        else {
-            return Ok(None);
-        };
-        if !name.contains('.') || !self.reaches_current_setting(call)? {
-            return Ok(None);
-        }
-        Ok(Some(any(eval::Context::data_type(&self.truth, &DataType::Text))))
-    }
-
-    /// The declared setting `expression` reads, `current_setting(...)` or
-    /// `NULLIF(current_setting(...), '')`, with whether `NULLIF` turns `''`
-    /// into `NULL`.
-    fn setting_operand(
-        &mut self,
-        expression: &Expr,
-    ) -> Result<Option<(SettingRead<'b>, bool)>, LookupError> {
-        let Expr::Function(call) = unnest(expression) else { return Ok(None) };
-        if let Some(read) = self.setting_read(call)? {
-            return Ok(Some((read, false)));
-        }
-        let (Some(ExpressionForm::NullIf), FunctionArguments::List(list)) =
-            (expression_form(&call.name), &call.args)
-        else {
-            return Ok(None);
-        };
-        let [
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(read)),
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(empty))),
-        ] = list.args.as_slice()
-        else {
-            return Ok(None);
-        };
-        let (Value::SingleQuotedString(empty), Expr::Function(read)) = (&empty.value, unnest(read))
-        else {
-            return Ok(None);
-        };
-        if !empty.is_empty() {
-            return Ok(None);
-        }
-        Ok(self.setting_read(read)?.map(|read| (read, true)))
-    }
-}
-
-/// Any value of `ty`, or `NULL`, read without raising.
-fn any(ty: ScalarType) -> Evaluation {
-    Evaluation::new(ty, true, false, Values::Unlisted(Unlisted::any()))
 }
 
 /// The domains checking a value assigned to a target of a body.
@@ -551,96 +451,6 @@ fn held_value<DB: DatabaseLike>(
     guarantees.reference(&named).map_or_else(|| base.clone(), |held| base.meet(held))
 }
 
-/// The value `argument` passes when it is a literal written in place.
-fn literal(argument: &FunctionArg) -> Option<&Value> {
-    match argument {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => Some(&value.value),
-        _ => None,
-    }
-}
-
-/// `expression` without the parentheses around it.
-fn unnest(mut expression: &Expr) -> &Expr {
-    while let Expr::Nested(inner) = expression {
-        expression = inner;
-    }
-    expression
-}
-
-/// A read of a declared setting, under one request's presence.
-struct SettingRead<'d> {
-    setting: &'d SessionSetting,
-    held: Held,
-    /// Whether the read passes `missing_ok` as true, reading `NULL` rather
-    /// than raising on a connection that never set the setting.
-    missing_ok: bool,
-    /// The type `current_setting` returns.
-    text: ScalarType,
-}
-
-impl SettingRead<'_> {
-    /// What `current_setting(...)` reads, or `NULLIF` of it and `''` when
-    /// `nullified`. A request leaving the setting unset reads `NULL` on a
-    /// connection that never set it, or raises without `missing_ok`, and `''`
-    /// once a transaction that set it has ended. A setting set together with
-    /// others reads text other than `''` where the request sets it, and one
-    /// every request sets may read `''`.
-    fn text(&self, nullified: bool) -> Evaluation {
-        let empty = PgValue::Text(String::new());
-        let mut excluded = Unlisted::any();
-        excluded.excluded.insert(empty.clone());
-        let set = Evaluation::new(self.text.clone(), false, false, Values::Unlisted(excluded));
-        let empty = if nullified {
-            Evaluation::null(self.text.clone())
-        } else {
-            Evaluation::new(
-                self.text.clone(),
-                false,
-                false,
-                Values::Listed(BTreeSet::from([empty])),
-            )
-        };
-        let unset =
-            if nullified { empty.clone() } else { empty.clone().with_null(self.missing_ok) };
-        match self.held {
-            Held::Always => set.join(&empty),
-            Held::Set => set,
-            Held::Unset => unset.with_error(!self.missing_ok),
-            Held::Either => set.join(&unset.with_error(!self.missing_ok)),
-        }
-    }
-
-    /// What casting the read, or `NULLIF` of it and `''` when `nullified`,
-    /// to `target` gives, when `target` is the setting's declared type with
-    /// the same modifiers, whose canonical rendering a set setting's text
-    /// is. `''` raises the cast.
-    fn typed(&self, target: &DataType, ty: ScalarType, nullified: bool) -> Option<Evaluation> {
-        let SettingContent::Value(value) = self.setting.content() else { return None };
-        let declared = value.single_type()?;
-        let modifier = type_modifier::declared(declared);
-        if PgType::of(declared) != PgType::of(target)
-            || modifier.is_none()
-            || modifier != type_modifier::declared(target)
-        {
-            return None;
-        }
-        let set = Evaluation::new(ty.clone(), false, false, Values::Unlisted(Unlisted::any()));
-        let unset = match (nullified, self.missing_ok) {
-            (true, missing_ok) => Evaluation::null(ty).with_error(!missing_ok),
-            (false, true) => Evaluation::null(ty).with_error(true),
-            (false, false) => Evaluation::raising(ty),
-        };
-        Some(match self.held {
-            // A type whose rendering may be `''` reads `NULL` through
-            // `NULLIF`.
-            Held::Always => set.with_null(nullified),
-            Held::Set => set,
-            Held::Unset => unset,
-            Held::Either => set.join(&unset),
-        })
-    }
-}
-
 impl<DB: DatabaseLike> eval::Context for BodyTruth<'_, '_, DB> {
     type Reference = usize;
     type Error = LookupError;
@@ -687,42 +497,15 @@ impl<DB: DatabaseLike> eval::Context for BodyTruth<'_, '_, DB> {
         self.truth.may_plan_as_constant(reference)
     }
 
-    /// What a read of a declared setting gives under the request's
-    /// presence, for `current_setting(...)`, `NULLIF` of it and `''`, and
-    /// either cast to the setting's declared type, and what a read of
-    /// another customized option with `missing_ok` gives.
+    /// What a read of a request setting gives, under the request's
+    /// presence for a setting the deployment declares.
     fn expression(&mut self, expression: &Expr) -> Result<Option<Evaluation>, LookupError> {
-        if self.presence.is_none() {
-            return Ok(None);
-        }
-        if let Expr::Cast {
-            kind: CastKind::Cast | CastKind::DoubleColon,
-            expr,
-            data_type,
-            format: None,
-            ..
-        } = expression
-        {
-            let ty = self.truth.data_type(data_type);
-            let Some(typed) = self
-                .setting_operand(expr)?
-                .and_then(|(read, nullified)| read.typed(data_type, ty, nullified))
-            else {
-                return Ok(None);
-            };
-            // The read stands for the whole cast, so it meets the checks of
-            // the type it casts to here.
-            if !eval::Context::cast_checks(self, data_type)? {
-                return Ok(Some(typed));
-            }
-            let raises = typed.may_raise();
-            let checked = eval::Context::checked_cast(self, data_type, typed)?;
-            return Ok(Some(if raises { checked.with_error(true) } else { checked }));
-        }
-        match self.setting_operand(expression)? {
-            Some((read, nullified)) => Ok(Some(read.text(nullified))),
-            None => self.custom_read(expression),
-        }
+        let presence = self.presence.as_ref();
+        let read = self.truth.setting_expression(
+            |name| presence.and_then(|presence| presence.setting(name)),
+            expression,
+        )?;
+        read.map(|read| read.checked(self)).transpose()
     }
 }
 

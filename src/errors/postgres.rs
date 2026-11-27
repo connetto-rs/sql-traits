@@ -2533,6 +2533,7 @@ impl LookupError {
             }
             Self::InvalidObjectName { .. }
             | Self::CheckNotOfTable { .. }
+            | Self::SeveralDeployments { .. }
             | Self::TableLookupConflict { same_stored_identity: false, .. }
             | Self::ObjectNotInDatabase { .. }
             | Self::CallNotInExpression { .. }

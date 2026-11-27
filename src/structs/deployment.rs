@@ -448,12 +448,7 @@ impl Deployment {
         let unsplit = self
             .settings
             .iter()
-            .map(|setting| {
-                (!changed(setting)).then_some(match setting.presence {
-                    SettingPresence::Always => Held::Always,
-                    SettingPresence::MayBeUnset => Held::Either,
-                })
-            })
+            .map(|setting| (!changed(setting)).then_some(setting.held()))
             .collect();
         let mut presences: Vec<Vec<Option<Held>>> = vec![unsplit];
         for group in split {
@@ -987,6 +982,16 @@ impl SessionSetting {
     /// PostgreSQL compares setting names.
     pub(crate) fn is_named(&self, name: &str) -> bool {
         self.name.eq_ignore_ascii_case(name)
+    }
+
+    /// Whether a request sets the setting, read over every request alike,
+    /// before a group of settings set together is split into the requests
+    /// setting it and those leaving it unset.
+    pub(crate) fn held(&self) -> Held {
+        match self.presence {
+            SettingPresence::Always => Held::Always,
+            SettingPresence::MayBeUnset => Held::Either,
+        }
     }
 }
 
