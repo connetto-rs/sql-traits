@@ -136,6 +136,7 @@ mod inheritance_changes;
 mod inherited_column_declarations;
 mod inherited_definition_matching;
 mod inherited_privileges;
+mod insert_filled_columns;
 mod key_conflict_clauses;
 mod key_ordinal_cost;
 mod key_type_btree_opclass;
