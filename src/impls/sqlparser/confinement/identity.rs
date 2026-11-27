@@ -105,7 +105,7 @@ pub(super) fn same_identity<DB: DatabaseLike>(
 }
 
 /// The values every row of its table holds `column` to, the expression it is
-/// generated as or the values [`checked_values`] reads.
+/// generated as or the first list [`checked_value_lists`] reads.
 pub(super) fn held_values<'a, DB: DatabaseLike>(
     database: &'a DB,
     column: &'a DB::Column,
@@ -113,33 +113,35 @@ pub(super) fn held_values<'a, DB: DatabaseLike>(
     if let Some(expression) = column.generation_expression() {
         return Ok(Some(vec![expression]));
     }
-    checked_values(database, column)
+    Ok(checked_value_lists(database, column)?.into_iter().next())
 }
 
-/// The values a `NOT NULL` column is held to by a top-level conjunct of a
-/// validated check, `=` one value or `IN` a list of values, those of the
-/// first such check.
-fn checked_values<'a, DB: DatabaseLike>(
+/// The values a `NOT NULL` column is held to, one list for each top-level
+/// conjunct of a validated check holding it `=` one value or `IN` a list of
+/// values, in the order of the checks. A nullable column is held to none,
+/// since a check holding `NULL` passes.
+pub(crate) fn checked_value_lists<'a, DB: DatabaseLike>(
     database: &'a DB,
     column: &'a DB::Column,
-) -> Result<Option<Vec<&'a Expr>>, LookupError> {
+) -> Result<Vec<Vec<&'a Expr>>, LookupError> {
+    let mut lists = Vec::new();
     if column.is_nullable(database)? {
-        return Ok(None);
+        return Ok(lists);
     }
     let stored = column.stored_column_name();
     for check in column.check_constraints(database)? {
         if !check.is_validated(database)? {
             continue;
         }
-        if let Some((_, values)) = conjuncts(check.expression(database))
-            .into_iter()
-            .filter_map(fixed_by)
-            .find(|(name, _)| *name == stored)
-        {
-            return Ok(Some(values));
-        }
+        lists.extend(
+            conjuncts(check.expression(database))
+                .into_iter()
+                .filter_map(fixed_by)
+                .filter(|(name, _)| *name == stored)
+                .map(|(_, values)| values),
+        );
     }
-    Ok(None)
+    Ok(lists)
 }
 
 /// A column with the texts its row may hold in it.
