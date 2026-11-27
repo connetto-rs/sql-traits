@@ -24,7 +24,7 @@ use sqlparser_expr_eval::{
     implied, sql_values::postgres::PgValue,
 };
 
-use super::{Engine, Key, Relation, Site, Source, TopLevel, TruthContext};
+use super::{Engine, Key, Relation, Site, Source, TruthContext};
 use crate::{
     errors::LookupError,
     impls::{body_expression, dql::scoped_roots::is_input, sql_query_body},
@@ -563,8 +563,12 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                 _ => None,
             }
         });
+        let distinct = match &select.distinct {
+            Some(Distinct::On(keys)) => keys.as_slice(),
+            _ => &[],
+        };
         let Some((aggregate, sets)) =
-            self.query_calls(index, items.chain(keys.map(|key| &key.expr)))?
+            self.query_calls(index, items.chain(distinct).chain(keys.map(|key| &key.expr)))?
         else {
             return Ok(None);
         };
@@ -646,13 +650,14 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         Ok(Some((rows, constraints)))
     }
 
-    /// Whether `expressions`, the select list and sort keys of the planned
-    /// query at `index`, call an aggregate outside a window and whether they
-    /// call a function returning a set, outside the queries they nest.
+    /// Whether `expressions`, the select list, `DISTINCT ON` keys and sort
+    /// keys of the planned query at `index`, call an aggregate outside a
+    /// window and whether they call a function returning a set, outside the
+    /// queries they nest.
     /// `None` where a call runs no function the read knows, which may be an
-    /// aggregate, or where an aggregate may belong to an enclosing query,
-    /// which PostgreSQL decides by the level of the columns its arguments
-    /// read.
+    /// aggregate, or where an aggregate may belong to another query than
+    /// the one it is written in, which PostgreSQL decides by the level of
+    /// the columns it reads.
     fn query_calls<'e>(
         &mut self,
         index: usize,
@@ -661,13 +666,18 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         let scope = self.nested.queries[index].scope;
         let (mut aggregate, mut sets, mut known) = (false, false, true);
         for expression in expressions {
-            let mut visitor = TopLevel {
-                depth: 0,
-                floor: 0,
-                each: |node: &Expr| -> Result<(), LookupError> {
-                    let Expr::Function(call) = node else { return Ok(()) };
+            let mut visitor = Calls {
+                queries: Vec::new(),
+                each: |nested: Option<usize>, call: &Function| -> Result<(), LookupError> {
+                    if !known {
+                        return Ok(());
+                    }
+                    if let Some(address) = nested {
+                        known = self.stays_nested(address, call)?;
+                        return Ok(());
+                    }
                     let callees = self.callees(call)?;
-                    known &= !callees.is_empty();
+                    known = !callees.is_empty();
                     for callee in callees {
                         let aggregates =
                             call.over.is_none() && callee.kind == CalleeKind::Aggregate;
@@ -687,15 +697,41 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         Ok(known.then_some((aggregate, sets)))
     }
 
-    /// Whether every column the arguments of `call` read is one of the
-    /// `FROM` items binding in `scope`, a context and a scope in it, so that
-    /// the aggregate `call` belongs to the query of those items.
+    /// Whether `call`, written in the planned query at `address` nested in
+    /// the query being read, runs no aggregate of an enclosing query.
+    /// PostgreSQL makes an aggregate reading only columns of enclosing
+    /// queries an aggregate of the nearest of them.
+    fn stays_nested(&mut self, address: usize, call: &Function) -> Result<bool, LookupError> {
+        if call.over.is_some() {
+            return Ok(true);
+        }
+        let Some(index) =
+            self.nested.queries.iter().position(|plan| plan.address == address && !plan.active)
+        else {
+            return Ok(false);
+        };
+        let scope = self.nested.queries[index].scope;
+        let site = mem::replace(&mut self.nested.queries[index].site, Site::empty());
+        let frame = self.enter(site, None);
+        let stays = self.callees(call).and_then(|callees| {
+            let plain = !callees.is_empty()
+                && callees.iter().all(|callee| callee.kind != CalleeKind::Aggregate);
+            if plain { Ok(true) } else { self.reads_locally(call, scope) }
+        });
+        self.nested.queries[index].site = self.leave(frame);
+        stays
+    }
+
+    /// Whether every column the arguments, sort keys and filter of `call`
+    /// read is one of the `FROM` items binding in `scope`, a context and a
+    /// scope in it, so that the aggregate `call` belongs to the query of
+    /// those items.
     fn reads_locally(
         &mut self,
         call: &Function,
         scope: Option<(usize, usize)>,
     ) -> Result<bool, LookupError> {
-        let walked = walk_expressions(&call.args, |node| {
+        let walked = walk_expressions(call, |node| {
             let local = match node {
                 Expr::Subquery(_)
                 | Expr::Exists { .. }
@@ -1559,6 +1595,36 @@ fn carried(value: &Evaluation, ty: &ScalarType) -> Evaluation {
     let values =
         if value.values().is_empty() { Values::none() } else { Values::Unlisted(Unlisted::any()) };
     Evaluation::new(ty.clone(), value.may_be_null(), false, values)
+}
+
+/// Hands `each` every call a node makes, with the address of the innermost
+/// query nested in the node that holds the call, `None` for a call outside
+/// them, until `each` fails.
+struct Calls<F> {
+    queries: Vec<usize>,
+    each: F,
+}
+
+impl<F: FnMut(Option<usize>, &Function) -> Result<(), LookupError>> Visitor for Calls<F> {
+    type Break = LookupError;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+        self.queries.push(ptr::from_ref(query).addr());
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+        self.queries.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::Function(call) = expression else { return ControlFlow::Continue(()) };
+        match (self.each)(self.queries.last().copied(), call) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
 }
 
 /// Whether the key `key` names a value the query whose `FROM` items bind

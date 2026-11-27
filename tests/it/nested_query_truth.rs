@@ -228,6 +228,30 @@ fn aggregates() -> Result<(), Error> {
     // stays unread.
     let sql = "(SELECT t.o FROM caps WHERE t.o > 5 ORDER BY count(o IS NULL)) > 5";
     assert!(truth(sql)?.outcomes.falsity);
+    // An aggregate in a nested query whose arguments read only columns of
+    // `c` belongs to the query reading `c`, which then returns one row.
+    for sql in [
+        "EXISTS (SELECT (SELECT max(c.o)) FROM caps AS c WHERE false)",
+        "EXISTS (SELECT (SELECT max(c.o) FROM caps AS d) FROM caps AS c WHERE false)",
+        "EXISTS (SELECT 1 FROM caps AS c WHERE false ORDER BY (SELECT max(c.o)))",
+        "EXISTS (SELECT (SELECT count(*) FILTER (WHERE c.o > 0)) FROM caps AS c WHERE false)",
+        "EXISTS (SELECT DISTINCT ON ((SELECT max(c.o))) 1 FROM caps AS c WHERE false)",
+    ] {
+        assert!(truth(sql)?.outcomes.truth, "{sql}");
+    }
+    let sql = "(SELECT (SELECT count(c.o)) FROM caps AS c WHERE false) IS NULL";
+    assert!(truth(sql)?.outcomes.falsity);
+    let sql = "EXISTS (SELECT DISTINCT ON (max(c.o)) 1 FROM caps AS c WHERE false)";
+    assert_eq!(truth(sql)?.outcomes, Outcomes::TRUE);
+    // A window function belongs to the query it is written in.
+    let sql = "EXISTS (SELECT (SELECT count(c.o) OVER ()) FROM caps AS c WHERE false)";
+    assert_eq!(truth(sql)?.outcomes, Outcomes::FALSE);
+    // The filter reads only `t`, so `count(*)` belongs to the outer level.
+    let sql = "EXISTS (SELECT count(*) FILTER (WHERE t.o > 0) FROM caps WHERE false)";
+    assert_ne!(truth(sql)?.raising, Raising::Never);
+    // Reading a column of `d`, the aggregate belongs to the query reading `d`.
+    let sql = "EXISTS (SELECT (SELECT max(d.o) FROM caps AS d) FROM caps AS c WHERE false)";
+    assert_eq!(truth(sql)?.outcomes, Outcomes::FALSE);
     Ok(())
 }
 
