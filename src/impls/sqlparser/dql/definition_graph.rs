@@ -197,6 +197,16 @@ struct SelectIndex {
     scope: ScopeId,
 }
 
+/// A `VALUES` list the graph derived columns for.
+struct ValuesList {
+    /// The address of the list.
+    address: usize,
+    /// Its column definitions, at this range of [`DefinitionGraph::lists`].
+    columns: Range<usize>,
+    /// The scope its cells are read in.
+    cells: ScopeCursor,
+}
+
 fn select_address(select: &Select) -> usize {
     core::ptr::from_ref(select).addr()
 }
@@ -231,9 +241,8 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// The definition lists the nodes of `VALUES` columns and
     /// [`Self::values`] name by range.
     lists: Vec<DefinitionId>,
-    /// The column definitions of every `VALUES` list derived, by the list's
-    /// address, at a range of [`Self::lists`].
-    values: Vec<(usize, Range<usize>)>,
+    /// Every `VALUES` list derived.
+    values: Vec<ValuesList>,
     case: IdentifierCase,
     dialect: crate::impls::SqlparserDialect,
 }
@@ -319,11 +328,18 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     /// The column definitions of `values`, `None` for a list the graph did
     /// not enumerate.
     pub(super) fn values_columns(&self, values: &Values) -> Option<&[DefinitionId]> {
+        self.values_list(values).map(|list| &self.lists[list.columns.start..list.columns.end])
+    }
+
+    /// The scope the cells of `values` are read in, `None` for a list the
+    /// graph did not enumerate.
+    pub(super) fn values_cursor(&self, values: &Values) -> Option<ScopeCursor> {
+        self.values_list(values).map(|list| list.cells)
+    }
+
+    fn values_list(&self, values: &Values) -> Option<&ValuesList> {
         let address = core::ptr::from_ref(values).addr();
-        self.values
-            .iter()
-            .find(|(held, _)| *held == address)
-            .map(|(_, columns)| &self.lists[columns.start..columns.end])
+        self.values.iter().find(|list| list.address == address)
     }
 
     fn resolve_definition_id<'scope>(
@@ -1156,7 +1172,11 @@ impl<'query, 'db, DB: DatabaseLike> DerivationProfile<'query, 'db, DB>
         let start = self.graph.lists.len();
         self.graph.lists.extend_from_slice(&columns);
         let address = core::ptr::from_ref(values.get()).addr();
-        self.graph.values.push((address, start..self.graph.lists.len()));
+        self.graph.values.push(ValuesList {
+            address,
+            columns: start..self.graph.lists.len(),
+            cells: scope,
+        });
         Ok(columns)
     }
 

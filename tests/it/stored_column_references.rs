@@ -43,6 +43,7 @@ fn an_unknown_column_is_refused() {
         r#"CREATE VIEW v8 AS SELECT unknown_catalog.public.t."nosuch" FROM t;"#,
         r#"CREATE VIEW v9 AS SELECT id FROM t ORDER BY "nosuch";"#,
         r#"CREATE VIEW v10 AS SELECT id FROM t UNION SELECT id FROM t ORDER BY "nosuch";"#,
+        r#"CREATE VIEW v11 AS SELECT x FROM (VALUES ("nosuch")) AS s(x);"#,
     ] {
         let parsed = parse(statement);
         assert!(
@@ -85,6 +86,8 @@ fn a_resolved_column_stays_accepted() {
         "CREATE VIEW v AS SELECT ctid, tableoid, t.xmin FROM t;",
         "CREATE VIEW v AS SELECT id FROM t ORDER BY ctid;",
         "CREATE VIEW v AS SELECT column1 FROM (VALUES (1)) AS x;",
+        "CREATE VIEW v AS SELECT (SELECT sum(x) FROM (VALUES (a), (1)) AS s(x)) AS n FROM t;",
+        "CREATE VIEW v AS SELECT x FROM t, LATERAL (VALUES (a)) AS s(x);",
         "CREATE VIEW v AS SELECT t.row_to_json, t.text FROM t;",
         "CREATE VIEW v AS SELECT make_interval(days => a) AS i FROM t;",
         "CREATE TYPE pair AS (x INT, y INT);
