@@ -3621,11 +3621,13 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             return Ok(None);
         };
         let [Statement::Query(query)] = statements.as_ref() else { return Ok(None) };
-        let projected = projected(query);
-        let selection = output_selection(query);
-        if projected.is_none() && selection.is_none() {
+        let shape = if let Some(returned) = projected(query) {
+            AccessorBody::Projected(returned)
+        } else if let Some(selection) = output_selection(query) {
+            AccessorBody::Selected(selection)
+        } else {
             return Ok(None);
-        }
+        };
         let path = match accessor.search_path(database)? {
             Some(path) => path,
             None => scope.path.clone(),
@@ -3647,16 +3649,15 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
             owner,
             accessing,
         };
-        let (returned, called) = match (projected, selection) {
-            (Some(returned), _) => (Cow::Borrowed(returned), None),
-            (None, Some(selection)) => {
+        let (returned, called) = match shape {
+            AccessorBody::Projected(returned) => (Cow::Borrowed(returned), None),
+            AccessorBody::Selected(selection) => {
                 let Some((returned, called)) = self.selected_outputs(scope, &body, selection)?
                 else {
                     return Ok(None);
                 };
                 (Cow::Owned(returned), Some(called))
             }
-            (None, None) => return Ok(None),
         };
         let Some((setting_read, accessed, returns_read)) = read(&body, &returned)? else {
             return Ok(None);
@@ -3729,29 +3730,33 @@ impl<'db, DB: DatabaseLike> Reader<'db, DB> {
         let returned = called
             .returned_values(database, self.deployment)
             .map_err(|source| refuse(OutputRefusal::Unreturned(Box::new(source))))?;
-        let mut types = Vec::new();
-        for ((mode, output), declared) in called
+        let declared: Vec<_> = called
             .argument_modes()
             .zip(called.stored_argument_names(database))
             .zip(called.argument_type_names(database))
-        {
-            if let (ArgMode::Out | ArgMode::InOut, Some(output)) = (mode, output) {
-                let Some(declared) = parse_data_type(&declared) else { return Ok(None) };
-                types.push((output, declared));
-            }
-        }
+            .filter(|((mode, _), _)| matches!(mode, ArgMode::Out | ArgMode::InOut))
+            .filter_map(|((_, output), declared)| Some((output?, declared)))
+            .collect();
+        let typed: Option<Vec<_>> = returned
+            .iter()
+            .map(|value| {
+                let (_, declared) = declared.iter().find(|(output, _)| output == value.name())?;
+                Some((value, parse_data_type(declared)?))
+            })
+            .collect();
+        let Some(outputs) = typed else { return Ok(None) };
         // A function in `FROM` is named by its own name, without its schema.
-        let qualifier = if let Some(alias) = alias {
-            alias.name.clone()
-        } else {
-            let Some((function_name, quoted)) = object_name_last_part(name) else {
-                return Ok(None);
-            };
-            Ident { quote_style: quoted.then_some('"'), ..Ident::new(function_name) }
+        let qualifier = match alias {
+            Some(alias) => Some(alias.name.clone()),
+            None => {
+                object_name_last_part(name).map(|(function_name, quoted)| {
+                    Ident { quote_style: quoted.then_some('"'), ..Ident::new(function_name) }
+                })
+            }
         };
+        let Some(qualifier) = qualifier else { return Ok(None) };
         let mut selected = selected.clone();
-        let mut substitution =
-            OutputSubstitution { qualifier: &qualifier, returned: &returned, types: &types };
+        let mut substitution = OutputSubstitution { qualifier: &qualifier, outputs: &outputs };
         match walk_mut(&mut selected, &mut substitution) {
             ControlFlow::Continue(()) => Ok(Some((selected, called))),
             ControlFlow::Break(None) => Ok(None),
@@ -4720,6 +4725,14 @@ fn projected(query: &Query) -> Option<&Expr> {
 /// [<alias>]`, the alias naming no column.
 type OutputSelection<'q> = (&'q Expr, &'q ObjectName, Option<&'q TableAlias>);
 
+/// What the body of an accessor selects its one expression from.
+enum AccessorBody<'q> {
+    /// The expression alone, reading no relation.
+    Projected(&'q Expr),
+    /// The expression over the one row a function returns.
+    Selected(OutputSelection<'q>),
+}
+
 /// The expression `query` selects from the one row a call passing no
 /// argument hands its `FROM`, beside the call's name and alias.
 fn output_selection(query: &Query) -> Option<OutputSelection<'_>> {
@@ -4740,14 +4753,13 @@ fn output_selection(query: &Query) -> Option<OutputSelection<'_>> {
 
 /// Replaces each name of a column of the row a function returns, bare or
 /// qualified by `qualifier`, with what the output parameter of that name
-/// holds, cast to its type in `types` unless the expression casts to that
-/// type itself. Breaks with `None` on a subquery, which resolves names in
-/// scopes of its own, and on a name no output answers, and with the
-/// refusal where the output holds no one expression.
+/// holds, cast to its type unless the expression casts to that type itself.
+/// Breaks with `None` on a subquery, which resolves names in scopes of its
+/// own, and on a name no output answers, and with the refusal where the
+/// output holds no one expression.
 struct OutputSubstitution<'o> {
     qualifier: &'o Ident,
-    returned: &'o [ReturnedValue],
-    types: &'o [(Cow<'o, str>, DataType)],
+    outputs: &'o [(&'o ReturnedValue, DataType)],
 }
 
 impl VisitorMut for OutputSubstitution<'_> {
@@ -4769,14 +4781,11 @@ impl VisitorMut for OutputSubstitution<'_> {
             _ => return ControlFlow::Continue(()),
         };
         let quoted = column.quote_style.is_some();
-        let Some(output) = self
-            .returned
+        let Some((output, declared)) = self
+            .outputs
             .iter()
-            .find(|output| identifiers_match(output.name(), true, &column.value, quoted))
+            .find(|(output, _)| identifiers_match(output.name(), true, &column.value, quoted))
         else {
-            return ControlFlow::Break(None);
-        };
-        let Some((_, declared)) = self.types.iter().find(|(name, _)| name == output.name()) else {
             return ControlFlow::Break(None);
         };
         let held = match output.output() {

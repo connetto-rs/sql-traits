@@ -10347,3 +10347,241 @@ fn a_parent_arm_subtracts_a_helpers_pairs() {
         assert_eq!(returned, expected, "{caller}");
     }
 }
+
+/// The installation arm of `authz.caller_grantees` in [`NAMESPACE_PAIRS`].
+const INSTALLATION_ARM: &str =
+    "  SELECT grantee.namespace_id, grantee.id FROM public.grantees grantee
+  WHERE grantee.namespace_id = (SELECT authz.acting_installation_namespace_id())
+    AND grantee.id = (SELECT authz.acting_installation_id()) AND grantee.kind = 'installation'";
+
+/// A request test that holds on every request the deployment admits.
+const EITHER: &str = "((SELECT authz.caller_id()) IS NULL OR \
+                      (SELECT authz.acting_installation_namespace_id()) IS NOT NULL)";
+
+/// Helpers granting the organizations of the installations a request names,
+/// the arm comparing its grantee with a set another helper returns.
+const INSTALLATION_ORGANIZATIONS: &str = "
+CREATE FUNCTION authz.acting_installation_ids() RETURNS SETOF UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT grantee.id FROM public.grantees grantee
+  WHERE grantee.namespace_id = (SELECT authz.acting_installation_namespace_id())
+    AND grantee.id = (SELECT authz.acting_installation_id())
+$$;
+CREATE FUNCTION authz.installation_organizations() RETURNS SETOF UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT permission.organization_id FROM public.installation_permissions permission
+  WHERE permission.installation_id IN (SELECT authz.acting_installation_ids()) AND EITHER
+$$;
+ALTER FUNCTION authz.acting_installation_ids() OWNER TO authz_owner;
+ALTER FUNCTION authz.installation_organizations() OWNER TO authz_owner;
+GRANT EXECUTE ON FUNCTION authz.installation_organizations() TO app;
+";
+
+/// What PostgreSQL 18.7 returns from `authz.caller_grantees()` with
+/// [`INSTALLATION_ARM`] also testing [`EITHER`], and from
+/// `authz.installation_organizations()` in [`INSTALLATION_ORGANIZATIONS`],
+/// called as `app` over [`NAMESPACE_PAIR_ROWS`] for the requests of
+/// [`NAMESPACE_PAIRS_MEASURED`] in their order.
+const EITHER_MEASURED: [(&[[&str; 2]], &[&str]); 5] = [
+    (&[[NAMESPACE_ZERO, USER_C1], [NAMESPACE_ZERO, SIGNED_IN_D1]], &[]),
+    (
+        &[[NAMESPACE_ZERO, SIGNED_IN_D1], [NAMESPACE_A1, INSTALLATION_B1]],
+        &[ORGANIZATION_F1, ORGANIZATION_F3],
+    ),
+    (
+        &[[NAMESPACE_ZERO, SIGNED_IN_D1], [NAMESPACE_A2, INSTALLATION_B1]],
+        &[ORGANIZATION_F1, ORGANIZATION_F3],
+    ),
+    (
+        &[[NAMESPACE_ZERO, SIGNED_IN_D1], [NAMESPACE_A1, INSTALLATION_B1]],
+        &[ORGANIZATION_F1, ORGANIZATION_F3],
+    ),
+    (&[], &[]),
+];
+
+#[test]
+fn each_arm_a_split_answers_names_the_grantee_of_the_arm_it_splits() {
+    let deployment = namespace_deployment(&DataType::Uuid);
+    let caller_null = "(SELECT authz.caller_id()) IS NULL";
+    let namespace_set = "(SELECT authz.acting_installation_namespace_id()) IS NOT NULL";
+    let organizations_arm =
+        "  SELECT permission.organization_id FROM public.installation_permissions permission
+  WHERE permission.installation_id IN (SELECT authz.acting_installation_ids()) AND";
+    let mut rendered = Vec::new();
+    for (installation, organizations) in [
+        (format!("{INSTALLATION_ARM} AND {EITHER}"), format!("{organizations_arm} {EITHER}")),
+        (
+            format!(
+                "{INSTALLATION_ARM} AND {caller_null}\n  UNION\n{INSTALLATION_ARM} AND {namespace_set}"
+            ),
+            format!(
+                "{organizations_arm} {caller_null}\n  UNION\n{organizations_arm} {namespace_set}"
+            ),
+        ),
+    ] {
+        let helpers = INSTALLATION_ORGANIZATIONS
+            .replace(&format!("{organizations_arm} EITHER"), &organizations);
+        assert_ne!(helpers, INSTALLATION_ORGANIZATIONS, "the organizations arm is replaced");
+        let sql = format!("{}{helpers}", NAMESPACE_PAIRS.replace(INSTALLATION_ARM, &installation));
+        let database = postgres(&sql);
+        let grantees =
+            namespace_helper(&database, &deployment, "caller_grantees").expect("answered");
+        let organizations = namespace_helper(&database, &deployment, "installation_organizations")
+            .expect("answered");
+        let requests = NAMESPACE_PAIRS_MEASURED.iter().map(|&(request, ..)| request);
+        for (request, (pairs, measured)) in requests.zip(EITHER_MEASURED) {
+            assert_grantees(&grantees, &installation, &[(request, pairs)]);
+            let returned: Vec<_> =
+                evaluate(&organizations, request, NAMESPACE_PAIR_ROWS).into_iter().collect();
+            assert_eq!(returned, measured, "{:?} {:?}", request.caller, request.values);
+        }
+        rendered.push((render(&grantees), render(&organizations)));
+    }
+    assert_eq!(rendered[0], rendered[1], "both spellings answer the same arms");
+    assert_eq!(
+        rendered[0].1,
+        "installation_permissions.organization_id WHERE installation_id IN \
+         authz.acting_installation_ids() {grantees.id WHERE \
+         namespace_id = app.installation_namespace_id AND id = app.installation_id} \
+         AND app.user_id IS UNSET \
+         UNION installation_permissions.organization_id WHERE installation_id IN \
+         authz.acting_installation_ids() {grantees.id WHERE \
+         namespace_id = app.installation_namespace_id AND id = app.installation_id} \
+         AND app.installation_namespace_id IS SET"
+    );
+}
+
+#[test]
+fn a_presence_gate_reads_whether_it_raises_on_an_unset_setting() {
+    let deployment = namespace_deployment(&DataType::Uuid);
+    let written = "(SELECT authz.acting_installation_id()) IS NOT NULL)";
+    for (read, raises) in [
+        (written.to_string(), false),
+        ("current_setting('app.installation_id') IS NOT NULL)".to_string(), true),
+    ] {
+        let sql = NAMESPACE_PAIRS.replace(written, &read);
+        let database = postgres(&sql);
+        let set = namespace_helper(&database, &deployment, "caller_grantees").expect("answered");
+        let HelperArm::Grant(grant) = set.arms().last().expect("an arm") else {
+            panic!("the last arm grants")
+        };
+        let [set_setting] = grant.set_settings() else { panic!("one set setting") };
+        assert_eq!(set_setting.setting().name(), INSTALLATION);
+        assert_eq!(set_setting.raises_when_unset(), raises, "{read}");
+        assert_eq!(set_setting.reads_empty_as_unset(), !raises, "{read}");
+    }
+}
+
+#[test]
+fn an_accessor_reads_a_validator_only_through_its_named_outputs_on_its_path() {
+    let accessor = "SELECT id FROM authz.acting_installation()";
+    let header = "LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp";
+    let read = "installation_permissions.organization_id WHERE \
+                installation_namespace_id = app.installation_namespace_id \
+                AND installation_id = app.installation_id";
+    let uuid =
+        |replaced: &[(&str, &str)]| permitted_with(NAMESPACE_PAIRS, &DataType::Uuid, replaced);
+    for replaced in [
+        (accessor, "SELECT v.id FROM authz.acting_installation() v"),
+        (header, "LANGUAGE plpgsql STABLE SECURITY DEFINER"),
+        (header, "LANGUAGE plpgsql STABLE SET search_path = pg_catalog, pg_temp"),
+    ] {
+        assert_eq!(uuid(&[replaced]).as_deref(), Ok(read), "{replaced:?}");
+    }
+    for replaced in [
+        &[(accessor, "SELECT id FROM authz.caller_grantees()")][..],
+        &[(accessor, "SELECT other.id FROM authz.acting_installation()")],
+        &[(accessor, "SELECT nope FROM authz.acting_installation()")],
+        &[(accessor, "SELECT (SELECT id) FROM authz.acting_installation()")],
+        &[(header, "LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public")],
+        &[(
+            VALIDATED_ID,
+            "id := (NULLIF(current_setting('app.installation_id', true), '')::UUID);",
+        )],
+        &[(VALIDATED_ID, "id := NULL;"), (VALIDATION, "")],
+        &[(VALIDATED_ID, ""), (VALIDATION, "")],
+    ] {
+        let refused = uuid(replaced);
+        assert!(
+            matches!(refused, Err(HelperSetError::Irreducible { .. })),
+            "{replaced:?}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn a_guard_reads_only_two_setting_reads_in_their_declared_types() {
+    let guarded =
+        "SELECT CASE WHEN id IS NOT NULL THEN namespace_id END FROM authz.acting_installation()";
+    let id = "NULLIF(current_setting('app.installation_id', true), '')";
+    let namespace = "NULLIF(current_setting('app.installation_namespace_id', true), '')::uuid";
+    let answer = |tested: &str, read: &str| {
+        permitted_with(
+            NAMESPACE_PAIRS,
+            &DataType::Uuid,
+            &[(guarded, &format!("SELECT CASE WHEN {tested} IS NOT NULL THEN {read} END"))],
+        )
+    };
+    let constant = answer(&format!("{id}::uuid"), "'00000000-0000-0000-0000-0000000000a1'::uuid");
+    assert!(matches!(constant, Err(HelperSetError::Irreducible { .. })), "{constant:?}");
+    let text = answer(&format!("{id}::text"), namespace);
+    assert!(
+        matches!(&text, Err(HelperSetError::SettingCast { setting, cast, .. })
+            if setting == INSTALLATION && cast == "TEXT"),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn an_accessor_refusal_names_why_the_validator_reads_as_no_setting() {
+    let header = "LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp";
+    let refusal = |sql: &str, identity: &DataType, replaced: &[(&str, &str)]| {
+        permitted_with(sql, identity, replaced).expect_err("refused").to_string()
+    };
+    let in_text = namespace_pairs_in_text();
+    for (message, reason) in [
+        (
+            refusal(
+                NAMESPACE_PAIRS,
+                &DataType::Uuid,
+                &[(header, &header.replace("STABLE", "IMMUTABLE"))],
+            ),
+            "selects what an IMMUTABLE function returns",
+        ),
+        (
+            refusal(
+                &in_text,
+                &DataType::Text,
+                &[(header, &format!("{header} SET app.installation_id = ''")), (VALIDATION, "")],
+            ),
+            "selects what a function returns that sets the setting it reads",
+        ),
+        (
+            refusal(
+                NAMESPACE_PAIRS,
+                &DataType::Uuid,
+                &[(
+                    VALIDATED_ID,
+                    &format!(
+                        "IF namespace_id IS NULL THEN id := NULL; ELSE {VALIDATED_ID} END IF;"
+                    ),
+                )],
+            ),
+            "whose output `id` several assignments give",
+        ),
+        (
+            refusal(NAMESPACE_PAIRS, &DataType::Uuid, &[(VALIDATED_ID, "id := namespace_id;")]),
+            "whose output `id` no assignment of an expression gives",
+        ),
+        (
+            refusal(
+                NAMESPACE_PAIRS,
+                &DataType::Uuid,
+                &[(header, &format!("{header} SET app.installation_id = ''"))],
+            ),
+            "whose outputs are not read (",
+        ),
+    ] {
+        assert!(message.contains(reason), "{message}");
+    }
+}
