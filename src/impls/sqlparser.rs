@@ -28,6 +28,7 @@ mod function_body;
 mod grant;
 mod helper_set;
 mod index_clauses;
+mod insert_filled;
 mod maintenance_body;
 mod outside_code;
 mod plpgsql_body;
@@ -64,6 +65,7 @@ pub(crate) use grant::{
     split_by_column_scope, validate_granted_columns,
 };
 pub(crate) use helper_set::helper_set;
+pub(crate) use insert_filled::trigger_filled_columns;
 pub(crate) use maintenance_body::maintenance_body;
 pub(crate) use user_defined_type::{
     bound_user_type, user_type_holds, user_type_in_schema, user_type_named,

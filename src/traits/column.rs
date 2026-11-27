@@ -682,6 +682,46 @@ pub trait ColumnLike:
         self.is_serial(database) || self.identity_generation(database).is_some()
     }
 
+    /// Returns whether every `INSERT` into the column's table takes the
+    /// column's value from the database whatever value the statement gives,
+    /// as [`TableLike::filled_on_insert_columns`] describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`TableLike::filled_on_insert_columns`] returns.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE t (id INT, kind TEXT, parent_kind TEXT);
+    ///      CREATE FUNCTION copy_kind() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    ///      BEGIN
+    ///        SELECT parent.kind INTO NEW.parent_kind FROM t parent WHERE parent.id = NEW.id;
+    ///        RETURN NEW;
+    ///      END $$;
+    ///      CREATE TRIGGER copy_kind BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION copy_kind();",
+    /// )?;
+    /// let t = db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let filled = |name| -> Result<bool, sql_traits::errors::Error> {
+    ///     Ok(t.column(name, &db, IdentifierCase::AsWritten)?.unwrap().is_filled_on_insert(&db)?)
+    /// };
+    /// assert!(filled("parent_kind")?);
+    /// assert!(!filled("kind")?);
+    /// assert!(!filled("id")?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn is_filled_on_insert(&self, database: &Self::DB) -> Result<bool, LookupError> {
+        let table: &<Self::DB as DatabaseLike>::Table = ColumnLike::table(self, database);
+        Ok(table.filled_on_insert_columns(database)?.any(|column| column == self.borrow()))
+    }
+
     /// Returns whether the column is a hidden column of a SQLite virtual
     /// table, which `SELECT *` leaves out while a query naming it reads it.
     ///

@@ -7,6 +7,7 @@ use core::{borrow::Borrow, fmt::Debug, hash::Hash};
 
 use crate::{
     errors::{Error, LookupError, ObjectKind, RowSecurityError},
+    impls::trigger_filled_columns,
     structs::{
         ActingRole, Assumption, ExpressionTruth, ForeignTableSource, HeldPrivileges,
         IdentifierCase, PartitionBound, ReplicaIdentity, RowSecurity, RowStatement,
@@ -14,9 +15,9 @@ use crate::{
         fingerprint::{FingerprintError, compute_persistence_v1},
     },
     traits::{
-        ColumnGrantLike, ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike, Metadata,
-        PolicyLike, Relation, RoleLike, RuleLike, TableGrantLike, TriggerLike,
-        check_constraint::non_tautological, role::privilege_holders,
+        ColumnGrantLike, ColumnLike, DataTypeLike, DatabaseLike, ForeignKeyLike,
+        IdentityGeneration, Metadata, PolicyLike, Relation, RoleLike, RuleLike, TableGrantLike,
+        TriggerLike, check_constraint::non_tautological, role::privilege_holders,
     },
     utils::identifier_resolution::{identifiers_match, is_temporary_schema, stored_identifier},
 };
@@ -190,6 +191,83 @@ pub trait TableLike:
                 Ok(Relation::Table(table) | Relation::ForeignTable(table))
                     if table.borrow() == self.borrow()
             )
+        }))
+    }
+
+    /// Returns the columns whose value every `INSERT` into the table takes
+    /// from the database whatever value the statement gives, in declaration
+    /// order.
+    ///
+    /// Those are the computed columns, `GENERATED ALWAYS AS (expression)`
+    /// stored or virtual, the `GENERATED ALWAYS AS IDENTITY` columns, which
+    /// take a given value only under `OVERRIDING SYSTEM VALUE`, and the
+    /// columns the `BEFORE INSERT` row triggers overwrite before anything
+    /// reads the value given.
+    ///
+    /// The triggers are those firing for a session whose
+    /// `session_replication_role` is `origin`, taken in the byte order of
+    /// their names as PostgreSQL fires them. One without `WHEN` fills a
+    /// column when its PL/pgSQL body assigns that field of `NEW` on every
+    /// path returning `NEW`, by `:=` or by `SELECT … INTO`, and nothing
+    /// before the assignment names the field or the whole of `NEW`, whether
+    /// an earlier trigger, an earlier `WHEN` condition or an earlier part of
+    /// the body. A path that raises or returns `NULL` inserts nothing. A
+    /// body this cannot read, such as one in another language, may read
+    /// every field, and a body returning anything but `NEW` or `NULL` fills
+    /// nothing. A rule on `INSERT` keeps every given value, and a
+    /// partitioned table with partitions answers what every partition
+    /// fills.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LookupError::ObjectNotInDatabase`] when `database` does not
+    /// hold this table, and the [`LookupError`] that reading the
+    /// `search_path` setting of a trigger's function raises.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let db = ParserDB::parse::<PostgreSqlDialect>(
+    ///     "CREATE TABLE notes (
+    ///          id INT GENERATED ALWAYS AS IDENTITY,
+    ///          body TEXT,
+    ///          slug TEXT,
+    ///          edited_at TIMESTAMPTZ,
+    ///          length INT GENERATED ALWAYS AS (length(body)) STORED
+    ///      );
+    ///      CREATE FUNCTION stamp() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    ///      BEGIN
+    ///        NEW.edited_at := now();
+    ///        NEW.slug := lower(NEW.slug);
+    ///        RETURN NEW;
+    ///      END $$;
+    ///      CREATE TRIGGER stamp BEFORE INSERT ON notes FOR EACH ROW EXECUTE FUNCTION stamp();",
+    /// )?;
+    /// let notes =
+    ///     db.table_by_target(TargetName::new("notes", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let filled: Vec<&str> =
+    ///     notes.filled_on_insert_columns(&db)?.map(ColumnLike::column_name).collect();
+    /// // `slug` keeps a lowered copy of the given value
+    /// assert_eq!(filled, ["id", "edited_at", "length"]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn filled_on_insert_columns<'db>(
+        &'db self,
+        database: &'db Self::DB,
+    ) -> Result<impl Iterator<Item = &'db <Self::DB as DatabaseLike>::Column>, LookupError>
+    where
+        Self: 'db,
+    {
+        let triggered = trigger_filled_columns(self.borrow(), database)?;
+        Ok(self.columns(database)?.filter(move |column| {
+            column.generation_expression().is_some()
+                || column.identity_generation(database) == Some(IdentityGeneration::Always)
+                || triggered.contains(column.stored_column_name().as_ref())
         }))
     }
 
