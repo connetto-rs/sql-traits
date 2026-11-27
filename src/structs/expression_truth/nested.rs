@@ -649,26 +649,30 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// Whether `expressions`, the select list and sort keys of the planned
     /// query at `index`, call an aggregate outside a window and whether they
     /// call a function returning a set, outside the queries they nest.
-    /// `None` where an aggregate may belong to an enclosing query, which
-    /// PostgreSQL decides by the level of the columns its arguments read.
+    /// `None` where a call runs no function the read knows, which may be an
+    /// aggregate, or where an aggregate may belong to an enclosing query,
+    /// which PostgreSQL decides by the level of the columns its arguments
+    /// read.
     fn query_calls<'e>(
         &mut self,
         index: usize,
         expressions: impl Iterator<Item = &'e Expr>,
     ) -> Result<Option<(bool, bool)>, LookupError> {
         let scope = self.nested.queries[index].scope;
-        let (mut aggregate, mut sets, mut local) = (false, false, true);
+        let (mut aggregate, mut sets, mut known) = (false, false, true);
         for expression in expressions {
             let mut visitor = TopLevel {
                 depth: 0,
                 floor: 0,
                 each: |node: &Expr| -> Result<(), LookupError> {
                     let Expr::Function(call) = node else { return Ok(()) };
-                    for callee in self.callees(call)? {
+                    let callees = self.callees(call)?;
+                    known &= !callees.is_empty();
+                    for callee in callees {
                         let aggregates =
                             call.over.is_none() && callee.kind == CalleeKind::Aggregate;
-                        if aggregates && local {
-                            local = self.reads_locally(call, scope)?;
+                        if aggregates && known {
+                            known = self.reads_locally(call, scope)?;
                         }
                         aggregate |= aggregates;
                         sets |= callee.returns_set;
@@ -680,7 +684,7 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
                 return Err(error);
             }
         }
-        Ok(local.then_some((aggregate, sets)))
+        Ok(known.then_some((aggregate, sets)))
     }
 
     /// Whether every column the arguments of `call` read is one of the
@@ -807,8 +811,12 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
     /// Whether scanning `table` may raise for the role the read runs as,
     /// through a missing `SELECT` privilege or a policy clause that may
     /// raise on a row it tests. The caller's read may raise where the read
-    /// of any acting role of the assumed deployment may.
+    /// of any acting role of the assumed deployment may. SQLite checks no
+    /// privilege and no policy.
     fn table_read_raises(&mut self, table: &'a DB::Table) -> Result<bool, LookupError> {
+        if self.engine == Engine::Sqlite {
+            return Ok(false);
+        }
         let Reader::Caller = self.nested.reader else {
             return self.read_raises_as(table, self.nested.reader);
         };
@@ -1061,11 +1069,9 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
         values: &ValueRows,
         guarantees: Guarantees<usize>,
     ) -> Result<Option<Read>, LookupError> {
-        let rows = match values.rows.len() {
-            0 => Rows::NONE,
-            1 => Rows::ONE,
-            _ => Rows::new(false, false, true),
-        };
+        // A `VALUES` list writes at least one row.
+        let many = values.rows.len() > 1;
+        let rows = Rows::new(false, !many, many);
         let mut read = Read { rows, columns: None, error: false, guarantees };
         for row in &values.rows {
             let mut evaluated = Vec::with_capacity(row.content.len());

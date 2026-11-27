@@ -9,7 +9,10 @@
 use sql_traits::{errors::Error, prelude::*};
 use sqlparser::{
     ast::{Expr, SetExpr, Statement},
-    dialect::PostgreSqlDialect,
+    dialect::{
+        ClickHouseDialect, Dialect, DuckDbDialect, GenericDialect, MsSqlDialect, MySqlDialect,
+        PostgreSqlDialect, SQLiteDialect, SnowflakeDialect,
+    },
     parser::Parser,
 };
 
@@ -46,7 +49,27 @@ const SCHEMA: &str = "CREATE TABLE caps (o INT NOT NULL, role INT NOT NULL);
      CREATE TABLE screened (n INT NOT NULL);
      GRANT SELECT ON screened TO PUBLIC;
      ALTER TABLE screened ENABLE ROW LEVEL SECURITY;
-     CREATE POLICY compares ON screened FOR SELECT USING (n > 0);";
+     CREATE POLICY compares ON screened FOR SELECT USING (n > 0);
+     CREATE FUNCTION all_caps() RETURNS SETOF caps LANGUAGE sql STABLE
+         AS $$ SELECT caps.* FROM caps $$;
+     CREATE FUNCTION mismatched() RETURNS TABLE (a INT, b INT) LANGUAGE sql STABLE
+         AS $$ SELECT 1 $$;
+     CREATE FUNCTION nothing() RETURNS INT LANGUAGE sql STABLE AS $$ SELECT 1 WHERE false $$;
+     CREATE FUNCTION no_rows() RETURNS SETOF INT LANGUAGE sql STABLE
+         AS $$ SELECT 1 WHERE false $$;
+     CREATE FUNCTION broken() RETURNS INT LANGUAGE sql STABLE AS $$ SELECT x FROM nowhere $$;
+     CREATE FUNCTION two_statements() RETURNS INT LANGUAGE sql STABLE
+         AS $$ SELECT 1; SELECT 2 $$;
+     CREATE FUNCTION garbled() RETURNS INT LANGUAGE sql STABLE AS $$ SELECT ( $$;
+     CREATE FUNCTION counted(x INT) RETURNS BIGINT LANGUAGE sql STABLE
+         AS $$ SELECT count(x) FROM caps $$;
+     CREATE TABLE loop_a (n INT NOT NULL);
+     CREATE TABLE loop_b (n INT NOT NULL);
+     GRANT SELECT ON loop_a, loop_b TO PUBLIC;
+     ALTER TABLE loop_a ENABLE ROW LEVEL SECURITY;
+     ALTER TABLE loop_b ENABLE ROW LEVEL SECURITY;
+     CREATE POLICY a_reads_b ON loop_a FOR SELECT USING (EXISTS (SELECT 1 FROM loop_b));
+     CREATE POLICY b_reads_a ON loop_b FOR SELECT USING (EXISTS (SELECT 1 FROM loop_a));";
 
 const UNDECIDED: Outcomes = Outcomes { truth: true, falsity: true, null: false };
 
@@ -201,6 +224,10 @@ fn aggregates() -> Result<(), Error> {
     assert!(truth(sql)?.outcomes.falsity);
     let sql = "(SELECT 10 / t.maybe FROM caps WHERE t.maybe <> 0 ORDER BY count(*)) IS NULL";
     assert_eq!(truth(sql)?.raising, Raising::Sometimes);
+    // A call resolving to no function may be an aggregate, so the query
+    // stays unread.
+    let sql = "(SELECT t.o FROM caps WHERE t.o > 5 ORDER BY count(o IS NULL)) > 5";
+    assert!(truth(sql)?.outcomes.falsity);
     Ok(())
 }
 
@@ -249,6 +276,117 @@ fn reads_run_as_each_acting_role_of_the_deployment() -> Result<(), Error> {
         ("EXISTS (SELECT 1 FROM guarded)", ["ghost"].as_slice()),
     ] {
         assert_eq!(read(sql, acting)?.raising, Raising::Sometimes, "{sql} as {acting:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn shapes_the_read_follows() -> Result<(), Error> {
+    for (sql, outcomes) in [
+        ("EXISTS (SELECT DISTINCT o FROM caps)", UNDECIDED),
+        ("o IN (SELECT a.o FROM caps AS a LEFT JOIN caps AS b USING (o))", UNDECIDED),
+        ("EXISTS (SELECT 1 FROM caps CROSS JOIN positive)", UNDECIDED),
+        ("EXISTS (SELECT *, 1 FROM caps LEFT JOIN positive ON true)", UNDECIDED),
+        ("(SELECT count(CAST(o AS TEXT)) FROM caps) IS NULL", Outcomes::FALSE),
+        ("EXISTS (SELECT 1 FROM one())", Outcomes::TRUE),
+        ("(SELECT x FROM one() AS x) = 1", Outcomes::TRUE),
+        // A strict function returns no row for a `NULL` argument.
+        ("EXISTS (SELECT 1 FROM capped(NULL))", Outcomes::FALSE),
+        ("o IN (SELECT * FROM capped(t.maybe))", UNDECIDED),
+        ("EXISTS (SELECT 1 FROM all_caps())", UNDECIDED),
+        ("EXISTS (SELECT 1 FROM caps LEFT JOIN positive ON true CROSS JOIN capped2(1))", UNDECIDED),
+        ("inverse(1) IS NULL OR inverse(2) IS NULL", Outcomes::FALSE),
+        ("nothing() IS NULL", Outcomes::TRUE),
+        ("(SELECT x FROM no_rows() AS x) IS NULL", Outcomes::TRUE),
+        // A set without rows leaves the expression no value to test.
+        ("no_rows() IS NULL", Outcomes::NONE),
+        ("counted(1) IS NULL", Outcomes::FALSE),
+        ("EXISTS (SELECT 1 FROM caps OFFSET 0)", UNDECIDED),
+        ("EXISTS (SELECT 1 FROM caps LIMIT 0)", Outcomes::FALSE),
+        ("EXISTS (SELECT 1 FROM caps LIMIT 5)", UNDECIDED),
+        (
+            "EXISTS (SELECT 1 FROM screened) OR EXISTS (SELECT 1 FROM screened WHERE n > 1)",
+            UNDECIDED,
+        ),
+    ] {
+        assert_eq!(truth(sql)?, never_raising(outcomes), "{sql}");
+    }
+    Ok(())
+}
+
+#[test]
+fn shapes_the_read_leaves_raising() -> Result<(), Error> {
+    for sql in [
+        "EXISTS (SELECT 1 FROM nowhere)",
+        "EXISTS (SELECT 1 FROM pg_catalog.pg_class)",
+        "EXISTS (SELECT 1 FROM no_such_function())",
+        "EXISTS (SELECT 1 FROM caps GROUP BY o)",
+        "(SELECT count((SELECT 1)) FROM caps) IS NULL",
+        // PostgreSQL refuses rows of differing lengths.
+        "EXISTS (VALUES (1), (1, 2))",
+        "broken() IS NULL",
+        "two_statements() IS NULL",
+        // A body that does not parse.
+        "garbled() IS NULL",
+        // The body returns one column where two are declared.
+        "EXISTS (SELECT 1 FROM mismatched())",
+        // A negative count raises.
+        "EXISTS (SELECT 1 FROM caps OFFSET t.k)",
+        "EXISTS (SELECT 1 FROM caps LIMIT t.k)",
+        // Each policy reads the table the other guards.
+        "EXISTS (SELECT 1 FROM loop_a)",
+    ] {
+        assert_ne!(truth(sql)?.raising, Raising::Never, "{sql}");
+    }
+    let db = ParserDB::parse::<PostgreSqlDialect>(SCHEMA)?;
+    let table =
+        db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    let deployment = Deployment::new("authenticator", ["keeper", "ghost"], []).unwrap();
+    let assumptions = [Assumption::Deployment(&deployment)];
+    let read = |sql: &str| {
+        table.truth_under(&db, &expression(sql), IdentifierCase::AsWritten, &assumptions)
+    };
+    assert_eq!(read("EXISTS (SELECT 1 FROM loop_a)")?.raising, Raising::Sometimes);
+    assert_eq!(read("EXISTS (SELECT 1 FROM screened)")?, never_raising(UNDECIDED));
+    Ok(())
+}
+
+#[test]
+fn reads_under_other_engines() -> Result<(), Error> {
+    let schema = "CREATE TABLE caps (o INT NOT NULL, role INT NOT NULL);
+         CREATE TABLE t (o INT NOT NULL);";
+    let read =
+        |db: &ParserDB, sql: &str, dialect: &dyn Dialect| -> Result<ExpressionTruth, Error> {
+            let table = db
+                .table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?
+                .unwrap();
+            let expression = Parser::new(dialect).try_with_sql(sql).unwrap().parse_expr().unwrap();
+            Ok(table.truth_under(db, &expression, IdentifierCase::AsWritten, &[])?)
+        };
+    // SQLite checks no privilege on the tables a query reads.
+    let sqlite = ParserDB::parse::<SQLiteDialect>(schema)?;
+    let sql = "EXISTS (SELECT 1 FROM caps)";
+    assert_eq!(read(&sqlite, sql, &SQLiteDialect {})?, never_raising(UNDECIDED));
+    let generic = ParserDB::parse::<GenericDialect>(&format!(
+        "{schema} GRANT SELECT ON caps TO PUBLIC; ALTER TABLE caps ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY positive ON caps FOR SELECT USING (role > 0);"
+    ))?;
+    for (sql, dialect) in [
+        ("EXISTS (SELECT 1 FROM caps WHERE role > 0)", &GenericDialect {} as &dyn Dialect),
+        ("EXISTS (SELECT 1 FROM caps ORDER BY ALL)", &DuckDbDialect {}),
+    ] {
+        assert_eq!(read(&generic, sql, dialect)?, never_raising(UNDECIDED), "{sql}");
+    }
+    // Clauses the read does not follow.
+    for (sql, dialect) in [
+        ("EXISTS (SELECT 1 FROM caps ORDER BY o WITH FILL)", &ClickHouseDialect {} as &dyn Dialect),
+        ("EXISTS (SELECT 1 FROM caps ORDER BY o INTERPOLATE)", &ClickHouseDialect {}),
+        ("EXISTS (SELECT 1 FROM caps LIMIT 1 BY o)", &ClickHouseDialect {}),
+        ("EXISTS (SELECT 1 FROM caps LIMIT 1, 2)", &MySqlDialect {}),
+        ("upper(SELECT 'a') IS NULL", &SnowflakeDialect {}),
+        ("EXISTS (SELECT 1 FROM caps CROSS APPLY caps AS other)", &MsSqlDialect {}),
+    ] {
+        assert_ne!(read(&generic, sql, dialect)?.raising, Raising::Never, "{sql}");
     }
     Ok(())
 }
