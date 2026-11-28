@@ -90,7 +90,8 @@ pub use embedded_sql::EmbeddedSql;
 pub use exclusion_index::ExclusionIndex;
 pub use expression_context::{
     ArraySource, AssignedValue, AssignmentResolution, CallApplication, ColumnAssignment,
-    ExpressionContext, Operand, OperatorApplication,
+    CommonTypeApplication, CommonTypeInput, CommonTypeResolution, ExpressionContext, Operand,
+    OperatorApplication,
 };
 pub(crate) use expression_context::{
     CallRefusal, ReparsePins, Site, applies_operators, array_of, binary_operator_name, column_type,

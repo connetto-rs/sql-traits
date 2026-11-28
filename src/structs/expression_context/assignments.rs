@@ -407,7 +407,7 @@ impl<'s, 'node, 'db, DB: DatabaseLike> Stored<'s, '_, 'node, '_, 'db, DB> {
 /// The rows of `source` when it is a `VALUES` list whose cells an `INSERT`
 /// stores one by one, which PostgreSQL does unless the list carries a clause
 /// of a query.
-fn direct_values(source: &Query) -> Option<impl Iterator<Item = &[Expr]>> {
+pub(super) fn direct_values(source: &Query) -> Option<impl Iterator<Item = &[Expr]>> {
     let plain = source.with.is_none()
         && source.order_by.is_none()
         && source.limit_clause.is_none()
