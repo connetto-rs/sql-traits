@@ -107,8 +107,8 @@ fn specs(statement: RowStatement) -> Vec<Spec> {
 /// Returns [`RowSecurityError::RoleRequired`] when a caller holding no role
 /// meets a policy scoped to a role, and [`RowSecurityError::UnsettledRole`]
 /// when no entry reaches a declared `role` and one names a role the schema
-/// does not declare, or `CURRENT_USER`, `CURRENT_ROLE` or `SESSION_USER`,
-/// which name whoever ran `CREATE POLICY`.
+/// does not declare, or is a `CURRENT_USER`, `CURRENT_ROLE` or `SESSION_USER`
+/// the input never settled to a role.
 fn applies<DB: DatabaseLike>(
     policy: &DB::Policy,
     role: ActingRole<'_, DB::Role>,

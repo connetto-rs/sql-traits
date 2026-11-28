@@ -14105,6 +14105,9 @@ impl ParserDB {
                             policy.to.as_deref().unwrap_or_default(),
                         )?;
                     }
+                    // PostgreSQL stores the role a keyword names when the
+                    // statement runs, which no later role change moves.
+                    session_roles.bind_policy_roles(policy.to.as_deref_mut().unwrap_or_default());
 
                     // A policy exists only on its table, so an absent one is
                     // refused outright, as the database does and as the
@@ -14740,7 +14743,7 @@ impl ParserDB {
                         AlterPolicyOperation::Rename { new_name } => {
                             Arc::make_mut(&mut builder.policies_mut()[index].0).name = new_name;
                         }
-                        AlterPolicyOperation::Apply { to, mut using, mut with_check } => {
+                        AlterPolicyOperation::Apply { mut to, mut using, mut with_check } => {
                             if access_resolution == AccessResolution::ClosedWorld {
                                 validate_policy_roles(
                                     &builder,
@@ -14748,6 +14751,7 @@ impl ParserDB {
                                     to.as_deref().unwrap_or_default(),
                                 )?;
                             }
+                            session_roles.bind_policy_roles(to.as_deref_mut().unwrap_or_default());
                             column_references::refuse_in_expressions(
                                 &builder,
                                 &table_name,

@@ -102,8 +102,8 @@ fn a_policy_names_roles_under_identifier_rules() {
     assert!(!applies(&database, "quoted_public", "reader"));
 }
 
-/// `CURRENT_USER` names whichever role runs the statement, which the schema
-/// never says, so it matches no declared role.
+/// `CURRENT_USER` names the role that created the policy, which an input
+/// with no session role never names, so it matches no declared role.
 #[test]
 fn a_session_principal_names_no_declared_role() {
     let database = parse(
