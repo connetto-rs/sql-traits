@@ -22,8 +22,8 @@ use crate::{
     structs::{
         AggregateKind, Assumption, CallResolution, ColumnBinding, ColumnDefinition, ColumnScope,
         Definition, DefinitionSource, ExpressionScope, ExpressionTruth, FunctionKind,
-        FunctionResultType, IdentifierCase, OperandType, OperatorResolution, PlPgSqlScope,
-        PlPgSqlVariable, QueryOutput, SelectedOperator, TargetName, VariableKind,
+        FunctionResultType, IdentifierCase, OperandEvidence, OperandType, OperatorResolution,
+        PlPgSqlScope, PlPgSqlVariable, QueryOutput, SelectedOperator, TargetName, VariableKind,
         plpgsql_flow::{FlowPoint, Reached, Round, Row, is_record, join},
         plpgsql_scope::stored_parts,
     },
@@ -37,7 +37,9 @@ use crate::{
             Matched, WrittenName, called_name, called_object_name, reached_by_name,
             resolve_function, written_argument_names, written_names,
         },
-        coercion::{CommonType, base, canonical_owned, facts, select_common_type, type_name},
+        coercion::{
+            CommonType, base, canonical_owned, conversion, facts, select_common_type, type_name,
+        },
         identifier_resolution::{identifiers_match, stored_identifier},
         object_name::{PG_CATALOG, RoutinePath, reaches_unheld_schema},
         operator_typing::resolve_operator,
@@ -1972,6 +1974,28 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 })
             })
             .unwrap_or(Collapse::Unknown))
+    }
+
+    /// The evidence of `element` converted into `element_type`, the element
+    /// type of the array PostgreSQL builds of an `IN` list, as
+    /// `transformAExprIn` coerces each element, or `None` when the type of
+    /// `element` is unknown or the facts prove no conversion.
+    pub(crate) fn element_evidence(
+        &self,
+        element: &Expr,
+        element_type: &TargetName<'_>,
+    ) -> Result<Option<OperandEvidence<'db, DB>>, LookupError> {
+        let (source, typmod) = match self.type_of(element)? {
+            OperandType::Known { type_name, typmod } => {
+                (canonical_owned(self.database, PgType::from_target(&type_name)), typmod)
+            }
+            OperandType::UntypedLiteral => (PgType::UNKNOWN, None),
+            OperandType::Unknown => return Ok(None),
+        };
+        let target = canonical_owned(self.database, PgType::from_target(element_type));
+        let Some(name) = type_name(self.database, &target) else { return Ok(None) };
+        let steps = conversion(self.database, &source, typmod, &target);
+        Ok(steps.map(|steps| OperandEvidence::new(name, false, steps)))
     }
 
     /// Whether `element` holds a column reference that binds in the query

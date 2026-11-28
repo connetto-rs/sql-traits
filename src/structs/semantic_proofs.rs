@@ -58,8 +58,9 @@ use crate::{
 /// PostgreSQL stores, its pattern under the escape function the grammar
 /// inserts, and a `BETWEEN` range the comparisons with its bounds, when every
 /// operand they convert is proved. An `IN` list is the `= ANY (ARRAY[...])`
-/// and the comparisons PostgreSQL resolves it into, when every element of the
-/// array is an untyped literal or of the array's element type. Every other
+/// and the comparisons PostgreSQL resolves it into, when the conversion of
+/// every element into the array's element type is proved, an element of
+/// another type cast to it as the deparse writes it. Every other
 /// node is left as written.
 ///
 /// [`Self::view`] lends the proofs to a canonicalizer.
@@ -626,38 +627,26 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
 
     /// The element type of the array PostgreSQL builds of `built`, the
     /// elements of an `IN` list testing `left`.
-    fn common_type(&self, left: &Expr, built: &[&Expr]) -> Result<Option<PgType>, LookupError> {
+    fn common_type(
+        &self,
+        left: &Expr,
+        built: &[&Expr],
+    ) -> Result<Option<TargetName<'static>>, LookupError> {
         let common = self.context.collapse(left, built)?;
         let Collapse::Into(OperandType::Known { type_name, .. }) = common else { return Ok(None) };
-        Ok(Some(PgType::from_target(&type_name)))
+        Ok(Some(type_name.into_owned()))
     }
 
     /// The conversion of `element` into `common`, the element type of the
-    /// array it is built into.
+    /// array it is built into, as `transformAExprIn` coerces it.
     fn array_element(
         &self,
-        common: Option<&PgType>,
+        common: Option<&TargetName<'_>>,
         element: &Expr,
     ) -> Result<Result<Option<Spelled>, Unproved>, LookupError> {
-        let converted = match self.context.type_of(element)? {
-            OperandType::UntypedLiteral => {
-                common.and_then(|common| self.literal(common, element)).map(Some)
-            }
-            OperandType::Known { type_name, .. }
-                if common == Some(&PgType::from_target(&type_name)) =>
-            {
-                match folded(element) {
-                    Ok(Some((pg_type, constant))) => {
-                        (common == Some(&pg_type))
-                            .then(|| Some(Spelled::Constant(Box::new(constant))))
-                    }
-                    Ok(None) => Some(None),
-                    Err(Unproved) => None,
-                }
-            }
-            _ => None,
-        };
-        Ok(converted.ok_or(Unproved))
+        let Some(common) = common else { return Ok(Err(Unproved)) };
+        let evidence = self.context.element_evidence(element, common)?;
+        Ok(evidence.map_or(Err(Unproved), |evidence| self.spelled(&evidence, element)))
     }
 
     /// The spelling of `operand` converted as `evidence` has it, `None` when
