@@ -320,6 +320,7 @@ fn unproved_operations_and_lists_keep_their_spelling() {
         "n = -1",
         "n > -1e3",
         "s IN (1)",
+        "i IN (1, $1)",
         "n IN (-1, 2)",
         "n IN (-1e3, -2e3)",
         "i LIKE 'a%'",
