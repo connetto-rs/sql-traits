@@ -711,6 +711,11 @@ fn in_lists_collapse_the_elements_free_of_their_own_columns() {
     let OperatorResolution::Selected(equals) = applications[0].resolution() else { unreachable!() };
     assert_eq!(equals.left().map(|left| left.target().name()), Some("numeric"));
     assert_eq!(equals.right().target().name(), "numeric");
+
+    // An element of unknown type leaves the list undecided.
+    let unknown = self::query("SELECT i IN (1, no_such_function(), 2) FROM t");
+    let context = ExpressionContext::new(&unknown, &db, IdentifierCase::AsWritten).unwrap();
+    assert_eq!(described(&context, &projected(&unknown)), [None]);
 }
 
 /// An `IN` list in a function argument inside an aliased parenthesized join
@@ -1066,6 +1071,7 @@ fn refused_calls_answer_why() {
                 CallResolution::Undetermined => "undetermined".to_owned(),
                 CallResolution::Selected(_) => panic!("{node} selects a function"),
                 CallResolution::Cast(_) => panic!("{node} is a cast"),
+                CallResolution::Sqlite(_) => panic!("{node} is a SQLite call"),
             }
         })
         .collect();

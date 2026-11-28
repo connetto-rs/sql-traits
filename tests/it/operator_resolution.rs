@@ -54,6 +54,7 @@ fn resolved(
             format!("unbound {}", signature(operator))
         }
         OperatorResolution::Undetermined => "undetermined".to_owned(),
+        OperatorResolution::Sqlite(_) => "sqlite".to_owned(),
     }
 }
 

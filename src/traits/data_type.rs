@@ -4,6 +4,7 @@ use alloc::{borrow::Cow, vec, vec::Vec};
 use core::{fmt::Debug, num::NonZeroU32, ptr};
 
 use crate::{
+    structs::Affinity,
     traits::{ColumnCollation, DatabaseLike},
     utils::{
         normalize_postgres_type_cow,
@@ -522,6 +523,35 @@ pub trait DataTypeLike: Debug + Send + Sync {
     #[inline]
     fn normalized_name<'db>(&'db self, database: &'db Self::DB) -> Cow<'db, str> {
         normalize_postgres_type_cow(self.name(database))
+    }
+
+    /// Returns the affinity SQLite gives a column declared with this type, by
+    /// [`Affinity::of_declared_type`] over the type as the declaration
+    /// spells it, which the default reads from [`Self::name`].
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # fn main() -> Result<(), sql_traits::errors::Error> {
+    /// use sql_traits::prelude::*;
+    /// use sqlparser::dialect::SQLiteDialect;
+    ///
+    /// let db = ParserDB::parse::<SQLiteDialect>(
+    ///     "CREATE TABLE t (id INTEGER, label VARCHAR(20), payload, score DOUBLE PRECISION, day DATE);",
+    /// )?;
+    /// let table = db.table_by_target(TargetName::new("t", false), IdentifierCase::AsWritten)?.unwrap();
+    /// let affinities: Vec<_> =
+    ///     table.columns(&db)?.map(|column| column.data_type(&db).sqlite_affinity(&db)).collect();
+    /// assert_eq!(
+    ///     affinities,
+    ///     [Affinity::Integer, Affinity::Text, Affinity::Blob, Affinity::Real, Affinity::Numeric]
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    fn sqlite_affinity(&self, database: &Self::DB) -> Affinity {
+        Affinity::of_declared_type(&self.name(database))
     }
 
     /// Returns the builtin scalar family of the type, or `None` for a type

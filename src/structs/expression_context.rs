@@ -1,12 +1,17 @@
 //! The facts each expression node of one query takes.
 
+mod sqlite;
+
 use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, string::ToString, vec::Vec};
 use core::{cell::RefCell, ops::ControlFlow, sync::atomic::Ordering};
 
-use sqlparser::ast::{
-    ArgMode, BinaryOperator, CastKind, ColumnDef, DataType, DuplicateTreatment, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Ident, InTarget,
-    ObjectNamePart, Query, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
+use sqlparser::{
+    ast::{
+        ArgMode, BinaryOperator, CastKind, ColumnDef, DataType, DuplicateTreatment, Expr, Function,
+        FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArguments, Ident, InTarget,
+        ObjectNamePart, Query, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
+    },
+    dialect::SQLiteDialect,
 };
 
 use crate::{
@@ -28,8 +33,8 @@ use crate::{
         plpgsql_scope::stored_parts,
     },
     traits::{
-        ColumnLike, DataTypeLike, DatabaseLike, FunctionLike, OperatorLike, Relation, TableLike,
-        TriggerLike,
+        ColumnLike, DataTypeLike, DatabaseLike, DialectLike, FunctionLike, OperatorLike, Relation,
+        TableLike, TriggerLike,
     },
     utils::{
         call_sites::expression_form,
@@ -49,6 +54,10 @@ use crate::{
 
 /// The binding and type of every expression node of one borrowed query, as
 /// PostgreSQL derives them in the scope the node sits in.
+///
+/// Over a SQLite database the types are SQLite's, [`OperandType::Sqlite`]
+/// with the affinity and storage classes of each node, as
+/// <https://www.sqlite.org/datatype3.html> defines them.
 ///
 /// A node is answered by identity, so a node borrowed from a copy of the
 /// query is refused with [`LookupError::ExpressionNotInQuery`].
@@ -110,6 +119,9 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     /// runs it under.
     variables: Option<&'query PlPgSqlScope<'query, 'db, DB>>,
     declared_columns: Option<&'query [ColumnDef]>,
+    /// Whether the database is SQLite's, whose affinity and storage classes
+    /// the context derives in place of PostgreSQL's types.
+    sqlite: bool,
     /// The type [`Self::type_of`] derived for each node it typed, by address,
     /// so that typing an operator chain types each node of it once.
     types: RefCell<BTreeMap<usize, OperandType<'static>>>,
@@ -623,6 +635,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             variables: None,
             function: None,
             declared_columns: None,
+            sqlite: database.dialect().sqlparser_dialect().is::<SQLiteDialect>(),
             types: RefCell::default(),
         }
     }
@@ -1178,6 +1191,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         &'s self,
         definition: ColumnDefinition<'s, 'query, 'db, DB>,
     ) -> Result<OperandType<'s>, LookupError> {
+        if self.sqlite {
+            return self.sqlite_definition_type(&definition);
+        }
         Ok(match definition {
             ColumnDefinition::Base { column, database, .. } => {
                 let previous = self.pins.and_then(|pins| {
@@ -1257,6 +1273,12 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// that name, an output reading a cursor parameter or any other variable
     /// staying unknown.
     ///
+    /// Over a SQLite database the type is [`OperandType::Sqlite`]. A column
+    /// reference takes the affinity of its declared type, a `STRICT` column
+    /// holds its declared class alone, and `CAST` takes the affinity of its
+    /// target. A literal, an operator and a call have no affinity and the
+    /// storage classes their values take.
+    ///
     /// # Errors
     ///
     /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
@@ -1277,6 +1299,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     #[cfg_attr(feature = "std", recursive::recursive)]
     fn derived_type(&self, expression: &Expr) -> Result<OperandType<'_>, LookupError> {
         self.check(expression)?;
+        if self.sqlite {
+            return self.sqlite_type(expression);
+        }
         Ok(match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 if let Some(columns) = self.declared_columns {
@@ -1379,6 +1404,14 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// comparisons, comparisons with a subquery, the boolean connectives and
     /// calls answer `None`.
     ///
+    /// Over a SQLite database each application answers
+    /// [`OperatorResolution::Sqlite`] with the conversion SQLite applies to
+    /// each operand. A comparison applies the affinity section 4.2 of the
+    /// datatype document picks, arithmetic reads numbers, `%`, the bitwise
+    /// operators and the shifts read integers, and `||`, `LIKE` and `GLOB`
+    /// read text. An operand of unknown type leaves the application
+    /// [`OperatorResolution::Undetermined`].
+    ///
     /// # Errors
     ///
     /// Returns [`LookupError::ExpressionNotInQuery`] for a node of another
@@ -1421,6 +1454,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         if folded(expression).is_some() {
             return Ok(Some(Vec::new()));
         }
+        if self.sqlite {
+            return self.sqlite_operators(expression);
+        }
         Ok(self.applications(expression)?.map(|(applications, _)| applications))
     }
 
@@ -1437,6 +1473,11 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// and `CURRENT_DATE`, and a call written with clauses PostgreSQL has no
     /// grammar for answer `None`. A parenthesized node answers for its
     /// content.
+    ///
+    /// Over a SQLite database a call of a core or math built-in scalar
+    /// function answers [`CallResolution::Sqlite`] with the conversion it
+    /// applies to each argument, and any other call
+    /// [`CallResolution::Undetermined`].
     ///
     /// # Errors
     ///
@@ -1476,6 +1517,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         self.check(expression)?;
         let function = match expression {
             Expr::Nested(inner) => return self.call(inner),
+            _ if self.sqlite => return self.sqlite_call(expression),
             Expr::Function(function) => function,
             _ => return Ok(None),
         };
@@ -1709,7 +1751,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             CallResolution::Cast(_) => {
                 clauses.and_then(CallClauses::plain_rule).map(CallRefusal::Misapplied)
             }
-            CallResolution::Undetermined => None,
+            CallResolution::Undetermined | CallResolution::Sqlite(_) => None,
         };
         let refused = refused.filter(|_| !self.call_reaches_unheld_schema(&name, call));
         Ok(CallApplication { name, arguments, resolution, refused })
@@ -1814,7 +1856,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             OperatorResolution::NotFound => Some(Unresolved::DoesNotExist),
             OperatorResolution::Ambiguous(_) => Some(Unresolved::NotUnique),
             OperatorResolution::UnboundPolymorphic(_) => Some(Unresolved::PolymorphicUnknown),
-            OperatorResolution::Selected(_) | OperatorResolution::Undetermined => None,
+            OperatorResolution::Selected(_)
+            | OperatorResolution::Undetermined
+            | OperatorResolution::Sqlite(_) => None,
         };
         let refused = reason
             .filter(|_| {
@@ -1950,7 +1994,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             types.push(match self.type_of(node)? {
                 OperandType::Known { type_name, .. } => PgType::from_target(&type_name),
                 OperandType::UntypedLiteral => PgType::UNKNOWN,
-                OperandType::Unknown => return Ok(Collapse::Unknown),
+                OperandType::Sqlite { .. } | OperandType::Unknown => return Ok(Collapse::Unknown),
             });
         }
         let common = select_common_type(self.database, &types, |pg_type| pg_type).ok();
@@ -2205,7 +2249,9 @@ pub(crate) fn array_of<'db, D: DatabaseLike>(
         OperandType::Known { type_name, typmod } => {
             known(database, PgType::from_target(type_name).array(), *typmod)
         }
-        OperandType::UntypedLiteral | OperandType::Unknown => OperandType::Unknown,
+        OperandType::UntypedLiteral | OperandType::Sqlite { .. } | OperandType::Unknown => {
+            OperandType::Unknown
+        }
     }
 }
 
@@ -2784,7 +2830,9 @@ fn without_typmod(type_name: Option<TargetName<'_>>) -> OperandType<'_> {
 fn weighed_name(weighed: &OperandType<'_>) -> Box<str> {
     match weighed {
         OperandType::Known { type_name, .. } => type_name.name().into(),
-        OperandType::UntypedLiteral | OperandType::Unknown => "unknown".into(),
+        OperandType::UntypedLiteral | OperandType::Sqlite { .. } | OperandType::Unknown => {
+            "unknown".into()
+        }
     }
 }
 

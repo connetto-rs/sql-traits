@@ -18,7 +18,7 @@ use sqlparser::ast::{
 
 use crate::{
     impls::sqlparser::{SqlparserDialect, bound_domain, bound_user_type},
-    structs::{ParserDB, UserDefinedType, metadata::ResolvedCollation},
+    structs::{Affinity, ParserDB, UserDefinedType, metadata::ResolvedCollation},
     traits::{
         ArrayDimension, CharacterLengthUnit, ColumnCollation, DataTypeLike, DatabaseLike,
         EnumWidth, Enumeration, EnumerationKind, EnumerationMember, ExtensionLike, IntervalFields,
@@ -138,6 +138,11 @@ impl DataTypeLike for DataType {
     #[inline]
     fn name<'db>(&'db self, _database: &'db Self::DB) -> Cow<'db, str> {
         normalize_sqlparser_type(self)
+    }
+
+    #[inline]
+    fn sqlite_affinity(&self, _database: &Self::DB) -> Affinity {
+        Affinity::of_written(stored_as(self))
     }
 
     #[inline]

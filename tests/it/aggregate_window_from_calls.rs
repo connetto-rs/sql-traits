@@ -36,6 +36,7 @@ fn describe(call: &CallApplication<'_, '_, ParserDB>) -> String {
         CallResolution::Ambiguous(_) => "ambiguous".to_owned(),
         CallResolution::UnboundPolymorphic(_) => "unbound".to_owned(),
         CallResolution::Undetermined => "undetermined".to_owned(),
+        CallResolution::Sqlite(_) => "sqlite".to_owned(),
     }
 }
 

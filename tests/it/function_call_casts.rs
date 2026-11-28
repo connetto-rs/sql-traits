@@ -45,10 +45,11 @@ fn read(schema: &str, call: &str) -> (String, Option<String>) {
         CallResolution::Ambiguous(_) => "ambiguous".to_owned(),
         CallResolution::UnboundPolymorphic(_) => "unbound".to_owned(),
         CallResolution::Undetermined => "undetermined".to_owned(),
+        CallResolution::Sqlite(_) => "sqlite".to_owned(),
     };
     let typed = match context.type_of(&expression).expect("the call has a type or none") {
         OperandType::Known { type_name, .. } => Some(type_name.to_string()),
-        OperandType::UntypedLiteral | OperandType::Unknown => None,
+        OperandType::UntypedLiteral | OperandType::Sqlite { .. } | OperandType::Unknown => None,
     };
     (resolution, typed)
 }

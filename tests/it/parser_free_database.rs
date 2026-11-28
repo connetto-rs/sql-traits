@@ -3190,3 +3190,16 @@ fn a_catalog_without_sqlite_options_declares_neither() {
     assert!(!docs.is_strict());
     assert!(!docs.is_without_rowid());
 }
+
+/// A catalog storing a type as its name alone takes SQLite's affinity from that
+/// name.
+#[test]
+fn the_inherited_sqlite_affinity_reads_the_type_name() {
+    let catalog = catalog();
+    let affinities = ["BIGINT", "VARCHAR(5)", "", "FLOAT", "DECIMAL(10,2)"]
+        .map(|name| MemoryDataType(name.to_owned()).sqlite_affinity(&catalog));
+    assert_eq!(
+        affinities,
+        [Affinity::Integer, Affinity::Text, Affinity::Blob, Affinity::Real, Affinity::Numeric]
+    );
+}

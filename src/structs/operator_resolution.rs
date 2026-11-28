@@ -1,9 +1,12 @@
 //! The operator PostgreSQL selects for an operator invocation and the type
-//! each operand takes.
+//! each operand takes, or the conversions SQLite applies to the operands.
 
 use alloc::vec::Vec;
 
-use crate::{structs::TargetName, traits::DatabaseLike};
+use crate::{
+    structs::{Affinity, SqliteOperator, StorageClasses, TargetName},
+    traits::DatabaseLike,
+};
 
 /// The type of one operand of an operator invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -18,6 +21,15 @@ pub enum OperandType<'a> {
     },
     /// An untyped literal such as `'admin'` or `NULL`, of type `unknown`.
     UntypedLiteral,
+    /// A SQLite value, with the affinity the expression has, if any, and
+    /// the storage classes its values take.
+    Sqlite {
+        /// The affinity of the expression, `None` for an expression that has
+        /// none.
+        affinity: Option<Affinity>,
+        /// The storage classes of the values.
+        storage: StorageClasses,
+    },
     /// A value whose type the caller does not know.
     Unknown,
 }
@@ -30,12 +42,13 @@ impl OperandType<'_> {
                 OperandType::Known { type_name: type_name.into_owned(), typmod }
             }
             Self::UntypedLiteral => OperandType::UntypedLiteral,
+            Self::Sqlite { affinity, storage } => OperandType::Sqlite { affinity, storage },
             Self::Unknown => OperandType::Unknown,
         }
     }
 }
 
-/// What PostgreSQL does with an operator invocation.
+/// What PostgreSQL does with an operator invocation, or what SQLite does.
 #[derive(Debug, Clone)]
 #[expect(
     clippy::large_enum_variant,
@@ -55,6 +68,9 @@ pub enum OperatorResolution<'db, DB: DatabaseLike> {
     /// The operator catalog, an operand type or a fact selection needs is
     /// missing.
     Undetermined,
+    /// SQLite applies the operator after converting the operands as this
+    /// says.
+    Sqlite(SqliteOperator),
 }
 
 /// The operator PostgreSQL selects and what each operand takes.

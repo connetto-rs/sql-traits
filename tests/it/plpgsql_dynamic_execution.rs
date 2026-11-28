@@ -19,6 +19,8 @@ use sqlparser::{
     dialect::PostgreSqlDialect,
 };
 
+use crate::support::operand_rendering::rendered;
+
 fn postgres(sql: &str) -> ParserDB {
     ParserDB::parse::<PostgreSqlDialect>(sql).expect("schema parses")
 }
@@ -40,16 +42,6 @@ fn sites(database: &ParserDB, name: &str) -> Result<Vec<(String, Vec<String>)>, 
             (site.command().to_string(), site.arguments().map(ToString::to_string).collect())
         })
         .collect())
-}
-
-/// How a test spells the type an expression takes.
-fn rendered(operand: &OperandType<'_>) -> String {
-    match operand {
-        OperandType::Known { type_name, typmod: Some(typmod) } => format!("{type_name}({typmod})"),
-        OperandType::Known { type_name, typmod: None } => type_name.to_string(),
-        OperandType::UntypedLiteral => "unknown literal".to_owned(),
-        OperandType::Unknown => "?".to_owned(),
-    }
 }
 
 /// Every name, `$n` and scalar subquery the command of each site of `name`
