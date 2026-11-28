@@ -292,6 +292,36 @@ fn converted_list_elements_read_as_postgresql_deparses_them() {
     }
 }
 
+/// `ANY`, `SOME` and `ALL` comparisons with arrays read as the conversions
+/// PostgreSQL applies to the tested operand, the array and its elements.
+#[test]
+fn quantified_comparisons_read_as_postgresql_deparses_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    for (declared, deparsed) in [
+        (
+            "c = ANY (ARRAY['ab '::varchar, 'x'])",
+            "(c = ANY ((ARRAY['ab '::character varying, 'x'::character varying])::bpchar[]))",
+        ),
+        (
+            "c = ANY (ARRAY['x'::char(2), 'ab '::varchar])",
+            "(c = ANY (ARRAY['x'::character(2), ('ab '::character varying)::bpchar]))",
+        ),
+        ("c = ANY (ARRAY['ab '::text])", "((c)::text = ANY (ARRAY['ab '::text]))"),
+        ("c::text = ANY (ARRAY['ab ', 'x'])", "((c)::text = ANY (ARRAY['ab '::text, 'x'::text]))"),
+        ("s = ANY (ARRAY['ab ', 'x'])", "(s = ANY (ARRAY['ab '::text, 'x'::text]))"),
+        ("s = SOME (ARRAY['a'])", "(s = ANY (ARRAY['a'::text]))"),
+        ("v = ANY (ARRAY['a', 'b'])", "((v)::text = ANY (ARRAY['a'::text, 'b'::text]))"),
+        (
+            "s <> ALL (ARRAY['a'::varchar, 'b'])",
+            "(s <> ALL ((ARRAY['a'::character varying, 'b'::character varying])::text[]))",
+        ),
+        ("s = ANY (ARRAY['a', 'b']::text[])", "(s = ANY (ARRAY['a'::text, 'b'::text]))"),
+        ("s = ANY ((ARRAY['a'])::text[])", "(s = ANY (ARRAY['a'::text]))"),
+    ] {
+        assert_eq!(canonical(&db, declared), canonical(&db, deparsed), "{declared}");
+    }
+}
+
 #[test]
 fn unproved_operations_and_lists_keep_their_spelling() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
@@ -307,6 +337,7 @@ fn unproved_operations_and_lists_keep_their_spelling() {
             view.pattern_coercions(&expression).unwrap().is_some(),
             view.range_coercions(&expression).unwrap().is_some(),
             view.membership_coercions(&expression).unwrap().is_some(),
+            view.quantified_coercions(&expression).unwrap().is_some(),
         )
     };
     // No `=` takes `text` and `int4`. A cast to `mood` is spelled
@@ -328,9 +359,15 @@ fn unproved_operations_and_lists_keep_their_spelling() {
         "s LIKE 'a' ESCAPE 1",
         "s BETWEEN 'a' AND 1",
         "s LIKE ANY (ARRAY['a%'])",
+        "s = ANY (ARRAY[1])",
+        "s = ANY ('{a,b}')",
+        "c = ANY (ARRAY['ab ']::char(2)[])",
+        "n = ANY (ARRAY[-1, 2.5])",
+        "s = ANY (ARRAY['a', 1]::text[])",
+        "s = ANY (ARRAY[NULL::mood])",
         "m BETWEEN 'happy' AND 'sad'",
     ] {
-        assert_eq!(proved(check), (false, false, false, false), "{check}");
+        assert_eq!(proved(check), (false, false, false, false, false), "{check}");
     }
 }
 

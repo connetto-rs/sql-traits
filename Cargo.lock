@@ -1017,8 +1017,8 @@ dependencies = [
 
 [[package]]
 name = "sql-values"
-version = "0.6.0"
-source = "git+https://github.com/connetto-rs/sql-values?branch=main#bee0f26da9575f1f0ab38550e3188cb25590058e"
+version = "0.7.0"
+source = "git+https://github.com/connetto-rs/sql-values?branch=main#64b4c38ef1dd720155f25bf80611110b9b5c867b"
 dependencies = [
  "jiff",
  "thiserror",
@@ -1027,7 +1027,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.64.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#590c51ba5741df9a60403cc125c6e4d269f4bcb7"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ca4383ffe1f822583d837ee5c3d0977198887d40"
 dependencies = [
  "log",
  "recursive",
@@ -1037,7 +1037,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#07e59506f43915ac188a99ce0afa677f14ed82f4"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#b58ba1c9a70b5bf9ccde2a19503e6d67447dac8e"
 dependencies = [
  "recursive",
  "seahash",
@@ -1048,7 +1048,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-expr-eval"
 version = "0.1.0"
-source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#0747feeca17d09d257e708d14a667213350a5f88"
+source = "git+https://github.com/connetto-rs/sqlparser-expr-eval?branch=main#4ee69a5f141b58a7ffe9b199d16efd9fd629c64b"
 dependencies = [
  "quine-mc_cluskey",
  "rpds",
@@ -1081,7 +1081,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.7.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#590c51ba5741df9a60403cc125c6e4d269f4bcb7"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#ca4383ffe1f822583d837ee5c3d0977198887d40"
 dependencies = [
  "proc-macro2",
  "quote",

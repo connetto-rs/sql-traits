@@ -105,6 +105,33 @@ fn literals_and_casts_take_their_postgres_types() {
     );
 }
 
+/// An `ARRAY[...]` constructor takes the array over its elements' common
+/// type, as PostgreSQL 18 reports it with `pg_typeof`.
+#[test]
+fn array_constructors_take_their_elements_common_type() {
+    let db = ParserDB::parse::<PostgreSqlDialect>("").unwrap();
+    let query = query(
+        "SELECT ARRAY['a', 'b'], ARRAY['ab '::varchar, 'x'], ARRAY['x'::char(2), 'ab '::varchar],
+                ARRAY[1, 2.5], (ARRAY[1, 2]), ARRAY[ARRAY[1]], ARRAY[1, true]",
+    );
+    let context = ExpressionContext::new(&query, &db, IdentifierCase::AsWritten).unwrap();
+    let types: Vec<_> =
+        projected(&query).into_iter().map(|node| context.type_of(node).unwrap()).collect();
+    assert_eq!(
+        types,
+        [
+            pg("_text"),
+            pg("_varchar"),
+            pg("_bpchar"),
+            pg("_numeric"),
+            pg("_int4"),
+            // A nested constructor, and elements without a common type.
+            OperandType::Unknown,
+            OperandType::Unknown,
+        ]
+    );
+}
+
 /// A column reference binds in its own scope, so a table read again in a
 /// nested `SELECT` gives the inner reference its own `FROM` item, and takes
 /// the column's type and modifier.

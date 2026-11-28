@@ -10,15 +10,16 @@ use core::ops::ControlFlow;
 
 use sqlparser::{
     ast::{
-        BinaryOperator, CastKind, DataType, Expr, Ident, InTarget, Query, UnaryOperator, Value,
-        ValueWithSpan, Visitor,
+        Array, BinaryOperator, CastKind, DataType, Expr, Ident, InTarget, Query, UnaryOperator,
+        Value, ValueWithSpan, Visitor,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
 use sqlparser_canonicalize::{
     ArrayCoercions, CanonicalizeError, Conversion, MembershipCoercions, MembershipElement,
-    OperatorCoercions, PatternCoercions, RangeCoercions, SemanticContext,
+    OperatorCoercions, PatternCoercions, QuantifiedCoercions, QuantifiedElements, RangeCoercions,
+    SemanticContext,
 };
 
 use crate::{
@@ -60,8 +61,13 @@ use crate::{
 /// operand they convert is proved. An `IN` list is the `= ANY (ARRAY[...])`
 /// and the comparisons PostgreSQL resolves it into, when the conversion of
 /// every element into the array's element type is proved, an element of
-/// another type cast to it as the deparse writes it. Every other
-/// node is left as written.
+/// another type cast to it as the deparse writes it. An `ANY`, `SOME` or
+/// `ALL` comparison with an array spells the conversion of the tested
+/// operand and of the array, and of each element of an `ARRAY[...]`
+/// constructor into its element type. A cast over a constructor holding an
+/// untyped literal is pushed into its elements, as PostgreSQL pushes it,
+/// when the cast's element type carries no modifier. Every other node is
+/// left as written.
 ///
 /// [`Self::view`] lends the proofs to a canonicalizer.
 ///
@@ -105,6 +111,9 @@ pub struct SemanticProofs<'root> {
     ranges: Vec<(usize, (Coercions, Coercions))>,
     /// The resolution of each proved `IN` list, by address.
     memberships: Vec<(usize, Membership)>,
+    /// The conversions of each proved `ANY`, `SOME` or `ALL` comparison, by
+    /// address.
+    quantified: Vec<(usize, Quantified)>,
 }
 
 /// A converted operand as PostgreSQL's deparse spells it.
@@ -168,6 +177,29 @@ enum Element {
     Array(Option<Spelled>),
     /// Compared on its own.
     Comparison(Coercions),
+}
+
+/// The conversions of an `ANY`, `SOME` or `ALL` comparison with an array.
+#[derive(Debug, Clone)]
+struct Quantified {
+    /// The conversion of the tested operand and the cast of the array the
+    /// right operand yields.
+    array: (Option<Spelled>, Option<DataType>),
+    /// The conversions of the elements of the right operand.
+    elements: Elements,
+}
+
+/// How the elements of the right operand of an `ANY`, `SOME` or `ALL`
+/// comparison convert.
+#[derive(Debug, Clone)]
+enum Elements {
+    /// Only with the whole array.
+    Whole,
+    /// Each element of an `ARRAY[...]` constructor into its element type.
+    Constructor(Vec<Option<Spelled>>),
+    /// Each element of an `ARRAY[...]` constructor into the element type of
+    /// the cast over it.
+    PushedCast(Vec<Option<Spelled>>),
 }
 
 impl<'root> SemanticProofs<'root> {
@@ -268,6 +300,7 @@ impl<'root> SemanticProofs<'root> {
                 patterns: Vec::new(),
                 ranges: Vec::new(),
                 memberships: Vec::new(),
+                quantified: Vec::new(),
             },
         };
         if let ControlFlow::Break(error) = walk(expression, &mut prover) {
@@ -280,6 +313,7 @@ impl<'root> SemanticProofs<'root> {
         proofs.patterns.sort_unstable_by_key(|(address, _)| *address);
         proofs.ranges.sort_unstable_by_key(|(address, _)| *address);
         proofs.memberships.sort_unstable_by_key(|(address, _)| *address);
+        proofs.quantified.sort_unstable_by_key(|(address, _)| *address);
         Ok(proofs)
     }
 
@@ -315,7 +349,21 @@ impl<'root> SemanticProofs<'root> {
                 (*address, array, elements)
             })
             .collect();
-        SemanticProofView { proofs: self, memberships }
+        let quantified = self
+            .quantified
+            .iter()
+            .filter_map(|(address, quantified)| {
+                let (Elements::Constructor(elements) | Elements::PushedCast(elements)) =
+                    &quantified.elements
+                else {
+                    return None;
+                };
+                let conversions =
+                    elements.iter().map(|element| element.as_ref().map(Spelled::conversion));
+                Some((*address, conversions.collect()))
+            })
+            .collect();
+        SemanticProofView { proofs: self, memberships, quantified }
     }
 
     /// Refuses a node that is not one of the root's.
@@ -339,6 +387,9 @@ pub struct SemanticProofView<'p> {
     /// The array comparison and the element resolutions of each proved `IN`
     /// list, by address.
     memberships: Vec<(usize, Option<ArrayCoercions<'p>>, Vec<MembershipElement<'p>>)>,
+    /// The element conversions of each proved `ANY`, `SOME` or `ALL`
+    /// comparison with an `ARRAY[...]` constructor, by address.
+    quantified: Vec<(usize, Vec<Option<Conversion<'p>>>)>,
 }
 
 impl SemanticContext for SemanticProofView<'_> {
@@ -390,6 +441,27 @@ impl SemanticContext for SemanticProofView<'_> {
         Ok(self.memberships.binary_search_by_key(&address, |(held, ..)| *held).ok().map(|index| {
             let (_, array, elements) = &self.memberships[index];
             MembershipCoercions { array: *array, elements }
+        }))
+    }
+
+    fn quantified_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<QuantifiedCoercions<'_>>, CanonicalizeError> {
+        let address = self.proofs.check(occurrence)?;
+        Ok(found(&self.proofs.quantified, address).map(|quantified| {
+            let conversions = found(&self.quantified, address).map_or(&[][..], Vec::as_slice);
+            let elements = match quantified.elements {
+                Elements::Whole => QuantifiedElements::Whole,
+                Elements::Constructor(_) => QuantifiedElements::Constructor(conversions),
+                Elements::PushedCast(_) => QuantifiedElements::PushedCast(conversions),
+            };
+            let (left, array) = &quantified.array;
+            QuantifiedCoercions {
+                left: left.as_ref().map(Spelled::conversion),
+                elements,
+                array: array.as_ref().map(Conversion::Cast),
+            }
         }))
     }
 }
@@ -474,6 +546,10 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
             Expr::In { expr: left, target: InTarget::List(list), global: false, .. } => {
                 let proved = self.membership(expression, left, list)?;
                 self.proofs.memberships.extend(proved.map(|membership| (address, membership)));
+            }
+            Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+                let proved = self.quantified(expression, left, right)?;
+                self.proofs.quantified.extend(proved.map(|quantified| (address, quantified)));
             }
             _ => {}
         }
@@ -605,9 +681,81 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
         Ok(Some(Membership { array, elements }))
     }
 
+    /// The conversions of the `ANY`, `SOME` or `ALL` comparison `expression`
+    /// of `left` with the array `right`, `None` when one is unproved.
+    fn quantified(
+        &self,
+        expression: &Expr,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<Option<Quantified>, LookupError> {
+        let applications = self.context.operators(expression)?.unwrap_or_default();
+        let [application] = applications.as_slice() else { return Ok(None) };
+        let (
+            OperatorResolution::Selected(selected),
+            Operand::Any(ArraySource::Node(_)) | Operand::All(ArraySource::Node(_)),
+        ) = (application.resolution(), application.right())
+        else {
+            return Ok(None);
+        };
+        let Some(array) = self.array_coercions(selected.left(), left, selected.right()) else {
+            return Ok(None);
+        };
+        let right = without_parentheses(right);
+        let elements = if let Expr::Array(constructor) = right {
+            let Some(elements) = self.constructed(right, &constructor.elem)? else {
+                return Ok(None);
+            };
+            Elements::Constructor(elements)
+        } else if let Some(constructor) = cast_constructor(right)
+            && self.holds_untyped(&constructor.elem)?
+        {
+            // PostgreSQL applies the cast's modifier to each element.
+            let OperandType::Known { typmod: None, .. } = self.context.type_of(right)? else {
+                return Ok(None);
+            };
+            let Some(elements) = self.constructed(right, &constructor.elem)? else {
+                return Ok(None);
+            };
+            Elements::PushedCast(elements)
+        } else {
+            Elements::Whole
+        };
+        Ok(Some(Quantified { array, elements }))
+    }
+
+    /// Whether one of `elements` is an untyped literal.
+    fn holds_untyped(&self, elements: &[Expr]) -> Result<bool, LookupError> {
+        for element in elements {
+            if self.context.type_of(element)? == OperandType::UntypedLiteral {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The conversion of each of `elements` into the element type of the
+    /// array `array` builds of them, `None` when one is unproved.
+    fn constructed(
+        &self,
+        array: &Expr,
+        elements: &[Expr],
+    ) -> Result<Option<Vec<Option<Spelled>>>, LookupError> {
+        let element_type = self.context.element_type_of(array)?;
+        let OperandType::Known { type_name, .. } = element_type else { return Ok(None) };
+        let mut conversions = Vec::with_capacity(elements.len());
+        for element in elements {
+            let Ok(conversion) = self.array_element(Some(&type_name), element)? else {
+                return Ok(None);
+            };
+            conversions.push(conversion);
+        }
+        Ok(Some(conversions))
+    }
+
     /// The conversion of `left` and the cast of the array an `IN` list
-    /// builds, as the evidence of the array comparison has them, `None` when
-    /// one is unproved.
+    /// builds or an `ANY`, `SOME` or `ALL` comparison reads, as the evidence
+    /// of the array comparison has them, `None` when one is unproved.
     fn array_coercions(
         &self,
         left_evidence: Option<&OperandEvidence<'_, DB>>,
@@ -774,6 +922,32 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
 
 /// A conversion no rewrite is proved for.
 struct Unproved;
+
+/// `expression` without the parentheses enclosing it.
+fn without_parentheses(mut expression: &Expr) -> &Expr {
+    while let Expr::Nested(inner) = expression {
+        expression = inner;
+    }
+    expression
+}
+
+/// The `ARRAY[...]` constructor under the cast to an array type `expression`
+/// writes, which PostgreSQL pushes into the constructor's elements.
+fn cast_constructor(expression: &Expr) -> Option<&Array> {
+    let Expr::Cast {
+        kind: CastKind::Cast | CastKind::DoubleColon,
+        expr,
+        data_type: DataType::Array(_),
+        format: None,
+    } = expression
+    else {
+        return None;
+    };
+    match without_parentheses(expr) {
+        Expr::Array(constructor) => Some(constructor),
+        _ => None,
+    }
+}
 
 /// The literal under the parentheses and `COLLATE` clauses of `operand`, and
 /// whether a `COLLATE` holds it.

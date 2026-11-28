@@ -1248,6 +1248,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// operand's type as `=` converts it. A call [`Self::call`] answers takes
     /// the result of the function PostgreSQL selects. A `-` over a numeric
     /// literal is the negative constant PostgreSQL's grammar folds it into.
+    /// An `ARRAY[...]` constructor is the array over the common type of its
+    /// elements, `text` when they are all untyped literals, and stays unknown
+    /// when empty or holding another constructor.
     /// A scalar subquery takes the type of its one output column. One of
     /// several columns stays unknown, and so does a set operation, whose
     /// column takes the common type of its operands.
@@ -1323,6 +1326,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             }
             Expr::TypedString(typed) => declared_type(self.database, &typed.data_type),
             Expr::Interval(_) => catalog("interval"),
+            Expr::Array(array) => self.constructed_type(&array.elem)?,
             Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, data_type, .. } => {
                 declared_type(self.database, data_type)
             }
@@ -1983,10 +1987,42 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         })
     }
 
+    /// The type of the `ARRAY[...]` constructor of `elements`, the array over
+    /// the type `transformArrayExpr` selects for them.
+    fn constructed_type(&self, elements: &[Expr]) -> Result<OperandType<'_>, LookupError> {
+        if elements.is_empty()
+            || elements.iter().any(|element| matches!(unparenthesized(element), Expr::Array(_)))
+        {
+            return Ok(OperandType::Unknown);
+        }
+        let mut types = Vec::with_capacity(elements.len());
+        for element in elements {
+            let Some((pg_type, _)) = self.coerced(element)? else {
+                return Ok(OperandType::Unknown);
+            };
+            types.push(pg_type);
+        }
+        let element = match select_common_type(self.database, &types, |pg_type| pg_type) {
+            Ok(Some(CommonType::At(position))) => types.swap_remove(position),
+            Ok(Some(CommonType::Base(base))) => base,
+            Ok(Some(CommonType::AllUnknown)) => PgType::TEXT,
+            Ok(None) | Err(_) => return Ok(OperandType::Unknown),
+        };
+        Ok(known(self.database, canonical_owned(self.database, element).array(), None))
+    }
+
+    /// The type of each element of the array `array` evaluates to, as an
+    /// operator comparing with each of them reads it.
+    #[cfg(feature = "canonicalize")]
+    pub(crate) fn element_type_of(&self, array: &Expr) -> Result<OperandType<'db>, LookupError> {
+        Ok(element_type(self.database, self.type_of(array)?).into_owned())
+    }
+
     /// The evidence of `element` converted into `element_type`, the element
-    /// type of the array PostgreSQL builds of an `IN` list, as
-    /// `transformAExprIn` coerces each element, or `None` when the type of
-    /// `element` is unknown or the facts prove no conversion.
+    /// type of the array PostgreSQL builds of an `IN` list or an `ARRAY[...]`
+    /// constructor, as `transformAExprIn` and `transformArrayExpr` coerce each
+    /// element, or `None` when the type of `element` is unknown or the facts
+    /// prove no conversion.
     #[cfg(feature = "canonicalize")]
     pub(crate) fn element_evidence(
         &self,
