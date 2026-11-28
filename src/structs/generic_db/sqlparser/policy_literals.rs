@@ -35,7 +35,10 @@ use crate::{
         metadata::{ClauseLiterals, UnreadableLiteral},
     },
     traits::ColumnLike,
-    utils::walk::{walk, walk_expressions, walk_mut},
+    utils::{
+        postgres_types,
+        walk::{walk, walk_expressions, walk_mut},
+    },
 };
 
 /// The session state a policy's literals are read under.
@@ -116,15 +119,23 @@ enum Temporal {
 }
 
 impl Temporal {
+    /// The date or time type `data_type` names, a catalog type named with
+    /// `pg_catalog` among them. A name sqlparser reads as no type of its own
+    /// counts only qualified, since a schema on the path may hold a type of
+    /// that name.
     fn of(data_type: &DataType) -> Option<Self> {
-        let zoned =
-            |zone: &TimezoneInfo| matches!(zone, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz);
-        match data_type {
-            DataType::Date => Some(Self::Date),
-            DataType::Timestamp(_, zone) if zoned(zone) => Some(Self::TimestampTz),
-            DataType::Timestamp(..) => Some(Self::Timestamp),
-            DataType::Time(_, zone) if zoned(zone) => Some(Self::TimeTz),
-            DataType::Time(..) => Some(Self::Time),
+        if matches!(data_type, DataType::Custom(name, _) if name.0.len() < 2) {
+            return None;
+        }
+        let postgres_types::PgType::Catalog(name) = postgres_types::PgType::of(data_type) else {
+            return None;
+        };
+        match name {
+            "date" => Some(Self::Date),
+            "timestamp" => Some(Self::Timestamp),
+            "timestamptz" => Some(Self::TimestampTz),
+            "time" => Some(Self::Time),
+            "timetz" => Some(Self::TimeTz),
             _ => None,
         }
     }

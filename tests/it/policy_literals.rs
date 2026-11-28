@@ -322,6 +322,36 @@ fn every_typed_position_reads_its_literal_as_postgresql_does() -> Result<(), Loo
 }
 
 #[test]
+fn a_column_of_a_catalog_type_named_with_its_schema_types_its_literal() -> Result<(), LookupError> {
+    let db = parse(
+        "SET TIME ZONE 'Europe/Rome';
+         CREATE SCHEMA app;
+         CREATE DOMAIN app.timestamptz AS TEXT;
+         CREATE TABLE q (
+             doc INT,
+             joined pg_catalog.timestamptz,
+             clock \"pg_catalog\".timetz,
+             shadow app.timestamptz
+         );
+         CREATE POLICY p_member ON t USING (EXISTS (SELECT 1 FROM q AS member
+             WHERE member.doc = t.id AND member.joined < '2030-01-01 00:00:00'));
+         CREATE POLICY p_clock ON q USING (clock < '12:00+02');
+         CREATE POLICY p_cast ON t USING (tz < '2026-07-01 12:00'::pg_catalog.timestamptz);
+         CREATE POLICY p_shadow ON q USING (shadow < '2030-01-01 00:00:00');",
+    );
+    assert_eq!(
+        using(&db, "p_member")?,
+        "EXISTS (SELECT 1 FROM q AS member WHERE member.doc = t.id \
+         AND member.joined < '2029-12-31 23:00:00+00'::TIMESTAMP WITH TIME ZONE)"
+    );
+    assert_eq!(using(&db, "p_clock")?, "clock < '12:00:00+02'::TIME WITH TIME ZONE");
+    assert_eq!(using(&db, "p_cast")?, "tz < '2026-07-01 10:00:00+00'::pg_catalog.timestamptz");
+    // A domain of another schema over text takes its literal as text.
+    assert_eq!(using(&db, "p_shadow")?, "shadow < '2030-01-01 00:00:00'");
+    Ok(())
+}
+
+#[test]
 fn the_session_time_zone_reads_a_literal_until_the_script_sets_its_own() -> Result<(), Error> {
     let db = ParseOptions::default()
         .with_session_time_zone("Asia/Tokyo")?
