@@ -6,7 +6,7 @@
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::{
     ast::{SetExpr, Statement},
-    dialect::PostgreSqlDialect,
+    dialect::{PostgreSqlDialect, SQLiteDialect},
     parser::Parser,
 };
 
@@ -219,4 +219,70 @@ fn views_and_data_modifying_ctes_store_their_values() {
         context.assignments(&parse("UPDATE t SET a = b")),
         Err(LookupError::ExpressionNotInQuery { .. })
     ));
+}
+
+/// Each shape a statement writes values in answers its values, and a shape
+/// storing none, a `DELETE` included, answers none.
+#[test]
+fn every_written_shape_answers_its_values() {
+    let db = schema();
+    let both = ["a: int4 <- function int8->int4", "n: numeric <- function int4->numeric"];
+    assert_eq!(stored(&db, "UPDATE t SET (a, n) = (b, a)"), both);
+    let none: [String; 0] = [];
+    assert_eq!(stored(&db, "UPDATE t SET (a, n) = ROW(t.*)"), none);
+    assert_eq!(stored(&db, "UPDATE t SET (a, n) = b"), none);
+    assert_eq!(stored(&db, "INSERT INTO t DEFAULT VALUES"), none);
+    assert_eq!(
+        stored(
+            &db,
+            "MERGE INTO t USING t AS src ON t.a = src.a
+             WHEN MATCHED AND t.b > 0 THEN DELETE
+             WHEN MATCHED THEN UPDATE SET b = src.a",
+        ),
+        ["b: int8 <- function int4->int8"]
+    );
+    let statement = parse("DELETE FROM t");
+    let context = ExpressionContext::for_statement(
+        &statement,
+        &ExpressionScope::Empty,
+        &db,
+        IdentifierCase::Folded,
+    )
+    .expect("statement resolves");
+    assert!(context.assignments(&statement).expect("nothing to type").is_none());
+}
+
+/// A value stored in a field of a column, or of a type or into a type the
+/// facts do not settle, is undetermined, and a type no cast reaches outside
+/// the string types is refused.
+#[test]
+fn missing_facts_leave_the_assignment_undetermined() {
+    let db = schema();
+    let statement = parse("UPDATE t SET v = s, a.f = 1");
+    let context = ExpressionContext::for_statement(
+        &statement,
+        &ExpressionScope::Empty,
+        &db,
+        IdentifierCase::Folded,
+    )
+    .expect("statement resolves");
+    let assignments = context.assignments(&statement).expect("values type").expect("known");
+    let varchar = TargetName::new("varchar", false).with_schema("pg_catalog", false);
+    assert_eq!(
+        assignments[0].column_type(),
+        &OperandType::Known { type_name: varchar, typmod: Some(9) }
+    );
+    assert_eq!(assignments[1].column_type(), &OperandType::Unknown);
+    assert!(matches!(assignments[1].resolution(), AssignmentResolution::Undetermined));
+    assert_eq!(stored(&db, "UPDATE t SET a = no_such_function(1)"), ["a: undetermined"]);
+    assert_eq!(stored(&db, "UPDATE t SET a = d"), ["a: refused"]);
+
+    let extension = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE e (a INT4, h hstore[]);")
+        .expect("schema parses");
+    assert_eq!(stored(&extension, "UPDATE e SET h = a"), ["h: undetermined"]);
+
+    // A database answering no casts proves no length coercion.
+    let sqlite =
+        ParserDB::parse::<SQLiteDialect>("CREATE TABLE t (v VARCHAR(5));").expect("schema parses");
+    assert_eq!(stored(&sqlite, "UPDATE t SET v = 'x'"), ["v: undetermined"]);
 }

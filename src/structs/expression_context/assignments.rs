@@ -4,9 +4,9 @@
 use alloc::{string::ToString, vec::Vec};
 
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, DoUpdate, Expr, Ident, Insert, MergeAction, MergeInsertExpr,
-    MergeInsertKind, MergeUpdateExpr, MergeUpdateKind, ObjectName, OnConflict, OnConflictAction,
-    OnInsert, Query, SetExpr, Statement,
+    Assignment, AssignmentTarget, DoUpdate, Expr, Ident, Insert, MergeAction, MergeClause,
+    MergeInsertExpr, MergeInsertKind, MergeUpdateExpr, MergeUpdateKind, ObjectName, OnConflict,
+    OnConflictAction, OnInsert, Query, SetExpr, Statement,
 };
 
 use super::{ExpressionContext, plain_arguments, unparenthesized, unquoted_name};
@@ -105,6 +105,16 @@ type Column<'s> = (&'s str, bool, OperandType<'s>);
 /// names and whether it names a field or an element of that column.
 type Target = (usize, bool);
 
+/// What a data-modifying statement writes values from.
+enum Writes<'node> {
+    /// An `INSERT`, with its `ON CONFLICT DO UPDATE`.
+    Insert(&'node Insert),
+    /// The `SET` list of an `UPDATE`.
+    Set(&'node [Assignment]),
+    /// The clauses of a `MERGE`.
+    Merge(&'node [MergeClause]),
+}
+
 impl<'db, DB: DatabaseLike> ExpressionContext<'_, 'db, DB> {
     /// Returns the values the data-modifying `statement` stores in columns
     /// of the relation it writes, in the order it writes them, each with the
@@ -120,9 +130,10 @@ impl<'db, DB: DatabaseLike> ExpressionContext<'_, 'db, DB> {
     /// value in the column it names, a multi-column item each element of its
     /// row or each output of its subquery, and the `INSERT` of a `MERGE` each
     /// cell of its row. `DEFAULT` stores the column's default, which no value
-    /// here stands for. A name no column of the relation takes and the
-    /// outputs past a wildcard whose columns are not enumerated store
-    /// nothing here.
+    /// here stands for. A name no column of the relation takes, the outputs
+    /// past a wildcard whose columns are not enumerated, a `ROW` passing a
+    /// `*` and a multi-column item reading neither a `ROW` nor a subquery,
+    /// which PostgreSQL refuses, store nothing here.
     ///
     /// Assignment converts by implicit and assignment casts, converts any
     /// value to a string type through text and ends with the length coercion
@@ -167,36 +178,23 @@ impl<'db, DB: DatabaseLike> ExpressionContext<'_, 'db, DB> {
         if !self.scope.modifies(statement) {
             return Err(LookupError::ExpressionNotInQuery { expression: statement.to_string() });
         }
-        let Some(written) = self.scope.written_columns(statement) else { return Ok(None) };
-        let columns = written
-            .map(|(name, quoted, definition)| Ok((name, quoted, self.definition_type(definition)?)))
-            .collect::<Result<Vec<Column<'s>>, LookupError>>()?;
-        let mut stored = Stored { context: self, columns: &columns, assignments: Vec::new() };
-        match statement {
-            Statement::Insert(insert) => stored.insert(insert)?,
-            Statement::Update(update) => stored.set(&update.assignments)?,
-            Statement::Merge(merge) => {
-                for clause in &merge.clauses {
-                    match &clause.action {
-                        MergeAction::Update(MergeUpdateExpr {
-                            kind: MergeUpdateKind::Set(assignments),
-                            ..
-                        }) => stored.set(assignments)?,
-                        MergeAction::Insert(MergeInsertExpr {
-                            columns,
-                            kind: MergeInsertKind::Values(values),
-                            ..
-                        }) => {
-                            let targets = stored.targets(columns);
-                            for row in &values.rows {
-                                stored.row(&targets, row.iter())?;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        let writes = match statement {
+            Statement::Insert(insert) => Writes::Insert(insert),
+            Statement::Update(update) => Writes::Set(&update.assignments),
+            Statement::Merge(merge) => Writes::Merge(&merge.clauses),
+            // A `DELETE` writes no column.
             _ => return Ok(None),
+        };
+        let Some(written) = self.scope.written_columns(statement) else { return Ok(None) };
+        let mut columns = Vec::new();
+        for (name, quoted, definition) in written {
+            columns.push((name, quoted, self.definition_type(definition)?));
+        }
+        let mut stored = Stored { context: self, columns: &columns, assignments: Vec::new() };
+        match writes {
+            Writes::Insert(insert) => stored.insert(insert)?,
+            Writes::Set(assignments) => stored.set(assignments)?,
+            Writes::Merge(clauses) => stored.merge(clauses)?,
         }
         Ok(Some(stored.assignments))
     }
@@ -230,6 +228,32 @@ impl<'s, 'node, 'db, DB: DatabaseLike> Stored<'s, '_, 'node, '_, 'db, DB> {
         })) = &insert.on
         {
             self.set(assignments)?;
+        }
+        Ok(())
+    }
+
+    /// The values the `UPDATE` and `INSERT` actions of `MERGE` clauses store.
+    fn merge(&mut self, clauses: &'node [MergeClause]) -> Result<(), LookupError> {
+        for clause in clauses {
+            match &clause.action {
+                MergeAction::Update(MergeUpdateExpr {
+                    kind: MergeUpdateKind::Set(assignments),
+                    ..
+                }) => self.set(assignments)?,
+                MergeAction::Insert(MergeInsertExpr {
+                    columns,
+                    kind: MergeInsertKind::Values(values),
+                    ..
+                }) => {
+                    let targets = self.targets(columns);
+                    for row in &values.rows {
+                        self.row(&targets, row.iter())?;
+                    }
+                }
+                // `DELETE`, `DO NOTHING` and `INSERT DEFAULT VALUES` store no
+                // value.
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -357,12 +381,12 @@ impl<'s, 'node, 'db, DB: DatabaseLike> Stored<'s, '_, 'node, '_, 'db, DB> {
         column: &OperandType<'_>,
     ) -> AssignmentResolution<'db, DB> {
         let database = self.context.database;
-        let (Some(source), Some(target)) =
-            (typed_input(database, value), typed_input(database, column))
+        let Some(((source, target), name)) =
+            typed_input(database, value).zip(typed_input(database, column)).and_then(|types| {
+                let name = type_name(database, &types.1.0)?;
+                Some((types, name))
+            })
         else {
-            return AssignmentResolution::Undetermined;
-        };
-        let Some(name) = type_name(database, &target.0) else {
             return AssignmentResolution::Undetermined;
         };
         match assignment(
