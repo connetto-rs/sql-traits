@@ -10,16 +10,16 @@ use core::ops::ControlFlow;
 
 use sqlparser::{
     ast::{
-        Array, BinaryOperator, CastKind, DataType, Expr, Ident, InTarget, Query, UnaryOperator,
-        Value, ValueWithSpan, Visitor,
+        Array, BinaryOperator, CastKind, DataType, Expr, Function, FunctionArguments, Ident,
+        InTarget, Query, UnaryOperator, Value, ValueWithSpan, Visitor,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
 use sqlparser_canonicalize::{
-    ArrayCoercions, CanonicalizeError, Conversion, MembershipCoercions, MembershipElement,
-    OperatorCoercions, PatternCoercions, QuantifiedCoercions, QuantifiedElements, RangeCoercions,
-    SemanticContext,
+    ArrayCoercions, CallCoercions, CanonicalizeError, Conversion, MembershipCoercions,
+    MembershipElement, OperatorCoercions, PatternCoercions, QuantifiedCoercions,
+    QuantifiedElements, RangeCoercions, SemanticContext,
 };
 
 use crate::{
@@ -66,8 +66,12 @@ use crate::{
 /// operand and of the array, and of each element of an `ARRAY[...]`
 /// constructor into its element type. A cast over a constructor holding an
 /// untyped literal is pushed into its elements, as PostgreSQL pushes it,
-/// when the cast's element type carries no modifier. Every other node is
-/// left as written.
+/// when the cast's element type carries no modifier. A call PostgreSQL
+/// selects one function for spells each converted argument as the cast or
+/// the constant the deparse writes, keeping its name, its written arguments
+/// and their named notation, when every argument is proved and no `VARIADIC`
+/// parameter collects them into an array. Every other node is left as
+/// written.
 ///
 /// [`Self::view`] lends the proofs to a canonicalizer.
 ///
@@ -114,6 +118,9 @@ pub struct SemanticProofs<'root> {
     /// The conversions of each proved `ANY`, `SOME` or `ALL` comparison, by
     /// address.
     quantified: Vec<(usize, Quantified)>,
+    /// The conversion of each argument of each proved call, in written
+    /// order, by address.
+    calls: Vec<(usize, Vec<Option<Spelled>>)>,
 }
 
 /// A converted operand as PostgreSQL's deparse spells it.
@@ -215,7 +222,7 @@ impl<'root> SemanticProofs<'root> {
     ///
     /// Returns the errors [`ExpressionContext::for_expression`] returns and
     /// the lookup errors typing an operand of a comparison or an `IN` list
-    /// returns.
+    /// or an argument of a call returns.
     pub fn for_expression<'db, DB: DatabaseLike>(
         expression: &'root Expr,
         scope: &ExpressionScope<'_, 'db, DB>,
@@ -301,6 +308,7 @@ impl<'root> SemanticProofs<'root> {
                 ranges: Vec::new(),
                 memberships: Vec::new(),
                 quantified: Vec::new(),
+                calls: Vec::new(),
             },
         };
         if let ControlFlow::Break(error) = walk(expression, &mut prover) {
@@ -314,6 +322,7 @@ impl<'root> SemanticProofs<'root> {
         proofs.ranges.sort_unstable_by_key(|(address, _)| *address);
         proofs.memberships.sort_unstable_by_key(|(address, _)| *address);
         proofs.quantified.sort_unstable_by_key(|(address, _)| *address);
+        proofs.calls.sort_unstable_by_key(|(address, _)| *address);
         Ok(proofs)
     }
 
@@ -363,7 +372,20 @@ impl<'root> SemanticProofs<'root> {
                 Some((*address, conversions.collect()))
             })
             .collect();
-        SemanticProofView { proofs: self, memberships, quantified }
+        let calls = self
+            .calls
+            .iter()
+            .map(|(address, arguments)| {
+                (
+                    *address,
+                    arguments
+                        .iter()
+                        .map(|spelled| spelled.as_ref().map(Spelled::conversion))
+                        .collect(),
+                )
+            })
+            .collect();
+        SemanticProofView { proofs: self, memberships, quantified, calls }
     }
 
     /// Refuses a node that is not one of the root's.
@@ -390,6 +412,8 @@ pub struct SemanticProofView<'p> {
     /// The element conversions of each proved `ANY`, `SOME` or `ALL`
     /// comparison with an `ARRAY[...]` constructor, by address.
     quantified: Vec<(usize, Vec<Option<Conversion<'p>>>)>,
+    /// The conversion of each argument of each proved call, by address.
+    calls: Vec<(usize, Vec<Option<Conversion<'p>>>)>,
 }
 
 impl SemanticContext for SemanticProofView<'_> {
@@ -463,6 +487,14 @@ impl SemanticContext for SemanticProofView<'_> {
                 array: array.as_ref().map(Conversion::Cast),
             }
         }))
+    }
+
+    fn call_coercions(
+        &self,
+        occurrence: &Expr,
+    ) -> Result<Option<CallCoercions<'_>>, CanonicalizeError> {
+        let address = self.proofs.check(occurrence)?;
+        Ok(found(&self.calls, address).map(|arguments| CallCoercions { arguments }))
     }
 }
 
@@ -551,6 +583,10 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
                 let proved = self.quantified(expression, left, right)?;
                 self.proofs.quantified.extend(proved.map(|quantified| (address, quantified)));
             }
+            Expr::Function(function) => {
+                let proved = self.call(expression, function)?;
+                self.proofs.calls.extend(proved.map(|arguments| (address, arguments)));
+            }
             _ => {}
         }
         Ok(())
@@ -613,6 +649,31 @@ impl<DB: DatabaseLike> Prover<'_, '_, '_, '_, DB> {
         let applications = self.context.operators(expression)?.unwrap_or_default();
         let [low, high] = applications.as_slice() else { return Ok(None) };
         Ok(self.applied(low).zip(self.applied(high)))
+    }
+
+    /// The conversion of each written argument of the call `expression` of
+    /// `function`, in written order, `None` when one is unproved, when no
+    /// one function is selected or when a `VARIADIC` parameter collects the
+    /// arguments into an array, which the deparse writes as one.
+    fn call(
+        &self,
+        expression: &Expr,
+        function: &Function,
+    ) -> Result<Option<Vec<Option<Spelled>>>, LookupError> {
+        let FunctionArguments::List(list) = &function.args else { return Ok(None) };
+        let Some(call) = self.context.call(expression)? else { return Ok(None) };
+        let CallResolution::Selected(selected) = call.resolution() else { return Ok(None) };
+        // `WITHIN GROUP` orderings and the `*` of `count(*)` are not written
+        // arguments of the list.
+        if selected.variadic().is_some() || selected.arguments().len() != list.args.len() {
+            return Ok(None);
+        }
+        Ok(selected
+            .arguments()
+            .iter()
+            .zip(call.arguments())
+            .map(|(argument, written)| self.spelled(argument.evidence(), written).ok())
+            .collect())
     }
 
     /// The conversions of `left` and `right` as `left_evidence` and
