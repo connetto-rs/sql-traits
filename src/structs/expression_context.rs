@@ -1947,11 +1947,8 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     ) -> Result<Collapse<'_>, LookupError> {
         let mut types = Vec::with_capacity(elements.len() + 1);
         for node in core::iter::once(left).chain(elements.iter().copied()) {
-            types.push(match self.type_of(node)? {
-                OperandType::Known { type_name, .. } => PgType::from_target(&type_name),
-                OperandType::UntypedLiteral => PgType::UNKNOWN,
-                OperandType::Unknown => return Ok(Collapse::Unknown),
-            });
+            let Some((pg_type, _)) = self.coerced(node)? else { return Ok(Collapse::Unknown) };
+            types.push(pg_type);
         }
         let common = select_common_type(self.database, &types, |pg_type| pg_type).ok();
         Ok(common
@@ -1972,6 +1969,36 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 })
             })
             .unwrap_or(Collapse::Unknown))
+    }
+
+    /// The type `node` enters a coercion with and the modifier it carries,
+    /// `unknown` for an untyped literal, or `None` when its type is unknown.
+    fn coerced(&self, node: &Expr) -> Result<Option<(PgType, Option<i32>)>, LookupError> {
+        Ok(match self.type_of(node)? {
+            OperandType::Known { type_name, typmod } => {
+                Some((PgType::from_target(&type_name), typmod))
+            }
+            OperandType::UntypedLiteral => Some((PgType::UNKNOWN, None)),
+            OperandType::Unknown => None,
+        })
+    }
+
+    /// The evidence of `element` converted into `element_type`, the element
+    /// type of the array PostgreSQL builds of an `IN` list, as
+    /// `transformAExprIn` coerces each element, or `None` when the type of
+    /// `element` is unknown or the facts prove no conversion.
+    #[cfg(feature = "canonicalize")]
+    pub(crate) fn element_evidence(
+        &self,
+        element: &Expr,
+        element_type: &TargetName<'_>,
+    ) -> Result<Option<crate::structs::OperandEvidence<'db, DB>>, LookupError> {
+        let Some((source, typmod)) = self.coerced(element)? else { return Ok(None) };
+        let source = canonical_owned(self.database, source);
+        let target = canonical_owned(self.database, PgType::from_target(element_type));
+        let Some(name) = type_name(self.database, &target) else { return Ok(None) };
+        let steps = crate::utils::coercion::conversion(self.database, &source, typmod, &target);
+        Ok(steps.map(|steps| crate::structs::OperandEvidence::new(name, false, steps)))
     }
 
     /// Whether `element` holds a column reference that binds in the query

@@ -252,6 +252,46 @@ fn operators_matches_and_ranges_read_as_postgresql_deparses_them() {
     }
 }
 
+/// `IN` list elements of another type than the array PostgreSQL builds read
+/// as the casts the deparse writes, mixed fixed and varying character types
+/// included, with the blanks of each constant kept as written.
+#[test]
+fn converted_list_elements_read_as_postgresql_deparses_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
+    for (declared, deparsed) in [
+        ("c IN ('ab ', 'x'::text)", "(c = ANY (ARRAY['ab '::bpchar, ('x'::text)::bpchar]))"),
+        (
+            "c IN ('ab '::text, 'x'::text)",
+            "(c = ANY (ARRAY[('ab '::text)::bpchar, ('x'::text)::bpchar]))",
+        ),
+        (
+            "c IN ('ab '::text, 'ab '::text)",
+            "(c = ANY (ARRAY[('ab '::text)::bpchar, ('ab '::text)::bpchar]))",
+        ),
+        ("c IN ('ab '::text)", "((c)::text = 'ab '::text)"),
+        ("s IN ('ab ', 'x')", "(s = ANY (ARRAY['ab '::text, 'x'::text]))"),
+        (
+            "c IN ('x'::character(2), 'ab '::character varying)",
+            "(c = ANY (ARRAY['x'::character(2), ('ab '::character varying)::bpchar]))",
+        ),
+        (
+            "s IN ('ab '::character(3), 'x')",
+            "(s = ANY (ARRAY[('ab '::character(3))::text, 'x'::text]))",
+        ),
+        (
+            "s IN ('ab '::character varying, 'x'::character(2))",
+            "(s = ANY (ARRAY[('ab '::character varying)::text, ('x'::character(2))::text]))",
+        ),
+        (
+            "d IN ('a'::text, 'b'::character varying)",
+            "((d)::text = ANY (ARRAY['a'::text, ('b'::character varying)::text]))",
+        ),
+        ("i IN (1, 2.5)", "((i)::numeric = ANY (ARRAY[(1)::numeric, 2.5]))"),
+    ] {
+        assert_eq!(canonical(&db, declared), canonical(&db, deparsed), "{declared}");
+    }
+}
+
 #[test]
 fn unproved_operations_and_lists_keep_their_spelling() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
@@ -269,8 +309,7 @@ fn unproved_operations_and_lists_keep_their_spelling() {
             view.membership_coercions(&expression).unwrap().is_some(),
         )
     };
-    // No `=` takes `text` and `int4`, and PostgreSQL casts `1` into the
-    // `numeric` array, which no proof spells. A cast to `mood` is spelled
+    // No `=` takes `text` and `int4`. A cast to `mood` is spelled
     // as the deparsing session's `search_path` reaches the type, a converted
     // negative constant as a cast of its quoted cast, and a negated exponent
     // as the digits `numeric_in` expands it into. No `~~` takes `int4`, and
@@ -281,7 +320,7 @@ fn unproved_operations_and_lists_keep_their_spelling() {
         "n = -1",
         "n > -1e3",
         "s IN (1)",
-        "i IN (1, 2.5)",
+        "i IN (1, $1)",
         "n IN (-1, 2)",
         "n IN (-1e3, -2e3)",
         "i LIKE 'a%'",
