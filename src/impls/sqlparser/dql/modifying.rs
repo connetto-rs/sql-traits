@@ -2,7 +2,7 @@
 //! the statement stands: by itself, as the body of a `WITH`-prefixed query,
 //! or as a data-modifying CTE, whose output is its `RETURNING` list.
 
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
 use core::slice;
 
 use sqlparser::ast::{
@@ -15,11 +15,13 @@ use sqlparser::ast::{
 use super::{
     AstRef, CteShape, DerivationProfile, DerivedShape, Deriving, DerivingView, NestedQueryWalker,
     RelationKey, append_select_item, collect_from_items, collect_lone_factor,
-    definition_graph::{DefinitionDerivation, DefinitionId, ScopeCursor, ScopeId},
+    definition_graph::{DefinitionDerivation, DefinitionId, ScopeCursor, ScopeId, WrittenColumn},
     derive_view_shape, index_nested_query_scopes,
 };
 use crate::{
-    errors::LookupError, traits::DatabaseLike, utils::object_name::target_name_from_object_name,
+    errors::LookupError,
+    traits::{ColumnLike, DatabaseLike, TableLike},
+    utils::object_name::target_name_from_object_name,
 };
 
 /// The scopes the clauses of one data-modifying statement resolve in.
@@ -47,6 +49,11 @@ type Ctes<'c, 'query, 'db, DB> = &'c [CteShape<'query, 'db, DB, DefinitionId>];
 /// The columns a `RETURNING` list outputs, `None` when it outputs none or
 /// some cannot be named.
 type Returned<'query, 'db, DB> = Option<DerivedShape<'query, 'db, DB, DefinitionId>>;
+
+/// The scopes of one statement's clauses, the columns its `RETURNING` list
+/// outputs and the relation it writes, when the derivation knows one.
+type Built<'query, 'db, DB> =
+    (ModifyingScopes, Returned<'query, 'db, DB>, Option<Target<'query, 'db, DB>>);
 
 /// The relation a data-modifying statement writes, whose row the target's
 /// name or alias, `excluded`, `old` and `new` read.
@@ -80,7 +87,7 @@ pub(super) fn derive<'query, 'db, DB: DatabaseLike>(
     outer: Option<ScopeCursor>,
 ) -> Result<Returned<'query, 'db, DB>, LookupError> {
     let mut builder = Builder { profile, ctes, deriving, outer };
-    let (scopes, returned) = match statement {
+    let (scopes, returned, target) = match statement {
         Statement::Update(update) => builder.update(update)?,
         Statement::Delete(delete) => builder.delete(delete)?,
         Statement::Insert(insert) => builder.insert(insert)?,
@@ -88,6 +95,10 @@ pub(super) fn derive<'query, 'db, DB: DatabaseLike>(
         _ => return Ok(None),
     };
     builder.profile.record_modifying(statement, scopes);
+    if let Some(target) = target {
+        let columns = builder.written_columns(target);
+        builder.profile.record_written(statement, columns);
+    }
     Ok(returned)
 }
 
@@ -124,10 +135,7 @@ struct Builder<'p, 'c, 'd, 'query, 'db, DB: DatabaseLike> {
 }
 
 impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
-    fn update(
-        &mut self,
-        update: &'query Update,
-    ) -> Result<(ModifyingScopes, Returned<'query, 'db, DB>), LookupError> {
+    fn update(&mut self, update: &'query Update) -> Result<Built<'query, 'db, DB>, LookupError> {
         let Update { table, from, assignments, selection, returning, .. } = update;
         let from: &'query [TableWithJoins] = match from {
             Some(UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from)) => {
@@ -151,13 +159,10 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             returning: Some(rows),
             ..ModifyingScopes::default()
         };
-        Ok((scopes, returned))
+        Ok((scopes, returned, target))
     }
 
-    fn delete(
-        &mut self,
-        delete: &'query Delete,
-    ) -> Result<(ModifyingScopes, Returned<'query, 'db, DB>), LookupError> {
+    fn delete(&mut self, delete: &'query Delete) -> Result<Built<'query, 'db, DB>, LookupError> {
         let Delete { from, using, selection, returning, .. } = delete;
         let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
         // The first table a `DELETE` names is its target.
@@ -173,16 +178,13 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             returning: Some(rows),
             ..ModifyingScopes::default()
         };
-        Ok((scopes, returned))
+        Ok((scopes, returned, None))
     }
 
     /// An `INSERT`: its source query reads the scope it stands in,
     /// `RETURNING` its target, and `ON CONFLICT DO UPDATE` its target with
     /// the `excluded` row.
-    fn insert(
-        &mut self,
-        insert: &'query Insert,
-    ) -> Result<(ModifyingScopes, Returned<'query, 'db, DB>), LookupError> {
+    fn insert(&mut self, insert: &'query Insert) -> Result<Built<'query, 'db, DB>, LookupError> {
         let Insert { table, table_alias, source, on, returning, .. } = insert;
         if let Some(source) = source {
             index_nested_query_scopes(
@@ -229,16 +231,13 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
         let returned = self.returning(returned_scope, rows, returning.as_deref())?;
         let scopes =
             ModifyingScopes { returning: Some(rows), conflict, ..ModifyingScopes::default() };
-        Ok((scopes, returned))
+        Ok((scopes, returned, target))
     }
 
     /// A `MERGE`: the source and then the target, the order `RETURNING *`
     /// lists their columns in, with the source alone and the target alone
     /// for the clauses that read one side.
-    fn merge(
-        &mut self,
-        merge: &'query Merge,
-    ) -> Result<(ModifyingScopes, Returned<'query, 'db, DB>), LookupError> {
+    fn merge(&mut self, merge: &'query Merge) -> Result<Built<'query, 'db, DB>, LookupError> {
         let Merge { table, source, on, clauses, output, .. } = merge;
         let target = self.factor_target(table)?;
         let mut both = self.profile.begin_unowned_scope(self.outer);
@@ -311,7 +310,42 @@ impl<'query, 'db, DB: DatabaseLike> Builder<'_, '_, '_, 'query, 'db, DB> {
             _ => None,
         };
         let returned = self.returning(both, rows, returning)?;
-        Ok((scopes, returned))
+        Ok((scopes, returned, target))
+    }
+
+    /// The columns of `target`, in order, each with what declares its type:
+    /// a table's own columns and a view's output columns.
+    fn written_columns(&mut self, target: Target<'query, 'db, DB>) -> Vec<WrittenColumn<'db>> {
+        match target {
+            Target::Table(table) => {
+                let database = self.deriving.database;
+                table
+                    .columns(database)
+                    .into_iter()
+                    .flatten()
+                    .map(|column| {
+                        WrittenColumn {
+                            name: Cow::Borrowed(column.column_name()),
+                            quoted: column.column_name_is_quoted(),
+                            definition: self.profile.column_definition(table, column, database),
+                        }
+                    })
+                    .collect()
+            }
+            Target::View { shape, .. } => {
+                shape
+                    .columns
+                    .into_iter()
+                    .map(|column| {
+                        WrittenColumn {
+                            name: Cow::Owned(column.name),
+                            quoted: column.quoted,
+                            definition: column.definition,
+                        }
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// The relation `factor` names as a statement's target.

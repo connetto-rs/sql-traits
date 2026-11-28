@@ -1,7 +1,8 @@
 //! Whether PostgreSQL converts a value of one type to another without being
-//! asked, as `can_coerce_type` decides under `COERCION_IMPLICIT`, and the
-//! common type `select_common_type` settles on, both read from the casts and
-//! the type facts a database answers.
+//! asked, as `can_coerce_type` decides under `COERCION_IMPLICIT`, the steps
+//! it applies to store a value under `COERCION_ASSIGNMENT`, and the common
+//! type `select_common_type` settles on, all read from the casts and the
+//! type facts a database answers.
 //!
 //! A database answering no casts proves no conversion, and one answering no
 //! facts about a type proves nothing about it, so an answer needing either is
@@ -266,11 +267,35 @@ impl<'db, D: DatabaseLike + 'db> Steps<'db, D> for Vec<CoercionStep<'db, D>> {
     }
 }
 
+/// The context PostgreSQL converts a value in, its `CoercionContext`, which
+/// decides the casts it may apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Context {
+    /// An operand, an argument or a value meeting others at a common type,
+    /// `COERCION_IMPLICIT`, which applies implicit casts only.
+    Implicit,
+    /// A value a statement stores in a column, `COERCION_ASSIGNMENT`, which
+    /// also applies assignment casts and converts any value to a string
+    /// type through text.
+    Assignment,
+}
+
+impl Context {
+    /// Whether a cast of `cast` context applies in this one.
+    fn admits(self, cast: CastContext) -> bool {
+        match cast {
+            CastContext::Implicit => true,
+            CastContext::Assignment => self >= Self::Assignment,
+            CastContext::Explicit => false,
+        }
+    }
+}
+
 /// Whether PostgreSQL converts a value of the canonical type `source` to the
 /// canonical type `target` without being asked, as `can_coerce_type` decides
 /// under `COERCION_IMPLICIT` for a declared target that is not polymorphic.
 pub(crate) fn can_coerce<D: DatabaseLike>(database: &D, source: &PgType, target: &PgType) -> Proof {
-    coerce(database, source, None, target, &mut ())
+    coerce(database, source, None, target, Context::Implicit, &mut ())
 }
 
 /// The steps PostgreSQL applies to convert a value of the canonical type
@@ -284,16 +309,71 @@ pub(crate) fn conversion<'db, D: DatabaseLike>(
     target: &PgType,
 ) -> Option<Vec<CoercionStep<'db, D>>> {
     let mut steps = Vec::new();
-    (coerce(database, source, typmod, target, &mut steps) == Proof::Yes).then_some(steps)
+    (coerce(database, source, typmod, target, Context::Implicit, &mut steps) == Proof::Yes)
+        .then_some(steps)
 }
 
-/// The search behind [`can_coerce`] and [`conversion`], recording the steps
-/// it finds in `steps`.
+/// The steps PostgreSQL applies under `context` to store a value of the
+/// canonical type `source`, carrying the modifier `typmod`, as the canonical
+/// type `target` carrying `target_typmod`, as `coerce_to_target_type` builds
+/// them: the conversion, then the length coercion the target's modifier
+/// needs. [`None`] when PostgreSQL refuses the value.
+pub(crate) fn assignment<'db, D: DatabaseLike>(
+    database: &'db D,
+    (source, typmod): (&PgType, Option<i32>),
+    (target, target_typmod): (&PgType, Option<i32>),
+    context: Context,
+) -> Result<Option<Vec<CoercionStep<'db, D>>>, Undetermined> {
+    let mut steps = Vec::new();
+    if !proven(coerce(database, source, typmod, target, context, &mut steps))? {
+        return Ok(None);
+    }
+    let Some(applied) = target_typmod else { return Ok(Some(steps)) };
+    // A converted value carries no modifier, but the input function of
+    // `interval` reads a literal under the target's.
+    let carried = if steps.is_empty() {
+        typmod
+    } else if source.is_unknown() && *target == PgType::Catalog("interval") {
+        target_typmod
+    } else {
+        None
+    };
+    if carried != Some(applied) {
+        length(database, target, applied, &mut steps)?;
+    }
+    Ok(Some(steps))
+}
+
+/// Records the length coercion `coerce_type_typmod` applies to give a value
+/// of the canonical type `target` the modifier `typmod`, element by element
+/// for an array, and nothing for a type without one, such as a domain.
+fn length<'db, D: DatabaseLike>(
+    database: &'db D,
+    target: &PgType,
+    typmod: i32,
+    steps: &mut Vec<CoercionStep<'db, D>>,
+) -> Result<(), Undetermined> {
+    if database.casts().is_none() {
+        return Err(Undetermined);
+    }
+    let element = target.element().unwrap_or(target);
+    let Some(cast) = cast(database, element, element) else { return Ok(()) };
+    let step = CoercionStep::LengthCoercion { cast, typmod };
+    steps.push(match target {
+        PgType::Array(_) => CoercionStep::Array { element: Vec::from([step]) },
+        _ => step,
+    });
+    Ok(())
+}
+
+/// The search behind [`can_coerce`], [`conversion`] and [`assignment`],
+/// recording the steps it finds in `steps`.
 fn coerce<'db, D: DatabaseLike, S: Steps<'db, D>>(
     database: &'db D,
     source: &PgType,
     typmod: Option<i32>,
     target: &PgType,
+    context: Context,
     steps: &mut S,
 ) -> Proof {
     if source == target || target.is_any() {
@@ -313,7 +393,7 @@ fn coerce<'db, D: DatabaseLike, S: Steps<'db, D>>(
         }
         proof
     };
-    attempt(steps, &|steps| pathway(database, source, typmod, target, steps))
+    attempt(steps, &|steps| pathway(database, source, typmod, target, context, steps))
         .or_else(|| attempt(steps, &|steps| record(database, source, target, steps)))
         .or_else(|| attempt(steps, &|steps| inherits(database, source, target, steps)))
 }
@@ -337,13 +417,14 @@ fn literal<'db, D: DatabaseLike, S: Steps<'db, D>>(
     }
 }
 
-/// Whether `find_coercion_pathway` finds an implicit conversion between two
-/// canonical types, recording the steps `coerce_type` takes along it.
+/// Whether `find_coercion_pathway` finds a conversion between two canonical
+/// types under `context`, recording the steps `coerce_type` takes along it.
 fn pathway<'db, D: DatabaseLike, S: Steps<'db, D>>(
     database: &'db D,
     source: &PgType,
     typmod: Option<i32>,
     target: &PgType,
+    context: Context,
     steps: &mut S,
 ) -> Proof {
     let (Ok(source_base), Ok(target_base)) = (base(database, source), base(database, target))
@@ -365,8 +446,9 @@ fn pathway<'db, D: DatabaseLike, S: Steps<'db, D>>(
         // A converted value carries no modifier, and an array's modifier is
         // its elements'.
         let element_typmod = typmod.take();
+        let mark = steps.mark();
         match cast(database, &source_base, &target_base) {
-            Some(cast) if cast.context() == CastContext::Implicit => {
+            Some(cast) if context.admits(cast.context()) => {
                 steps.note(|| {
                     Some(match cast.method() {
                         CastMethod::Binary => CoercionStep::Relabel(cast),
@@ -376,15 +458,29 @@ fn pathway<'db, D: DatabaseLike, S: Steps<'db, D>>(
                 })
             }
             Some(_) => Proof::No,
-            // Arrays convert element by element without a cast of their own.
+            // Arrays convert element by element without a cast of their own,
+            // and a value reaches a string type through text by assignment.
             None => {
-                match (&*source_base, &*target_base) {
+                let elements = match (&*source_base, &*target_base) {
                     (PgType::Array(source), PgType::Array(target)) => {
                         steps.elements(|steps| {
-                            pathway(database, source, element_typmod, target, steps)
+                            pathway(database, source, element_typmod, target, context, steps)
                         })
                     }
                     _ => Proof::No,
+                };
+                match elements {
+                    Proof::No if context >= Context::Assignment => {
+                        match category(database, &target_base) {
+                            Ok(category) if category == TypeCategory::STRING => {
+                                steps.reset(mark);
+                                through_text(database, &target_base, steps)
+                            }
+                            Ok(_) => Proof::No,
+                            Err(Undetermined) => Proof::Unknown,
+                        }
+                    }
+                    elements => elements,
                 }
             }
         }
@@ -393,6 +489,17 @@ fn pathway<'db, D: DatabaseLike, S: Steps<'db, D>>(
         (Proof::Yes, Cow::Owned(base)) => domain(database, target, &base, typmod, steps),
         (converted, _) => converted,
     }
+}
+
+/// Records the conversion through the output function of a value's type and
+/// the input function of the canonical type `target` that PostgreSQL applies
+/// where no cast reaches it.
+fn through_text<'db, D: DatabaseLike, S: Steps<'db, D>>(
+    database: &'db D,
+    target: &PgType,
+    steps: &mut S,
+) -> Proof {
+    steps.note(|| Some(CoercionStep::AutomaticInOut { target: type_name(database, target)? }))
 }
 
 /// The steps `coerce_to_domain` adds for the domain `target` over `base`, to
