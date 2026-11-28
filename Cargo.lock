@@ -1037,7 +1037,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.2.1"
-source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=main#b58ba1c9a70b5bf9ccde2a19503e6d67447dac8e"
+source = "git+https://github.com/connetto-rs/sqlparser-canonicalize?branch=upstream%2Fcall-coercions#ca07adfb77834aa4773df5a61a9ea3d6573d0c67"
 dependencies = [
  "recursive",
  "seahash",

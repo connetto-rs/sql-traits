@@ -371,6 +371,57 @@ fn unproved_operations_and_lists_keep_their_spelling() {
     }
 }
 
+const CALLS: &str = "CREATE TABLE t (s TEXT, v VARCHAR(5), c CHAR(3), i INT4);
+CREATE FUNCTION f(a INT4, b TEXT DEFAULT 'x') RETURNS BOOLEAN IMMUTABLE LANGUAGE sql AS 'SELECT true';
+CREATE FUNCTION g(VARIADIC xs INT4[]) RETURNS BOOLEAN IMMUTABLE LANGUAGE sql AS 'SELECT true';
+CREATE SCHEMA authz;
+CREATE TYPE authz.role AS ENUM ('admin', 'member');
+CREATE FUNCTION authz.organizations_with(r authz.role) RETURNS BOOLEAN IMMUTABLE LANGUAGE sql AS 'SELECT true';";
+
+/// A call keeps its name, its written arguments in their written order and
+/// its named notation, each argument converted as PostgreSQL converts it
+/// into the parameter it passes.
+#[test]
+fn calls_read_as_postgresql_deparses_them() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(CALLS).unwrap();
+    for (declared, deparsed) in [
+        (
+            "current_setting('app.user_id', true) <> ''",
+            "(current_setting('app.user_id'::text, true) <> ''::text)",
+        ),
+        ("f('3')", "f(3)"),
+        ("f(b => 'y', a => '3')", "f(b => 'y'::text, a => 3)"),
+        ("f(a := i, b := s)", "f(a => i, b => s)"),
+        ("length(v) > 0", "(length((v)::text) > 0)"),
+        ("lower(c) = 'a'", "(lower((c)::text) = 'a'::text)"),
+        ("upper(lower('A')) <> ''", "(upper(lower('A'::text)) <> ''::text)"),
+    ] {
+        assert_eq!(canonical(&db, declared), canonical(&db, deparsed), "{declared}");
+    }
+    // A type outside `pg_catalog` is spelled as the reading session's
+    // `search_path` reaches it.
+    let public = &[("public", false)];
+    assert_eq!(
+        canonical_on_path(&db, "authz.organizations_with('admin')", public),
+        canonical_on_path(&db, "authz.organizations_with('admin'::authz.role)", public),
+    );
+}
+
+#[test]
+fn unproved_calls_keep_their_arguments() {
+    let db = ParserDB::parse::<PostgreSqlDialect>(CALLS).unwrap();
+    let scope = ExpressionScope::Table(table(&db));
+    // `g` collects its arguments into an array, no `f` takes `text`, and no
+    // function is named `missing`.
+    for check in ["g(1, '2')", "f(s)", "missing('a')"] {
+        let expression = parse(check);
+        let proofs =
+            SemanticProofs::for_expression(&expression, &scope, &db, IdentifierCase::Folded)
+                .unwrap();
+        assert!(proofs.view().call_coercions(&expression).unwrap().is_none(), "{check}");
+    }
+}
+
 #[test]
 fn a_trigger_condition_keeps_its_row_qualifications() {
     let db = ParserDB::parse::<PostgreSqlDialect>(DDL).unwrap();
@@ -420,4 +471,5 @@ fn a_node_of_another_expression_is_refused() {
     assert!(view.range_coercions(&copy).is_err());
     assert!(view.column_reference(&copy).is_err());
     assert!(view.membership_coercions(&copy).is_err());
+    assert!(view.call_coercions(&copy).is_err());
 }

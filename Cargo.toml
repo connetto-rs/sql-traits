@@ -65,7 +65,7 @@ sqlparser-expr-eval = { git = "https://github.com/connetto-rs/sqlparser-expr-eva
 sqlparser-plpgsql-dataflow = { git = "https://github.com/connetto-rs/sqlparser-plpgsql-dataflow", branch = "main", default-features = false }
 # Lends a table attribute out of the shared table node, so the node holds the only copy.
 yoke = { version = "0.8.4", default-features = false, features = ["alloc"] }
-sqlparser-canonicalize = { git = "https://github.com/connetto-rs/sqlparser-canonicalize", branch = "main", default-features = false, optional = true }
+sqlparser-canonicalize = { git = "https://github.com/connetto-rs/sqlparser-canonicalize", branch = "upstream/call-coercions", default-features = false, optional = true }
 serde_json = { version = "1.0", optional = true }
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"], optional = true }
 
