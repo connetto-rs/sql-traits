@@ -18,7 +18,7 @@ use sqlparser::{
     ast::{
         Action, AlterDefaultPrivileges, AlterDefaultPrivilegesOperation, ContextModifier,
         CreateFunction, DefaultPrivilegesObjectType, DefaultPrivilegesOption, Expr, Grant,
-        GrantObjects, Grantee, GranteeName, GranteesType, Ident, ObjectName, ObjectNamePart,
+        GrantObjects, Grantee, GranteeName, GranteesType, Ident, ObjectName, ObjectNamePart, Owner,
         Privileges, Reset, Set, SetSessionAuthorizationParamKind, Statement,
     },
     tokenizer::Span,
@@ -147,6 +147,22 @@ impl SessionRoles {
                     Some(GranteeName::ObjectName(ObjectName::from(vec![Ident::with_quote(
                         '"', role,
                     )])));
+            }
+        }
+    }
+
+    /// Binds the session principals of a policy's `TO` list to the roles
+    /// they name now, as PostgreSQL stores a policy's roles. A principal
+    /// naming the unnamed role stays a keyword.
+    pub(super) fn bind_policy_roles(&self, owners: &mut [Owner]) {
+        for owner in owners {
+            let role = match owner {
+                Owner::CurrentUser | Owner::CurrentRole => self.creating_role(),
+                Owner::SessionUser => self.session_role(),
+                Owner::Ident(_) => continue,
+            };
+            if let Some(role) = role {
+                *owner = Owner::Ident(Ident::with_quote('"', role));
             }
         }
     }

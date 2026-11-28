@@ -159,9 +159,11 @@ impl ParseOptions {
     /// Migrations are applied as a role no statement names, so this states
     /// it. Every object created before a `SET ROLE` or `SET SESSION
     /// AUTHORIZATION` moves away from it is owned by this role and takes the
-    /// defaults `ALTER DEFAULT PRIVILEGES FOR ROLE` gives it, and
+    /// defaults `ALTER DEFAULT PRIVILEGES FOR ROLE` gives it, a policy created
+    /// `TO CURRENT_USER` or `TO SESSION_USER` then applies to this role, and
     /// `RESET SESSION AUTHORIZATION` comes back to it. Without one, that role
-    /// is unnamed and what it creates has no owner.
+    /// is unnamed, what it creates has no owner and such a policy keeps its
+    /// keyword.
     ///
     /// # Example
     ///

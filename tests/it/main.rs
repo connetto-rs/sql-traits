@@ -189,6 +189,7 @@ mod policy_applies_to_role;
 mod policy_clause_analysis;
 mod policy_literals;
 mod policy_recursion;
+mod policy_session_roles;
 mod possible_privileges;
 mod postgres_catalog_cost;
 mod postgres_errors;

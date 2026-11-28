@@ -290,7 +290,10 @@ pub trait PolicyLike:
     /// A policy that applies to every role names none, as
     /// [`Self::applies_to_public`] reports. PostgreSQL stores only the public
     /// pseudo-role for it, and keeps that alone when the `TO` list also names
-    /// other roles.
+    /// other roles. `CURRENT_USER`, `CURRENT_ROLE` and `SESSION_USER` come
+    /// back as the role they named when the policy was created or its roles
+    /// last altered, and as the keyword while the input leaves that role
+    /// unnamed.
     ///
     /// # Example
     ///
@@ -370,8 +373,9 @@ pub trait PolicyLike:
     /// usual identifier rules, and to each role that has one of those among
     /// its [`inherited_roles`](RoleLike::inherited_roles), since PostgreSQL
     /// applies a policy to every role that uses the named role's privileges.
-    /// A `TO` entry such as `CURRENT_USER` names whichever role runs the
-    /// statement, which the schema never says, so it matches no role.
+    /// A `TO` entry still spelled `CURRENT_USER`, `CURRENT_ROLE` or
+    /// `SESSION_USER` names a role the input never states, so it matches no
+    /// role.
     ///
     /// # Example
     ///
