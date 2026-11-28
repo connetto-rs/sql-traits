@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 
 use sqlparser::ast::{
-    BinaryOperator, CastKind, CeilFloorKind, ColumnDef, DataType, DateTimeField, Expr, InTarget,
+    BinaryOperator, CastKind, CeilFloorKind, DataType, DateTimeField, Expr, InTarget,
     UnaryOperator, Value,
 };
 
@@ -54,15 +54,10 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     ) -> Result<OperandType<'static>, LookupError> {
         Ok(match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                match self.declared_column(expression) {
-                    Some(column) => sqlite_column_def(column),
-                    None => {
-                        match self.reference(expression)? {
-                            Some((definition, _)) => self.sqlite_definition_type(&definition)?,
-                            None => OperandType::Unknown,
-                        }
-                    }
-                }
+                let reference = self.reference(expression)?;
+                reference.map_or(Ok(OperandType::Unknown), |(definition, _)| {
+                    self.sqlite_definition_type(&definition)
+                })?
             }
             // Parentheses and `COLLATE` keep the affinity of what they wrap.
             Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => {
@@ -435,10 +430,9 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         name: &str,
         arguments: &[&Expr],
     ) -> Result<CallResolution<'db, DB>, LookupError> {
-        let Some(builtin) = BUILTINS.iter().find(|builtin| {
-            builtin.names.iter().any(|known| known.eq_ignore_ascii_case(name))
-                && builtin.takes(arguments.len())
-        }) else {
+        let Some(builtin) =
+            BUILTINS.iter().find(|builtin| builtin.named(name) && builtin.takes(arguments.len()))
+        else {
             return Ok(CallResolution::Undetermined);
         };
         let mut storages = Vec::with_capacity(arguments.len());
@@ -451,7 +445,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         let conversions = (0..storages.len())
             .map(|position| builtin.reading(position).conversion(position, &storages))
             .collect();
-        Ok(CallResolution::Sqlite(SqliteCall::new(conversions, builtin.returns.storage(&storages))))
+        Ok(CallResolution::Sqlite(SqliteCall::new(conversions, builtin.4.storage(&storages))))
     }
 }
 
@@ -473,12 +467,6 @@ const fn without_affinity(storage: StorageClasses) -> OperandType<'static> {
 /// the affinity stores what it converts in.
 const fn stored(affinity: Affinity) -> OperandType<'static> {
     OperandType::Sqlite { affinity: Some(affinity), storage: affinity.preferred_storage() }
-}
-
-/// The type of a column the generated expression being typed declares,
-/// before the table holding it exists.
-fn sqlite_column_def(column: &ColumnDef) -> OperandType<'static> {
-    stored(Affinity::of_written(&column.data_type))
 }
 
 /// A value of `affinity` held in the class the affinity prefers, a `BLOB`
@@ -747,45 +735,35 @@ impl Returns {
 }
 
 /// A built-in scalar function of SQLite.
-struct Builtin {
+struct Builtin(
     /// The names it is called by.
-    names: &'static [&'static str],
+    &'static [&'static str],
     /// The fewest arguments it takes.
-    least: usize,
+    usize,
     /// The most arguments it takes, `None` for any number.
-    most: Option<usize>,
+    Option<usize>,
     /// How it reads each argument, the last reading repeating for the
     /// arguments past it.
-    readings: &'static [Reading],
+    &'static [Reading],
     /// What it returns.
-    returns: Returns,
-}
+    Returns,
+);
 
 impl Builtin {
+    /// Whether it is called by `name`.
+    fn named(&self, name: &str) -> bool {
+        self.0.iter().any(|known| known.eq_ignore_ascii_case(name))
+    }
+
     /// Whether it takes `count` arguments.
     fn takes(&self, count: usize) -> bool {
-        count >= self.least && self.most.is_none_or(|most| count <= most)
+        count >= self.1 && self.2.is_none_or(|most| count <= most)
     }
 
     /// How it reads the argument at `position`.
     fn reading(&self, position: usize) -> Reading {
-        self.readings
-            .get(position)
-            .or_else(|| self.readings.last())
-            .copied()
-            .unwrap_or(Reading::AsIs)
+        self.3.get(position).or_else(|| self.3.last()).copied().unwrap_or(Reading::AsIs)
     }
-}
-
-/// A built-in taking from `least` to `most` arguments.
-const fn builtin(
-    names: &'static [&'static str],
-    least: usize,
-    most: Option<usize>,
-    readings: &'static [Reading],
-    returns: Returns,
-) -> Builtin {
-    Builtin { names, least, most, readings, returns }
 }
 
 const INTEGER: Returns = Returns::Class(StorageClasses::INTEGER);
@@ -797,45 +775,45 @@ const BLOB: Returns = Returns::Class(StorageClasses::BLOB);
 /// <https://www.sqlite.org/lang_corefunc.html> and
 /// <https://www.sqlite.org/lang_mathfunc.html> document them.
 static BUILTINS: &[Builtin] = &[
-    builtin(&["abs"], 1, Some(1), &[Reading::Number], Returns::Number),
-    builtin(&["changes", "last_insert_rowid", "random", "total_changes"], 0, Some(0), &[], INTEGER),
-    builtin(&["char"], 0, None, &[Reading::Integer], TEXT),
-    builtin(&["coalesce"], 2, None, &[Reading::AsIs], Returns::Any),
-    builtin(&["concat"], 1, None, &[Reading::Text], TEXT),
-    builtin(&["concat_ws"], 2, None, &[Reading::Text], TEXT),
-    builtin(&["current_date", "current_time", "current_timestamp"], 0, Some(0), &[], TEXT),
-    builtin(&["format", "printf"], 0, None, &[Reading::Text, Reading::AsIs], TEXT),
-    builtin(&["glob"], 2, Some(2), &[Reading::Text], INTEGER),
-    builtin(&["hex"], 1, Some(1), &[Reading::Blob], TEXT),
-    builtin(&["ifnull"], 2, Some(2), &[Reading::AsIs], Returns::Any),
-    builtin(&["iif", "if"], 2, None, &[Reading::AsIs], Returns::Picked),
-    builtin(&["instr"], 2, Some(2), &[Reading::TextUnlessAllBlobs], INTEGER),
-    builtin(&["length", "octet_length"], 1, Some(1), &[Reading::TextOrBlob], INTEGER),
-    builtin(&["like"], 2, Some(3), &[Reading::Text], INTEGER),
-    builtin(&["likelihood"], 2, Some(2), &[Reading::AsIs], Returns::First),
-    builtin(&["likely", "unlikely"], 1, Some(1), &[Reading::AsIs], Returns::First),
-    builtin(&["lower", "soundex", "unistr", "upper"], 1, Some(1), &[Reading::Text], TEXT),
-    builtin(&["ltrim", "rtrim", "trim"], 1, Some(2), &[Reading::Text], TEXT),
-    builtin(&["max", "min"], 2, None, &[Reading::AsIs], Returns::Any),
-    builtin(&["nullif"], 2, Some(2), &[Reading::AsIs], Returns::First),
-    builtin(&["quote", "typeof", "unistr_quote"], 1, Some(1), &[Reading::AsIs], TEXT),
-    builtin(&["randomblob", "zeroblob"], 1, Some(1), &[Reading::Integer], BLOB),
-    builtin(&["replace"], 3, Some(3), &[Reading::Text], TEXT),
-    builtin(&["round"], 1, Some(2), &[Reading::Real, Reading::Integer], REAL),
-    builtin(&["sign"], 1, Some(1), &[Reading::Number], INTEGER),
-    builtin(&["sqlite_compileoption_get"], 1, Some(1), &[Reading::Integer], TEXT),
-    builtin(&["sqlite_compileoption_used"], 1, Some(1), &[Reading::Text], INTEGER),
-    builtin(&["sqlite_source_id", "sqlite_version"], 0, Some(0), &[], TEXT),
-    builtin(
+    Builtin(&["abs"], 1, Some(1), &[Reading::Number], Returns::Number),
+    Builtin(&["changes", "last_insert_rowid", "random", "total_changes"], 0, Some(0), &[], INTEGER),
+    Builtin(&["char"], 0, None, &[Reading::Integer], TEXT),
+    Builtin(&["coalesce"], 2, None, &[Reading::AsIs], Returns::Any),
+    Builtin(&["concat"], 1, None, &[Reading::Text], TEXT),
+    Builtin(&["concat_ws"], 2, None, &[Reading::Text], TEXT),
+    Builtin(&["current_date", "current_time", "current_timestamp"], 0, Some(0), &[], TEXT),
+    Builtin(&["format", "printf"], 0, None, &[Reading::Text, Reading::AsIs], TEXT),
+    Builtin(&["glob"], 2, Some(2), &[Reading::Text], INTEGER),
+    Builtin(&["hex"], 1, Some(1), &[Reading::Blob], TEXT),
+    Builtin(&["ifnull"], 2, Some(2), &[Reading::AsIs], Returns::Any),
+    Builtin(&["iif", "if"], 2, None, &[Reading::AsIs], Returns::Picked),
+    Builtin(&["instr"], 2, Some(2), &[Reading::TextUnlessAllBlobs], INTEGER),
+    Builtin(&["length", "octet_length"], 1, Some(1), &[Reading::TextOrBlob], INTEGER),
+    Builtin(&["like"], 2, Some(3), &[Reading::Text], INTEGER),
+    Builtin(&["likelihood"], 2, Some(2), &[Reading::AsIs], Returns::First),
+    Builtin(&["likely", "unlikely"], 1, Some(1), &[Reading::AsIs], Returns::First),
+    Builtin(&["lower", "soundex", "unistr", "upper"], 1, Some(1), &[Reading::Text], TEXT),
+    Builtin(&["ltrim", "rtrim", "trim"], 1, Some(2), &[Reading::Text], TEXT),
+    Builtin(&["max", "min"], 2, None, &[Reading::AsIs], Returns::Any),
+    Builtin(&["nullif"], 2, Some(2), &[Reading::AsIs], Returns::First),
+    Builtin(&["quote", "typeof", "unistr_quote"], 1, Some(1), &[Reading::AsIs], TEXT),
+    Builtin(&["randomblob", "zeroblob"], 1, Some(1), &[Reading::Integer], BLOB),
+    Builtin(&["replace"], 3, Some(3), &[Reading::Text], TEXT),
+    Builtin(&["round"], 1, Some(2), &[Reading::Real, Reading::Integer], REAL),
+    Builtin(&["sign"], 1, Some(1), &[Reading::Number], INTEGER),
+    Builtin(&["sqlite_compileoption_get"], 1, Some(1), &[Reading::Integer], TEXT),
+    Builtin(&["sqlite_compileoption_used"], 1, Some(1), &[Reading::Text], INTEGER),
+    Builtin(&["sqlite_source_id", "sqlite_version"], 0, Some(0), &[], TEXT),
+    Builtin(
         &["substr", "substring"],
         2,
         Some(3),
         &[Reading::TextOrBlob, Reading::Integer],
         Returns::Part,
     ),
-    builtin(&["unhex"], 1, Some(2), &[Reading::Text], BLOB),
-    builtin(&["unicode"], 1, Some(1), &[Reading::Text], INTEGER),
-    builtin(
+    Builtin(&["unhex"], 1, Some(2), &[Reading::Text], BLOB),
+    Builtin(&["unicode"], 1, Some(1), &[Reading::Text], INTEGER),
+    Builtin(
         &[
             "acos", "acosh", "asin", "asinh", "atan", "atanh", "cos", "cosh", "degrees", "exp",
             "ln", "log10", "log2", "radians", "sin", "sinh", "sqrt", "tan", "tanh",
@@ -845,10 +823,10 @@ static BUILTINS: &[Builtin] = &[
         &[Reading::Real],
         REAL,
     ),
-    builtin(&["atan2", "mod", "pow", "power"], 2, Some(2), &[Reading::Real], REAL),
-    builtin(&["log"], 1, Some(2), &[Reading::Real], REAL),
-    builtin(&["pi"], 0, Some(0), &[], REAL),
-    builtin(
+    Builtin(&["atan2", "mod", "pow", "power"], 2, Some(2), &[Reading::Real], REAL),
+    Builtin(&["log"], 1, Some(2), &[Reading::Real], REAL),
+    Builtin(&["pi"], 0, Some(0), &[], REAL),
+    Builtin(
         &["ceil", "ceiling", "floor", "trunc"],
         1,
         Some(1),

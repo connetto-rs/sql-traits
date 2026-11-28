@@ -8,7 +8,7 @@
 use sql_traits::prelude::*;
 use sqlparser::{
     ast::{Expr, SelectItem, SetExpr},
-    dialect::SQLiteDialect,
+    dialect::{Dialect, PostgreSqlDialect, SQLiteDialect},
 };
 
 use crate::support::query_parsing::query_with;
@@ -58,8 +58,18 @@ fn projected(
     sql: &str,
     answer: impl Fn(&ExpressionContext<'_, '_, ParserDB>, &Expr) -> String,
 ) -> Vec<String> {
+    projected_in(&SQLiteDialect {}, sql, answer)
+}
+
+/// Each projected expression of `sql`, parsed in `dialect`, over [`SCHEMA`],
+/// with what `answer` reads off it in the context of the query.
+fn projected_in(
+    dialect: &dyn Dialect,
+    sql: &str,
+    answer: impl Fn(&ExpressionContext<'_, '_, ParserDB>, &Expr) -> String,
+) -> Vec<String> {
     let db = ParserDB::parse::<SQLiteDialect>(SCHEMA).expect("the schema parses");
-    let query = query_with(&SQLiteDialect {}, sql);
+    let query = query_with(dialect, sql);
     let context =
         ExpressionContext::new(&query, &db, IdentifierCase::Folded).expect("the query is typed");
     let SetExpr::Select(select) = query.body.as_ref() else { panic!("a plain SELECT") };
@@ -77,7 +87,7 @@ fn projected(
         .collect()
 }
 
-/// The type of each projected expression of `sql`.
+/// The type each projected expression of `sql` takes.
 fn types(sql: &str) -> Vec<String> {
     projected(sql, |context, expression| {
         typed(&context.type_of(expression).expect("a node of the query"))
@@ -85,13 +95,13 @@ fn types(sql: &str) -> Vec<String> {
 }
 
 /// The operators each projected expression of `sql` applies, each spelled
-/// as `name(left,right)` with the conversion of each operand.
+/// as `name(left,right)` with the conversion of each operand, and `not
+/// derived` for a node whose operators the context does not derive.
 fn operators(sql: &str) -> Vec<String> {
     projected(sql, |context, expression| {
-        let applications = context
-            .operators(expression)
-            .expect("a node of the query")
-            .expect("the operators are derived");
+        let Some(applications) = context.operators(expression).expect("a node of the query") else {
+            return "not derived".to_owned();
+        };
         let spelled: Vec<_> = applications
             .iter()
             .map(|application| {
@@ -116,13 +126,13 @@ fn operators(sql: &str) -> Vec<String> {
 }
 
 /// The call each projected expression of `sql` makes, spelled as the
-/// conversion of each argument and the classes it returns.
+/// conversion of each argument and the classes it returns, and `no call` for
+/// a node that is none.
 fn calls(sql: &str) -> Vec<String> {
     projected(sql, |context, expression| {
-        let application = context
-            .call(expression)
-            .expect("a node of the query")
-            .unwrap_or_else(|| panic!("{expression:?} is a plain call"));
+        let Some(application) = context.call(expression).expect("a node of the query") else {
+            return "no call".to_owned();
+        };
         match application.resolution() {
             CallResolution::Sqlite(call) => {
                 let arguments: Vec<_> = call.arguments().iter().copied().map(converted).collect();
@@ -347,7 +357,121 @@ fn a_builtin_function_reads_its_arguments_as_it_documents() {
 #[test]
 fn a_call_sqlite_does_not_define_is_undetermined() {
     assert_eq!(
-        calls("SELECT my_function(i), round(i, 2, 3), main.round(i) FROM t"),
-        ["undetermined", "undetermined", "undetermined",]
+        calls(
+            "SELECT my_function(i), round(i, 2, 3), main.round(i), round(my_function(i)), i FROM t"
+        ),
+        ["undetermined", "undetermined", "undetermined", "undetermined", "no call"]
+    );
+}
+
+#[test]
+fn the_conditional_builtins_return_what_they_pick() {
+    assert_eq!(
+        calls("SELECT nullif(i, s), iif(i, s, r), iif(i, s), hex(i), hex(x) FROM strict_t"),
+        ["(-,-) INTEGER", "(-,-,-) REAL|TEXT", "(-,-) TEXT", "(Blob) TEXT", "(-) TEXT"]
+    );
+    assert_eq!(
+        types("SELECT round(i), nullif(i, s), iif(i, s, r) FROM t"),
+        ["-:REAL", "-:INTEGER", "-:REAL|TEXT"]
+    );
+}
+
+#[test]
+fn every_comparison_and_arithmetic_operator_names_what_it_applies() {
+    assert_eq!(
+        operators(
+            "SELECT i <> s, i < s, i <= s, i > s, i >= s, i IS NOT s, s IS DISTINCT FROM 5, \
+             5 = s FROM t"
+        ),
+        [
+            "<>(-,Affinity(Numeric))",
+            "<(-,Affinity(Numeric))",
+            "<=(-,Affinity(Numeric))",
+            ">(-,Affinity(Numeric))",
+            ">=(-,Affinity(Numeric))",
+            "IS NOT(-,Affinity(Numeric))",
+            "IS NOT(-,Affinity(Text))",
+            "=(Affinity(Text),-)",
+        ]
+    );
+    assert_eq!(
+        operators(
+            "SELECT i - s, i / s, i & s, i | s, i >> s, s GLOB i, ~s, +s, i, 'a', \
+             CAST(s AS INT), s COLLATE NOCASE FROM t"
+        ),
+        [
+            "-(-,Numeric)",
+            "/(-,Numeric)",
+            "&(-,Integer)",
+            "|(-,Integer)",
+            ">>(-,Integer)",
+            "GLOB(-,Text)",
+            "~(-,Integer)",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    );
+}
+
+#[test]
+fn connectives_and_calls_apply_no_operator_the_context_derives() {
+    assert_eq!(
+        operators("SELECT i AND s, NOT i, i LIKE s ESCAPE 'x', round(i), i IS NULL FROM t"),
+        ["not derived", "not derived", "not derived", "not derived", "not derived"]
+    );
+}
+
+#[test]
+fn a_test_or_connective_returns_an_integer_and_an_unknown_operand_leaves_the_result_unknown() {
+    assert_eq!(
+        types(
+            "SELECT NOT i, ~i, TRUE, i IS NULL, i AND s, -my_function(i), +my_function(i), \
+             my_function(i) + 1, CASE WHEN i THEN my_function(i) END, nosuch, i REGEXP s, value, \
+             (i, s) FROM t, json_each('[1]')"
+        ),
+        [
+            "-:INTEGER",
+            "-:INTEGER",
+            "-:INTEGER",
+            "-:INTEGER",
+            "-:INTEGER",
+            "?",
+            "?",
+            "?",
+            "?",
+            "?",
+            "?",
+            "?",
+            "?"
+        ]
+    );
+}
+
+#[test]
+fn an_operator_sqlite_does_not_have_leaves_the_node_untyped() {
+    let unknown = |context: &ExpressionContext<'_, '_, ParserDB>, expression: &Expr| {
+        let typed = typed(&context.type_of(expression).expect("a node of the query"));
+        let applied = context.operators(expression).expect("a node of the query");
+        format!("{typed} {}", if applied.is_some() { "derived" } else { "not derived" })
+    };
+    assert_eq!(
+        projected_in(&PostgreSqlDialect {}, "SELECT @ i, i ->> 'a', B'01' FROM t", unknown),
+        ["? not derived", "? not derived", "? derived"]
+    );
+}
+
+#[test]
+fn a_derived_column_takes_the_type_of_its_definition() {
+    assert_eq!(
+        types(
+            "SELECT k, column1, m, n FROM (SELECT CAST(s AS INTEGER) AS k FROM t), \
+             (VALUES (1), (2.5)), (SELECT my_function(i) AS m FROM t UNION SELECT i FROM t), \
+             (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) \
+              SELECT n FROM c)"
+        ),
+        ["Integer:INTEGER", "-:INTEGER|REAL", "?", "-:INTEGER"]
     );
 }

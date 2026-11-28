@@ -1304,24 +1304,31 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         }
         Ok(match expression {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-                if let Some(column) = self.declared_column(expression) {
-                    return Ok(declared_type(self.database, &column.data_type));
-                }
-                if self.declared_columns.is_some() {
+                if let Some(columns) = self.declared_columns {
                     let name = match expression {
                         Expr::Identifier(name) => Some(name),
                         Expr::CompoundIdentifier(names) => names.last(),
                         _ => None,
                     };
-                    if name.is_some_and(|name| {
-                        self.case.identifiers_match(
+                    if let Some(name) = name {
+                        if let Some(column) = columns.iter().find(|column| {
+                            self.case.identifiers_match(
+                                &column.name.value,
+                                column.name.quote_style.is_some(),
+                                &name.value,
+                                name.quote_style.is_some(),
+                            )
+                        }) {
+                            return Ok(declared_type(self.database, &column.data_type));
+                        }
+                        if self.case.identifiers_match(
                             "tableoid",
                             false,
                             &name.value,
                             name.quote_style.is_some(),
-                        )
-                    }) {
-                        return Ok(catalog("oid"));
+                        ) {
+                            return Ok(catalog("oid"));
+                        }
                     }
                 }
                 match self.reference(expression)? {
@@ -2067,25 +2074,6 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             .and_then(|position| self.parameters.get(position.checked_sub(1)?))
             .cloned()
             .unwrap_or(OperandType::Unknown)
-    }
-
-    /// The column the generated expression being typed declares that the
-    /// column reference `expression` names, before the table holding it
-    /// exists.
-    fn declared_column(&self, expression: &Expr) -> Option<&'query ColumnDef> {
-        let name = match expression {
-            Expr::Identifier(name) => name,
-            Expr::CompoundIdentifier(names) => names.last()?,
-            _ => return None,
-        };
-        self.declared_columns?.iter().find(|column| {
-            self.case.identifiers_match(
-                &column.name.value,
-                column.name.quote_style.is_some(),
-                &name.value,
-                name.quote_style.is_some(),
-            )
-        })
     }
 
     /// Whether `expression` is a node of the query.
