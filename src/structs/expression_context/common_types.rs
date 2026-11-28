@@ -148,9 +148,8 @@ impl<'db, DB: DatabaseLike> ExpressionContext<'_, 'db, DB> {
     /// let SelectItem::UnnamedExpr(case) = &select.projection[0] else { unreachable!() };
     ///
     /// let application = context.common_type(case)?.expect("a CASE");
-    /// let CommonTypeResolution::Selected { common, inputs } = application.resolution() else {
-    ///     unreachable!()
-    /// };
+    /// let resolution = application.resolution();
+    /// let CommonTypeResolution::Selected { common, inputs } = resolution else { unreachable!() };
     /// assert_eq!(common.name(), "numeric");
     /// // `a` converts by the cast `numeric(int4)`, `n` stays as it is.
     /// assert!(matches!(inputs[0].conversion(), [CoercionStep::Function(_)]));

@@ -181,6 +181,10 @@ fn values_columns_meet_across_rows() {
     let labels: Vec<String> = columns.iter().map(|column| label(&db, column)).collect();
     assert_eq!(labels, ["numeric: function int4->numeric | ", "text: input text | input text"]);
     assert_eq!(typed(&context.type_of(projected(&statement)).expect("x types")), "numeric");
+    // A column whose rows share no type takes none.
+    let statement = parse("SELECT x FROM (VALUES (1), (DATE '2026-01-01')) AS v(x)");
+    let context = context_of(&db, &statement);
+    assert_eq!(typed(&context.type_of(projected(&statement)).expect("x types")), "unknown");
 
     let statement = parse("INSERT INTO t (a) VALUES (1), (2)");
     let context = context_of(&db, &statement);
@@ -209,6 +213,10 @@ fn only_common_type_sites_answer() {
         let context = context_of(&db, &statement);
         assert!(context.common_type(projected(&statement)).expect("a node").is_none());
     }
+    // `NULLIF` takes exactly two values, and no function `nullif` takes one.
+    let statement = parse("SELECT NULLIF(a) FROM t");
+    let context = context_of(&db, &statement);
+    assert_eq!(typed(&context.type_of(projected(&statement)).expect("a node")), "unknown");
     let cast_array = |sql: &str| {
         let statement = parse(&format!("SELECT {sql} FROM t"));
         let context = context_of(&db, &statement);
