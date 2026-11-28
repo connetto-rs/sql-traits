@@ -277,8 +277,12 @@ fn missing_facts_leave_the_assignment_undetermined() {
     assert_eq!(stored(&db, "UPDATE t SET a = no_such_function(1)"), ["a: undetermined"]);
     assert_eq!(stored(&db, "UPDATE t SET a = d"), ["a: refused"]);
 
-    let extension = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE e (a INT4, h hstore[]);")
-        .expect("schema parses");
+    // Nothing tells whether the unknown base of the domain is a string type
+    // that text conversion reaches.
+    let extension = ParserDB::parse::<PostgreSqlDialect>(
+        "CREATE DOMAIN tagged AS hstore; CREATE TABLE e (a INT4, h tagged);",
+    )
+    .expect("schema parses");
     assert_eq!(stored(&extension, "UPDATE e SET h = a"), ["h: undetermined"]);
 
     // A database answering no casts proves no length coercion.
