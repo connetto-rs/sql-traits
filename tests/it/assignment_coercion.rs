@@ -277,8 +277,8 @@ fn missing_facts_leave_the_assignment_undetermined() {
     assert_eq!(stored(&db, "UPDATE t SET a = no_such_function(1)"), ["a: undetermined"]);
     assert_eq!(stored(&db, "UPDATE t SET a = d"), ["a: refused"]);
 
-    // Nothing tells whether the unknown base of the domain is a string type
-    // that text conversion reaches.
+    // A domain over a type the database holds no facts about has none of
+    // its own.
     let extension = ParserDB::parse::<PostgreSqlDialect>(
         "CREATE DOMAIN tagged AS hstore; CREATE TABLE e (a INT4, h tagged);",
     )
