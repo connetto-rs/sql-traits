@@ -43,12 +43,14 @@ use crate::{
         operator_typing::resolve_operator,
         postgres_types::PgType,
         type_modifier,
-        walk::{walk, walk_expressions},
+        walk::walk,
     },
 };
 
 mod assignments;
+mod common_types;
 pub use assignments::{AssignedValue, AssignmentResolution, ColumnAssignment};
+pub use common_types::{CommonTypeApplication, CommonTypeInput, CommonTypeResolution};
 
 /// The binding and type of every expression node of one borrowed query, as
 /// PostgreSQL derives them in the scope the node sits in.
@@ -95,6 +97,12 @@ pub struct ExpressionContext<'query, 'db, DB: DatabaseLike> {
     scope: ColumnScope<'query, 'db, DB>,
     /// The address of every expression node of the query, sorted.
     nodes: Vec<usize>,
+    /// The address of every `ARRAY[...]` node a cast is written over, with
+    /// the cast's type, sorted by address.
+    array_casts: Vec<(usize, DataType)>,
+    /// The address of every `VALUES` list PostgreSQL stores row by row,
+    /// sorted.
+    direct_values: Vec<usize>,
     /// The address of every column reference of the query, with the rule its
     /// clause resolves it by, sorted by address.
     sites: Vec<(usize, Option<SiteRule>)>,
@@ -607,17 +615,16 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
         parameters: Vec<OperandType<'db>>,
         value: Option<OperandType<'db>>,
     ) -> Self {
-        let mut nodes = Vec::new();
-        let _ = walk_expressions(root, |expression| {
-            nodes.push(address(expression));
-            ControlFlow::<()>::Continue(())
-        });
-        nodes.sort_unstable();
+        let mut inventory = common_types::Inventory::default();
+        let _ = walk(root, &mut inventory);
+        let common_types::Inventory { nodes, array_casts, direct_values } = inventory.sorted();
         sites.sort_unstable_by_key(|(address, _)| *address);
         Self {
             database,
             scope,
             nodes,
+            array_casts,
+            direct_values,
             sites,
             case,
             parameters,
@@ -1227,6 +1234,13 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
             ColumnDefinition::Variable(variable) => {
                 variable.data_type().cloned().unwrap_or(OperandType::Unknown)
             }
+            ColumnDefinition::Values { rows } => {
+                let cells = rows
+                    .iter()
+                    .map(|row| self.definition_type(row.definition()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.values_column_type(&cells)
+            }
             _ => OperandType::Unknown,
         })
     }
@@ -1253,7 +1267,11 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
     /// literal is the negative constant PostgreSQL's grammar folds it into.
     /// A scalar subquery takes the type of its one output column. One of
     /// several columns stays unknown, and so does a set operation, whose
-    /// column takes the common type of its operands.
+    /// column takes the common type of its operands. A `CASE`, `COALESCE`,
+    /// `GREATEST` and `LEAST` take the type [`Self::common_type`] selects,
+    /// and an `ARRAY[...]` the array type over it, or the type of the cast
+    /// written over it. A column of a `VALUES` list takes the type its cells
+    /// meet at. Each keeps the modifier every value carries unconverted.
     ///
     /// Under [`ExpressionScope::PlPgSql`] a field of the record a cursor
     /// `FOR` loop declares takes the type of the cursor query's output of
@@ -1330,6 +1348,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                 declared_type(self.database, data_type)
             }
             Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => self.type_of(inner)?,
+            Expr::Case { .. } | Expr::Array(_) => self.common_result(expression)?,
             _ => {
                 match folded(expression) {
                     Some((digits, negative)) => catalog(number_type(digits, negative)),
@@ -1348,6 +1367,7 @@ impl<'query, 'db, DB: DatabaseLike> ExpressionContext<'query, 'db, DB> {
                                         resolution: CallResolution::Cast(target),
                                         ..
                                     }) => without_typmod(Some(target)),
+                                    None => self.common_result(expression)?,
                                     _ => OperandType::Unknown,
                                 }
                             }
@@ -2766,14 +2786,21 @@ fn nullif_operands(function: &Function) -> Option<(&Expr, &Expr)> {
     if !unquoted_name(function).is_some_and(|name| name.eq_ignore_ascii_case("nullif")) {
         return None;
     }
+    match *positional_arguments(function)?.as_slice() {
+        [left, right] => Some((left, right)),
+        _ => None,
+    }
+}
+
+/// The nodes of the arguments of `function` when it passes each plainly by
+/// position, as PostgreSQL's grammar reads the expressions it writes like a
+/// call.
+fn positional_arguments(function: &Function) -> Option<Vec<&Expr>> {
     let FunctionArguments::List(list) = &function.args else { return None };
     if !list.args.iter().all(|argument| matches!(argument, FunctionArg::Unnamed(_))) {
         return None;
     }
-    match *plain_arguments(function)?.as_slice() {
-        [left, right] => Some((left, right)),
-        _ => None,
-    }
+    plain_arguments(function)
 }
 
 /// The type of a value of type `type_name`, which carries no modifier.

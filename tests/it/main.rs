@@ -39,6 +39,7 @@ mod column_storage;
 mod column_type_change_dependents;
 mod column_written_constraints;
 mod comment_on_documentation;
+mod common_type_coercion;
 mod constraint_renames;
 mod constraint_using_index;
 mod constraint_validation;
