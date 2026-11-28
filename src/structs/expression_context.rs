@@ -47,6 +47,9 @@ use crate::{
     },
 };
 
+mod assignments;
+pub use assignments::{AssignedValue, AssignmentResolution, ColumnAssignment};
+
 /// The binding and type of every expression node of one borrowed query, as
 /// PostgreSQL derives them in the scope the node sits in.
 ///

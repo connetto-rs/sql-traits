@@ -16,6 +16,7 @@ mod alter_table_set_schema;
 mod altered_policies;
 mod array_column_types;
 mod array_vector_interval_types;
+mod assignment_coercion;
 mod attach_adopts_primary_key;
 mod binary_send;
 mod call_kind_rules;

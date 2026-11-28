@@ -1,5 +1,6 @@
 //! Helpers several integration test modules share.
 
+pub(crate) mod coercion_steps;
 pub(crate) mod column_names;
 pub(crate) mod column_nullability;
 pub(crate) mod column_type_probes;

@@ -3,7 +3,7 @@
 use core::fmt;
 
 use sqlparser::ast::{
-    DataType, Expr, FunctionArg, ObjectName, Query, Select, SetOperator, TableFactor,
+    DataType, Expr, FunctionArg, ObjectName, Query, Select, SetOperator, Statement, TableFactor,
     TableWithJoins,
 };
 
@@ -1447,6 +1447,26 @@ impl<'query, 'db, DB: DatabaseLike> ColumnScope<'query, 'db, DB> {
     /// of its expression, `None` for one sitting where no scope was derived.
     pub(crate) fn site_rules(&self, query: &Query) -> alloc::vec::Vec<(usize, Option<SiteRule>)> {
         self.graph.site_rules(query)
+    }
+
+    /// Whether the scope was built over the data-modifying `statement`.
+    pub(crate) fn modifies(&self, statement: &Statement) -> bool {
+        self.graph.modifying_scopes(statement).is_some()
+    }
+
+    /// The columns of the relation the data-modifying `statement` writes, in
+    /// order, each by its stored name, quoting and definition, `None` for a
+    /// statement whose target the scope does not know.
+    pub(crate) fn written_columns(
+        &self,
+        statement: &Statement,
+    ) -> Option<impl Iterator<Item = (&str, bool, ColumnDefinition<'_, 'query, 'db, DB>)>> {
+        let columns = self.graph.written_columns(statement)?;
+        Some(
+            columns.iter().map(|column| {
+                (&*column.name, column.quoted, self.graph.definition(column.definition))
+            }),
+        )
     }
 
     /// The scopes of `root` under the names `scope` reaches, with the rule

@@ -161,7 +161,8 @@ impl<'db, DB: DatabaseLike> OperandEvidence<'db, DB> {
     }
 }
 
-/// One step of the conversion PostgreSQL applies to an operand.
+/// One step of the conversion PostgreSQL applies to an operand, an argument
+/// or a value it stores.
 #[derive(Debug, Clone)]
 pub enum CoercionStep<'db, DB: DatabaseLike> {
     /// The input function of this type reads an untyped literal, the base
@@ -182,6 +183,13 @@ pub enum CoercionStep<'db, DB: DatabaseLike> {
     /// The output function of the source type and the input function of the
     /// target type convert the value.
     InOut(&'db DB::Cast),
+    /// The output function of the value's type and the input function of
+    /// `target` convert the value where no cast reaches `target`, as
+    /// PostgreSQL converts any value it stores in a string type.
+    AutomaticInOut {
+        /// The type whose input function reads the value's text.
+        target: TargetName<'db>,
+    },
     /// Each element of an array is converted by this plan.
     Array {
         /// The plan applied to each element.
@@ -194,12 +202,14 @@ pub enum CoercionStep<'db, DB: DatabaseLike> {
     /// The row of a table is converted to the row of a table it inherits
     /// from or is a partition of.
     Inherited,
-    /// The length coercion of the base type applies the modifier a domain
-    /// declares for it.
+    /// The length coercion of a type applies a modifier, the one a domain
+    /// declares for its base type or the one of the column a value is stored
+    /// in.
     LengthCoercion {
-        /// The cast of the base type to itself that applies the modifier.
+        /// The cast of the type to itself that applies the modifier.
         cast: &'db DB::Cast,
-        /// The modifier, as `pg_type.typtypmod` stores it.
+        /// The modifier, as `pg_type.typtypmod` or `pg_attribute.atttypmod`
+        /// stores it.
         typmod: i32,
     },
     /// The value is checked against the constraints of the domain.

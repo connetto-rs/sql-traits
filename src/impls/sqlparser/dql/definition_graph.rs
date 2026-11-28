@@ -1,4 +1,7 @@
-use alloc::{borrow::ToOwned, vec::Vec};
+use alloc::{
+    borrow::{Cow, ToOwned},
+    vec::Vec,
+};
 use core::{marker::PhantomData, ops::Range, slice};
 
 use sqlparser::ast::{
@@ -207,6 +210,16 @@ struct ValuesList {
     cells: ScopeCursor,
 }
 
+/// A column of the relation a data-modifying statement writes.
+pub(crate) struct WrittenColumn<'db> {
+    /// The column's name, as stored.
+    pub(crate) name: Cow<'db, str>,
+    /// Whether the name is quoted.
+    pub(crate) quoted: bool,
+    /// What declares the column's type.
+    pub(crate) definition: DefinitionId,
+}
+
 fn select_address(select: &Select) -> usize {
     core::ptr::from_ref(select).addr()
 }
@@ -235,6 +248,9 @@ pub(crate) struct DefinitionGraph<'query, 'db, DB: DatabaseLike> {
     /// The scopes the clauses of every data-modifying statement resolve in,
     /// by the statement's address.
     modifying: Vec<(usize, ModifyingScopes)>,
+    /// The columns of the relation every `INSERT`, `UPDATE` and `MERGE`
+    /// writes, in order, by the statement's address.
+    written: Vec<(usize, Vec<WrittenColumn<'db>>)>,
     /// The scope of every parenthesized join under an alias, by the join's
     /// address.
     joins: Vec<(usize, ScopeId)>,
@@ -253,6 +269,14 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionGraph<'query, 'db, DB> {
     pub(crate) fn modifying_scopes(&self, statement: &Statement) -> Option<ModifyingScopes> {
         let address = core::ptr::from_ref(statement).addr();
         self.modifying.iter().find(|(held, _)| *held == address).map(|(_, scopes)| *scopes)
+    }
+
+    /// The columns of the relation the data-modifying statement `statement`
+    /// writes, in order, `None` for a statement the graph was not built over
+    /// or whose target it does not know.
+    pub(crate) fn written_columns(&self, statement: &Statement) -> Option<&[WrittenColumn<'db>]> {
+        let address = core::ptr::from_ref(statement).addr();
+        self.written.iter().find(|(held, _)| *held == address).map(|(_, columns)| &**columns)
     }
 
     pub(crate) fn definition<'scope>(
@@ -783,6 +807,7 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
                 join_trees: Vec::new(),
                 queries: Vec::new(),
                 modifying: Vec::new(),
+                written: Vec::new(),
                 joins: Vec::new(),
                 lists: Vec::new(),
                 values: Vec::new(),
@@ -926,6 +951,15 @@ impl<'query, 'db, DB: DatabaseLike> DefinitionDerivation<'query, 'db, DB> {
     /// Records the scopes the clauses of `statement` resolve in.
     pub(super) fn record_modifying(&mut self, statement: &Statement, scopes: ModifyingScopes) {
         self.graph.modifying.push((core::ptr::from_ref(statement).addr(), scopes));
+    }
+
+    /// Records the columns of the relation `statement` writes.
+    pub(super) fn record_written(
+        &mut self,
+        statement: &Statement,
+        columns: Vec<WrittenColumn<'db>>,
+    ) {
+        self.graph.written.push((core::ptr::from_ref(statement).addr(), columns));
     }
 
     /// Whether a relation named `name`, unquoted, is in reach from `cursor`.
