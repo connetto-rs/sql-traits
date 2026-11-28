@@ -44,6 +44,7 @@ fn rendered(operand: &OperandType<'_>) -> String {
         OperandType::Known { type_name, typmod: None } => type_name.to_string(),
         OperandType::UntypedLiteral => "unknown literal".to_owned(),
         OperandType::Unknown => "?".to_owned(),
+        OperandType::Sqlite { .. } => "sqlite".to_owned(),
     }
 }
 

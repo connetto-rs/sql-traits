@@ -1398,6 +1398,7 @@ fn enum_operands_need_the_enum_kind() {
             OperatorResolution::Ambiguous(_) => "ambiguous",
             OperatorResolution::UnboundPolymorphic(_) => "unbound",
             OperatorResolution::Undetermined => "undetermined",
+            OperatorResolution::Sqlite(_) => "sqlite",
         }
     };
     assert_eq!(resolution(Some(TypeKind::Enum)), "selected");

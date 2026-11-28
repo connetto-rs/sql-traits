@@ -1066,6 +1066,7 @@ fn refused_calls_answer_why() {
                 CallResolution::Undetermined => "undetermined".to_owned(),
                 CallResolution::Selected(_) => panic!("{node} selects a function"),
                 CallResolution::Cast(_) => panic!("{node} is a cast"),
+                CallResolution::Sqlite(_) => panic!("{node} is a SQLite call"),
             }
         })
         .collect();

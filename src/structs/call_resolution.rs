@@ -1,14 +1,15 @@
 //! The function PostgreSQL selects for a call, or the cast it reads the call
-//! as, and the type each argument takes.
+//! as, and the type each argument takes, or the conversions a SQLite
+//! built-in function applies to the arguments.
 
 use alloc::vec::Vec;
 
 use crate::{
-    structs::{OperandEvidence, TargetName},
+    structs::{OperandEvidence, SqliteCall, TargetName},
     traits::DatabaseLike,
 };
 
-/// What PostgreSQL does with a function call.
+/// What PostgreSQL does with a function call, or what SQLite does.
 #[derive(Debug, Clone)]
 pub enum CallResolution<'db, DB: DatabaseLike> {
     /// PostgreSQL runs this function.
@@ -28,6 +29,9 @@ pub enum CallResolution<'db, DB: DatabaseLike> {
     /// An argument type or a fact selection needs is missing, or the call
     /// writes clauses PostgreSQL's grammar refuses before any selection.
     Undetermined,
+    /// SQLite runs the built-in scalar function after converting the
+    /// arguments as this says.
+    Sqlite(SqliteCall),
 }
 
 /// The function PostgreSQL selects and what each argument takes.

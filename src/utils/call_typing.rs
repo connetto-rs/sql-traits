@@ -1238,7 +1238,7 @@ pub(crate) fn typed_input(
             Some((canonical_owned(database, parsed), *typmod))
         }
         OperandType::UntypedLiteral => Some((PgType::UNKNOWN, None)),
-        OperandType::Unknown => None,
+        OperandType::Sqlite { .. } | OperandType::Unknown => None,
     }
 }
 

@@ -793,7 +793,8 @@ impl<'a, DB: DatabaseLike> TruthContext<'a, DB> {
             CallResolution::Undetermined
             | CallResolution::Cast(_)
             | CallResolution::NotFound
-            | CallResolution::UnboundPolymorphic(_) => Vec::new(),
+            | CallResolution::UnboundPolymorphic(_)
+            | CallResolution::Sqlite(_) => Vec::new(),
         })
     }
 
